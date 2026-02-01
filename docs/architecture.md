@@ -128,8 +128,27 @@ SIMD-optimized similarity with optional int8 quantization and dimension pruning.
 
 ### Text Processing (`core/text.py`)
 
-- **Diff generation**: Unified diff format with context
-- **Smart truncation**: Preserves structure (functions, classes) when cutting
+Advanced diff and truncation with delta compression and syntax awareness.
+
+| Feature | Description |
+|---------|-------------|
+| **Delta compression** | Store changes only (10-100x smaller) |
+| **Semantic truncation** | Cut at function/class boundaries |
+| **Diff statistics** | Track insertions/deletions/modifications |
+| **Streaming diff** | Memory-efficient for multi-GB files |
+| **Language detection** | Python, TypeScript, Go support |
+
+**API:**
+- `generate_diff(old, new)` — Unified diff with stats
+- `compute_delta(old, new)` — Compressed change representation
+- `truncate_semantic(content, max_size)` — Syntax-aware truncation
+- `diff_stats(old, new)` — Change metrics
+
+**Example:**
+```python
+delta = compute_delta(old, new)
+# Delta: 245 bytes vs 15KB original (98% compression)
+```
 
 ---
 
