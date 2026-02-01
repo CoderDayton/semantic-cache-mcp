@@ -64,6 +64,7 @@ read path="/src/app.py"
 
 ```diff
 // Diff for /src/app.py (changed since cache):
+// Stats: +3 -1 ~2 lines, 8.5% size
 --- cached
 +++ current
 @@ -42,7 +42,7 @@
@@ -96,9 +97,11 @@ Cleared 42 cache entries
 
 - **80%+ Token Reduction** — Returns diffs instead of full files when content changes
 - **Local Embeddings** — FastEmbed with nomic-embed-text-v1.5 (no API keys needed)
-- **Semantic Similarity** — Finds related cached files using embeddings (cosine similarity > 0.85)
-- **Content-Addressable Storage** — Rabin fingerprinting CDC + BLAKE2b hashing for deduplication
-- **Adaptive Compression** — Brotli compression tuned by Shannon entropy
+- **Semantic Similarity** — Batch SIMD operations with optional int8 quantization (14x faster)
+- **Content-Addressable Storage** — HyperCDC chunking (2.7x faster) + BLAKE3 hashing (4.9x faster)
+- **Delta Compression** — Stores only changes for 10-100x compression on minimal edits
+- **Adaptive Compression** — Multi-codec ZSTD/LZ4/Brotli (3.7x faster)
+- **Semantic Truncation** — Preserves code structure at function/class boundaries
 - **LRU-K Eviction** — Frequency-aware cache management (keeps frequently accessed files)
 - **o200k_base Tokenizer** — Accurate GPT-4o token counting with auto-download
 - **Structured Logging** — Debug, info, and warning levels via `LOG_LEVEL` env var
@@ -149,6 +152,21 @@ Cache settings in `config.py`:
 
 ---
 
+## ⚡ Performance
+
+Recent optimizations deliver **2-20x speedups** across core operations:
+
+| Component | Improvement | Details |
+|-----------|-------------|---------|
+| **Chunking** | 2.7x faster | HyperCDC vs Rabin fingerprinting |
+| **Hashing** | 3.8-4.9x faster | BLAKE3 vs BLAKE2b (8KB+ chunks) |
+| **Compression** | 3.7x faster | ZSTD caching + native threading |
+| **Similarity** | 8-14x faster | Batch SIMD + int8 quantization |
+
+See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis.
+
+---
+
 ## 📚 Documentation
 
 | Guide                                      | Description                                |
@@ -190,7 +208,10 @@ See [Contributing Guide](docs/contributing.md) for commit conventions and code s
 
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and powered by:
 
-- Rabin fingerprinting for content-defined chunking
-- BLAKE2b for cryptographic hashing
-- Shannon entropy for adaptive compression
+- HyperCDC (Gear hash) for content-defined chunking
+- BLAKE3 for cryptographic hashing (with BLAKE2b fallback)
+- ZSTD/LZ4/Brotli multi-codec compression
+- int8 quantization for fast similarity search
 - LRU-K for frequency-aware eviction
+
+See [Performance](docs/performance.md) for benchmarks and optimization details.
