@@ -46,10 +46,14 @@ class SemanticCache:
         Returns:
             Embedding as array.array or None if unavailable
         """
-        result = embed(text)
-        if result:
-            logger.debug(f"Embedding generated for {text[:50]}...")
-        return result
+        try:
+            result = embed(text)
+            if result:
+                logger.debug(f"Embedding generated for {text[:50]}...")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get embedding: {e}")
+            return None
 
     # -------------------------------------------------------------------------
     # Delegated operations
