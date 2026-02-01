@@ -11,7 +11,12 @@ from .hashing import (
     StreamingHasher,
     get_hash_stats,
 )
-from .similarity import cosine_similarity
+from .similarity import (
+    cosine_similarity,
+    cosine_similarity_batch,
+    cosine_similarity_batch_matrix,
+    top_k_similarities,
+)
 from .text import generate_diff, truncate_smart
 from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 from .embeddings import embed, embed_query, warmup as warmup_embeddings, get_model_info
@@ -29,6 +34,9 @@ __all__ = [
     "StreamingHasher",
     "get_hash_stats",
     "cosine_similarity",
+    "cosine_similarity_batch",
+    "cosine_similarity_batch_matrix",
+    "top_k_similarities",
     "count_tokens",
     "generate_diff",
     "truncate_smart",

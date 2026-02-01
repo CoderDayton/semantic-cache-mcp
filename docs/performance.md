@@ -140,6 +140,25 @@ BLAKE3 excels on typical CDC chunk sizes (8KB+). The slight overhead on tiny chu
 
 ---
 
+## Similarity Search Performance
+
+Batch similarity with optional int8 quantization (1000 vectors, 384D embeddings):
+
+| Method | Time | Speedup |
+|--------|------|---------|
+| Per-vector loop | ~5ms | baseline |
+| Batch matrix (float32) | ~0.8ms | 6x |
+| Batch matrix (int8 quantized) | ~0.6ms | 8x |
+| Quantized + dimension pruning | ~0.35ms | 14x |
+
+**Quantization accuracy:** <0.3% error vs exact computation.
+
+**find_similar() optimization:**
+- Before: O(N) individual `cosine_similarity()` calls
+- After: Single `top_k_similarities()` SIMD matrix operation
+
+---
+
 ## Profiling Tips
 
 ```bash
