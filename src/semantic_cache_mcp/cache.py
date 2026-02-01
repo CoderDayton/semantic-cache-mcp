@@ -9,30 +9,31 @@ Scientific improvements over token-optimizer-mcp:
 6. Delta encoding - Binary diff for minimal storage
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import math
 import os
 import sqlite3
-import struct
 import time
-import zlib
 from collections import deque
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import brotli
-import httpx
+
+if TYPE_CHECKING:
+    from openai import OpenAI
 
 # Configuration
 CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp"
 DB_PATH = CACHE_DIR / "cache.db"
-EMBEDDINGS_URL = os.environ.get("EMBEDDINGS_URL", "http://localhost:8899/v1/embeddings")
+EMBEDDINGS_BASE_URL = os.environ.get("EMBEDDINGS_URL", "http://localhost:8899/v1")
 MAX_CONTENT_SIZE = 100_000  # 100KB default max return size
 SIMILARITY_THRESHOLD = 0.85  # Semantic similarity threshold for related files
-CHUNK_SIZE = 4096  # Rolling hash chunk size
 MAX_CACHE_ENTRIES = 10_000  # LRU-K limit
 
 
@@ -77,6 +78,8 @@ class RollingHash:
     WINDOW = 48  # Window size for rolling hash
     MASK = 0x1FFF  # 13 bits - average chunk size ~8KB
 
+    __slots__ = ("hash", "window", "pow_out")
+
     def __init__(self) -> None:
         self.hash = 0
         self.window: deque[int] = deque(maxlen=self.WINDOW)
@@ -100,7 +103,9 @@ class RollingHash:
         return (self.hash & self.MASK) == 0
 
 
-def content_defined_chunking(content: bytes, min_size: int = 2048, max_size: int = 65536) -> Iterator[bytes]:
+def content_defined_chunking(
+    content: bytes, min_size: int = 2048, max_size: int = 65536
+) -> Iterator[bytes]:
     """Split content into chunks using rolling hash (Rabin fingerprinting).
 
     Content-defined chunking finds natural boundaries that survive insertions
@@ -108,9 +113,10 @@ def content_defined_chunking(content: bytes, min_size: int = 2048, max_size: int
     """
     hasher = RollingHash()
     chunk_start = 0
+    n = len(content)
 
-    for i, byte in enumerate(content):
-        hasher.update(byte)
+    for i in range(n):
+        hasher.update(content[i])
         chunk_size = i - chunk_start + 1
 
         # Check for boundary (but respect min/max size)
@@ -119,7 +125,7 @@ def content_defined_chunking(content: bytes, min_size: int = 2048, max_size: int
             chunk_start = i + 1
 
     # Emit final chunk
-    if chunk_start < len(content):
+    if chunk_start < n:
         yield content[chunk_start:]
 
 
@@ -133,16 +139,20 @@ def estimate_entropy(data: bytes) -> float:
     if not data:
         return 0.0
 
+    # Use array for O(1) lookups instead of dict
     freq = [0] * 256
     for byte in data:
         freq[byte] += 1
 
     entropy = 0.0
     n = len(data)
+    log2_n = math.log2(n)
+
+    # Optimized: only iterate non-zero frequencies
     for count in freq:
         if count > 0:
-            p = count / n
-            entropy -= p * math.log2(p)
+            # p * log2(p) = count/n * log2(count/n) = count/n * (log2(count) - log2(n))
+            entropy -= count * (math.log2(count) - log2_n) / n
 
     return entropy
 
@@ -157,55 +167,56 @@ class SemanticCache:
     - LRU-K eviction for frequency-aware cache management
     """
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
+    __slots__ = ("db_path", "_client")
+
+    def __init__(self, db_path: Path = DB_PATH, client: OpenAI | None = None) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-        self._http = httpx.Client(timeout=10.0)
+        self._client = client
 
     def _init_db(self) -> None:
         """Initialize SQLite schema with content-addressable storage."""
-        conn = sqlite3.connect(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            # Content-addressable chunk store
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chunks (
+                    hash TEXT PRIMARY KEY,
+                    data BLOB NOT NULL,
+                    size INTEGER NOT NULL,
+                    ref_count INTEGER DEFAULT 1
+                )
+            """)
 
-        # Content-addressable chunk store
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS chunks (
-                hash TEXT PRIMARY KEY,
-                data BLOB NOT NULL,
-                size INTEGER NOT NULL,
-                ref_count INTEGER DEFAULT 1
-            )
-        """)
+            # File metadata with chunk references
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    path TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    chunk_hashes TEXT NOT NULL,
+                    mtime REAL NOT NULL,
+                    tokens INTEGER NOT NULL,
+                    embedding BLOB,
+                    created_at REAL NOT NULL,
+                    access_history TEXT NOT NULL
+                )
+            """)
 
-        # File metadata with chunk references
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS files (
-                path TEXT PRIMARY KEY,
-                content_hash TEXT NOT NULL,
-                chunk_hashes TEXT NOT NULL,
-                mtime REAL NOT NULL,
-                tokens INTEGER NOT NULL,
-                embedding BLOB,
-                created_at REAL NOT NULL,
-                access_history TEXT NOT NULL
-            )
-        """)
+            # Index for LRU-K eviction
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON files(created_at)")
 
-        # Index for LRU-K eviction
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON files(created_at)")
-
-        conn.commit()
-        conn.close()
-
-    def _hash_chunk(self, data: bytes) -> str:
+    @staticmethod
+    def _hash_chunk(data: bytes) -> str:
         """Hash chunk using BLAKE2b (faster than SHA256, cryptographically secure)."""
         return hashlib.blake2b(data, digest_size=20).hexdigest()
 
-    def _hash_content(self, content: str) -> str:
+    @staticmethod
+    def _hash_content(content: str) -> str:
         """Hash full content for change detection."""
         return hashlib.blake2b(content.encode(), digest_size=16).hexdigest()
 
-    def _compress_adaptive(self, data: bytes) -> bytes:
+    @staticmethod
+    def _compress_adaptive(data: bytes) -> bytes:
         """Compress with adaptive quality based on entropy.
 
         High entropy data (already compressed) -> quality 1 (fast)
@@ -222,98 +233,100 @@ class SemanticCache:
 
         return brotli.compress(data, quality=quality)
 
-    def _decompress(self, data: bytes) -> bytes:
+    @staticmethod
+    def _decompress(data: bytes) -> bytes:
         """Decompress Brotli data."""
         return brotli.decompress(data)
 
-    def _count_tokens(self, content: str) -> int:
+    @staticmethod
+    def _count_tokens(content: str) -> int:
         """Approximate token count using byte-pair encoding heuristic.
 
         More accurate than char/4 for code:
         - Whitespace and punctuation are often single tokens
         - Common words/identifiers are 1-2 tokens
         """
-        # Simple but more accurate heuristic
         words = len(content.split())
         chars = len(content)
-        # Roughly: tokens ≈ words + punctuation overhead
         return int(words * 1.3 + chars * 0.1)
 
     def _get_embedding(self, text: str) -> list[float] | None:
         """Get embedding from shared service for semantic similarity."""
+        if self._client is None:
+            return None
         try:
             # Truncate to first 512 chars for embedding (enough for semantic matching)
             sample = text[:512]
-            resp = self._http.post(
-                EMBEDDINGS_URL,
-                json={"input": [sample], "model": "TaylorAI/bge-micro-v2"},
+            response = self._client.embeddings.create(
+                input=[sample],
+                model="text-embedding",  # Service uses configured model
             )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
+            return response.data[0].embedding
         except Exception:
             return None
 
-    def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
         """Cosine similarity for normalized embeddings (dot product)."""
-        return sum(x * y for x, y in zip(a, b, strict=True))
+        total = 0.0
+        for x, y in zip(a, b, strict=True):
+            total += x * y
+        return total
 
     def _store_chunks(self, content: bytes) -> list[str]:
         """Store content as content-addressable chunks. Returns chunk hashes."""
-        conn = sqlite3.connect(self.db_path)
-        chunk_hashes = []
+        chunk_hashes: list[str] = []
 
-        for chunk in content_defined_chunking(content):
-            chunk_hash = self._hash_chunk(chunk)
-            compressed = self._compress_adaptive(chunk)
+        with sqlite3.connect(self.db_path) as conn:
+            for chunk in content_defined_chunking(content):
+                chunk_hash = self._hash_chunk(chunk)
+                compressed = self._compress_adaptive(chunk)
 
-            # Insert or increment ref_count
-            conn.execute(
-                """
-                INSERT INTO chunks (hash, data, size, ref_count)
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
-                """,
-                (chunk_hash, compressed, len(chunk)),
-            )
-            chunk_hashes.append(chunk_hash)
+                # Insert or increment ref_count
+                conn.execute(
+                    """
+                    INSERT INTO chunks (hash, data, size, ref_count)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
+                    """,
+                    (chunk_hash, compressed, len(chunk)),
+                )
+                chunk_hashes.append(chunk_hash)
 
-        conn.commit()
-        conn.close()
         return chunk_hashes
 
     def _load_chunks(self, chunk_hashes: list[str]) -> bytes:
         """Reassemble content from chunk hashes."""
-        conn = sqlite3.connect(self.db_path)
-        content = b""
+        parts: list[bytes] = []
 
-        for chunk_hash in chunk_hashes:
-            row = conn.execute("SELECT data FROM chunks WHERE hash = ?", (chunk_hash,)).fetchone()
-            if row:
-                content += self._decompress(row[0])
+        with sqlite3.connect(self.db_path) as conn:
+            for chunk_hash in chunk_hashes:
+                row = conn.execute(
+                    "SELECT data FROM chunks WHERE hash = ?", (chunk_hash,)
+                ).fetchone()
+                if row:
+                    parts.append(self._decompress(row[0]))
 
-        conn.close()
-        return content
+        return b"".join(parts)
 
     def _release_chunks(self, chunk_hashes: list[str]) -> None:
         """Decrement ref_count for chunks, delete if zero."""
-        conn = sqlite3.connect(self.db_path)
-        for chunk_hash in chunk_hashes:
-            conn.execute(
-                "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?", (chunk_hash,)
-            )
-        conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            for chunk_hash in chunk_hashes:
+                conn.execute(
+                    "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
+                    (chunk_hash,),
+                )
+            conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
 
     def get(self, path: str) -> CacheEntry | None:
         """Get cached entry if exists."""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT path, content_hash, chunk_hashes, mtime, tokens, embedding, created_at, access_history "
-            "FROM files WHERE path = ?",
-            (path,),
-        ).fetchone()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT path, content_hash, chunk_hashes, mtime, tokens, embedding, "
+                "created_at, access_history FROM files WHERE path = ?",
+                (path,),
+            ).fetchone()
 
         if not row:
             return None
@@ -356,51 +369,52 @@ class SemanticCache:
         embedding_json = json.dumps(embedding) if embedding else None
         access_history = json.dumps([time.time()])
 
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO files
-            (path, content_hash, chunk_hashes, mtime, tokens, embedding, created_at, access_history)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                path,
-                content_hash,
-                json.dumps(chunk_hashes),
-                mtime,
-                tokens,
-                embedding_json,
-                time.time(),
-                access_history,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO files
+                (path, content_hash, chunk_hashes, mtime, tokens, embedding, created_at, access_history)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    path,
+                    content_hash,
+                    json.dumps(chunk_hashes),
+                    mtime,
+                    tokens,
+                    embedding_json,
+                    time.time(),
+                    access_history,
+                ),
+            )
 
         # Evict if over limit
         self._evict_lru_k()
 
     def record_access(self, path: str) -> None:
         """Record access for LRU-K tracking."""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute("SELECT access_history FROM files WHERE path = ?", (path,)).fetchone()
-        if row:
-            history = json.loads(row[0])
-            history.append(time.time())
-            # Keep last 5 accesses (K=5 for LRU-K)
-            history = history[-5:]
-            conn.execute(
-                "UPDATE files SET access_history = ? WHERE path = ?",
-                (json.dumps(history), path),
-            )
-            conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT access_history FROM files WHERE path = ?", (path,)
+            ).fetchone()
+            if row:
+                history = json.loads(row[0])
+                history.append(time.time())
+                # Keep last 5 accesses (K=5 for LRU-K)
+                history = history[-5:]
+                conn.execute(
+                    "UPDATE files SET access_history = ? WHERE path = ?",
+                    (json.dumps(history), path),
+                )
 
-    def find_similar(self, embedding: list[float], exclude_path: str | None = None) -> str | None:
+    def find_similar(
+        self, embedding: list[float], exclude_path: str | None = None
+    ) -> str | None:
         """Find semantically similar cached file using embeddings."""
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT path, embedding FROM files WHERE embedding IS NOT NULL").fetchall()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT path, embedding FROM files WHERE embedding IS NOT NULL"
+            ).fetchall()
 
         best_path = None
         best_sim = SIMILARITY_THRESHOLD
@@ -422,49 +436,44 @@ class SemanticCache:
         LRU-K evicts based on K-th most recent access, not just most recent.
         This prevents one-time accesses from evicting frequently-used entries.
         """
-        conn = sqlite3.connect(self.db_path)
-        count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
-        if count <= MAX_CACHE_ENTRIES:
-            conn.close()
-            return
+            if count <= MAX_CACHE_ENTRIES:
+                return
 
-        # Get all entries with their K-th access time (K=2)
-        rows = conn.execute("SELECT path, chunk_hashes, access_history FROM files").fetchall()
+            # Get all entries with their K-th access time (K=2)
+            rows = conn.execute(
+                "SELECT path, chunk_hashes, access_history FROM files"
+            ).fetchall()
 
-        entries_with_score = []
-        for path, chunks_json, history_json in rows:
-            history = json.loads(history_json)
-            # LRU-K score: K-th most recent access (or oldest if < K accesses)
-            k = 2
-            score = history[-k] if len(history) >= k else history[0]
-            entries_with_score.append((score, path, json.loads(chunks_json)))
+            entries_with_score: list[tuple[float, str, list[str]]] = []
+            for path, chunks_json, history_json in rows:
+                history = json.loads(history_json)
+                # LRU-K score: K-th most recent access (or oldest if < K accesses)
+                k = 2
+                score = history[-k] if len(history) >= k else history[0]
+                entries_with_score.append((score, path, json.loads(chunks_json)))
 
-        # Sort by score (oldest K-th access first)
-        entries_with_score.sort()
+            # Sort by score (oldest K-th access first)
+            entries_with_score.sort()
 
-        # Evict oldest 10%
-        evict_count = max(1, count // 10)
-        for _, path, chunk_hashes in entries_with_score[:evict_count]:
-            conn.execute("DELETE FROM files WHERE path = ?", (path,))
-            self._release_chunks(chunk_hashes)
+            # Evict oldest 10%
+            evict_count = max(1, count // 10)
+            for _, path, chunk_hashes in entries_with_score[:evict_count]:
+                conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                self._release_chunks(chunk_hashes)
 
-        conn.commit()
-        conn.close()
-
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, int | float]:
         """Get detailed cache statistics."""
-        conn = sqlite3.connect(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            file_stats = conn.execute(
+                "SELECT COUNT(*), SUM(tokens) FROM files"
+            ).fetchone()
 
-        file_stats = conn.execute("""
-            SELECT COUNT(*), SUM(tokens) FROM files
-        """).fetchone()
-
-        chunk_stats = conn.execute("""
-            SELECT COUNT(*), SUM(size), SUM(LENGTH(data)) FROM chunks
-        """).fetchone()
-
-        conn.close()
+            chunk_stats = conn.execute(
+                "SELECT COUNT(*), SUM(size), SUM(LENGTH(data)) FROM chunks"
+            ).fetchone()
 
         db_size = self.db_path.stat().st_size if self.db_path.exists() else 0
         original_size = chunk_stats[1] or 0
@@ -476,24 +485,20 @@ class SemanticCache:
             "unique_chunks": chunk_stats[0] or 0,
             "original_bytes": original_size,
             "compressed_bytes": compressed_size,
-            "compression_ratio": round(compressed_size / original_size, 3) if original_size > 0 else 0,
+            "compression_ratio": round(compressed_size / original_size, 3)
+            if original_size > 0
+            else 0,
             "dedup_ratio": round(original_size / db_size, 2) if db_size > 0 else 1,
             "db_size_mb": round(db_size / 1024 / 1024, 2),
         }
 
     def clear(self) -> int:
         """Clear all cache entries."""
-        conn = sqlite3.connect(self.db_path)
-        count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        conn.execute("DELETE FROM files")
-        conn.execute("DELETE FROM chunks")
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            conn.execute("DELETE FROM files")
+            conn.execute("DELETE FROM chunks")
         return count
-
-    def close(self) -> None:
-        """Close HTTP client."""
-        self._http.close()
 
 
 def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
@@ -501,7 +506,11 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
-    diff = list(unified_diff(old_lines, new_lines, fromfile="cached", tofile="current", n=context_lines))
+    diff = list(
+        unified_diff(
+            old_lines, new_lines, fromfile="cached", tofile="current", n=context_lines
+        )
+    )
 
     if not diff:
         return "// No changes"
@@ -509,7 +518,9 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     return "".join(diff)
 
 
-def truncate_smart(content: str, max_size: int, keep_top: int = 80, keep_bottom: int = 40) -> str:
+def truncate_smart(
+    content: str, max_size: int, keep_top: int = 80, keep_bottom: int = 40
+) -> str:
     """Smart truncation preserving structure."""
     if len(content) <= max_size:
         return content
@@ -521,7 +532,9 @@ def truncate_smart(content: str, max_size: int, keep_top: int = 80, keep_bottom:
     top_content = "".join(top_lines)
     bottom_content = "".join(bottom_lines)
 
-    truncation_msg = f"\n\n// ... [{len(lines) - keep_top - keep_bottom} lines truncated] ...\n\n"
+    truncation_msg = (
+        f"\n\n// ... [{len(lines) - keep_top - keep_bottom} lines truncated] ...\n\n"
+    )
 
     total = len(top_content) + len(truncation_msg) + len(bottom_content)
     if total > max_size:
