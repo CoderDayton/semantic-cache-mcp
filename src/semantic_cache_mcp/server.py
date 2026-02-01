@@ -47,7 +47,9 @@ async def app_lifespan(server: FastMCP):
 mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
 
 
-@mcp.tool()
+@mcp.tool(
+    meta={"version": "0.4.0", "author": "Dayton Dunbar", "github": "https://github.com/CoderDayton/semantic-cache-mcp"}
+)
 def read(
     ctx: Context,
     path: str,
@@ -87,7 +89,18 @@ def read(
 
 @mcp.tool()
 def stats(ctx: Context) -> str:
-    """Get semantic cache statistics: files, tokens, compression, deduplication ratios."""
+    """Retrieve comprehensive semantic cache statistics including:
+
+    - Number of files tracked in the cache
+    - Total and unique token counts
+    - Compression and deduplication ratios for stored file content
+    - Current cache size versus disk usage
+    - Embedding model status and readiness
+    - Performance metrics if available (e.g., hit/miss rates, recent cache savings)
+    - Additional implementation-specific details, if exposed by the cache backend
+
+    Use this tool to monitor cache health, efficiency, and performance over time.
+    """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     cache_stats = cache.get_stats()
 
@@ -101,7 +114,11 @@ def stats(ctx: Context) -> str:
 
 @mcp.tool()
 def clear(ctx: Context) -> str:
-    """Clear the semantic cache."""
+    """Clear all entries from the semantic cache, including file content, diffs, and similarity indexes.
+
+    Use this tool when you need to reset the cache state, purge cached tokens, or start fresh.
+    Returns the number of entries removed.
+    """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     count = cache.clear()
     return f"Cleared {count} cache entries"
