@@ -1,13 +1,20 @@
 [project]
 name = "semantic-cache-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Lightweight MCP server for semantic file caching with 80%+ token reduction"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "brotli>=1.2.0",
+    "fastembed>=0.7.4",
     "fastmcp>=3.0.0b1",
-    "openai>=2.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
 ]
 
 [project.scripts]
@@ -30,3 +37,10 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"

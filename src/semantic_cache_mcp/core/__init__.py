@@ -6,6 +6,7 @@ from .hashing import hash_chunk, hash_content
 from .similarity import cosine_similarity
 from .text import generate_diff, truncate_smart
 from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
+from .embeddings import embed, embed_query, warmup as warmup_embeddings, get_model_info
 
 __all__ = [
     "content_defined_chunking",
@@ -19,4 +20,8 @@ __all__ = [
     "truncate_smart",
     "BPETokenizer",
     "get_tokenizer",
+    "embed",
+    "embed_query",
+    "warmup_embeddings",
+    "get_model_info",
 ]

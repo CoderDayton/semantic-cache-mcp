@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Set
+
+logger = logging.getLogger(__name__)
 
 # Cache directory for tokenizer files
 TOKENIZER_CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp" / "tokenizer"
@@ -275,9 +278,11 @@ _SPECIAL_TOKENS = {"<|endoftext|>": 199999, "<|endofprompt|>": 200018}
 
 def _init_tokenizer(cache_file: Path) -> BPETokenizer:
     """Initialize tokenizer from cache file."""
+    logger.info(f"Loading o200k_base tokenizer from {cache_file}")
     tok = BPETokenizer()
     tok.load_tiktoken_file(cache_file)
     tok.add_special_tokens(_SPECIAL_TOKENS)
+    logger.info(f"Tokenizer initialized with {len(tok.vocab)} tokens")
     return tok
 
 
@@ -306,6 +311,7 @@ def _ensure_tokenizer() -> BPETokenizer | None:
             if _verify_hash(cache_file, O200K_BASE_SHA256):
                 _tokenizer = _init_tokenizer(cache_file)
                 return _tokenizer
+            logger.warning("Hash verification failed, re-downloading tokenizer")
             cache_file.unlink()  # Remove corrupted file
         except Exception:
             pass

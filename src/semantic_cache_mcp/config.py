@@ -1,16 +1,19 @@
 """Configuration constants for semantic-cache-mcp."""
 
+import logging
 from os import environ
 from pathlib import Path
 from typing import Final
 
+# Logging configuration
+LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+
 # Paths
 CACHE_DIR: Final = Path.home() / ".cache" / "semantic-cache-mcp"
 DB_PATH: Final = CACHE_DIR / "cache.db"
-
-# External services
-EMBEDDINGS_BASE_URL: Final = environ.get("EMBEDDINGS_URL", "http://localhost:8899/v1")
-EMBEDDINGS_MODEL: Final = environ.get("EMBEDDINGS_MODEL", "text-embedding-3-small")
 
 # Cache limits
 MAX_CONTENT_SIZE: Final = 100_000  # 100KB default max return size

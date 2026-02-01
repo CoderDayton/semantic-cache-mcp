@@ -4,7 +4,6 @@ from .cache import SemanticCache, smart_read
 from .config import (
     CACHE_DIR,
     DB_PATH,
-    EMBEDDINGS_BASE_URL,
     MAX_CACHE_ENTRIES,
     MAX_CONTENT_SIZE,
     SIMILARITY_THRESHOLD,
@@ -12,7 +11,7 @@ from .config import (
 from .server import mcp
 from .types import CacheEntry, ReadResult
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # Main classes
@@ -26,7 +25,6 @@ __all__ = [
     # Configuration
     "CACHE_DIR",
     "DB_PATH",
-    "EMBEDDINGS_BASE_URL",
     "MAX_CACHE_ENTRIES",
     "MAX_CONTENT_SIZE",
     "SIMILARITY_THRESHOLD",

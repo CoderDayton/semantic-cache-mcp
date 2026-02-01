@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import array
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from ..config import (
     ACCESS_HISTORY_SIZE,
@@ -103,6 +106,7 @@ class SQLiteStorage:
                 chunks_data,
             )
 
+        logger.debug(f"Stored {len(chunks_data)} chunks")
         return [h for h, _, _ in chunks_data]
 
     def load_chunks(self, chunk_hashes: list[ChunkHash]) -> bytes:
@@ -208,6 +212,8 @@ class SQLiteStorage:
         chunk_hashes = self.store_chunks(content_bytes)
         tokens = count_tokens(content)
         embedding_json = json.dumps(list(embedding)) if embedding else None
+
+        logger.debug(f"Stored {len(chunk_hashes)} chunks for {path}")
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -326,6 +332,8 @@ class SQLiteStorage:
             for _, path, chunk_hashes in entries_with_score[:evict_count]:
                 conn.execute("DELETE FROM files WHERE path = ?", (path,))
                 self.release_chunks(chunk_hashes)
+
+            logger.info(f"Cache eviction: removed {evict_count} entries")
 
     # -------------------------------------------------------------------------
     # Statistics and management
