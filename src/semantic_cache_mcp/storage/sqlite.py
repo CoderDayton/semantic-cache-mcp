@@ -331,8 +331,14 @@ class SQLiteStorage:
             evict_count = max(1, count // 10)
             for _, path, chunk_hashes in entries_with_score[:evict_count]:
                 conn.execute("DELETE FROM files WHERE path = ?", (path,))
-                self.release_chunks(chunk_hashes)
+                # Release chunks inline to avoid nested connection
+                conn.executemany(
+                    "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
+                    ((h,) for h in chunk_hashes),
+                )
 
+            # Clean up chunks with zero references
+            conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
             logger.info(f"Cache eviction: removed {evict_count} entries")
 
     # -------------------------------------------------------------------------

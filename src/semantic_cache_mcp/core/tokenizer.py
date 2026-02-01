@@ -335,7 +335,8 @@ def _ensure_tokenizer() -> BPETokenizer | None:
 def count_tokens(content: str) -> int:
     """Count tokens using o200k_base BPE tokenizer.
 
-    Falls back to heuristic if tokenizer unavailable.
+    Falls back to heuristic if tokenizer unavailable or content too large.
+    For very large content (>50KB), uses heuristic to avoid O(n²) BPE overhead.
 
     Args:
         content: Text to count tokens for
@@ -345,6 +346,25 @@ def count_tokens(content: str) -> int:
     """
     if not content:
         return 0
+
+    # Use heuristic for large content to avoid O(n²) BPE overhead
+    MAX_TOKENIZE_SIZE = 10_000
+    if len(content) > MAX_TOKENIZE_SIZE:
+        # Sample-based estimation: tokenize start and end, extrapolate
+        tokenizer = _ensure_tokenizer()
+        if tokenizer and tokenizer.vocab:
+            try:
+                sample_size = 2_000  # Small samples to avoid BPE slowdown
+                start_tokens = tokenizer.count(content[:sample_size])
+                end_tokens = tokenizer.count(content[-sample_size:])
+                avg_tokens_per_char = (start_tokens + end_tokens) / (sample_size * 2)
+                return int(len(content) * avg_tokens_per_char)
+            except Exception:
+                pass
+        # Fallback heuristic
+        spaces = content.count(" ") + content.count("\n") + content.count("\t")
+        words = spaces + 1
+        return int(words * 1.3 + len(content) * 0.1)
 
     tokenizer = _ensure_tokenizer()
 
