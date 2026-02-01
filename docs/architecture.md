@@ -88,12 +88,21 @@ BLAKE3 hashing (with BLAKE2b fallback) for high-performance content addressing.
 
 ### Tokenizer (`core/tokenizer.py`)
 
-Self-contained BPE tokenizer compatible with OpenAI's o200k_base encoding.
+Optimized BPE tokenizer with O(N log M) merge algorithm.
 
-- Auto-downloads tiktoken file from OpenAI (~3.5MB)
-- SHA256 verification for security
-- Falls back to heuristic if unavailable
-- 200,000 token vocabulary (GPT-4o compatible)
+| Feature | Description |
+|---------|-------------|
+| **Priority queue merging** | O(N log M) vs O(N²) naive search |
+| **Merge caching** | Memoize BPE operations |
+| **Fast path** | Single-byte tokens skip BPE |
+| **Sample estimation** | O(1) token count for >50KB text |
+| **Lazy compilation** | Regex pattern compiled once |
+
+**Compatibility:**
+- OpenAI o200k_base encoding (GPT-4o)
+- Auto-downloads tiktoken file (~3.5MB)
+- SHA256 verification
+- Heuristic fallback if unavailable
 
 ### Embeddings (`core/embeddings.py`)
 

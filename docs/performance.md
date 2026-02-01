@@ -21,6 +21,7 @@
 | **Native ZSTD threading** | 19x faster large files | Use ZSTD threads, not Python |
 | **BLAKE3 hashing** | 3.8-4.9x faster than BLAKE2b | Hardware-accelerated, parallelizable |
 | **LRU cache for hashing** | Skip repeated hashing | 16K chunks, 4K blocks, 2K content |
+| **Priority queue tokenizer** | O(N log M) vs O(N²) | Heap-based BPE merging |
 | **Batch SQLite queries** | 2-5x faster inserts | `executemany` + `IN` clause |
 | **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
 | **Generator expressions** | Avoid intermediate lists | Used in hot paths |
