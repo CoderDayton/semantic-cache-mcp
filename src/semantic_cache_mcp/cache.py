@@ -6,7 +6,12 @@ import logging
 from pathlib import Path
 
 from .config import DB_PATH, MAX_CONTENT_SIZE
-from .core import count_tokens, generate_diff, truncate_smart
+from .core import (
+    count_tokens,
+    generate_diff,
+    truncate_semantic,
+    diff_stats,
+)
 from .core.embeddings import embed
 from .storage import SQLiteStorage
 from .types import CacheEntry, EmbeddingVector, ReadResult
@@ -175,13 +180,19 @@ def smart_read(
                 compression_ratio=1.0,
             )
 
-        # File changed - generate diff
+        # File changed - generate diff with stats
         old_content = cache.get_content(cached)
         diff_content = generate_diff(old_content, content)
+        stats = diff_stats(old_content, content)
         diff_tokens = count_tokens(diff_content)
 
         if diff_tokens < tokens_original * 0.6:
-            result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
+            stats_msg = (
+                f"// Stats: +{stats['insertions']} -{stats['deletions']} "
+                f"~{stats['modifications']} lines, "
+                f"{stats['compression_ratio']:.1%} size\n"
+            )
+            result_content = f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
             embedding = cache.get_embedding(content)
             cache.put(str(file_path), content, mtime, embedding)
 
@@ -207,11 +218,18 @@ def smart_read(
                 if similar_entry:
                     similar_content = cache.get_content(similar_entry)
                     diff_content = generate_diff(similar_content, content)
+                    stats = diff_stats(similar_content, content)
                     diff_tokens = count_tokens(diff_content)
 
                     if diff_tokens < tokens_original * 0.7:
+                        stats_msg = (
+                            f"// Stats: +{stats['insertions']} -{stats['deletions']} "
+                            f"~{stats['modifications']} lines, "
+                            f"{stats['compression_ratio']:.1%} size\n"
+                        )
                         result_content = (
                             f"// Similar to cached: {similar_path}\n"
+                            f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
                         cache.put(str(file_path), content, mtime, embedding)
@@ -229,12 +247,13 @@ def smart_read(
                             semantic_match=similar_path,
                         )
 
-    # Strategy 4 & 5: Full read (with optional truncation)
+    # Strategy 4 & 5: Full read (with optional semantic truncation)
     truncated = False
     final_content = content
 
     if len(content) > max_size:
-        final_content = truncate_smart(content, max_size)
+        # Use semantic truncation to preserve code structure
+        final_content = truncate_semantic(content, max_size)
         truncated = True
 
     embedding = cache.get_embedding(content)

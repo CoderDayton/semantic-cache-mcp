@@ -17,7 +17,15 @@ from .similarity import (
     cosine_similarity_batch_matrix,
     top_k_similarities,
 )
-from .text import generate_diff, truncate_smart
+from .text import (
+    generate_diff,
+    truncate_smart,
+    truncate_semantic,
+    compute_delta,
+    apply_delta,
+    diff_stats,
+    DiffDelta,
+)
 from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 from .embeddings import embed, embed_query, warmup as warmup_embeddings, get_model_info
 
@@ -40,6 +48,11 @@ __all__ = [
     "count_tokens",
     "generate_diff",
     "truncate_smart",
+    "truncate_semantic",
+    "compute_delta",
+    "apply_delta",
+    "diff_stats",
+    "DiffDelta",
     "BPETokenizer",
     "get_tokenizer",
     "embed",

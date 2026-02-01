@@ -159,6 +159,36 @@ Batch similarity with optional int8 quantization (1000 vectors, 384D embeddings)
 
 ---
 
+## Text Processing Optimizations
+
+Delta compression and semantic truncation for efficient diffs:
+
+| Feature | Benefit | Use Case |
+|---------|---------|----------|
+| **Delta compression** | 10-100x smaller | Minimal changes to large files |
+| **Semantic truncation** | Preserves structure | Code files (Python, TS, Go) |
+| **Diff stats** | Track changes | Metadata for cache decisions |
+
+**Delta compression example:**
+```python
+# 15KB file with 5 line changes
+delta = compute_delta(old, new)
+# Result: 245 bytes (98% compression)
+```
+
+**Semantic truncation:**
+- Cuts at function/class boundaries instead of arbitrary lines
+- Detects language (Python, TypeScript, Go)
+- Preserves code integrity for LLM parsing
+
+**Cache diff output:**
+```
+// Stats: +5 -2 ~3 lines, 12.3% size
+// Diff for file.py (changed since cache):
+```
+
+---
+
 ## Profiling Tips
 
 ```bash
