@@ -2,7 +2,15 @@
 
 from .chunking import hypercdc_chunks
 from .compression import compress_adaptive, decompress, estimate_entropy
-from .hashing import hash_chunk, hash_content
+from .hashing import (
+    hash_chunk,
+    hash_content,
+    hash_chunk_binary,
+    DeduplicateIndex,
+    HierarchicalHasher,
+    StreamingHasher,
+    get_hash_stats,
+)
 from .similarity import cosine_similarity
 from .text import generate_diff, truncate_smart
 from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
@@ -15,6 +23,11 @@ __all__ = [
     "estimate_entropy",
     "hash_chunk",
     "hash_content",
+    "hash_chunk_binary",
+    "DeduplicateIndex",
+    "HierarchicalHasher",
+    "StreamingHasher",
+    "get_hash_stats",
     "cosine_similarity",
     "count_tokens",
     "generate_diff",

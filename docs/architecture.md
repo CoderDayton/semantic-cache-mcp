@@ -69,11 +69,22 @@ Multi-codec adaptive compression with ZSTD (primary), LZ4, and Brotli.
 
 ### Hashing (`core/hashing.py`)
 
-BLAKE2b with `@lru_cache` for repeated chunks.
+BLAKE3 hashing (with BLAKE2b fallback) for high-performance content addressing.
 
-- 32-byte digests (256-bit security)
-- LRU cache prevents rehashing identical content
-- Used for both chunk addressing and content verification
+| Feature | Description |
+|---------|-------------|
+| **BLAKE3** | 3.8-4.9x faster than BLAKE2b on 8KB+ chunks |
+| **LRU caching** | 16K chunks, 4K blocks, 2K content hashes |
+| **Streaming** | Memory-efficient hashing for large files |
+| **Hierarchical** | Chunk → block → content multi-level hashing |
+| **DeduplicateIndex** | Fast fingerprint-based dedup lookups (~1M ops/sec) |
+
+**API:**
+- `hash_chunk(data)` — Hash CDC chunk (cached)
+- `hash_content(content)` — Hash full content (str or bytes)
+- `DeduplicateIndex` — Fast dedup with binary fingerprints
+- `HierarchicalHasher` — Multi-level chunk→block→content hashing
+- `StreamingHasher` — Incremental hashing for large files
 
 ### Tokenizer (`core/tokenizer.py`)
 
