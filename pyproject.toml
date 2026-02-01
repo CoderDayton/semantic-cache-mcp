@@ -1,6 +1,6 @@
 [project]
 name = "semantic-cache-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Lightweight MCP server for semantic file caching with 80%+ token reduction"
 readme = "README.md"
 requires-python = ">=3.12"
