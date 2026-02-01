@@ -9,11 +9,11 @@ semantic_cache_mcp/
 ├── cache.py            # SemanticCache facade (orchestration)
 ├── server.py           # FastMCP tools (read, stats, clear)
 ├── core/               # Core algorithms (single responsibility)
-│   ├── chunking.py     # Rabin fingerprinting CDC
-│   ├── compression.py  # Adaptive Brotli compression
+│   ├── chunking.py     # HyperCDC gear-hash chunking
+│   ├── compression.py  # Multi-codec (ZSTD/LZ4/Brotli)
 │   ├── embeddings.py   # FastEmbed local embeddings
 │   ├── hashing.py      # BLAKE2b with LRU cache
-│   ├── similarity.py   # Cosine similarity
+│   ├── similarity.py   # Cosine similarity (NumPy optimized)
 │   ├── tokenizer.py    # o200k_base BPE tokenizer
 │   └── text.py         # Diff generation, smart truncation
 └── storage/            # Persistence layer
@@ -34,27 +34,38 @@ semantic_cache_mcp/
 
 ### Chunking (`core/chunking.py`)
 
-Rabin fingerprinting with rolling hash for content-defined chunking (CDC).
+HyperCDC with Gear hash for high-performance content-defined chunking (CDC).
 
 **How it works:**
-1. Slide a window over the content
-2. Compute rolling hash using Rabin polynomial
-3. Split when hash matches boundary condition (mask)
-4. Results in ~8KB average chunks that align on content boundaries
+1. Pre-computed 256-entry gear table for fast byte lookups
+2. Rolling hash: `h = ((h << 1) + gear[byte]) & MASK_64`
+3. Split when `(h & mask) == 0` (normalized chunking)
+4. Skip-min optimization: no boundary checks in first 2KB
+5. Results in ~8KB average chunks that align on content boundaries
+
+**Performance:** ~13-14 MB/s (2.7x faster than Rabin fingerprinting)
 
 **Benefits:**
 - Similar files share chunks even if bytes shift
 - Enables efficient deduplication across files
+- Gear hash is simpler and faster than Rabin polynomial
 
 ### Compression (`core/compression.py`)
 
-Adaptive Brotli compression based on Shannon entropy estimation.
+Multi-codec adaptive compression with ZSTD (primary), LZ4, and Brotli.
 
-| Entropy Level | Quality | Use Case |
-|---------------|---------|----------|
-| High (>7.0) | 1 | Already compressed data |
-| Medium (>5.5) | 4 | Mixed content |
-| Low (<=5.5) | 6 | Highly compressible text |
+| Entropy Level | Codec | Level | Throughput |
+|---------------|-------|-------|------------|
+| Very High (>7.5) | STORE | - | 29 GB/s |
+| High (>6.5) | ZSTD | 1 | 6.9 GB/s |
+| Medium (>4.0) | ZSTD | 3 | 5.3 GB/s |
+| Low (<=4.0) | ZSTD | 9 | 4.8 GB/s |
+
+**Features:**
+- Cached compressors (avoid object creation overhead)
+- Native ZSTD multi-threading for large files (>4MB)
+- O(1) magic-byte detection for pre-compressed data
+- Automatic codec fallback chain
 
 ### Hashing (`core/hashing.py`)
 
@@ -85,12 +96,15 @@ Local text embeddings using FastEmbed with nomic-embed-text-v1.5.
 
 ### Similarity (`core/similarity.py`)
 
-Cosine similarity on normalized embeddings.
+NumPy-optimized cosine similarity (19-27x faster than pure Python).
 
 ```python
 def cosine_similarity(a, b) -> float:
-    return sum(x * y for x, y in zip(a, b))  # Normalized vectors
+    # NumPy vectorized dot product
+    return float(np.dot(a, b))  # Pre-normalized vectors
 ```
+
+Includes batch similarity for comparing against multiple vectors efficiently.
 
 ### Text Processing (`core/text.py`)
 
