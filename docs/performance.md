@@ -22,7 +22,12 @@
 | **BLAKE3 hashing** | 3.8-4.9x faster than BLAKE2b | Hardware-accelerated, parallelizable |
 | **LRU cache for hashing** | Skip repeated hashing | 16K chunks, 4K blocks, 2K content |
 | **Priority queue tokenizer** | O(N log M) vs O(N²) | Heap-based BPE merging |
-| **Batch SQLite queries** | 2-5x faster inserts | `executemany` + `IN` clause |
+| **SQLite WAL mode** | Better read concurrency | No reader locks, parallel access |
+| **Connection pooling** | Eliminate connection overhead | Queue-based pool, 5-10ms savings per query |
+| **WAL checkpointing** | Read-after-write consistency | TRUNCATE mode after commits |
+| **Partial indexes** | Faster filtered scans | Index on `embedding IS NOT NULL` |
+| **Batch SQL operations** | 2-5x faster updates | `executemany` + `IN` clause |
+| **WITHOUT ROWID tables** | 20-30% space savings | Text primary keys optimized |
 | **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
 | **Generator expressions** | Avoid intermediate lists | Used in hot paths |
 | **`__slots__` on dataclasses** | Eliminate `__dict__` | Memory-efficient models |
@@ -138,6 +143,43 @@ BLAKE3 vs BLAKE2b throughput (no cache):
 BLAKE3 excels on typical CDC chunk sizes (8KB+). The slight overhead on tiny chunks (<256B) is due to larger digest size (32 bytes vs 20 bytes).
 
 **DeduplicateIndex:** ~966K lookups/sec with thread-safe binary fingerprints.
+
+---
+
+## SQLite Query Optimization
+
+**WAL Mode Benefits:**
+- No reader locks: Reads never block reads or writes
+- Better concurrency: Multiple readers + one writer simultaneously
+- Faster writes: Asynchronous checkpointing
+
+**PRAGMA Settings:**
+```sql
+journal_mode = WAL        -- Write-Ahead Logging
+synchronous = NORMAL      -- Safe in WAL mode, 2-3x faster writes
+cache_size = -64000       -- 64MB cache (vs 2MB default)
+temp_store = MEMORY       -- Avoid disk I/O for temp tables
+mmap_size = 268435456     -- 256MB memory-mapped I/O
+```
+
+**Index Optimizations:**
+- **Partial index**: `CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL`
+  - Only indexes rows with embeddings (saves space, faster scans)
+  - Similarity search uses index for filtered `SELECT`
+- **WITHOUT ROWID**: Tables with text primary keys use B-tree directly (20-30% space savings)
+
+**Query Patterns:**
+- Batch deletes: `DELETE FROM files WHERE path IN (?, ?, ...)` vs individual deletes
+- Batch updates: `executemany()` for bulk ref_count changes
+- Order by created_at: Prioritize recent files in similarity search
+
+**Connection Pooling:**
+- Queue-based pool with bounded size (default: 5 connections)
+- Eliminates connection creation overhead (~5-10ms per connection)
+- `check_same_thread=False` allows cross-thread connection reuse
+- `PRAGMA wal_checkpoint(TRUNCATE)` after commits ensures read-after-write consistency
+- Thread-safe via `queue.Queue` for checkout/checkin
+- Automatic cleanup on shutdown
 
 ---
 
