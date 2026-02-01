@@ -1,6 +1,6 @@
 """Core algorithms for semantic caching."""
 
-from .chunking import content_defined_chunking
+from .chunking import hypercdc_chunks
 from .compression import compress_adaptive, decompress
 from .hashing import hash_chunk, hash_content
 from .similarity import cosine_similarity
@@ -9,7 +9,7 @@ from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 from .embeddings import embed, embed_query, warmup as warmup_embeddings, get_model_info
 
 __all__ = [
-    "content_defined_chunking",
+    "hypercdc_chunks",
     "compress_adaptive",
     "decompress",
     "hash_chunk",

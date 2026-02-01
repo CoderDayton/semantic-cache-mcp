@@ -140,8 +140,8 @@ perf: Inline rolling hash calculation for 2x speedup
 def test_chunking_deterministic():
     """Same input produces same chunks."""
     content = b"test content here"
-    chunks1 = list(content_defined_chunking(content))
-    chunks2 = list(content_defined_chunking(content))
+    chunks1 = list(hypercdc_chunks(content))
+    chunks2 = list(hypercdc_chunks(content))
     assert chunks1 == chunks2
 ```
 

@@ -21,7 +21,7 @@ from ..config import (
 )
 from ..core import (
     compress_adaptive,
-    content_defined_chunking,
+    hypercdc_chunks,
     cosine_similarity,
     count_tokens,
     decompress,
@@ -91,7 +91,7 @@ class SQLiteStorage:
         """
         chunks_data: list[tuple[str, bytes, int]] = []
 
-        for chunk in content_defined_chunking(content):
+        for chunk in hypercdc_chunks(content):
             chunk_hash = hash_chunk(chunk)
             compressed = compress_adaptive(chunk)
             chunks_data.append((chunk_hash, compressed, len(chunk)))

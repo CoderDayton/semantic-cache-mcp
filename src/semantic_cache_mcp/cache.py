@@ -76,9 +76,9 @@ class SemanticCache:
         """Store file in cache."""
         tokens = count_tokens(content)
         content_bytes = content.encode()
-        from .core import content_defined_chunking
+        from .core import hypercdc_chunks
 
-        chunks = sum(1 for _ in content_defined_chunking(content_bytes))
+        chunks = sum(1 for _ in hypercdc_chunks(content_bytes))
         self._storage.put(path, content, mtime, embedding)
         logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
 
