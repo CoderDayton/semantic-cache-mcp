@@ -42,23 +42,26 @@ The server provides three tools that Claude can use:
 
 ### `read` — Smart File Reading
 
-```
+```bash
 read path="/src/app.py"
 ```
 
 **What happens:**
+
 - First read: Full content returned, cached for future
 - Same file again: "File unchanged" (99% token savings)
 - File modified: Unified diff only (80-95% savings)
 - Similar file exists: Diff from similar file (70-90% savings)
 
 **Example output for unchanged file:**
-```
+
+```bash
 // File unchanged: /src/app.py (1,234 tokens cached)
 // [cache:true diff:false saved:1,200]
 ```
 
 **Example output for modified file:**
+
 ```diff
 // Diff for /src/app.py (changed since cache):
 --- cached
@@ -83,7 +86,7 @@ read path="/src/app.py"
 
 ### `clear` — Reset Cache
 
-```
+```text/plain
 Cleared 42 cache entries
 ```
 
@@ -104,25 +107,25 @@ Cleared 42 cache entries
 
 ## ⚙️ Configuration
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| Environment Variable | Default | Description                                             |
+| -------------------- | ------- | ------------------------------------------------------- |
+| `LOG_LEVEL`          | `INFO`  | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 **Embeddings:** Uses local [FastEmbed](https://github.com/qdrant/fastembed) with `nomic-ai/nomic-embed-text-v1.5` model. No API keys or external services needed.
 
 Cache settings in `config.py`:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `MAX_CONTENT_SIZE` | 100KB | Maximum content size returned |
-| `MAX_CACHE_ENTRIES` | 10,000 | LRU-K eviction threshold |
-| `SIMILARITY_THRESHOLD` | 0.85 | Minimum cosine similarity for matching |
+| Setting                | Default | Description                            |
+| ---------------------- | ------- | -------------------------------------- |
+| `MAX_CONTENT_SIZE`     | 100KB   | Maximum content size returned          |
+| `MAX_CACHE_ENTRIES`    | 10,000  | LRU-K eviction threshold               |
+| `SIMILARITY_THRESHOLD` | 0.85    | Minimum cosine similarity for matching |
 
 ---
 
 ## 🏗️ How It Works
 
-```
+```text/plain
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 │   Claude    │────▶│  smart_read  │────▶│   Cache     │
 │   Code      │     │              │     │   Lookup    │
@@ -148,12 +151,12 @@ Cache settings in `config.py`:
 
 ## 📚 Documentation
 
-| Guide | Description |
-|-------|-------------|
-| [Architecture](docs/architecture.md) | Component design, algorithms, data flow |
-| [Performance](docs/performance.md) | Optimization techniques, memory efficiency |
-| [Advanced Usage](docs/advanced-usage.md) | Programmatic API, custom storage backends |
-| [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging |
+| Guide                                      | Description                                |
+| ------------------------------------------ | ------------------------------------------ |
+| [Architecture](docs/architecture.md)       | Component design, algorithms, data flow    |
+| [Performance](docs/performance.md)         | Optimization techniques, memory efficiency |
+| [Advanced Usage](docs/advanced-usage.md)   | Programmatic API, custom storage backends  |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging               |
 
 ---
 
@@ -167,7 +170,7 @@ Contributions welcome! This project uses:
 
 ```bash
 # Development setup
-git clone <repo-url> && cd semantic-cache-mcp
+git clone https://github.com/CoderDayton/semantic-cache-mcp.git && cd semantic-cache-mcp
 uv sync
 uv run ruff check src/
 uv run mypy src/
