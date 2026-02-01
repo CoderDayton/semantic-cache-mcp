@@ -96,15 +96,12 @@ Cleared 42 cache entries
 ## ✨ Features
 
 - **80%+ Token Reduction** — Returns diffs instead of full files when content changes
-- **Local Embeddings** — FastEmbed with nomic-embed-text-v1.5 (no API keys needed)
-- **Semantic Similarity** — Batch SIMD operations with optional int8 quantization (14x faster)
-- **Content-Addressable Storage** — HyperCDC chunking (2.7x faster) + BLAKE3 hashing (4.9x faster)
-- **Delta Compression** — Stores only changes for 10-100x compression on minimal edits
-- **Adaptive Compression** — Multi-codec ZSTD/LZ4/Brotli (3.7x faster)
-- **Semantic Truncation** — Preserves code structure at function/class boundaries
-- **LRU-K Eviction** — Frequency-aware cache management (keeps frequently accessed files)
-- **o200k_base Tokenizer** — Accurate GPT-4o token counting with auto-download
-- **Structured Logging** — Debug, info, and warning levels via `LOG_LEVEL` env var
+- **Local Embeddings** — No API keys needed, runs entirely offline
+- **Semantic Similarity** — Finds related files using fast vector search
+- **Content-Addressable Storage** — Efficient deduplication and delta compression
+- **Smart Truncation** — Preserves code structure when cutting large files
+- **LRU-K Eviction** — Keeps frequently accessed files in cache
+- **Accurate Token Counting** — GPT-4o compatible tokenizer
 
 ---
 
