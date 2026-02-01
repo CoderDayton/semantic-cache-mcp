@@ -1,3 +1,33 @@
-"""Semantic Cache MCP - Lightweight semantic file caching for Claude Code."""
+"""Semantic Cache MCP - Lightweight semantic file caching with 80%+ token reduction."""
 
-__version__ = "0.1.0"
+from .cache import SemanticCache, smart_read
+from .config import (
+    CACHE_DIR,
+    DB_PATH,
+    EMBEDDINGS_BASE_URL,
+    MAX_CACHE_ENTRIES,
+    MAX_CONTENT_SIZE,
+    SIMILARITY_THRESHOLD,
+)
+from .server import mcp
+from .types import CacheEntry, ReadResult
+
+__version__ = "0.3.0"
+
+__all__ = [
+    # Main classes
+    "SemanticCache",
+    "CacheEntry",
+    "ReadResult",
+    # Functions
+    "smart_read",
+    # Server
+    "mcp",
+    # Configuration
+    "CACHE_DIR",
+    "DB_PATH",
+    "EMBEDDINGS_BASE_URL",
+    "MAX_CACHE_ENTRIES",
+    "MAX_CONTENT_SIZE",
+    "SIMILARITY_THRESHOLD",
+]
