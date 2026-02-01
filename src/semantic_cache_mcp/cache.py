@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import array
+import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from .config import DB_PATH, EMBEDDINGS_MODEL, MAX_CONTENT_SIZE
+from .config import DB_PATH, MAX_CONTENT_SIZE
 from .core import count_tokens, generate_diff, truncate_smart
+from .core.embeddings import embed
 from .storage import SQLiteStorage
 from .types import CacheEntry, EmbeddingVector, ReadResult
 
-if TYPE_CHECKING:
-    from openai import OpenAI
+logger = logging.getLogger(__name__)
 
 
 class SemanticCache:
@@ -20,48 +19,37 @@ class SemanticCache:
 
     This facade coordinates:
     - Storage backend (SQLite with content-addressable chunks)
-    - Embedding service (OpenAI-compatible API)
+    - Local embedding generation (FastEmbed)
     - Caching strategies (diff, truncate, semantic match)
     """
 
-    __slots__ = ("_storage", "_client")
+    __slots__ = ("_storage",)
 
-    def __init__(
-        self, db_path: Path = DB_PATH, client: OpenAI | None = None
-    ) -> None:
+    def __init__(self, db_path: Path = DB_PATH) -> None:
         """Initialize cache.
 
         Args:
             db_path: Path to SQLite database
-            client: OpenAI client for embeddings (optional)
         """
         self._storage = SQLiteStorage(db_path)
-        self._client = client
 
     # -------------------------------------------------------------------------
     # Embedding
     # -------------------------------------------------------------------------
 
     def get_embedding(self, text: str) -> EmbeddingVector | None:
-        """Get embedding vector for text.
+        """Get embedding vector for text using local FastEmbed model.
 
         Args:
-            text: Text to embed (first 512 chars used)
+            text: Text to embed
 
         Returns:
             Embedding as array.array or None if unavailable
         """
-        if self._client is None:
-            return None
-
-        try:
-            response = self._client.embeddings.create(
-                input=[text[:512]],
-                model=EMBEDDINGS_MODEL,
-            )
-            return array.array("f", response.data[0].embedding)
-        except Exception:
-            return None
+        result = embed(text)
+        if result:
+            logger.debug(f"Embedding generated for {text[:50]}...")
+        return result
 
     # -------------------------------------------------------------------------
     # Delegated operations
@@ -69,7 +57,10 @@ class SemanticCache:
 
     def get(self, path: str) -> CacheEntry | None:
         """Get cached entry for path."""
-        return self._storage.get(path)
+        entry = self._storage.get(path)
+        if entry:
+            logger.debug(f"Cache hit: {path}")
+        return entry
 
     def put(
         self,
@@ -79,7 +70,13 @@ class SemanticCache:
         embedding: EmbeddingVector | None = None,
     ) -> None:
         """Store file in cache."""
+        tokens = count_tokens(content)
+        content_bytes = content.encode()
+        from .core import content_defined_chunking
+
+        chunks = sum(1 for _ in content_defined_chunking(content_bytes))
         self._storage.put(path, content, mtime, embedding)
+        logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
 
     def get_content(self, entry: CacheEntry) -> str:
         """Get full content from cache entry."""

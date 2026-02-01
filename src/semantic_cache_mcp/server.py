@@ -2,7 +2,7 @@
 
 Provides smart_read tool that achieves 80%+ token reduction through:
 - Content-addressable storage with deduplication
-- Semantic similarity for related file detection
+- Semantic similarity for related file detection (local FastEmbed)
 - Diff-based updates for changed files
 - LRU-K eviction for optimal cache utilization
 """
@@ -10,25 +10,38 @@ Provides smart_read tool that achieves 80%+ token reduction through:
 from __future__ import annotations
 
 import json
+import logging
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.lifespan import lifespan
-from openai import OpenAI
 
 from .cache import SemanticCache, smart_read
-from .config import EMBEDDINGS_BASE_URL, MAX_CONTENT_SIZE
+from .config import MAX_CONTENT_SIZE
+from .core.embeddings import get_model_info, warmup
+
+logger = logging.getLogger(__name__)
 
 
 @lifespan
 async def app_lifespan(server: FastMCP):
-    """Initialize cache and OpenAI client on startup."""
-    client = OpenAI(base_url=EMBEDDINGS_BASE_URL, api_key="not-needed")
-    cache = SemanticCache(client=client)
+    """Initialize cache and embedding model on startup."""
+    logger.info("Semantic cache MCP server starting...")
+
+    # Warmup embedding model (downloads if needed, loads into memory)
+    logger.info("Initializing embedding model...")
+    warmup()
+
+    model_info = get_model_info()
+    logger.info(f"Embedding model ready: {model_info['model']}")
+
+    # Initialize cache
+    cache = SemanticCache()
+    logger.info("Semantic cache MCP server started")
 
     try:
-        yield {"cache": cache, "client": client}
+        yield {"cache": cache}
     finally:
-        client.close()
+        logger.info("Semantic cache MCP server stopped")
 
 
 mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
@@ -76,7 +89,14 @@ def read(
 def stats(ctx: Context) -> str:
     """Get semantic cache statistics: files, tokens, compression, deduplication ratios."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
-    return json.dumps(cache.get_stats(), indent=2)
+    cache_stats = cache.get_stats()
+
+    # Add embedding model info
+    model_info = get_model_info()
+    cache_stats["embedding_model"] = model_info["model"]
+    cache_stats["embedding_ready"] = model_info["ready"]
+
+    return json.dumps(cache_stats, indent=2)
 
 
 @mcp.tool()

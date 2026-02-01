@@ -1,50 +1,26 @@
-# 🚀 Semantic Cache MCP
+# Semantic Cache MCP
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastMCP 3.0](https://img.shields.io/badge/FastMCP-3.0-green.svg)](https://github.com/modelcontextprotocol/python-sdk)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Achieve 80%+ token reduction for Claude Code with intelligent semantic file caching**
+**Reduce Claude Code token usage by 80%+ with intelligent file caching.**
 
-Semantic Cache MCP is a lightweight [Model Context Protocol](https://modelcontextprotocol.io) server that dramatically reduces token usage through content-addressable storage, semantic similarity detection, and diff-based updates. Built with enterprise-grade architecture and scientific optimization.
-
----
-
-## ✨ Features
-
-- 🎯 **80%+ Token Reduction** — Intelligent caching strategies (diffs, semantic matching, truncation)
-- 🔬 **Scientific Deduplication** — Rabin fingerprinting CDC + BLAKE2b content-addressable storage
-- 🧠 **Semantic Similarity** — Finds related cached files using embeddings (cosine similarity > 0.85)
-- ⚡ **Performance Optimized** — Inlined rolling hash, LRU caching, batch SQLite queries, Brotli compression
-- 🏗️ **Enterprise Architecture** — Component-based structure with single-responsibility modules
-- 🪶 **Lightweight** — Minimal dependencies (FastMCP, OpenAI client, Brotli)
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that dramatically cuts token consumption when Claude reads files. Instead of sending full file contents every time, it returns diffs for changed files, finds semantically similar cached files, and intelligently truncates large files—all transparently. Works with any Claude Code session out of the box.
 
 ---
 
-## 📋 Table of Contents
-
-- [Quick Start](#-quick-start)
-- [Installation](#-installation)
-- [Configuration](#%EF%B8%8F-configuration)
-- [Tools Reference](#-tools-reference)
-- [Architecture](#-architecture)
-- [Performance](#-performance)
-- [Advanced Usage](#-advanced-usage)
-- [Contributing](#-contributing)
-- [License](#-license)
-
----
-
-## ⚡ Quick Start
-
-**1. Install the server:**
+## 📦 Installation
 
 ```bash
-cd /path/to/semantic-cache-mcp
-uv tool install .
+# Install with uv (recommended)
+uv tool install /path/to/semantic-cache-mcp
+
+# Or with pip
+pip install /path/to/semantic-cache-mcp
 ```
 
-**2. Add to Claude Code settings (`~/.claude/settings.json`):**
+Add to Claude Code settings (`~/.claude/settings.json`):
 
 ```json
 {
@@ -56,419 +32,162 @@ uv tool install .
 }
 ```
 
-**3. Use the `read` tool instead of Claude's built-in `Read`:**
-
-The server automatically provides:
-- `read` — Smart file reading with 80%+ token reduction
-- `stats` — Cache statistics and metrics
-- `clear` — Clear all cached entries
-
-**That's it!** Files are now intelligently cached with diffs, semantic matching, and compression.
-
-[↑ Back to top](#-semantic-cache-mcp)
+Restart Claude Code. Done.
 
 ---
 
-## 📦 Installation
+## 🚀 Usage
 
-### Prerequisites
+The server provides three tools that Claude can use:
 
-- **Python 3.12+** (uses modern type hints and performance features)
-- **uv** package manager (recommended) or pip
-- **Embeddings service** (optional, for semantic similarity)
-  - Default: `http://localhost:8899/v1` (OpenAI-compatible)
-  - Configure via `EMBEDDINGS_URL` environment variable
+### `read` — Smart File Reading
 
-### Development Installation
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd semantic-cache-mcp
-
-# Install with uv
-uv sync
-
-# Or install with pip
-pip install -e .
+```
+read path="/src/app.py"
 ```
 
-### Verify Installation
+**What happens:**
+- First read: Full content returned, cached for future
+- Same file again: "File unchanged" (99% token savings)
+- File modified: Unified diff only (80-95% savings)
+- Similar file exists: Diff from similar file (70-90% savings)
 
-```bash
-semantic-cache-mcp --help
+**Example output for unchanged file:**
+```
+// File unchanged: /src/app.py (1,234 tokens cached)
+// [cache:true diff:false saved:1,200]
 ```
 
-[↑ Back to top](#-semantic-cache-mcp)
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMBEDDINGS_URL` | `http://localhost:8899/v1` | OpenAI-compatible embeddings API endpoint |
-
-### Cache Settings
-
-Located in `semantic_cache_mcp/config.py`:
-
-```python
-# Cache limits
-MAX_CONTENT_SIZE = 100_000      # 100KB max return size
-MAX_CACHE_ENTRIES = 10_000      # LRU-K eviction threshold
-
-# Similarity
-SIMILARITY_THRESHOLD = 0.85     # Minimum cosine similarity
-NEAR_DUPLICATE_THRESHOLD = 0.98 # Early termination threshold
-
-# Chunking (Rabin fingerprinting)
-CHUNK_MIN_SIZE = 2048           # 2KB min chunk
-CHUNK_MAX_SIZE = 65536          # 64KB max chunk
-
-# Storage
-CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp"
-DB_PATH = CACHE_DIR / "cache.db"
-```
-
-[↑ Back to top](#-semantic-cache-mcp)
-
----
-
-## 🔧 Tools Reference
-
-### `read`
-
-Read files with intelligent caching and 80%+ token reduction.
-
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `path` | `str` | Required | Absolute or relative file path |
-| `max_size` | `int` | `100000` | Maximum content size to return (bytes) |
-| `diff_mode` | `bool` | `true` | Enable diff-based responses for cached files |
-| `force_full` | `bool` | `false` | Force full content even if cached |
-
-**Returns:** File content or diff with metadata footer
-
-**Caching Strategies (in order):**
-
-1. **File unchanged** (mtime match) → `"// No changes"` (99% reduction)
-2. **File changed** → Unified diff (80-95% reduction)
-3. **Semantically similar** → Reference + diff (70-90% reduction)
-4. **Large file** → Smart truncation (50-80% reduction)
-5. **New file** → Full content with caching
-
-**Example Response:**
-
-```python
-# Unchanged file
-// File unchanged: /path/to/file.py (1234 tokens cached)
-// [cache:true diff:false saved:1200]
-
-# Changed file (diff)
-// Diff for /path/to/file.py (changed since cache):
+**Example output for modified file:**
+```diff
+// Diff for /src/app.py (changed since cache):
 --- cached
 +++ current
-@@ -10,7 +10,7 @@
- def foo():
--    return "old"
-+    return "new"
-// [cache:true diff:true saved:800]
+@@ -42,7 +42,7 @@
+ def process():
+-    return old_value
++    return new_value
+// [cache:true diff:true saved:950]
 ```
 
-### `stats`
-
-Get detailed cache statistics.
-
-**Parameters:** None
-
-**Returns:** JSON object with metrics
-
-**Example Output:**
+### `stats` — Cache Metrics
 
 ```json
 {
   "files_cached": 42,
   "total_tokens_cached": 125000,
-  "unique_chunks": 156,
-  "original_bytes": 524288,
-  "compressed_bytes": 98304,
-  "compression_ratio": 0.187,
-  "dedup_ratio": 5.33,
-  "db_size_mb": 0.94
+  "compression_ratio": 0.19,
+  "dedup_ratio": 5.3
 }
 ```
 
-### `clear`
-
-Clear all cached entries.
-
-**Parameters:** None
-
-**Returns:** Confirmation message
+### `clear` — Reset Cache
 
 ```
 Cleared 42 cache entries
 ```
 
-[↑ Back to top](#-semantic-cache-mcp)
+---
+
+## ✨ Features
+
+- **80%+ Token Reduction** — Returns diffs instead of full files when content changes
+- **Local Embeddings** — FastEmbed with nomic-embed-text-v1.5 (no API keys needed)
+- **Semantic Similarity** — Finds related cached files using embeddings (cosine similarity > 0.85)
+- **Content-Addressable Storage** — Rabin fingerprinting CDC + BLAKE2b hashing for deduplication
+- **Adaptive Compression** — Brotli compression tuned by Shannon entropy
+- **LRU-K Eviction** — Frequency-aware cache management (keeps frequently accessed files)
+- **o200k_base Tokenizer** — Accurate GPT-4o token counting with auto-download
+- **Structured Logging** — Debug, info, and warning levels via `LOG_LEVEL` env var
 
 ---
 
-## 🏗️ Architecture
+## ⚙️ Configuration
 
-### Component-Based Structure
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
-```
-semantic_cache_mcp/
-├── config.py           # Configuration constants
-├── types.py            # Data models (CacheEntry, ReadResult)
-├── cache.py            # SemanticCache facade (orchestration)
-├── server.py           # FastMCP tools (read, stats, clear)
-├── core/               # Core algorithms (single responsibility)
-│   ├── chunking.py     # Rabin fingerprinting CDC
-│   ├── compression.py  # Adaptive Brotli compression
-│   ├── hashing.py      # BLAKE2b with LRU cache
-│   ├── similarity.py   # Cosine similarity, token counting
-│   └── text.py         # Diff generation, smart truncation
-└── storage/            # Persistence layer
-    └── sqlite.py       # SQLite content-addressable storage
-```
+**Embeddings:** Uses local [FastEmbed](https://github.com/qdrant/fastembed) with `nomic-ai/nomic-embed-text-v1.5` model. No API keys or external services needed.
 
-### Design Principles
+Cache settings in `config.py`:
 
-- **Single Responsibility** — Each module has one clear purpose
-- **Facade Pattern** — `SemanticCache` coordinates all components
-- **Dependency Inversion** — Storage backend is swappable
-- **Performance First** — Optimized hot paths, minimal allocations
-- **Type Safety** — Strict typing with domain type aliases
-
-### Key Components
-
-<details>
-<summary><strong>Core Algorithms</strong></summary>
-
-- **Chunking** (`core/chunking.py`): Rabin fingerprinting with rolling hash for content-defined chunking
-- **Compression** (`core/compression.py`): Adaptive Brotli based on Shannon entropy estimation
-- **Hashing** (`core/hashing.py`): BLAKE2b with `@lru_cache` for repeated chunks
-- **Similarity** (`core/similarity.py`): Cosine similarity on normalized embeddings
-- **Text** (`core/text.py`): Unified diff generation and structure-preserving truncation
-
-</details>
-
-<details>
-<summary><strong>Storage Layer</strong></summary>
-
-**SQLiteStorage** (`storage/sqlite.py`):
-- Content-addressable chunk store (like Git)
-- File metadata with chunk references
-- LRU-K eviction (frequency-aware cache management)
-- Batch operations with `executemany`
-
-**Schema:**
-```sql
-CREATE TABLE chunks (
-    hash TEXT PRIMARY KEY,
-    data BLOB NOT NULL,
-    size INTEGER NOT NULL,
-    ref_count INTEGER DEFAULT 1
-);
-
-CREATE TABLE files (
-    path TEXT PRIMARY KEY,
-    content_hash TEXT NOT NULL,
-    chunk_hashes TEXT NOT NULL,
-    mtime REAL NOT NULL,
-    tokens INTEGER NOT NULL,
-    embedding BLOB,
-    created_at REAL NOT NULL,
-    access_history TEXT NOT NULL
-);
-```
-
-</details>
-
-[↑ Back to top](#-semantic-cache-mcp)
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `MAX_CONTENT_SIZE` | 100KB | Maximum content size returned |
+| `MAX_CACHE_ENTRIES` | 10,000 | LRU-K eviction threshold |
+| `SIMILARITY_THRESHOLD` | 0.85 | Minimum cosine similarity for matching |
 
 ---
 
-## ⚡ Performance
+## 🏗️ How It Works
 
-### Optimization Techniques
-
-| Technique | Benefit | Implementation |
-|-----------|---------|----------------|
-| **Inlined rolling hash** | 2-3x faster chunking | Eliminated method call overhead |
-| **LRU cache for hashing** | Skip repeated hashing | `@lru_cache(maxsize=1024)` on pure functions |
-| **Counter for entropy** | 2-3x faster calculation | C-implemented `collections.Counter` |
-| **Batch SQLite queries** | 2-5x faster inserts | `executemany` + `IN` clause |
-| **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
-| **Generator expressions** | Avoid intermediate lists | Used in hot paths |
-| **`__slots__` on dataclasses** | Eliminate `__dict__` | Memory-efficient models |
-
-### Memory Efficiency
-
-```python
-# Before: list[float] — 72 bytes for 3 floats
-embedding = [0.1, 0.2, 0.3]
-
-# After: array.array('f') — 12 bytes for 3 floats
-embedding = array.array('f', [0.1, 0.2, 0.3])  # 6x reduction
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Claude    │────▶│  smart_read  │────▶│   Cache     │
+│   Code      │     │              │     │   Lookup    │
+└─────────────┘     └──────────────┘     └─────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+   ┌──────────┐     ┌──────────┐     ┌──────────┐
+   │ Unchanged│     │   Diff   │     │ Semantic │
+   │   99%    │     │  80-95%  │     │  70-90%  │
+   └──────────┘     └──────────┘     └──────────┘
 ```
 
-### Token Reduction Breakdown
+**Caching strategies (in order of preference):**
 
-| Strategy | Token Savings | Use Case |
-|----------|---------------|----------|
-| Unchanged file | 99% | File mtime matches cache |
-| Diff (changed) | 80-95% | File modified since cache |
-| Semantic match | 70-90% | Similar file in cache |
-| Truncation | 50-80% | Large files > 100KB |
-
-[↑ Back to top](#-semantic-cache-mcp)
+1. **File unchanged** — mtime matches cache → return "no changes" message
+2. **File changed** — compute unified diff → return diff only
+3. **Similar file** — find semantically similar cached file → return diff from it
+4. **Large file** — smart truncation preserving structure
+5. **New file** — return full content, store in cache
 
 ---
 
-## 🔬 Advanced Usage
+## 📚 Documentation
 
-### Programmatic API
-
-```python
-from semantic_cache_mcp import SemanticCache, smart_read
-from openai import OpenAI
-
-# Initialize with custom embeddings client
-client = OpenAI(base_url="http://localhost:8899/v1", api_key="not-needed")
-cache = SemanticCache(client=client)
-
-# Smart read with caching
-result = smart_read(
-    cache=cache,
-    path="/path/to/file.py",
-    max_size=50000,
-    diff_mode=True,
-)
-
-print(f"Tokens saved: {result.tokens_saved}")
-print(f"From cache: {result.from_cache}")
-print(f"Is diff: {result.is_diff}")
-```
-
-### Custom Storage Backend
-
-```python
-from semantic_cache_mcp.storage import SQLiteStorage
-from pathlib import Path
-
-# Use custom database location
-custom_storage = SQLiteStorage(db_path=Path("/tmp/my-cache.db"))
-cache = SemanticCache(client=None)
-cache._storage = custom_storage
-```
-
-### Monitoring Cache Performance
-
-```python
-# Get detailed statistics
-stats = cache.get_stats()
-
-print(f"Files: {stats['files_cached']}")
-print(f"Tokens: {stats['total_tokens_cached']}")
-print(f"Compression ratio: {stats['compression_ratio']:.1%}")
-print(f"Deduplication ratio: {stats['dedup_ratio']:.2f}x")
-```
-
-### Environment-Specific Configuration
-
-```bash
-# Development (local embeddings)
-export EMBEDDINGS_URL=http://localhost:8899/v1
-
-# Production (cloud embeddings)
-export EMBEDDINGS_URL=https://api.openai.com/v1
-
-# Start server
-semantic-cache-mcp
-```
-
-[↑ Back to top](#-semantic-cache-mcp)
+| Guide | Description |
+|-------|-------------|
+| [Architecture](docs/architecture.md) | Component design, algorithms, data flow |
+| [Performance](docs/performance.md) | Optimization techniques, memory efficiency |
+| [Advanced Usage](docs/advanced-usage.md) | Programmatic API, custom storage backends |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging |
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! This project follows enterprise-level code quality standards.
+Contributions welcome! This project uses:
 
-### Development Setup
+- **Python 3.12+** with strict type hints
+- **Ruff** for formatting and linting
+- **mypy** for type checking
 
 ```bash
-# Clone repository
-git clone <repository-url>
-cd semantic-cache-mcp
-
-# Install with dev dependencies
+# Development setup
+git clone <repo-url> && cd semantic-cache-mcp
 uv sync
-
-# Run tests (if available)
-uv run pytest
-
-# Format code
-uv run ruff format src/
-
-# Type check
+uv run ruff check src/
 uv run mypy src/
 ```
 
-### Code Quality Standards
-
-- **Type hints**: Strict typing with `mypy --strict`
-- **Formatting**: Ruff with 100-char line length
-- **Linting**: Ruff with E, F, I, N, W, UP, B, C4, SIM rules
-- **Architecture**: Single-responsibility modules, facade pattern
-- **Performance**: Profile hot paths, minimize allocations
-
-### Commit Guidelines
-
-```bash
-# Commit message format
-<type>: <description>
-
-Co-Authored-By: Your Name <email@example.com>
-```
-
-**Types:** `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore`
-
-[↑ Back to top](#-semantic-cache-mcp)
+See [Contributing Guide](docs/contributing.md) for commit conventions and code standards.
 
 ---
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+[MIT License](LICENSE) — use freely in personal and commercial projects.
 
 ---
 
 ## 🙏 Credits
 
-**Built with:**
-- [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) — Model Context Protocol framework
-- [OpenAI Python](https://github.com/openai/openai-python) — OpenAI-compatible client
-- [Brotli](https://github.com/google/brotli) — Google's compression algorithm
+Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and powered by:
 
-**Scientific techniques:**
 - Rabin fingerprinting for content-defined chunking
-- BLAKE2b for cryptographically secure hashing
-- Shannon entropy for adaptive compression quality
-- LRU-K eviction policy for frequency-aware cache management
-
----
-
-<p align="center">
-  Made with ❤️ for Claude Code users
-</p>
-
-[↑ Back to top](#-semantic-cache-mcp)
+- BLAKE2b for cryptographic hashing
+- Shannon entropy for adaptive compression
+- LRU-K for frequency-aware eviction
