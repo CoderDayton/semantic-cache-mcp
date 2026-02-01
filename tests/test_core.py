@@ -88,10 +88,10 @@ class TestHashing:
         assert hash1 == hash2
 
     def test_hash_chunk_format(self) -> None:
-        """Hash should be 40-character hex string."""
+        """Hash should be 64-character hex string (32-byte BLAKE3/BLAKE2b)."""
         data = b"Test"
         result = hash_chunk(data)
-        assert len(result) == 40
+        assert len(result) == 64
         assert all(c in "0123456789abcdef" for c in result)
 
     def test_hash_chunk_different_data(self) -> None:
@@ -108,15 +108,15 @@ class TestHashing:
         assert hash1 == hash2
 
     def test_hash_content_format(self) -> None:
-        """Content hash should be 32-character hex string."""
+        """Content hash should be 64-character hex string (32-byte BLAKE3/BLAKE2b)."""
         result = hash_content("Test")
-        assert len(result) == 32
+        assert len(result) == 64
         assert all(c in "0123456789abcdef" for c in result)
 
     def test_hash_content_empty_string(self) -> None:
         """Empty string should have a valid hash."""
         result = hash_content("")
-        assert len(result) == 32
+        assert len(result) == 64
 
 
 class TestCompression:

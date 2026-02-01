@@ -19,7 +19,8 @@
 | **Cached ZSTD compressors** | 2x faster compression | Avoid object creation per call |
 | **O(1) magic detection** | 15-20x faster detection | First-byte lookup table |
 | **Native ZSTD threading** | 19x faster large files | Use ZSTD threads, not Python |
-| **LRU cache for hashing** | Skip repeated hashing | `@lru_cache(maxsize=1024)` on pure functions |
+| **BLAKE3 hashing** | 3.8-4.9x faster than BLAKE2b | Hardware-accelerated, parallelizable |
+| **LRU cache for hashing** | Skip repeated hashing | 16K chunks, 4K blocks, 2K content |
 | **Batch SQLite queries** | 2-5x faster inserts | `executemany` + `IN` clause |
 | **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
 | **Generator expressions** | Avoid intermediate lists | Used in hot paths |
@@ -118,6 +119,24 @@ def _fast_entropy(data: bytes) -> float:
 - Native multi-threading for files > 4MB
 - O(1) magic-byte detection for pre-compressed data
 - Automatic codec fallback (ZSTD → Brotli → LZ4 → STORE)
+
+---
+
+## Hashing Performance
+
+BLAKE3 vs BLAKE2b throughput (no cache):
+
+| Chunk Size | BLAKE2b | BLAKE3 | Speedup |
+|------------|---------|--------|---------|
+| 256B | 543 MB/s | 468 MB/s | 0.86x |
+| 8KB | 1,094 MB/s | 4,195 MB/s | **3.83x** |
+| 64KB | 1,150 MB/s | 5,597 MB/s | **4.87x** |
+
+**Streaming (1MB file):** 1,140 → 5,121 MB/s (**4.5x faster**)
+
+BLAKE3 excels on typical CDC chunk sizes (8KB+). The slight overhead on tiny chunks (<256B) is due to larger digest size (32 bytes vs 20 bytes).
+
+**DeduplicateIndex:** ~966K lookups/sec with thread-safe binary fingerprints.
 
 ---
 
