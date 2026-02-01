@@ -7,14 +7,17 @@ Provides smart_read tool that achieves 80%+ token reduction through:
 - LRU-K eviction for optimal cache utilization
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from fastmcp import Context, FastMCP
+from fastmcp.server.lifespan import lifespan
+from openai import OpenAI
 
 from .cache import (
+    EMBEDDINGS_BASE_URL,
     MAX_CONTENT_SIZE,
     ReadResult,
     SemanticCache,
@@ -22,12 +25,26 @@ from .cache import (
     truncate_smart,
 )
 
-# Initialize server and cache
-server = Server("semantic-cache-mcp")
-cache = SemanticCache()
+
+@lifespan
+async def app_lifespan(server: FastMCP):
+    """Manage application lifecycle - initialize cache and OpenAI client."""
+    # Initialize OpenAI client pointing to local embeddings service
+    client = OpenAI(base_url=EMBEDDINGS_BASE_URL, api_key="not-needed")
+    cache = SemanticCache(client=client)
+
+    try:
+        yield {"cache": cache, "client": client}
+    finally:
+        client.close()
 
 
-def smart_read(
+# Initialize FastMCP server with lifespan
+mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
+
+
+def _smart_read(
+    cache: SemanticCache,
     path: str,
     max_size: int = MAX_CONTENT_SIZE,
     diff_mode: bool = True,
@@ -114,7 +131,6 @@ def smart_read(
             )
 
     # Check for semantically similar file in cache
-    semantic_match = None
     if not cached and diff_mode and not force_full:
         embedding = cache._get_embedding(content)
         if embedding:
@@ -128,7 +144,6 @@ def smart_read(
 
                     # Use semantic diff if it saves tokens
                     if diff_tokens < tokens_original * 0.7:
-                        semantic_match = similar_path
                         result_content = (
                             f"// Similar to cached: {similar_path}\n"
                             f"// Diff from similar file:\n{diff_content}"
@@ -147,7 +162,7 @@ def smart_read(
                             tokens_saved=tokens_original - tokens_returned,
                             truncated=False,
                             compression_ratio=len(result_content) / len(content),
-                            semantic_match=semantic_match,
+                            semantic_match=similar_path,
                         )
 
     # Full read (cache miss or diff not efficient)
@@ -175,105 +190,63 @@ def smart_read(
     )
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available tools."""
-    return [
-        Tool(
-            name="smart_read",
-            description=(
-                "Read files with 80%+ token reduction. Use INSTEAD of Read tool. "
-                "Returns diffs for changed files, minimal response for unchanged files, "
-                "and can reference semantically similar cached files."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to read",
-                    },
-                    "max_size": {
-                        "type": "integer",
-                        "description": "Maximum content size to return (default: 100000)",
-                        "default": 100000,
-                    },
-                    "diff_mode": {
-                        "type": "boolean",
-                        "description": "Return diff if file was previously read (default: true)",
-                        "default": True,
-                    },
-                    "force_full": {
-                        "type": "boolean",
-                        "description": "Force full content even if cached (default: false)",
-                        "default": False,
-                    },
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="cache_stats",
-            description="Get semantic cache statistics: files, tokens, compression, deduplication ratios",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-        Tool(
-            name="cache_clear",
-            description="Clear the semantic cache",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-    ]
+@mcp.tool()
+def smart_read(
+    ctx: Context,
+    path: str,
+    max_size: int = MAX_CONTENT_SIZE,
+    diff_mode: bool = True,
+    force_full: bool = False,
+) -> str:
+    """Read files with 80%+ token reduction. Use INSTEAD of Read tool.
+
+    Returns diffs for changed files, minimal response for unchanged files,
+    and can reference semantically similar cached files.
+
+    Args:
+        path: Path to the file to read
+        max_size: Maximum content size to return (default: 100000)
+        diff_mode: Return diff if file was previously read (default: true)
+        force_full: Force full content even if cached (default: false)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+    try:
+        result = _smart_read(
+            cache=cache,
+            path=path,
+            max_size=max_size,
+            diff_mode=diff_mode,
+            force_full=force_full,
+        )
+        # Compact metadata footer
+        meta = f"[cache:{result.from_cache} diff:{result.is_diff} saved:{result.tokens_saved}]"
+        return f"{result.content}\n// {meta}"
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error reading file: {e}"
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Handle tool calls."""
-    if name == "smart_read":
-        try:
-            result = smart_read(
-                path=arguments["path"],
-                max_size=arguments.get("max_size", MAX_CONTENT_SIZE),
-                diff_mode=arguments.get("diff_mode", True),
-                force_full=arguments.get("force_full", False),
-            )
+@mcp.tool()
+def cache_stats(ctx: Context) -> str:
+    """Get semantic cache statistics: files, tokens, compression, deduplication ratios."""
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+    stats = cache.get_stats()
+    return json.dumps(stats, indent=2)
 
-            # Compact metadata footer
-            meta = f"[cache:{result.from_cache} diff:{result.is_diff} saved:{result.tokens_saved}]"
-            response = f"{result.content}\n// {meta}"
-            return [TextContent(type="text", text=response)]
 
-        except FileNotFoundError as e:
-            return [TextContent(type="text", text=f"Error: {e}")]
-        except Exception as e:
-            return [TextContent(type="text", text=f"Error reading file: {e}")]
-
-    elif name == "cache_stats":
-        stats = cache.get_stats()
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
-
-    elif name == "cache_clear":
-        count = cache.clear()
-        return [TextContent(type="text", text=f"Cleared {count} cache entries")]
-
-    else:
-        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+@mcp.tool()
+def cache_clear(ctx: Context) -> str:
+    """Clear the semantic cache."""
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+    count = cache.clear()
+    return f"Cleared {count} cache entries"
 
 
 def main() -> None:
     """Run the MCP server."""
-    import asyncio
-
-    async def run() -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, server.create_initialization_options())
-
-    asyncio.run(run())
+    mcp.run()
 
 
 if __name__ == "__main__":
