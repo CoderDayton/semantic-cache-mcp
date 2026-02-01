@@ -7,7 +7,7 @@ import math
 
 import pytest
 
-from semantic_cache_mcp.core.chunking import content_defined_chunking
+from semantic_cache_mcp.core.chunking import hypercdc_chunks
 from semantic_cache_mcp.core.compression import (
     compress_adaptive,
     decompress,
@@ -23,33 +23,33 @@ class TestContentDefinedChunking:
 
     def test_empty_content_yields_nothing(self) -> None:
         """Empty content should yield no chunks."""
-        chunks = list(content_defined_chunking(b""))
+        chunks = list(hypercdc_chunks(b""))
         assert chunks == []
 
     def test_single_byte_yields_single_chunk(self) -> None:
         """Single byte should yield one chunk."""
-        chunks = list(content_defined_chunking(b"x"))
+        chunks = list(hypercdc_chunks(b"x"))
         assert len(chunks) == 1
         assert chunks[0] == b"x"
 
     def test_small_content_single_chunk(self) -> None:
         """Small content below min_size should be single chunk."""
         data = b"Hello, World!"
-        chunks = list(content_defined_chunking(data, min_size=100))
+        chunks = list(hypercdc_chunks(data, min_size=100))
         assert len(chunks) == 1
         assert chunks[0] == data
 
     def test_deterministic_output(self) -> None:
         """Same input should always produce same chunks."""
         data = b"The quick brown fox jumps over the lazy dog. " * 100
-        chunks1 = list(content_defined_chunking(data))
-        chunks2 = list(content_defined_chunking(data))
+        chunks1 = list(hypercdc_chunks(data))
+        chunks2 = list(hypercdc_chunks(data))
         assert chunks1 == chunks2
 
     def test_reassembly_matches_original(self) -> None:
         """Reassembled chunks should match original content."""
         data = b"Test data for chunking. " * 500
-        chunks = list(content_defined_chunking(data))
+        chunks = list(hypercdc_chunks(data))
         reassembled = b"".join(chunks)
         assert reassembled == data
 
@@ -57,7 +57,7 @@ class TestContentDefinedChunking:
         """All chunks should be at most max_size."""
         data = b"x" * 100000
         max_size = 8192
-        chunks = list(content_defined_chunking(data, max_size=max_size))
+        chunks = list(hypercdc_chunks(data, max_size=max_size))
         for chunk in chunks:
             assert len(chunk) <= max_size
 
@@ -65,7 +65,7 @@ class TestContentDefinedChunking:
         """Non-final chunks should be at least min_size."""
         data = b"y" * 50000
         min_size = 1024
-        chunks = list(content_defined_chunking(data, min_size=min_size))
+        chunks = list(hypercdc_chunks(data, min_size=min_size))
         # All but last chunk should meet min_size
         for chunk in chunks[:-1]:
             assert len(chunk) >= min_size
@@ -73,7 +73,7 @@ class TestContentDefinedChunking:
     def test_binary_content(self) -> None:
         """Binary content should chunk correctly."""
         data = bytes(range(256)) * 100
-        chunks = list(content_defined_chunking(data))
+        chunks = list(hypercdc_chunks(data))
         assert b"".join(chunks) == data
 
 
