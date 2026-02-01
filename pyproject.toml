@@ -8,6 +8,8 @@ dependencies = [
     "brotli>=1.2.0",
     "fastembed>=0.7.4",
     "fastmcp>=3.0.0b1",
+    "lz4>=4.4.5",
+    "zstandard>=0.25.0",
 ]
 
 [project.optional-dependencies]
