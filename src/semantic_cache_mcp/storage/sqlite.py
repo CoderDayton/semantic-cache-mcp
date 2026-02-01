@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import array
+import atexit
 import json
 import logging
+import queue
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +38,123 @@ from ..core import (
 from ..types import CacheEntry, ChunkData, ChunkHash, EmbeddingVector
 
 
+class ConnectionPool:
+    """Queue-based SQLite connection pool.
+
+    Maintains a pool of reusable connections with explicit checkout/checkin.
+    Thread-safe using queue.Queue for connection management.
+
+    Benefits:
+    - Avoids connection creation overhead
+    - Bounded pool size prevents resource exhaustion
+    - Thread-safe by design (queue handles locking)
+    - Connections properly closed on shutdown
+    - No thread affinity (any thread can use any connection)
+    """
+
+    __slots__ = ("db_path", "_pool", "_max_size", "_created", "_closed")
+
+    def __init__(self, db_path: Path, max_size: int = 5) -> None:
+        """Initialize connection pool.
+
+        Args:
+            db_path: Path to SQLite database
+            max_size: Maximum number of connections in pool
+        """
+        self.db_path = db_path
+        self._max_size = max_size
+        self._pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=max_size)
+        self._created = 0
+        self._closed = False
+        atexit.register(self.close_all)
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create and configure a new connection."""
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30.0,
+            check_same_thread=False,  # Allow connection to be used by any thread
+        )
+        conn.executescript("""
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -64000;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA busy_timeout = 5000;
+        """)
+        self._created += 1
+        logger.debug(f"Created connection {self._created}/{self._max_size}")
+        return conn
+
+    @contextmanager
+    def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Get connection from pool (creates new if pool not full).
+
+        Yields:
+            SQLite connection from pool
+        """
+        if self._closed:
+            raise RuntimeError("Connection pool is closed")
+
+        # Try to get existing connection, or create new if pool not full
+        conn = None
+        try:
+            conn = self._pool.get_nowait()
+        except queue.Empty:
+            if self._created < self._max_size:
+                conn = self._create_connection()
+            else:
+                # Pool full, wait for available connection
+                conn = self._pool.get(timeout=10.0)
+
+        try:
+            yield conn
+            # Commit on success (matches sqlite3.connect context manager)
+            conn.commit()
+            # Checkpoint WAL to ensure other connections see changes immediately
+            # TRUNCATE mode ensures WAL is fully written to main database
+            # Critical for connection pooling with WAL mode
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            # Rollback on error
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            # Return connection to pool if not closed
+            if conn and not self._closed:
+                try:
+                    self._pool.put_nowait(conn)
+                except queue.Full:
+                    # Pool full (shouldn't happen), close connection
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def close_all(self) -> None:
+        """Close all connections in pool."""
+        if self._closed:
+            return
+
+        self._closed = True
+        closed_count = 0
+
+        # Drain queue and close all connections
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+                closed_count += 1
+            except (queue.Empty, Exception):
+                break
+
+        logger.debug(f"Closed {closed_count} pooled connections")
+
+
 class SQLiteStorage:
     """SQLite-backed content-addressable storage with semantic similarity.
 
@@ -39,30 +163,39 @@ class SQLiteStorage:
     - File entries reference chunk hashes (like git)
     - Embeddings enable semantic similarity search
     - LRU-K eviction for frequency-aware cache management
+    - Queue-based connection pooling for concurrent access
     """
 
-    __slots__ = ("db_path",)
+    __slots__ = ("db_path", "_pool")
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        """Initialize storage.
+    def __init__(self, db_path: Path = DB_PATH, pool_size: int = 5) -> None:
+        """Initialize storage with connection pool.
 
         Args:
             db_path: Path to SQLite database file
+            pool_size: Maximum connections in pool (default: 5)
         """
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._pool = ConnectionPool(db_path, max_size=pool_size)
         self._init_schema()
 
+    def __del__(self) -> None:
+        """Clean up connection pool on deletion."""
+        if hasattr(self, "_pool"):
+            self._pool.close_all()
+
     def _init_schema(self) -> None:
-        """Initialize database schema."""
-        with sqlite3.connect(self.db_path) as conn:
+        """Initialize database schema with performance indexes."""
+        with self._pool.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS chunks (
                     hash TEXT PRIMARY KEY,
                     data BLOB NOT NULL,
                     size INTEGER NOT NULL,
                     ref_count INTEGER DEFAULT 1
-                );
+                ) WITHOUT ROWID;
+
                 CREATE TABLE IF NOT EXISTS files (
                     path TEXT PRIMARY KEY,
                     content_hash TEXT NOT NULL,
@@ -72,8 +205,10 @@ class SQLiteStorage:
                     embedding BLOB,
                     created_at REAL NOT NULL,
                     access_history TEXT NOT NULL
-                );
+                ) WITHOUT ROWID;
+
                 CREATE INDEX IF NOT EXISTS idx_created ON files(created_at);
+                CREATE INDEX IF NOT EXISTS idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;
             """)
 
     # -------------------------------------------------------------------------
@@ -96,7 +231,7 @@ class SQLiteStorage:
             compressed = compress_adaptive(chunk)
             chunks_data.append((chunk_hash, compressed, len(chunk)))
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             conn.executemany(
                 """
                 INSERT INTO chunks (hash, data, size, ref_count)
@@ -121,7 +256,7 @@ class SQLiteStorage:
         if not chunk_hashes:
             return b""
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             placeholders = ",".join("?" * len(chunk_hashes))
             rows = conn.execute(
                 f"SELECT hash, data FROM chunks WHERE hash IN ({placeholders})",
@@ -140,7 +275,7 @@ class SQLiteStorage:
         Args:
             chunk_hashes: Chunks to release
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             conn.executemany(
                 "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
                 ((h,) for h in chunk_hashes),
@@ -160,7 +295,7 @@ class SQLiteStorage:
         Returns:
             CacheEntry if found, None otherwise
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             row = conn.execute(
                 "SELECT path, content_hash, chunk_hashes, mtime, tokens, embedding, "
                 "created_at, access_history FROM files WHERE path = ?",
@@ -215,7 +350,7 @@ class SQLiteStorage:
 
         logger.debug(f"Stored {len(chunk_hashes)} chunks for {path}")
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO files
@@ -253,7 +388,7 @@ class SQLiteStorage:
         Args:
             path: File path accessed
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             row = conn.execute(
                 "SELECT access_history FROM files WHERE path = ?", (path,)
             ).fetchone()
@@ -275,8 +410,8 @@ class SQLiteStorage:
     ) -> str | None:
         """Find semantically similar cached file using batch similarity.
 
-        Uses SIMD-optimized batch operations for 8-14x faster search
-        compared to per-vector cosine similarity.
+        Uses SIMD-optimized batch operations for 8-14x faster search.
+        Optimized with partial index on embedding column.
 
         Args:
             embedding: Query embedding vector
@@ -285,12 +420,19 @@ class SQLiteStorage:
         Returns:
             Path of similar file or None
         """
-        with sqlite3.connect(self.db_path) as conn:
-            query = "SELECT path, embedding FROM files WHERE embedding IS NOT NULL"
-            params: tuple = ()
+        with self._pool.get_connection() as conn:
+            # Use partial index (idx_embedding) for fast filtered scan
+            query = """
+                SELECT path, embedding FROM files
+                WHERE embedding IS NOT NULL
+            """
+            params: list = []
             if exclude_path:
                 query += " AND path != ?"
-                params = (exclude_path,)
+                params.append(exclude_path)
+
+            # Order by created_at DESC to prioritize recent files
+            query += " ORDER BY created_at DESC"
             rows = conn.execute(query, params).fetchall()
 
         if not rows:
@@ -321,13 +463,22 @@ class SQLiteStorage:
     # -------------------------------------------------------------------------
 
     def _evict_if_needed(self) -> None:
-        """Evict entries using LRU-K policy if over limit."""
-        with sqlite3.connect(self.db_path) as conn:
+        """Evict entries using LRU-K policy if over limit.
+
+        Optimizations:
+        - Fast count check with early return
+        - Batch deletes and updates
+        - Single pass for chunk cleanup
+        """
+        with self._pool.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
             if count <= MAX_CACHE_ENTRIES:
                 return
 
+            evict_count = max(1, count // 10)
+
+            # Get candidates for eviction
             rows = conn.execute(
                 "SELECT path, chunk_hashes, access_history FROM files"
             ).fetchall()
@@ -340,16 +491,23 @@ class SQLiteStorage:
 
             entries_with_score.sort()
 
-            evict_count = max(1, count // 10)
-            for _, path, chunk_hashes in entries_with_score[:evict_count]:
-                conn.execute("DELETE FROM files WHERE path = ?", (path,))
-                # Release chunks inline to avoid nested connection
-                conn.executemany(
-                    "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
-                    ((h,) for h in chunk_hashes),
-                )
+            # Collect paths and chunks for batch operations
+            evict_paths = [path for _, path, _ in entries_with_score[:evict_count]]
+            evict_chunks = [
+                chunk for _, _, chunks in entries_with_score[:evict_count] for chunk in chunks
+            ]
 
-            # Clean up chunks with zero references
+            # Batch delete files
+            placeholders = ",".join("?" * len(evict_paths))
+            conn.execute(f"DELETE FROM files WHERE path IN ({placeholders})", evict_paths)
+
+            # Batch update chunk ref counts
+            conn.executemany(
+                "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
+                ((h,) for h in evict_chunks),
+            )
+
+            # Clean up unreferenced chunks
             conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
             logger.info(f"Cache eviction: removed {evict_count} entries")
 
@@ -363,7 +521,7 @@ class SQLiteStorage:
         Returns:
             Dictionary with cache metrics
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             file_stats = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM files"
             ).fetchone()
@@ -395,7 +553,7 @@ class SQLiteStorage:
         Returns:
             Number of entries cleared
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._pool.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             conn.executescript("DELETE FROM files; DELETE FROM chunks;")
         return count
