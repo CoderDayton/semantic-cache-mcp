@@ -6,7 +6,7 @@ import array
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import DB_PATH, MAX_CONTENT_SIZE
+from .config import DB_PATH, EMBEDDINGS_MODEL, MAX_CONTENT_SIZE
 from .core import count_tokens, generate_diff, truncate_smart
 from .storage import SQLiteStorage
 from .types import CacheEntry, EmbeddingVector, ReadResult
@@ -57,7 +57,7 @@ class SemanticCache:
         try:
             response = self._client.embeddings.create(
                 input=[text[:512]],
-                model="text-embedding",
+                model=EMBEDDINGS_MODEL,
             )
             return array.array("f", response.data[0].embedding)
         except Exception:

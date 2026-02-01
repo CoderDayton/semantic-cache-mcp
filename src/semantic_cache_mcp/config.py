@@ -10,6 +10,7 @@ DB_PATH: Final = CACHE_DIR / "cache.db"
 
 # External services
 EMBEDDINGS_BASE_URL: Final = environ.get("EMBEDDINGS_URL", "http://localhost:8899/v1")
+EMBEDDINGS_MODEL: Final = environ.get("EMBEDDINGS_MODEL", "text-embedding-3-small")
 
 # Cache limits
 MAX_CONTENT_SIZE: Final = 100_000  # 100KB default max return size

@@ -7,6 +7,7 @@ https://github.com/rasbt/LLMs-from-scratch/blob/main/ch02/05_bpe-from-scratch/bp
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,7 @@ TOKENIZER_CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp" / "tokenizer
 
 # o200k_base encoding URL (GPT-4o tokenizer with 199,997 tokens)
 O200K_BASE_URL = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 
 
 class BPETokenizer:
@@ -279,6 +281,15 @@ def _init_tokenizer(cache_file: Path) -> BPETokenizer:
     return tok
 
 
+def _verify_hash(path: Path, expected: str) -> bool:
+    """Verify SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest() == expected
+
+
 def _ensure_tokenizer() -> BPETokenizer | None:
     """Lazily load the o200k_base tokenizer. Downloads if not cached."""
     global _tokenizer, _tokenizer_loaded
@@ -289,19 +300,26 @@ def _ensure_tokenizer() -> BPETokenizer | None:
     _tokenizer_loaded = True
     cache_file = TOKENIZER_CACHE_DIR / "o200k_base.tiktoken"
 
-    # Try to load from cache
+    # Try to load from cache (with hash verification)
     if cache_file.exists():
         try:
-            _tokenizer = _init_tokenizer(cache_file)
-            return _tokenizer
+            if _verify_hash(cache_file, O200K_BASE_SHA256):
+                _tokenizer = _init_tokenizer(cache_file)
+                return _tokenizer
+            cache_file.unlink()  # Remove corrupted file
         except Exception:
             pass
 
-    # Try to download
+    # Try to download and verify
     try:
         import urllib.request
         TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         urllib.request.urlretrieve(O200K_BASE_URL, cache_file)
+
+        if not _verify_hash(cache_file, O200K_BASE_SHA256):
+            cache_file.unlink()
+            return None
+
         _tokenizer = _init_tokenizer(cache_file)
         return _tokenizer
     except Exception:
