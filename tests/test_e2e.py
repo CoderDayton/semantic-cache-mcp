@@ -262,7 +262,7 @@ class TestEdgeCases:
         binary_file = temp_dir / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\xff\xfe")
 
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(ValueError, match="Binary file not supported"):
             smart_read(semantic_cache, str(binary_file))
 
     def test_unicode_content(

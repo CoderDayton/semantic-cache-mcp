@@ -12,17 +12,16 @@ Features:
 
 from __future__ import annotations
 
-from difflib import unified_diff, SequenceMatcher
-from typing import List, Tuple, Optional, Iterator
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
-
+from difflib import SequenceMatcher, unified_diff
 
 # ---------------------------------------------------------------------------
 # Myers diff algorithm (faster for small deltas)
 # ---------------------------------------------------------------------------
 
-def _myers_diff(old: List[str], new: List[str]) -> List[Tuple[str, str]]:
+def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
     """
     Myers diff algorithm: optimal edit script for sequences.
 
@@ -31,7 +30,7 @@ def _myers_diff(old: List[str], new: List[str]) -> List[Tuple[str, str]]:
 
     Reference: "An O(ND) Difference Algorithm" by Myers (1986)
     """
-    def _backtrack(x: int, y: int, trace: dict) -> List[Tuple[str, str]]:
+    def _backtrack(x: int, y: int, trace: dict) -> list[tuple[str, str]]:
         """Backtrack from endpoint to reconstruct edit script."""
         edits = []
         while x > 0 or y > 0:
@@ -98,9 +97,9 @@ class DiffDelta:
     """Compressed representation of changes between two texts."""
     old_hash: str      # Hash of original text
     new_hash: str      # Hash of updated text
-    insertions: List[Tuple[int, str]]  # (line_number, content)
-    deletions: List[Tuple[int, str]]   # (line_number, content)
-    modifications: List[Tuple[int, str, str]]  # (line_number, old, new)
+    insertions: list[tuple[int, str]]  # (line_number, content)
+    deletions: list[tuple[int, str]]   # (line_number, content)
+    modifications: list[tuple[int, str, str]]  # (line_number, old, new)
     size_bytes: int    # Compressed size in bytes
 
 
@@ -222,7 +221,7 @@ def _detect_language(content: str) -> str:
     return 'generic'
 
 
-def _find_semantic_boundaries(lines: List[str], language: str) -> List[int]:
+def _find_semantic_boundaries(lines: list[str], language: str) -> list[int]:
     """Find line numbers of semantic boundaries (class/function defs)."""
     patterns = _SEMANTIC_PATTERNS.get(language, [])
     if not patterns:
@@ -361,8 +360,8 @@ def generate_diff_streaming(
     Yields:
         Lines of diff output
     """
-    with open(old_path, 'r', encoding='utf-8', errors='replace') as old_f, \
-         open(new_path, 'r', encoding='utf-8', errors='replace') as new_f:
+    with open(old_path, encoding='utf-8', errors='replace') as old_f, \
+         open(new_path, encoding='utf-8', errors='replace') as new_f:
 
         old_lines = old_f.readlines()
         new_lines = new_f.readlines()

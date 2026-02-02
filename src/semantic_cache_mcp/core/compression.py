@@ -12,14 +12,14 @@ Features:
 
 from __future__ import annotations
 
-import math
+import logging
 import struct
 import threading
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Iterator, Callable, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Optional imports with fallbacks
 try:
@@ -78,7 +78,7 @@ for _magic, _fmt in _INCOMPRESSIBLE_MAGIC.items():
     _MAGIC_BY_FIRST_BYTE[_first].append((_magic, _fmt))
 
 # Format header lengths to check
-_MAX_MAGIC_LEN = max(len(m) for m in _INCOMPRESSIBLE_MAGIC.keys())
+_MAX_MAGIC_LEN = max(len(m) for m in _INCOMPRESSIBLE_MAGIC)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ estimate_entropy = _fast_entropy
 # Incompressible detection
 # ---------------------------------------------------------------------------
 
-def _detect_incompressible(data: bytes, max_check: int = 1024) -> Tuple[bool, Optional[str]]:
+def _detect_incompressible(data: bytes, max_check: int = 1024) -> tuple[bool, str | None]:
     """
     Detect if data is already compressed/encrypted using magic bytes.
 
@@ -220,8 +220,8 @@ class ChunkDictionary:
 
     def __init__(self, config: CompressionConfig = DEFAULT_CONFIG):
         self._config = config
-        self._dict_data: Optional[bytes] = None
-        self._zstd_dict: Optional[object] = None  # zstd.ZstdCompressionDict
+        self._dict_data: bytes | None = None
+        self._zstd_dict: object | None = None  # zstd.ZstdCompressionDict
         self._chunks: list[bytes] = []
         self._lock = threading.Lock()
 
@@ -238,8 +238,9 @@ class ChunkDictionary:
             )
             self._dict_data = dict_data
             self._zstd_dict = zstd.ZstdCompressionDict(dict_data)
-        except Exception:
-            # Training can fail on insufficient diversity
+        except (ValueError, MemoryError, zstd.ZstdError) as e:
+            # Training can fail on insufficient diversity or memory
+            logger.debug(f"Dictionary training failed: {e}")
             self._dict_data = None
             self._zstd_dict = None
 
@@ -253,7 +254,7 @@ class ChunkDictionary:
             if len(self._chunks) % self._config.dict_window == 0:
                 self._train_dict()
 
-    def get_dict(self) -> Optional[object]:
+    def get_dict(self) -> object | None:
         """Get compiled dictionary for Zstd."""
         return self._zstd_dict
 
@@ -285,10 +286,10 @@ def _decompress_store(data: bytes) -> bytes:
 
 # Cached ZSTD compressors by level (avoid object creation in hot path)
 _ZSTD_COMPRESSORS: dict = {}
-_ZSTD_DECOMPRESSOR: Optional[object] = None
+_ZSTD_DECOMPRESSOR: object | None = None
 
 
-def _get_zstd_compressor(level: int, dict_obj: Optional[object] = None) -> object:
+def _get_zstd_compressor(level: int, dict_obj: object | None = None) -> object:
     """Get or create cached ZSTD compressor."""
     if dict_obj is not None:
         # Can't cache with dictionary
@@ -298,7 +299,7 @@ def _get_zstd_compressor(level: int, dict_obj: Optional[object] = None) -> objec
     return _ZSTD_COMPRESSORS[level]
 
 
-def _get_zstd_decompressor(dict_obj: Optional[object] = None) -> object:
+def _get_zstd_decompressor(dict_obj: object | None = None) -> object:
     """Get or create cached ZSTD decompressor."""
     global _ZSTD_DECOMPRESSOR
     if dict_obj is not None:
@@ -308,7 +309,7 @@ def _get_zstd_decompressor(dict_obj: Optional[object] = None) -> object:
     return _ZSTD_DECOMPRESSOR
 
 
-def _compress_zstd(data: bytes, level: int, dict_obj: Optional[object] = None) -> bytes:
+def _compress_zstd(data: bytes, level: int, dict_obj: object | None = None) -> bytes:
     """Compress with Zstd, optionally using dictionary."""
     if not HAS_ZSTD:
         raise RuntimeError("zstandard not installed")
@@ -316,7 +317,7 @@ def _compress_zstd(data: bytes, level: int, dict_obj: Optional[object] = None) -
     return cctx.compress(data)
 
 
-def _decompress_zstd(data: bytes, dict_obj: Optional[object] = None) -> bytes:
+def _decompress_zstd(data: bytes, dict_obj: object | None = None) -> bytes:
     """Decompress Zstd data."""
     if not HAS_ZSTD:
         raise RuntimeError("zstandard not installed")
@@ -427,7 +428,8 @@ def compress_adaptive(
                 cctx = _get_zstd_compressor(level, dict_obj)
                 compressed = cctx.compress(data)
                 return b'\x01' + compressed  # ZSTD = 1
-            except Exception:
+            except (ValueError, MemoryError, OSError) as e:
+                logger.debug(f"ZSTD compression failed, storing uncompressed: {e}")
                 return b'\x00' + struct.pack('>I', n) + data
 
         # Large data: use ZSTD multi-threaded mode
@@ -456,7 +458,8 @@ def compress_adaptive(
         else:
             compressed = brotli.compress(data, quality=level)
         return bytes([codec_byte]) + compressed
-    except Exception:
+    except (ValueError, MemoryError, OSError) as e:
+        logger.debug(f"Fallback compression failed: {e}")
         return b'\x00' + struct.pack('>I', n) + data
 
 
@@ -480,8 +483,8 @@ def _compress_parallel(
             cctx = zstd.ZstdCompressor(level=level, threads=num_threads)
             compressed = cctx.compress(data)
             return b'\x01' + compressed  # No parallel flag - native MT is transparent
-        except Exception:
-            pass  # Fall through to block-based
+        except (ValueError, MemoryError, OSError) as e:
+            logger.debug(f"Native MT compression failed, using blocks: {e}")
 
     # Block-based parallel for non-ZSTD codecs
     block_size = config.block_size
@@ -497,10 +500,11 @@ def _compress_parallel(
                 result = compressor(data, level)
             codec_byte = (0, 1, 2, 3)[codec.value - 1] if hasattr(codec, 'value') else 0
             return bytes([codec_byte]) + result
-        except Exception:
+        except (ValueError, MemoryError, OSError) as e:
+            logger.debug(f"Single-block compression failed: {e}")
             return b'\x00' + struct.pack('>I', len(data)) + data
 
-    def compress_block(args: Tuple[int, bytes]) -> Tuple[int, bytes]:
+    def compress_block(args: tuple[int, bytes]) -> tuple[int, bytes]:
         idx, block = args
         compressor = _COMPRESSORS[codec]
         try:
@@ -509,7 +513,8 @@ def _compress_parallel(
             else:
                 result = compressor(block, level)
             return idx, result
-        except Exception:
+        except (ValueError, MemoryError, OSError):
+            # Block compression failed - return uncompressed with length prefix
             return idx, struct.pack('>I', len(block)) + block
 
     blocks = [(i, data[i * block_size:(i + 1) * block_size]) for i in range(num_blocks)]
@@ -592,13 +597,14 @@ def _decompress_parallel(data: bytes, codec: Codec) -> bytes:
 
     decompressor = _DECOMPRESSORS[codec]
 
-    def decompress_block(args: Tuple[int, bytes]) -> Tuple[int, bytes]:
+    def decompress_block(args: tuple[int, bytes]) -> tuple[int, bytes]:
         idx, block = args
         try:
             if codec == Codec.ZSTD:
                 return idx, decompressor(block, None)
             return idx, decompressor(block)
-        except Exception:
+        except (ValueError, MemoryError, OSError):
+            # Decompression failed - return empty (data corruption)
             return idx, b''
 
     with ThreadPoolExecutor() as executor:

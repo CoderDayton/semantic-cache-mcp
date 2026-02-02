@@ -43,3 +43,43 @@ COMPRESSION_QUALITY: Final = {
 # LRU-K
 LRU_K: Final = 2  # K-th most recent access for eviction scoring
 ACCESS_HISTORY_SIZE: Final = 5  # Number of accesses to track
+
+# ---------------------------------------------------------------------------
+# Configuration validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_config() -> None:
+    """Validate configuration constants at module load time."""
+    errors: list[str] = []
+
+    if CHUNK_MAX_SIZE <= CHUNK_MIN_SIZE:
+        errors.append(
+            f"CHUNK_MAX_SIZE ({CHUNK_MAX_SIZE}) must be > CHUNK_MIN_SIZE ({CHUNK_MIN_SIZE})"
+        )
+
+    if MAX_CACHE_ENTRIES <= 0:
+        errors.append(f"MAX_CACHE_ENTRIES ({MAX_CACHE_ENTRIES}) must be > 0")
+
+    if MAX_CONTENT_SIZE <= 0:
+        errors.append(f"MAX_CONTENT_SIZE ({MAX_CONTENT_SIZE}) must be > 0")
+
+    if not 0 < SIMILARITY_THRESHOLD < 1:
+        errors.append(f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD}) must be between 0 and 1")
+
+    if not 0 < NEAR_DUPLICATE_THRESHOLD <= 1:
+        errors.append(
+            f"NEAR_DUPLICATE_THRESHOLD ({NEAR_DUPLICATE_THRESHOLD}) must be between 0 and 1"
+        )
+
+    if NEAR_DUPLICATE_THRESHOLD < SIMILARITY_THRESHOLD:
+        errors.append(
+            f"NEAR_DUPLICATE_THRESHOLD ({NEAR_DUPLICATE_THRESHOLD}) must be >= "
+            f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD})"
+        )
+
+    if errors:
+        raise ValueError("Configuration errors:\n  " + "\n  ".join(errors))
+
+
+_validate_config()

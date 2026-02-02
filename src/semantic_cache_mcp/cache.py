@@ -8,9 +8,9 @@ from pathlib import Path
 from .config import DB_PATH, MAX_CONTENT_SIZE
 from .core import (
     count_tokens,
+    diff_stats,
     generate_diff,
     truncate_semantic,
-    diff_stats,
 )
 from .core.embeddings import embed
 from .storage import SQLiteStorage
@@ -141,7 +141,28 @@ def smart_read(
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    content = file_path.read_text()
+    if not file_path.is_file():
+        raise ValueError(f"Not a regular file: {path}")
+
+    # Log symlink resolution for debugging
+    original = Path(path).expanduser()
+    if original.is_symlink():
+        logger.debug(f"Following symlink: {path} -> {file_path}")
+
+    # Check for binary file by reading first 8KB and looking for null bytes
+    try:
+        sample = file_path.read_bytes()[:8192]
+        if b"\x00" in sample:
+            raise ValueError(
+                f"Binary file not supported: {path}. "
+                "Semantic cache only handles text files."
+            )
+        content = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Try with error replacement for files with mixed encoding
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
+
     mtime = file_path.stat().st_mtime
     tokens_original = count_tokens(content)
 

@@ -17,12 +17,8 @@ For typical RAG/embedding search:
 from __future__ import annotations
 
 import array
-from typing import Tuple, List, Union
 
 import numpy as np
-
-from ..types import EmbeddingVector
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -56,7 +52,7 @@ DEFAULT_CONFIG = SimilarityConfig()
 # Quantization (int8)
 # ---------------------------------------------------------------------------
 
-def _quantize_vector(v: Union[array.array, list, np.ndarray]) -> Tuple[np.ndarray, float]:
+def _quantize_vector(v: array.array | list | np.ndarray) -> tuple[np.ndarray, float]:
     """
     Quantize embedding to int8.
 
@@ -100,7 +96,7 @@ def _dequantize_scale(q1: np.ndarray, s1: float, q2: np.ndarray, s2: float) -> f
 # Pre-quantization for storage (22x compression)
 # ---------------------------------------------------------------------------
 
-def quantize_embedding(v: Union[array.array, list, np.ndarray]) -> bytes:
+def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
     """
     Quantize embedding to int8 for compact storage.
 
@@ -160,8 +156,8 @@ def dequantize_embedding(blob: bytes) -> array.array:
 
 
 def similarity_from_quantized_blob(
-    query: Union[array.array, list, np.ndarray],
-    quantized_blobs: List[bytes],
+    query: array.array | list | np.ndarray,
+    quantized_blobs: list[bytes],
 ) -> np.ndarray:
     """
     Compute similarities directly from pre-quantized storage blobs.
@@ -213,10 +209,10 @@ def similarity_from_quantized_blob(
 
 
 def top_k_from_quantized(
-    query: Union[array.array, list, np.ndarray],
-    quantized_blobs: List[bytes],
+    query: array.array | list | np.ndarray,
+    quantized_blobs: list[bytes],
     k: int = 10,
-) -> List[Tuple[int, float]]:
+) -> list[tuple[int, float]]:
     """
     Find top-K similar vectors from pre-quantized storage.
 
@@ -276,8 +272,8 @@ def _select_pruning_dims(
 # ---------------------------------------------------------------------------
 
 def cosine_similarity(
-    a: Union[array.array, list, np.ndarray],
-    b: Union[array.array, list, np.ndarray],
+    a: array.array | list | np.ndarray,
+    b: array.array | list | np.ndarray,
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
 ) -> float:
     """
@@ -317,8 +313,8 @@ def cosine_similarity(
 
 
 def cosine_similarity_with_pruning(
-    a: Union[array.array, list, np.ndarray],
-    b: Union[array.array, list, np.ndarray],
+    a: array.array | list | np.ndarray,
+    b: array.array | list | np.ndarray,
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
     pruning_fraction: float = DEFAULT_CONFIG.PRUNING_FRACTION,
 ) -> float:
@@ -366,8 +362,8 @@ def cosine_similarity_with_pruning(
 # ---------------------------------------------------------------------------
 
 def cosine_similarity_batch(
-    query: Union[array.array, list, np.ndarray],
-    vectors: List[Union[array.array, list, np.ndarray]],
+    query: array.array | list | np.ndarray,
+    vectors: list[array.array | list | np.ndarray],
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
     use_pruning: bool = DEFAULT_CONFIG.USE_PRUNING,
 ) -> list:
@@ -432,8 +428,8 @@ def cosine_similarity_batch(
 
 
 def cosine_similarity_batch_matrix(
-    query: Union[array.array, list, np.ndarray],
-    vectors: List[Union[array.array, list, np.ndarray]],
+    query: array.array | list | np.ndarray,
+    vectors: list[array.array | list | np.ndarray],
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
 ) -> np.ndarray:
     """
@@ -487,11 +483,11 @@ def cosine_similarity_batch_matrix(
 # ---------------------------------------------------------------------------
 
 def top_k_similarities(
-    query: Union[array.array, list, np.ndarray],
-    vectors: List[Union[array.array, list, np.ndarray]],
+    query: array.array | list | np.ndarray,
+    vectors: list[array.array | list | np.ndarray],
     k: int = 10,
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
-) -> List[Tuple[int, float]]:
+) -> list[tuple[int, float]]:
     """
     Find top-K most similar vectors efficiently.
 
