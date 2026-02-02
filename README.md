@@ -1,23 +1,32 @@
-# Semantic Cache MCP
+<p align="center">
+  <img src="assets/logo.svg" width="128" height="128" alt="Semantic Cache MCP Logo">
+</p>
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![FastMCP 3.0](https://img.shields.io/badge/FastMCP-3.0-green.svg)](https://github.com/modelcontextprotocol/python-sdk)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<h1 align="center">Semantic Cache MCP</h1>
+
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"></a>
+  <a href="https://github.com/modelcontextprotocol/python-sdk"><img src="https://img.shields.io/badge/FastMCP-3.0-green.svg" alt="FastMCP 3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
+
+---
 
 **Reduce Claude Code token usage by 80%+ with intelligent file caching.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that dramatically cuts token consumption when Claude reads files. Instead of sending full file contents every time, it returns diffs for changed files, finds semantically similar cached files, and intelligently truncates large files—all transparently. Works with any Claude Code session out of the box.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that dramatically cuts token consumption when Claude reads files. Instead of sending full file contents every time, it returns diffs for changed files, finds semantically similar cached files, and intelligently truncates large files—all transparently.
 
 ---
 
 ## 📦 Installation
 
 ```bash
-# Install with uv (recommended)
-uv tool install /path/to/semantic-cache-mcp
+# Install from GitHub (recommended)
+uv tool install git+https://github.com/CoderDayton/semantic-cache-mcp.git
 
-# Or with pip
-pip install /path/to/semantic-cache-mcp
+# Or clone and install locally
+git clone https://github.com/CoderDayton/semantic-cache-mcp.git
+cd semantic-cache-mcp && uv tool install .
 ```
 
 Add to Claude Code settings (`~/.claude/settings.json`):
@@ -151,14 +160,15 @@ Cache settings in `config.py`:
 
 ## ⚡ Performance
 
-Recent optimizations deliver **2-20x speedups** across core operations:
+Recent optimizations deliver **2-22x improvements** across core operations:
 
 | Component | Improvement | Details |
 |-----------|-------------|---------|
+| **Embeddings** | 22x smaller | int8 quantization (772 vs 17KB/vector) |
+| **Similarity** | 1.7x faster | Pre-quantized binary search |
 | **Chunking** | 2.7x faster | HyperCDC vs Rabin fingerprinting |
-| **Hashing** | 3.8-4.9x faster | BLAKE3 vs BLAKE2b (8KB+ chunks) |
-| **Compression** | 3.7x faster | ZSTD caching + native threading |
-| **Similarity** | 8-14x faster | Batch SIMD + int8 quantization |
+| **Hashing** | 3.8x faster | BLAKE3 with BLAKE2b fallback |
+| **Compression** | 3.7x faster | ZSTD with adaptive quality |
 
 See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis.
 
@@ -181,17 +191,15 @@ Contributions welcome! This project uses:
 
 - **Python 3.12+** with strict type hints
 - **Ruff** for formatting and linting
-- **mypy** for type checking
+- **pytest** for testing
 
 ```bash
-# Development setup
-git clone https://github.com/CoderDayton/semantic-cache-mcp.git && cd semantic-cache-mcp
-uv sync
-uv run ruff check src/
-uv run mypy src/
+git clone https://github.com/CoderDayton/semantic-cache-mcp.git
+cd semantic-cache-mcp
+uv sync && uv run pytest
 ```
 
-See [Contributing Guide](docs/contributing.md) for commit conventions and code standards.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for setup, commit conventions, and code standards.
 
 ---
 
@@ -205,10 +213,9 @@ See [Contributing Guide](docs/contributing.md) for commit conventions and code s
 
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and powered by:
 
+- [FastEmbed](https://github.com/qdrant/fastembed) for local embeddings (nomic-embed-text-v1.5)
 - HyperCDC (Gear hash) for content-defined chunking
-- BLAKE3 for cryptographic hashing (with BLAKE2b fallback)
-- ZSTD/LZ4/Brotli multi-codec compression
-- int8 quantization for fast similarity search
-- LRU-K for frequency-aware eviction
-
-See [Performance](docs/performance.md) for benchmarks and optimization details.
+- BLAKE3 for cryptographic hashing
+- ZSTD/LZ4/Brotli adaptive compression
+- int8 quantized similarity search (22x storage reduction)
+- LRU-K frequency-aware cache eviction
