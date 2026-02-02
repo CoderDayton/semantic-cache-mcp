@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import array
-import math
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.types import EmbeddingVector

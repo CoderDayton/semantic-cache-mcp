@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import array
-import math
 import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from semantic_cache_mcp.storage.sqlite import SQLiteStorage
 from semantic_cache_mcp.types import EmbeddingVector

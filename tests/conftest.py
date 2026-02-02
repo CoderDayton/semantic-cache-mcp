@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import array
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
 from unittest.mock import patch
 
 import pytest

@@ -5,8 +5,6 @@ from __future__ import annotations
 import array
 import math
 
-import pytest
-
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
 from semantic_cache_mcp.core.compression import (
     compress_adaptive,
