@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <!-- Gradient for the outer ring -->
+    <linearGradient id="ringGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+
+    <!-- Gradient for inner elements -->
+    <linearGradient id="innerGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+
+    <!-- Gradient for the core -->
+    <radialGradient id="coreGradient" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#c4b5fd"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Outer ring - the cache boundary -->
+  <circle cx="256" cy="256" r="240" stroke="url(#ringGradient)" stroke-width="24" fill="none"/>
+
+  <!-- Middle ring - semantic layer -->
+  <circle cx="256" cy="256" r="180" stroke="url(#innerGradient)" stroke-width="8" fill="none" opacity="0.7"/>
+
+  <!-- Inner ring - compression layer -->
+  <circle cx="256" cy="256" r="120" stroke="url(#innerGradient)" stroke-width="4" fill="none" opacity="0.5"/>
+
+  <!-- Converging arcs - representing data flowing to cache -->
+  <!-- Top arc -->
+  <path d="M 176 100 Q 256 160 336 100" stroke="url(#ringGradient)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  <!-- Bottom arc -->
+  <path d="M 176 412 Q 256 352 336 412" stroke="url(#ringGradient)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  <!-- Left arc -->
+  <path d="M 100 176 Q 160 256 100 336" stroke="url(#ringGradient)" stroke-width="6" fill="none" stroke-linecap="round"/>
+  <!-- Right arc -->
+  <path d="M 412 176 Q 352 256 412 336" stroke="url(#ringGradient)" stroke-width="6" fill="none" stroke-linecap="round"/>
+
+  <!-- Embedding nodes - semantic vectors -->
+  <!-- Outer ring of nodes -->
+  <circle cx="256" cy="76" r="10" fill="url(#ringGradient)"/>
+  <circle cx="383" cy="129" r="10" fill="url(#ringGradient)"/>
+  <circle cx="436" cy="256" r="10" fill="url(#ringGradient)"/>
+  <circle cx="383" cy="383" r="10" fill="url(#ringGradient)"/>
+  <circle cx="256" cy="436" r="10" fill="url(#ringGradient)"/>
+  <circle cx="129" cy="383" r="10" fill="url(#ringGradient)"/>
+  <circle cx="76" cy="256" r="10" fill="url(#ringGradient)"/>
+  <circle cx="129" cy="129" r="10" fill="url(#ringGradient)"/>
+
+  <!-- Inner nodes - compressed representation -->
+  <circle cx="256" cy="156" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="327" cy="205" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="356" cy="256" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="327" cy="307" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="256" cy="356" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="185" cy="307" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="156" cy="256" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+  <circle cx="185" cy="205" r="8" fill="url(#innerGradient)" opacity="0.8"/>
+
+  <!-- Core - the cached semantic essence -->
+  <circle cx="256" cy="256" r="50" fill="url(#coreGradient)"/>
+
+  <!-- Core detail - stylized 'S' for semantic, formed by two arcs -->
+  <path d="M 240 235 Q 256 225 272 235 Q 288 245 272 255 Q 256 265 240 255 Q 224 265 240 277"
+        stroke="#ffffff" stroke-width="8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
