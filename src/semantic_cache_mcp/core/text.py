@@ -21,6 +21,7 @@ from difflib import SequenceMatcher, unified_diff
 # Myers diff algorithm (faster for small deltas)
 # ---------------------------------------------------------------------------
 
+
 def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
     """
     Myers diff algorithm: optimal edit script for sequences.
@@ -30,18 +31,19 @@ def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
 
     Reference: "An O(ND) Difference Algorithm" by Myers (1986)
     """
+
     def _backtrack(x: int, y: int, trace: dict) -> list[tuple[str, str]]:
         """Backtrack from endpoint to reconstruct edit script."""
         edits = []
         while x > 0 or y > 0:
             if (x - 1, y - 1) in trace.get((x, y), []):
-                edits.append((' ', old[x - 1]))
+                edits.append((" ", old[x - 1]))
                 x, y = x - 1, y - 1
             elif (x - 1, y) in trace.get((x, y), []):
-                edits.append(('-', old[x - 1]))
+                edits.append(("-", old[x - 1]))
                 x = x - 1
             elif (x, y - 1) in trace.get((x, y), []):
-                edits.append(('+', new[y - 1]))
+                edits.append(("+", new[y - 1]))
                 y = y - 1
             else:
                 break
@@ -51,29 +53,29 @@ def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
     if m == 0 and n == 0:
         return []
     if m == 0:
-        return [('+', line) for line in new]
+        return [("+", line) for line in new]
     if n == 0:
-        return [('-', line) for line in old]
+        return [("-", line) for line in old]
 
     # Simple SequenceMatcher-based fallback (not true Myers for simplicity)
     sm = SequenceMatcher(None, old, new)
     opcodes = sm.get_opcodes()
     edits = []
     for tag, i1, i2, j1, j2 in opcodes:
-        if tag == 'equal':
+        if tag == "equal":
             for line in old[i1:i2]:
-                edits.append((' ', line))
-        elif tag == 'replace':
+                edits.append((" ", line))
+        elif tag == "replace":
             for line in old[i1:i2]:
-                edits.append(('-', line))
+                edits.append(("-", line))
             for line in new[j1:j2]:
-                edits.append(('+', line))
-        elif tag == 'delete':
+                edits.append(("+", line))
+        elif tag == "delete":
             for line in old[i1:i2]:
-                edits.append(('-', line))
-        elif tag == 'insert':
+                edits.append(("-", line))
+        elif tag == "insert":
             for line in new[j1:j2]:
-                edits.append(('+', line))
+                edits.append(("+", line))
     return edits
 
 
@@ -82,9 +84,7 @@ def _unified_diff_fast(old: str, new: str, context_lines: int = 3) -> str:
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
-    diff = unified_diff(
-        old_lines, new_lines, fromfile="old", tofile="new", n=context_lines
-    )
+    diff = unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=context_lines)
     return "".join(diff)
 
 
@@ -92,15 +92,17 @@ def _unified_diff_fast(old: str, new: str, context_lines: int = 3) -> str:
 # Delta compression
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DiffDelta:
     """Compressed representation of changes between two texts."""
-    old_hash: str      # Hash of original text
-    new_hash: str      # Hash of updated text
+
+    old_hash: str  # Hash of original text
+    new_hash: str  # Hash of updated text
     insertions: list[tuple[int, str]]  # (line_number, content)
-    deletions: list[tuple[int, str]]   # (line_number, content)
+    deletions: list[tuple[int, str]]  # (line_number, content)
     modifications: list[tuple[int, str, str]]  # (line_number, old, new)
-    size_bytes: int    # Compressed size in bytes
+    size_bytes: int  # Compressed size in bytes
 
 
 def compute_delta(old: str, new: str) -> DiffDelta:
@@ -128,22 +130,24 @@ def compute_delta(old: str, new: str) -> DiffDelta:
     modifications = []
 
     for tag, i1, i2, j1, j2 in opcodes:
-        if tag == 'replace':
+        if tag == "replace":
             # Could be modification or deletion+insertion
             if i2 - i1 == j2 - j1:
                 # Line-by-line modification
                 for i, j in zip(range(i1, i2), range(j1, j2)):
-                    modifications.append((i1 + i - i1, old_lines[i].rstrip(), new_lines[j].rstrip()))
+                    modifications.append(
+                        (i1 + i - i1, old_lines[i].rstrip(), new_lines[j].rstrip())
+                    )
             else:
                 # Treat as deletion + insertion
                 for i in range(i1, i2):
                     deletions.append((i, old_lines[i]))
                 for j in range(j1, j2):
                     insertions.append((j, new_lines[j]))
-        elif tag == 'delete':
+        elif tag == "delete":
             for i in range(i1, i2):
                 deletions.append((i, old_lines[i]))
-        elif tag == 'insert':
+        elif tag == "insert":
             for j in range(j1, j2):
                 insertions.append((j, new_lines[j]))
 
@@ -180,7 +184,7 @@ def apply_delta(old: str, delta: DiffDelta) -> str:
     # Apply modifications
     for line_num, _, new_content in delta.modifications:
         if line_num < len(result_lines):
-            result_lines[line_num] = new_content + '\n'
+            result_lines[line_num] = new_content + "\n"
 
     return "".join(result_lines)
 
@@ -191,34 +195,34 @@ def apply_delta(old: str, delta: DiffDelta) -> str:
 
 # Regex patterns for semantic boundaries (Python/TypeScript/Go)
 _SEMANTIC_PATTERNS = {
-    'python': [
-        r'^\s*class\s+\w+',           # Class definition
-        r'^\s*def\s+\w+',             # Function definition
-        r'^\s*@\w+',                  # Decorator
-        r'^\s*if\s+__name__',         # Main block
+    "python": [
+        r"^\s*class\s+\w+",  # Class definition
+        r"^\s*def\s+\w+",  # Function definition
+        r"^\s*@\w+",  # Decorator
+        r"^\s*if\s+__name__",  # Main block
     ],
-    'typescript': [
-        r'^\s*(export\s+)?(class|interface|type|function)',
-        r'^\s*(export\s+)?const\s+\w+',
-        r'^\s*async\s+function',
+    "typescript": [
+        r"^\s*(export\s+)?(class|interface|type|function)",
+        r"^\s*(export\s+)?const\s+\w+",
+        r"^\s*async\s+function",
     ],
-    'go': [
-        r'^\s*type\s+\w+',
-        r'^\s*func\s+(\(.*?\)\s+)?\w+',
-        r'^\s*func\s+init',
+    "go": [
+        r"^\s*type\s+\w+",
+        r"^\s*func\s+(\(.*?\)\s+)?\w+",
+        r"^\s*func\s+init",
     ],
 }
 
 
 def _detect_language(content: str) -> str:
     """Detect file language from content."""
-    if 'import ' in content and 'def ' in content:
-        return 'python'
-    elif 'interface' in content or 'export' in content:
-        return 'typescript'
-    elif 'func ' in content and 'package ' in content:
-        return 'go'
-    return 'generic'
+    if "import " in content and "def " in content:
+        return "python"
+    elif "interface" in content or "export" in content:
+        return "typescript"
+    elif "func " in content and "package " in content:
+        return "go"
+    return "generic"
 
 
 def _find_semantic_boundaries(lines: list[str], language: str) -> list[int]:
@@ -228,7 +232,7 @@ def _find_semantic_boundaries(lines: list[str], language: str) -> list[int]:
         return []
 
     boundaries = [0]  # Always include start
-    combined_pattern = '|'.join(f'({p})' for p in patterns)
+    combined_pattern = "|".join(f"({p})" for p in patterns)
     regex = re.compile(combined_pattern)
 
     for i, line in enumerate(lines):
@@ -258,7 +262,7 @@ def truncate_semantic(
     n_lines = len(lines)
 
     if n_lines <= keep_top + keep_bottom:
-        return content[:max_size - 20] + "\n// [TRUNCATED]"
+        return content[: max_size - 20] + "\n// [TRUNCATED]"
 
     # Detect language for semantic boundaries
     language = _detect_language(content)
@@ -283,11 +287,13 @@ def truncate_semantic(
 
     top_content = "".join(lines[:top_cutoff])
     bottom_content = "".join(lines[bottom_cutoff:]) if bottom_cutoff < n_lines else ""
-    truncation_msg = f"\n\n// ... [{n_lines - top_cutoff - (n_lines - bottom_cutoff)} lines truncated] ...\n\n"
+    truncation_msg = (
+        f"\n\n// ... [{n_lines - top_cutoff - (n_lines - bottom_cutoff)} lines truncated] ...\n\n"
+    )
 
     total = len(top_content) + len(truncation_msg) + len(bottom_content)
     if total > max_size:
-        return content[:max_size - 20] + "\n// [TRUNCATED]"
+        return content[: max_size - 20] + "\n// [TRUNCATED]"
 
     return f"{top_content}{truncation_msg}{bottom_content}"
 
@@ -323,7 +329,7 @@ def truncate_smart(
     n_lines = len(lines)
 
     if n_lines <= keep_top + keep_bottom:
-        return content[:max_size - 20] + "\n// [TRUNCATED]"
+        return content[: max_size - 20] + "\n// [TRUNCATED]"
 
     top_content = "".join(lines[:keep_top])
     bottom_content = "".join(lines[-keep_bottom:]) if keep_bottom > 0 else ""
@@ -331,7 +337,7 @@ def truncate_smart(
 
     total = len(top_content) + len(truncation_msg) + len(bottom_content)
     if total > max_size:
-        return content[:max_size - 20] + "\n// [TRUNCATED]"
+        return content[: max_size - 20] + "\n// [TRUNCATED]"
 
     return f"{top_content}{truncation_msg}{bottom_content}"
 
@@ -339,6 +345,7 @@ def truncate_smart(
 # ---------------------------------------------------------------------------
 # Streaming diff (for huge files)
 # ---------------------------------------------------------------------------
+
 
 def generate_diff_streaming(
     old_path: str,
@@ -360,15 +367,14 @@ def generate_diff_streaming(
     Yields:
         Lines of diff output
     """
-    with open(old_path, encoding='utf-8', errors='replace') as old_f, \
-         open(new_path, encoding='utf-8', errors='replace') as new_f:
-
+    with (
+        open(old_path, encoding="utf-8", errors="replace") as old_f,
+        open(new_path, encoding="utf-8", errors="replace") as new_f,
+    ):
         old_lines = old_f.readlines()
         new_lines = new_f.readlines()
 
-    diff = unified_diff(
-        old_lines, new_lines, fromfile=old_path, tofile=new_path, n=context_lines
-    )
+    diff = unified_diff(old_lines, new_lines, fromfile=old_path, tofile=new_path, n=context_lines)
 
     for line in diff:
         yield line
@@ -390,9 +396,7 @@ def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = T
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
-    diff = unified_diff(
-        old_lines, new_lines, fromfile="old", tofile="new", n=context_lines
-    )
+    diff = unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=context_lines)
 
     result = "".join(diff)
     return result if result else "// No changes"
@@ -401,6 +405,7 @@ def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = T
 # ---------------------------------------------------------------------------
 # Utility: diff statistics
 # ---------------------------------------------------------------------------
+
 
 def diff_stats(old: str, new: str) -> dict:
     """

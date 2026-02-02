@@ -265,9 +265,7 @@ class SQLiteStorage:
 
         chunk_data = {h: data for h, data in rows}
 
-        return b"".join(
-            decompress(chunk_data[h]) for h in chunk_hashes if h in chunk_data
-        )
+        return b"".join(decompress(chunk_data[h]) for h in chunk_hashes if h in chunk_data)
 
     def release_chunks(self, chunk_hashes: list[ChunkHash]) -> None:
         """Decrement ref_count for chunks, delete if zero.
@@ -480,9 +478,7 @@ class SQLiteStorage:
             evict_count = max(1, count // 10)
 
             # Get candidates for eviction
-            rows = conn.execute(
-                "SELECT path, chunk_hashes, access_history FROM files"
-            ).fetchall()
+            rows = conn.execute("SELECT path, chunk_hashes, access_history FROM files").fetchall()
 
             entries_with_score: list[tuple[float, str, list[str]]] = []
             for path, chunks_json, history_json in rows:

@@ -20,20 +20,22 @@ from functools import lru_cache
 # Optional: use blake3 if available (faster than BLAKE2b)
 try:
     import blake3
+
     HAS_BLAKE3 = True
 except ImportError:
     HAS_BLAKE3 = False
 
 # Type aliases for clarity
-ChunkHash = str      # Hex digest (64 chars for 32-byte BLAKE3)
-BlockHash = str      # Intermediate level hash
-ContentHash = str    # Full content hash
+ChunkHash = str  # Hex digest (64 chars for 32-byte BLAKE3)
+BlockHash = str  # Intermediate level hash
+ContentHash = str  # Full content hash
 Fingerprint = bytes  # Binary hash for compact storage
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 class HashConfig:
     """Hash function configuration and parameters."""
@@ -43,19 +45,19 @@ class HashConfig:
     USE_SHA256_FALLBACK: bool = True  # Fallback if BLAKE3 unavailable
 
     # Digest sizes (bytes)
-    CHUNK_DIGEST_SIZE: int = 32        # 256 bits for chunks (collision-free for dedup)
-    BLOCK_DIGEST_SIZE: int = 32        # 256 bits for intermediate blocks
-    CONTENT_DIGEST_SIZE: int = 32      # 256 bits for full content
+    CHUNK_DIGEST_SIZE: int = 32  # 256 bits for chunks (collision-free for dedup)
+    BLOCK_DIGEST_SIZE: int = 32  # 256 bits for intermediate blocks
+    CONTENT_DIGEST_SIZE: int = 32  # 256 bits for full content
 
     # Caching configuration
-    CHUNK_CACHE_SIZE: int = 16384      # LRU cache for chunks (16K entries ~ 2MB pointers)
-    BLOCK_CACHE_SIZE: int = 4096       # LRU cache for blocks
-    CONTENT_CACHE_SIZE: int = 2048     # LRU cache for full content hashes
+    CHUNK_CACHE_SIZE: int = 16384  # LRU cache for chunks (16K entries ~ 2MB pointers)
+    BLOCK_CACHE_SIZE: int = 4096  # LRU cache for blocks
+    CONTENT_CACHE_SIZE: int = 2048  # LRU cache for full content hashes
 
     # Hierarchical hashing
     ENABLE_HIERARCHICAL: bool = True
-    BLOCK_SIZE: int = 256 * 1024       # 256KB blocks for mid-level hashing
-    STREAM_CHUNK_SIZE: int = 64 * 1024 # 64KB streaming buffer
+    BLOCK_SIZE: int = 256 * 1024  # 256KB blocks for mid-level hashing
+    STREAM_CHUNK_SIZE: int = 64 * 1024  # 64KB streaming buffer
 
     # Collision tracking
     TRACK_COLLISIONS: bool = True
@@ -68,6 +70,7 @@ DEFAULT_CONFIG = HashConfig()
 # ---------------------------------------------------------------------------
 # Hash function selection
 # ---------------------------------------------------------------------------
+
 
 def _get_hasher(digest_size: int = 32) -> object:
     """Get appropriate hash function instance."""
@@ -103,6 +106,7 @@ def _hash_hex(data: bytes, digest_size: int = 32) -> str:
 # LRU Caches for deduplication
 # ---------------------------------------------------------------------------
 
+
 @lru_cache(maxsize=DEFAULT_CONFIG.CHUNK_CACHE_SIZE)
 def _cached_chunk_hash(data: bytes) -> str:
     """LRU-cached chunk hashing."""
@@ -124,6 +128,7 @@ def _cached_content_hash(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Collision detection
 # ---------------------------------------------------------------------------
+
 
 class CollisionTracker:
     """Thread-safe collision detection for hash deduplication."""
@@ -171,6 +176,7 @@ _collision_tracker = CollisionTracker()
 # Core API: Chunk hashing
 # ---------------------------------------------------------------------------
 
+
 def hash_chunk(data: bytes) -> ChunkHash:
     """
     Hash a chunk using BLAKE3 (or BLAKE2b fallback) with LRU caching.
@@ -216,6 +222,7 @@ def hash_chunk_with_collision_check(data: bytes) -> tuple[ChunkHash, bool]:
 # Core API: Block/hierarchical hashing
 # ---------------------------------------------------------------------------
 
+
 def hash_block(data: bytes) -> BlockHash:
     """
     Hash a larger block (intermediate level for hierarchical dedup).
@@ -248,6 +255,7 @@ def hash_content(content: str | bytes) -> ContentHash:
 # ---------------------------------------------------------------------------
 # Streaming/incremental API
 # ---------------------------------------------------------------------------
+
 
 class StreamingHasher:
     """
@@ -291,7 +299,9 @@ class StreamingHasher:
             return self._hasher.digest()
 
 
-def hash_file_streaming(file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_CHUNK_SIZE) -> ContentHash:
+def hash_file_streaming(
+    file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_CHUNK_SIZE
+) -> ContentHash:
     """
     Hash large file in streaming mode (memory-efficient).
 
@@ -303,7 +313,7 @@ def hash_file_streaming(file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_
         Hex digest of full file
     """
     hasher = StreamingHasher(DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
-    with open(file_path, 'rb') as f:
+    with open(file_path, "rb") as f:
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
@@ -312,7 +322,9 @@ def hash_file_streaming(file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_
     return hasher.finalize()
 
 
-def hash_chunks_streaming(chunks_iter, combine: bool = True) -> tuple[list[ChunkHash], ContentHash | None]:
+def hash_chunks_streaming(
+    chunks_iter, combine: bool = True
+) -> tuple[list[ChunkHash], ContentHash | None]:
     """
     Hash a stream of chunks and optionally combine into content hash.
 
@@ -341,6 +353,7 @@ def hash_chunks_streaming(chunks_iter, combine: bool = True) -> tuple[list[Chunk
 # ---------------------------------------------------------------------------
 # Multi-level hierarchical hashing (for dedup)
 # ---------------------------------------------------------------------------
+
 
 class HierarchicalHasher:
     """
@@ -375,7 +388,7 @@ class HierarchicalHasher:
             return ""
 
         # Combine chunk hashes into block hash
-        combined = b''.join(ch.encode() for ch in self._chunk_hashes)
+        combined = b"".join(ch.encode() for ch in self._chunk_hashes)
         block_hash = hash_block(combined)
         self._blocks.append(block_hash)
         self._chunk_hashes.clear()
@@ -396,7 +409,7 @@ class HierarchicalHasher:
         if not self._blocks:
             return "", [], []
 
-        combined_blocks = b''.join(b.encode() for b in self._blocks)
+        combined_blocks = b"".join(b.encode() for b in self._blocks)
         content_hash = hash_content(combined_blocks)
 
         return content_hash, self._blocks.copy(), self._chunk_hashes.copy()
@@ -405,6 +418,7 @@ class HierarchicalHasher:
 # ---------------------------------------------------------------------------
 # Deduplication index utilities
 # ---------------------------------------------------------------------------
+
 
 class DeduplicateIndex:
     """
@@ -465,6 +479,7 @@ class DeduplicateIndex:
 # Diagnostics
 # ---------------------------------------------------------------------------
 
+
 def get_hash_stats() -> dict[str, any]:
     """Get hash function statistics."""
     return {
@@ -479,5 +494,3 @@ def get_hash_stats() -> dict[str, any]:
 def reset_collision_tracker() -> None:
     """Reset collision statistics."""
     _collision_tracker.clear()
-
-

@@ -20,9 +20,7 @@ from semantic_cache_mcp.types import EmbeddingVector
 class TestFullCacheLifecycle:
     """Test complete cache lifecycle: read → cache → modify → diff → clear."""
 
-    def test_first_read_caches_file(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_first_read_caches_file(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """First read should return full content and cache it."""
         # Create test file
         test_file = temp_dir / "test.py"
@@ -83,9 +81,7 @@ class TestFullCacheLifecycle:
         assert result.is_diff is True
         assert result.tokens_saved > 0
 
-    def test_force_full_bypasses_cache(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_force_full_bypasses_cache(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """force_full=True should return full content even if cached."""
         test_file = temp_dir / "test.py"
         test_file.write_text("def hello():\n    return 'world'\n")
@@ -123,9 +119,7 @@ class TestFullCacheLifecycle:
 class TestSemanticSimilarity:
     """Test semantic similarity detection between files."""
 
-    def test_similar_file_detected(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
+    def test_similar_file_detected(self, temp_dir: Path, mock_embeddings: EmbeddingVector) -> None:
         """Similar files should be detected via embeddings."""
         db_path = temp_dir / "cache.db"
 
@@ -167,9 +161,7 @@ class TestStatsAndClear:
         assert stats["files_cached"] == 0
         assert stats["total_tokens_cached"] == 0
 
-    def test_stats_after_caching(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_stats_after_caching(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Stats should reflect cached files."""
         # Create and cache files
         for i in range(3):
@@ -183,9 +175,7 @@ class TestStatsAndClear:
         assert stats["total_tokens_cached"] > 0
         assert stats["unique_chunks"] > 0
 
-    def test_clear_removes_all(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_clear_removes_all(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Clear should remove all cache entries."""
         # Cache some files
         for i in range(3):
@@ -206,9 +196,7 @@ class TestStatsAndClear:
 class TestLargeFiles:
     """Test handling of large files."""
 
-    def test_large_file_truncation(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_large_file_truncation(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Large files should be truncated to max_size."""
         large_file = temp_dir / "large.txt"
         large_file.write_text("x" * 200_000)  # 200KB
@@ -243,9 +231,7 @@ class TestEdgeCases:
         with pytest.raises(FileNotFoundError):
             smart_read(semantic_cache, "/nonexistent/path/file.txt")
 
-    def test_empty_file(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_empty_file(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Empty files should be handled gracefully."""
         empty_file = temp_dir / "empty.txt"
         empty_file.write_text("")
@@ -255,9 +241,7 @@ class TestEdgeCases:
         assert result.content == ""
         assert result.tokens_original == 0
 
-    def test_binary_file_error(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_binary_file_error(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Binary files should raise appropriate error."""
         binary_file = temp_dir / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\xff\xfe")
@@ -265,9 +249,7 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="Binary file not supported"):
             smart_read(semantic_cache, str(binary_file))
 
-    def test_unicode_content(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_unicode_content(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Unicode content should be handled correctly."""
         unicode_file = temp_dir / "unicode.txt"
         unicode_file.write_text("Hello \n Emoji \n Chinese ")
@@ -278,9 +260,7 @@ class TestEdgeCases:
         assert "" in result.content
         assert "" in result.content
 
-    def test_symlink_resolution(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_symlink_resolution(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Symlinks should be resolved to real path."""
         real_file = temp_dir / "real.txt"
         real_file.write_text("Real content")
@@ -296,9 +276,7 @@ class TestEdgeCases:
 class TestConcurrentAccess:
     """Test concurrent cache access."""
 
-    def test_multiple_reads_same_file(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_multiple_reads_same_file(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Multiple reads of same file should be consistent."""
         test_file = temp_dir / "shared.txt"
         test_file.write_text("Shared content\n")
@@ -317,9 +295,7 @@ class TestConcurrentAccess:
 class TestMCPToolIntegration:
     """Test MCP tool functions directly."""
 
-    def test_read_tool_format(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_read_tool_format(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Read tool should return properly formatted response."""
         test_file = temp_dir / "test.txt"
         test_file.write_text("Test content")
@@ -333,9 +309,7 @@ class TestMCPToolIntegration:
         assert hasattr(result, "tokens_saved")
         assert hasattr(result, "truncated")
 
-    def test_stats_json_serializable(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_stats_json_serializable(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Stats should be JSON serializable."""
         # Cache a file
         test_file = temp_dir / "test.txt"
@@ -371,9 +345,7 @@ class TestTokenSavings:
         # Should save most tokens
         assert result2.tokens_saved > original_tokens * 0.9
 
-    def test_diff_saves_tokens(
-        self, semantic_cache: SemanticCache, temp_dir: Path
-    ) -> None:
+    def test_diff_saves_tokens(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Diff should save tokens compared to full content."""
         test_file = temp_dir / "code.py"
         test_file.write_text("def func():\n    pass\n" * 50)

@@ -154,8 +154,7 @@ def smart_read(
         sample = file_path.read_bytes()[:8192]
         if b"\x00" in sample:
             raise ValueError(
-                f"Binary file not supported: {path}. "
-                "Semantic cache only handles text files."
+                f"Binary file not supported: {path}. Semantic cache only handles text files."
             )
         content = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:

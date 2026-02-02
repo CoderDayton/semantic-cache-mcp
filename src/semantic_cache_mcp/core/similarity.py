@@ -24,6 +24,7 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 class SimilarityConfig:
     """Tunable similarity search parameters."""
 
@@ -51,6 +52,7 @@ DEFAULT_CONFIG = SimilarityConfig()
 # ---------------------------------------------------------------------------
 # Quantization (int8)
 # ---------------------------------------------------------------------------
+
 
 def _quantize_vector(v: array.array | list | np.ndarray) -> tuple[np.ndarray, float]:
     """
@@ -96,6 +98,7 @@ def _dequantize_scale(q1: np.ndarray, s1: float, q2: np.ndarray, s2: float) -> f
 # Pre-quantization for storage (22x compression)
 # ---------------------------------------------------------------------------
 
+
 def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
     """
     Quantize embedding to int8 for compact storage.
@@ -128,7 +131,7 @@ def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
     quantized = np.round(arr * scale).astype(np.int8)
 
     # Pack: scale (float32) + quantized vector (int8[N])
-    return struct.pack('<f', scale) + quantized.tobytes()
+    return struct.pack("<f", scale) + quantized.tobytes()
 
 
 def dequantize_embedding(blob: bytes) -> array.array:
@@ -144,7 +147,7 @@ def dequantize_embedding(blob: bytes) -> array.array:
     import struct
 
     # Unpack scale (first 4 bytes)
-    scale = struct.unpack('<f', blob[:4])[0]
+    scale = struct.unpack("<f", blob[:4])[0]
 
     # Unpack quantized vector
     quantized = np.frombuffer(blob[4:], dtype=np.int8)
@@ -152,7 +155,7 @@ def dequantize_embedding(blob: bytes) -> array.array:
     # Dequantize
     arr = quantized.astype(np.float32) / scale
 
-    return array.array('f', arr.tolist())
+    return array.array("f", arr.tolist())
 
 
 def similarity_from_quantized_blob(
@@ -195,7 +198,7 @@ def similarity_from_quantized_blob(
     matrix = np.empty((n, dim), dtype=np.int8)
 
     for i, blob in enumerate(quantized_blobs):
-        scales[i] = struct.unpack('<f', blob[:4])[0]
+        scales[i] = struct.unpack("<f", blob[:4])[0]
         matrix[i] = np.frombuffer(blob[4:], dtype=np.int8)
 
     # Batch int8 dot product (SIMD-friendly)
@@ -238,6 +241,7 @@ def top_k_from_quantized(
 # Dimension pruning (PDX-inspired)
 # ---------------------------------------------------------------------------
 
+
 def _select_pruning_dims(
     query: np.ndarray,
     fraction: float = 0.8,
@@ -270,6 +274,7 @@ def _select_pruning_dims(
 # ---------------------------------------------------------------------------
 # Core similarity API (optimized)
 # ---------------------------------------------------------------------------
+
 
 def cosine_similarity(
     a: array.array | list | np.ndarray,
@@ -360,6 +365,7 @@ def cosine_similarity_with_pruning(
 # ---------------------------------------------------------------------------
 # Batch similarity (SIMD-optimized)
 # ---------------------------------------------------------------------------
+
 
 def cosine_similarity_batch(
     query: array.array | list | np.ndarray,
@@ -452,11 +458,14 @@ def cosine_similarity_batch_matrix(
         q_arr = np.asarray(query, dtype=np.float32)
 
     # Stack vectors into matrix
-    matrix = np.vstack([
-        np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array)
-        else np.asarray(v, dtype=np.float32)
-        for v in vectors
-    ])
+    matrix = np.vstack(
+        [
+            np.frombuffer(v, dtype=np.float32)
+            if isinstance(v, array.array)
+            else np.asarray(v, dtype=np.float32)
+            for v in vectors
+        ]
+    )
 
     if use_quantization:
         # Quantize all at once
@@ -466,7 +475,7 @@ def cosine_similarity_batch_matrix(
         max_vals = np.max(np.abs(matrix), axis=1, keepdims=True)
         max_vals[max_vals == 0] = 1.0
         scales = 127.0 / max_vals.flatten()
-        q_matrix = (matrix * (scales.reshape(-1, 1))) .round().astype(np.int8)
+        q_matrix = (matrix * (scales.reshape(-1, 1))).round().astype(np.int8)
 
         # int8 batch dot product
         sims = (q_matrix @ q_query.astype(np.int32)).astype(np.float32)
@@ -481,6 +490,7 @@ def cosine_similarity_batch_matrix(
 # ---------------------------------------------------------------------------
 # Top-K similarity (efficient)
 # ---------------------------------------------------------------------------
+
 
 def top_k_similarities(
     query: array.array | list | np.ndarray,
@@ -512,6 +522,7 @@ def top_k_similarities(
 # ---------------------------------------------------------------------------
 # Diagnostics and benchmarking
 # ---------------------------------------------------------------------------
+
 
 def estimate_speedup(
     num_vectors: int,

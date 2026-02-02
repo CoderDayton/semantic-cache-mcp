@@ -34,7 +34,7 @@ O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cf
 
 class BPETokenizer:
     """Self-contained BPE tokenizer compatible with tiktoken o200k_base encoding.
-    
+
     Optimized for speed and memory efficiency:
     - Priority queue for O(N log M) merge tracking
     - Memoized merge operations
@@ -95,7 +95,7 @@ class BPETokenizer:
 
     def _build_bpe_ranks(self) -> None:
         """Build BPE merge ranks via greedy split selection.
-        
+
         For each multi-byte token, find the split (prefix, suffix) where
         both parts exist in vocab. Prefer splits with highest-ranked prefix.
         """
@@ -110,7 +110,10 @@ class BPETokenizer:
                 prefix = token_bytes[:i]
                 suffix = token_bytes[i:]
                 if prefix in self.inverse_vocab and suffix in self.inverse_vocab:
-                    if best_split is None or self.inverse_vocab[prefix] < self.inverse_vocab[best_split[0]]:
+                    if (
+                        best_split is None
+                        or self.inverse_vocab[prefix] < self.inverse_vocab[best_split[0]]
+                    ):
                         best_split = (prefix, suffix)
 
             if best_split:
@@ -126,7 +129,7 @@ class BPETokenizer:
 
     def _bpe_merge_optimized(self, token_bytes: bytes) -> list[bytes]:
         """Apply BPE merges with O(N log M) complexity via priority queue.
-        
+
         Instead of scanning all pairs each iteration (O(N²)), use a heap
         to track pairs by rank and process in priority order.
         """
@@ -190,6 +193,7 @@ class BPETokenizer:
             return self._pat
         try:
             import regex
+
             self._pat = regex.compile(self._GPT4_PATTERN)
         except ImportError:
             self._pat = re.compile(self._SIMPLE_PATTERN, re.UNICODE)
@@ -205,7 +209,9 @@ class BPETokenizer:
         # Split around special tokens
         if self.special_tokens and allowed_special:
             special_pattern = (
-                "(" + "|".join(re.escape(t) for t in sorted(allowed_special, key=len, reverse=True)) + ")"
+                "("
+                + "|".join(re.escape(t) for t in sorted(allowed_special, key=len, reverse=True))
+                + ")"
             )
 
             last_idx = 0

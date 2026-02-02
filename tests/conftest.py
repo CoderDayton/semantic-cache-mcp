@@ -50,7 +50,9 @@ def semantic_cache_no_embeddings(temp_dir: Path) -> Generator[SemanticCache, Non
 
 
 @pytest.fixture
-def semantic_cache_with_embeddings(temp_dir: Path, mock_embeddings: EmbeddingVector) -> Generator[SemanticCache, None, None]:
+def semantic_cache_with_embeddings(
+    temp_dir: Path, mock_embeddings: EmbeddingVector
+) -> Generator[SemanticCache, None, None]:
     """Create a SemanticCache with mocked embeddings."""
     db_path = temp_dir / "semantic_cache_emb.db"
 

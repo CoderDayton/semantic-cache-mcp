@@ -22,31 +22,32 @@ from dataclasses import dataclass
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class HyperCDCConfig:
     # Target chunk sizes
-    min_size: int = 2 * 1024        # Region A: never cut below this
-    norm_size: int = 8 * 1024       # Region B→C transition (target center)
-    max_size: int = 64 * 1024       # Region C: force cut at this
+    min_size: int = 2 * 1024  # Region A: never cut below this
+    norm_size: int = 8 * 1024  # Region B→C transition (target center)
+    max_size: int = 64 * 1024  # Region C: force cut at this
 
     # Mask bits for different regions: E[size] ≈ 2^mask_bits
-    mask_weak_bits: int = 11        # ~2 KiB expected in weak region
-    mask_strong_bits: int = 13      # ~8 KiB expected in strong region
+    mask_weak_bits: int = 11  # ~2 KiB expected in weak region
+    mask_strong_bits: int = 13  # ~8 KiB expected in strong region
 
     # Entropy thresholds (bits per byte)
-    entropy_low: float = 1.5        # treat as low-entropy if below
-    entropy_high: float = 6.0       # treat as high-entropy if above
+    entropy_low: float = 1.5  # treat as low-entropy if below
+    entropy_high: float = 6.0  # treat as high-entropy if above
 
     # Step sizes
-    step_fast: int = 8              # bytes per iteration in low entropy spans
-    step_normal: int = 2            # FastCDC-style 2-byte stepping elsewhere
+    step_fast: int = 8  # bytes per iteration in low entropy spans
+    step_normal: int = 2  # FastCDC-style 2-byte stepping elsewhere
 
     # Semantic snapping radius
-    semantic_window: int = 128      # search radius around CDC boundary
+    semantic_window: int = 128  # search radius around CDC boundary
 
     # Entropy window
-    entropy_window: int = 256       # window size for entropy estimation
-    entropy_interval: int = 512     # re-check entropy every N bytes per chunk (tuned for perf)
+    entropy_window: int = 256  # window size for entropy estimation
+    entropy_interval: int = 512  # re-check entropy every N bytes per chunk (tuned for perf)
 
 
 # Default config tuned for general-purpose RAG/log/code workloads
@@ -55,9 +56,9 @@ DEFAULT_CONFIG = HyperCDCConfig()
 # Turbo config: Maximum speed, minimal features
 TURBO_CONFIG = HyperCDCConfig(
     entropy_interval=999999,  # Disable entropy checking
-    semantic_window=0,        # Disable semantic snapping
-    step_fast=1,              # No variable stepping
-    step_normal=1,            # Process every byte for accuracy
+    semantic_window=0,  # Disable semantic snapping
+    step_fast=1,  # No variable stepping
+    step_normal=1,  # Process every byte for accuracy
 )
 
 
@@ -79,6 +80,7 @@ def _gear_table() -> tuple[int, ...]:
 # ---------------------------------------------------------------------------
 # Utility: entropy and semantic snapping
 # ---------------------------------------------------------------------------
+
 
 def _shannon_entropy_fast(data: bytes) -> float:
     """Ultra-fast entropy approximation using unique byte ratio.
@@ -112,9 +114,9 @@ _shannon_entropy = _shannon_entropy_fast
 
 _SEMANTIC_TOKENS = [
     b"\n\n",  # paragraph break
-    b"\n",    # line break
-    b". ",    # sentence end (simple heuristic)
-    b"}",     # common in code / JSON
+    b"\n",  # line break
+    b". ",  # sentence end (simple heuristic)
+    b"}",  # common in code / JSON
 ]
 
 
@@ -147,7 +149,12 @@ def _snap_semantic_boundary(content: bytes, pos: int, window: int) -> int:
             cut = left + idx + tlen  # cut *after* token
             dist = abs(cut - pos)
             # Prefer closer cuts; if equal, prefer right side to avoid micro-chunks
-            if best_pos == pos and best_dist == 0 or dist < best_dist or (dist == best_dist and cut >= pos > best_pos):
+            if (
+                best_pos == pos
+                and best_dist == 0
+                or dist < best_dist
+                or (dist == best_dist and cut >= pos > best_pos)
+            ):
                 best_pos, best_dist = cut, dist
             start = idx + 1
 
@@ -158,6 +165,7 @@ def _snap_semantic_boundary(content: bytes, pos: int, window: int) -> int:
 # ---------------------------------------------------------------------------
 # Turbo-optimized chunker (maximum throughput)
 # ---------------------------------------------------------------------------
+
 
 def hypercdc_boundaries_turbo(
     content: bytes,
@@ -218,6 +226,7 @@ def hypercdc_boundaries_turbo(
 # ---------------------------------------------------------------------------
 # Core HyperCDC chunker
 # ---------------------------------------------------------------------------
+
 
 def hypercdc_boundaries(
     content: bytes,
@@ -336,6 +345,7 @@ def hypercdc_chunks(
 # ---------------------------------------------------------------------------
 # Optional: 2-level hierarchical chunking
 # ---------------------------------------------------------------------------
+
 
 def hierarchical_hypercdc_chunks(
     content: bytes,

@@ -24,49 +24,54 @@ logger = logging.getLogger(__name__)
 # Optional imports with fallbacks
 try:
     import zstandard as zstd
+
     HAS_ZSTD = True
 except ImportError:
     HAS_ZSTD = False
 
 try:
     import lz4.frame
+
     HAS_LZ4 = True
 except ImportError:
     HAS_LZ4 = False
 
 try:
     import brotli
+
     HAS_BROTLI = True
 except ImportError:
     HAS_BROTLI = False
 
+
 # Compression codec enum
 class Codec(Enum):
-    STORE = auto()    # No compression (framing only)
-    ZSTD = auto()     # Default: fast, good ratio, dictionary support
-    LZ4 = auto()      # Speed: decompression ~10x faster than Zstd
-    BROTLI = auto()   # Ratio: ~5-10% better than Zstd, slower
+    STORE = auto()  # No compression (framing only)
+    ZSTD = auto()  # Default: fast, good ratio, dictionary support
+    LZ4 = auto()  # Speed: decompression ~10x faster than Zstd
+    BROTLI = auto()  # Ratio: ~5-10% better than Zstd, slower
+
 
 # Magic bytes for incompressible format detection
 # Organized by first byte for fast lookup
 _INCOMPRESSIBLE_MAGIC = {
-    b'\xff\xd8\xff': 'JPEG',
-    b'\x89PNG': 'PNG',
-    b'PK\x03\x04': 'ZIP',
-    b'PK\x05\x06': 'ZIP_EMPTY',
-    b'PK\x07\x08': 'ZIP_SPANNED',
-    b'%PDF': 'PDF',
-    b'\x1f\x8b': 'GZIP',
-    b'BZ': 'BZIP2',
-    b'(\xb5/\xfd': 'ZSTD',
-    b'\xfd7zXZ': 'XZ',
-    b'Rar!': 'RAR',
-    b'\x42\x5a\x68': 'BZIP2',  # Alternative BZ2 magic
-    b'\x37\x7a\xbc\xaf': '7Z',
-    b'OggS': 'OGG',
-    b'ftyp': 'MP4',  # Actually at offset 4, but often detected
-    b'FLAC': 'FLAC',
-    b'WEBP': 'WEBP',
+    b"\xff\xd8\xff": "JPEG",
+    b"\x89PNG": "PNG",
+    b"PK\x03\x04": "ZIP",
+    b"PK\x05\x06": "ZIP_EMPTY",
+    b"PK\x07\x08": "ZIP_SPANNED",
+    b"%PDF": "PDF",
+    b"\x1f\x8b": "GZIP",
+    b"BZ": "BZIP2",
+    b"(\xb5/\xfd": "ZSTD",
+    b"\xfd7zXZ": "XZ",
+    b"Rar!": "RAR",
+    b"\x42\x5a\x68": "BZIP2",  # Alternative BZ2 magic
+    b"\x37\x7a\xbc\xaf": "7Z",
+    b"OggS": "OGG",
+    b"ftyp": "MP4",  # Actually at offset 4, but often detected
+    b"FLAC": "FLAC",
+    b"WEBP": "WEBP",
 }
 
 # Build O(1) lookup table: first_byte -> [(magic, fmt), ...]
@@ -85,6 +90,7 @@ _MAX_MAGIC_LEN = max(len(m) for m in _INCOMPRESSIBLE_MAGIC)
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class CompressionConfig:
     """Tunable compression parameters."""
@@ -95,9 +101,9 @@ class CompressionConfig:
     entropy_medium: float = 4.0
 
     # Size thresholds (bytes)
-    tiny_threshold: int = 256        # Don't compress at all
+    tiny_threshold: int = 256  # Don't compress at all
     parallel_threshold: int = 4 * 1024 * 1024  # Parallel blocks above 4MB (was 128KB - too low)
-    block_size: int = 1024 * 1024    # 1MB blocks for parallel mode
+    block_size: int = 1024 * 1024  # 1MB blocks for parallel mode
 
     # Codec selection by entropy tier
     codec_uncompressible: Codec = Codec.STORE
@@ -122,8 +128,8 @@ class CompressionConfig:
 
     # Dictionary training for CDC chunks
     enable_dict: bool = True
-    dict_size: int = 32 * 1024       # 32KB shared dictionary for similar chunks
-    dict_window: int = 256           # Number of chunks to train dict from
+    dict_size: int = 32 * 1024  # 32KB shared dictionary for similar chunks
+    dict_window: int = 256  # Number of chunks to train dict from
 
     # Latency mode: prefer LZ4 for speed-critical paths
     latency_mode: bool = False
@@ -135,6 +141,7 @@ DEFAULT_CONFIG = CompressionConfig()
 # ---------------------------------------------------------------------------
 # Entropy estimation
 # ---------------------------------------------------------------------------
+
 
 def _fast_entropy(data: bytes, sample_size: int = 256) -> float:
     """
@@ -157,7 +164,7 @@ def _fast_entropy(data: bytes, sample_size: int = 256) -> float:
     if n > sample_size:
         # Sample from start, middle, end for better coverage
         third = sample_size // 3
-        sample = data[:third] + data[n // 2 - third // 2:n // 2 + third // 2] + data[-third:]
+        sample = data[:third] + data[n // 2 - third // 2 : n // 2 + third // 2] + data[-third:]
     else:
         sample = data
 
@@ -180,6 +187,7 @@ estimate_entropy = _fast_entropy
 # Incompressible detection
 # ---------------------------------------------------------------------------
 
+
 def _detect_incompressible(data: bytes, max_check: int = 1024) -> tuple[bool, str | None]:
     """
     Detect if data is already compressed/encrypted using magic bytes.
@@ -198,7 +206,7 @@ def _detect_incompressible(data: bytes, max_check: int = 1024) -> tuple[bool, st
         check_len = min(n, _MAX_MAGIC_LEN)
         header = data[:check_len]
         for magic, fmt in candidates:
-            if header[:len(magic)] == magic:
+            if header[: len(magic)] == magic:
                 return True, fmt
 
     # Skip entropy check here - compress_adaptive already does it
@@ -209,6 +217,7 @@ def _detect_incompressible(data: bytes, max_check: int = 1024) -> tuple[bool, st
 # ---------------------------------------------------------------------------
 # Dictionary management for CDC chunks
 # ---------------------------------------------------------------------------
+
 
 class ChunkDictionary:
     """
@@ -234,7 +243,7 @@ class ChunkDictionary:
             # zstd.train_dictionary API
             dict_data = zstd.train_dictionary(
                 dict_size=self._config.dict_size,
-                samples=self._chunks[-self._config.dict_window:],
+                samples=self._chunks[-self._config.dict_window :],
             )
             self._dict_data = dict_data
             self._zstd_dict = zstd.ZstdCompressionDict(dict_data)
@@ -267,18 +276,19 @@ _chunk_dict = ChunkDictionary()
 # Compression engines
 # ---------------------------------------------------------------------------
 
+
 def _compress_store(data: bytes, level: int = 0) -> bytes:
     """No compression - just frame with length header."""
     # Simple framing: 4-byte length prefix
-    return struct.pack('>I', len(data)) + data
+    return struct.pack(">I", len(data)) + data
 
 
 def _decompress_store(data: bytes) -> bytes:
     """Parse stored frame."""
     if len(data) < 4:
         raise ValueError("Invalid store frame")
-    length = struct.unpack('>I', data[:4])[0]
-    result = data[4:4 + length]
+    length = struct.unpack(">I", data[:4])[0]
+    result = data[4 : 4 + length]
     if len(result) != length:
         raise ValueError("Truncated store frame")
     return result
@@ -377,6 +387,7 @@ _CODEC_FROM_BYTE: tuple = (Codec.STORE, Codec.ZSTD, Codec.LZ4, Codec.BROTLI)
 # Core compression API
 # ---------------------------------------------------------------------------
 
+
 def compress_adaptive(
     data: bytes,
     config: CompressionConfig = DEFAULT_CONFIG,
@@ -397,19 +408,19 @@ def compress_adaptive(
 
     # Tiny data: store uncompressed (fast path)
     if n <= config.tiny_threshold:
-        return b'\x00' + struct.pack('>I', n) + data  # Inline store
+        return b"\x00" + struct.pack(">I", n) + data  # Inline store
 
     # Check for already-compressed data
     is_incompressible, _ = _detect_incompressible(data)
     if is_incompressible:
-        return b'\x00' + struct.pack('>I', n) + data  # Inline store
+        return b"\x00" + struct.pack(">I", n) + data  # Inline store
 
     # Estimate entropy for level selection
     entropy = _fast_entropy(data)
 
     # Fast path: high entropy -> store directly
     if entropy >= config.entropy_uncompressible:
-        return b'\x00' + struct.pack('>I', n) + data
+        return b"\x00" + struct.pack(">I", n) + data
 
     # Select codec and level based on entropy tier
     # Most common path: ZSTD (>95% of cases when installed)
@@ -427,10 +438,10 @@ def compress_adaptive(
             try:
                 cctx = _get_zstd_compressor(level, dict_obj)
                 compressed = cctx.compress(data)
-                return b'\x01' + compressed  # ZSTD = 1
+                return b"\x01" + compressed  # ZSTD = 1
             except (ValueError, MemoryError, OSError) as e:
                 logger.debug(f"ZSTD compression failed, storing uncompressed: {e}")
-                return b'\x00' + struct.pack('>I', n) + data
+                return b"\x00" + struct.pack(">I", n) + data
 
         # Large data: use ZSTD multi-threaded mode
         return _compress_parallel(data, Codec.ZSTD, level, config)
@@ -438,14 +449,20 @@ def compress_adaptive(
     # Fallback codecs when ZSTD not available
     if HAS_LZ4:
         codec = Codec.LZ4
-        level = config.lz4_level_fast if entropy >= config.entropy_high else config.lz4_level_default
+        level = (
+            config.lz4_level_fast if entropy >= config.entropy_high else config.lz4_level_default
+        )
         codec_byte = 2
     elif HAS_BROTLI:
         codec = Codec.BROTLI
-        level = config.brotli_level_fast if entropy >= config.entropy_high else config.brotli_level_default
+        level = (
+            config.brotli_level_fast
+            if entropy >= config.entropy_high
+            else config.brotli_level_default
+        )
         codec_byte = 3
     else:
-        return b'\x00' + struct.pack('>I', n) + data  # No codecs available
+        return b"\x00" + struct.pack(">I", n) + data  # No codecs available
 
     # Parallel compression for large data
     if n >= config.parallel_threshold:
@@ -460,7 +477,7 @@ def compress_adaptive(
         return bytes([codec_byte]) + compressed
     except (ValueError, MemoryError, OSError) as e:
         logger.debug(f"Fallback compression failed: {e}")
-        return b'\x00' + struct.pack('>I', n) + data
+        return b"\x00" + struct.pack(">I", n) + data
 
 
 def _compress_parallel(
@@ -477,12 +494,13 @@ def _compress_parallel(
     # ZSTD has native multi-threading - use it directly (no Python thread overhead!)
     if codec == Codec.ZSTD and HAS_ZSTD:
         import os
+
         num_threads = os.cpu_count() or 4
         try:
             # Create multi-threaded compressor
             cctx = zstd.ZstdCompressor(level=level, threads=num_threads)
             compressed = cctx.compress(data)
-            return b'\x01' + compressed  # No parallel flag - native MT is transparent
+            return b"\x01" + compressed  # No parallel flag - native MT is transparent
         except (ValueError, MemoryError, OSError) as e:
             logger.debug(f"Native MT compression failed, using blocks: {e}")
 
@@ -498,11 +516,11 @@ def _compress_parallel(
                 result = compressor(data, level, None)
             else:
                 result = compressor(data, level)
-            codec_byte = (0, 1, 2, 3)[codec.value - 1] if hasattr(codec, 'value') else 0
+            codec_byte = (0, 1, 2, 3)[codec.value - 1] if hasattr(codec, "value") else 0
             return bytes([codec_byte]) + result
         except (ValueError, MemoryError, OSError) as e:
             logger.debug(f"Single-block compression failed: {e}")
-            return b'\x00' + struct.pack('>I', len(data)) + data
+            return b"\x00" + struct.pack(">I", len(data)) + data
 
     def compress_block(args: tuple[int, bytes]) -> tuple[int, bytes]:
         idx, block = args
@@ -515,9 +533,9 @@ def _compress_parallel(
             return idx, result
         except (ValueError, MemoryError, OSError):
             # Block compression failed - return uncompressed with length prefix
-            return idx, struct.pack('>I', len(block)) + block
+            return idx, struct.pack(">I", len(block)) + block
 
-    blocks = [(i, data[i * block_size:(i + 1) * block_size]) for i in range(num_blocks)]
+    blocks = [(i, data[i * block_size : (i + 1) * block_size]) for i in range(num_blocks)]
 
     with ThreadPoolExecutor() as executor:
         results = list(executor.map(compress_block, blocks))
@@ -526,10 +544,10 @@ def _compress_parallel(
     compressed_blocks = [r[1] for r in results]
 
     # Frame: [codec_byte | 0x80][num_blocks][block_sizes...][block_data...]
-    codec_byte = (0, 1, 2, 3)[codec.value - 1] if hasattr(codec, 'value') else 0
+    codec_byte = (0, 1, 2, 3)[codec.value - 1] if hasattr(codec, "value") else 0
     header = bytes([codec_byte | 0x80, num_blocks])
-    sizes = b''.join(struct.pack('>I', len(b)) for b in compressed_blocks)
-    return header + sizes + b''.join(compressed_blocks)
+    sizes = b"".join(struct.pack(">I", len(b)) for b in compressed_blocks)
+    return header + sizes + b"".join(compressed_blocks)
 
 
 def decompress(data: bytes) -> bytes:
@@ -583,7 +601,7 @@ def _decompress_parallel(data: bytes, codec: Codec) -> bytes:
     for _ in range(num_blocks):
         if offset + 4 > len(data):
             raise ValueError("Truncated block sizes")
-        size = struct.unpack('>I', data[offset:offset + 4])[0]
+        size = struct.unpack(">I", data[offset : offset + 4])[0]
         sizes.append(size)
         offset += 4
 
@@ -592,7 +610,7 @@ def _decompress_parallel(data: bytes, codec: Codec) -> bytes:
     for size in sizes:
         if offset + size > len(data):
             raise ValueError("Truncated block data")
-        blocks.append(data[offset:offset + size])
+        blocks.append(data[offset : offset + size])
         offset += size
 
     decompressor = _DECOMPRESSORS[codec]
@@ -605,18 +623,19 @@ def _decompress_parallel(data: bytes, codec: Codec) -> bytes:
             return idx, decompressor(block)
         except (ValueError, MemoryError, OSError):
             # Decompression failed - return empty (data corruption)
-            return idx, b''
+            return idx, b""
 
     with ThreadPoolExecutor() as executor:
         results = list(executor.map(decompress_block, enumerate(blocks)))
 
     results.sort(key=lambda x: x[0])
-    return b''.join(r[1] for r in results)
+    return b"".join(r[1] for r in results)
 
 
 # ---------------------------------------------------------------------------
 # Utility: codec stats and diagnostics
 # ---------------------------------------------------------------------------
+
 
 def estimate_compression_ratio(data: bytes) -> float:
     """Estimate compression ratio based on entropy (heuristic)."""

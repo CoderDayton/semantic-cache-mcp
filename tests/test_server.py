@@ -17,9 +17,7 @@ from semantic_cache_mcp.storage.sqlite import SQLiteStorage
 class TestFileNotFoundHandling:
     """Tests for file not found scenarios."""
 
-    def test_smart_read_file_not_found(
-        self, semantic_cache_no_embeddings: SemanticCache
-    ) -> None:
+    def test_smart_read_file_not_found(self, semantic_cache_no_embeddings: SemanticCache) -> None:
         """smart_read should raise FileNotFoundError for missing files."""
         with pytest.raises(FileNotFoundError):
             smart_read(semantic_cache_no_embeddings, "/nonexistent/file.txt")
@@ -148,6 +146,7 @@ class TestConcurrentAccess:
     ) -> None:
         """Concurrent reads should not corrupt cache."""
         file_path = sample_files["python"]
+        original_content = file_path.read_text()
         results: list[str] = []
         errors: list[Exception] = []
 
@@ -165,8 +164,9 @@ class TestConcurrentAccess:
             t.join()
 
         assert len(errors) == 0
-        # All results should be the same content
-        assert len(set(results)) == 1
+        # Results should be either full content or "unchanged" message (race condition)
+        for result in results:
+            assert result == original_content or "unchanged" in result.lower()
 
     def test_concurrent_writes(self, temp_dir: Path) -> None:
         """Concurrent writes should not corrupt database."""
@@ -280,9 +280,7 @@ class TestPathTraversalPrevention:
         result = smart_read(semantic_cache_no_embeddings, with_dots)
         assert result.content == "Test content"
 
-    def test_tilde_expansion(
-        self, semantic_cache_no_embeddings: SemanticCache
-    ) -> None:
+    def test_tilde_expansion(self, semantic_cache_no_embeddings: SemanticCache) -> None:
         """Tilde paths should be expanded."""
         # This tests that ~ is expanded, not that the file exists
         home = Path.home()
@@ -318,9 +316,7 @@ class TestDatabaseIntegrity:
         storage = SQLiteStorage(db_path)
 
         with sqlite3.connect(db_path) as conn:
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             table_names = {t[0] for t in tables}
 
             assert "chunks" in table_names
@@ -332,9 +328,7 @@ class TestDatabaseIntegrity:
         SQLiteStorage(db_path)
 
         with sqlite3.connect(db_path) as conn:
-            indexes = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            ).fetchall()
+            indexes = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
             index_names = {i[0] for i in indexes}
 
             assert "idx_created" in index_names

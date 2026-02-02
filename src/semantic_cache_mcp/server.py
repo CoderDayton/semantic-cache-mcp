@@ -55,7 +55,11 @@ mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
 
 
 @mcp.tool(
-    meta={"version": "1.0.0", "author": "Dayton Dunbar", "github": "https://github.com/CoderDayton/semantic-cache-mcp"}
+    meta={
+        "version": "1.0.0",
+        "author": "Dayton Dunbar",
+        "github": "https://github.com/CoderDayton/semantic-cache-mcp",
+    }
 )
 def read(
     ctx: Context,
