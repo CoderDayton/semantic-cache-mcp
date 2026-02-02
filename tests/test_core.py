@@ -223,7 +223,8 @@ class TestSimilarity:
         vec1 = array.array("f", [0.6, 0.8])
         vec2 = array.array("f", [0.6, 0.8])
         sim = cosine_similarity(vec1, vec2)
-        assert abs(sim - 1.0) < 1e-6
+        # int8 quantization introduces small rounding error (<0.01)
+        assert abs(sim - 1.0) < 0.01
 
     def test_zero_vector_handling(self) -> None:
         """Zero vectors should return 0 similarity."""
