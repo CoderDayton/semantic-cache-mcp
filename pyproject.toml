@@ -15,9 +15,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "bandit>=1.7.0",
+    "mypy>=1.8.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
 ]
 
 [project.scripts]
@@ -47,3 +50,12 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "venv"]
+skips = [
+    "B101",  # assert warnings (used in tests)
+    "B310",  # urllib.urlretrieve - we use known hardcoded URL
+    "B311",  # random - used for deterministic Gear hash table, not security
+    "B608",  # SQL injection - false positive, we use parameterized placeholders
+]

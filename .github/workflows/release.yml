@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest tests/ -x -q
+
+      - name: Build package
+        run: uv build
+
+      - name: Create hooks archive
+        run: |
+          cd hooks
+          zip -r ../hooks-${{ github.ref_name }}.zip .
+          cd ..
+
+      - name: Extract changelog for release
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          if [ -f CHANGELOG.md ]; then
+            echo "Extracting changelog for version $VERSION..."
+
+            # Extract section between this version header and the next version header
+            # Uses awk for more reliable multi-line extraction
+            awk -v ver="$VERSION" '
+              /^## \[/ {
+                if (found) exit
+                if ($0 ~ "\\[" ver "\\]") found=1
+              }
+              found { print }
+            ' CHANGELOG.md > release_notes.md
+
+            # Check if we got content
+            if [ -s release_notes.md ]; then
+              echo "Changelog section found:"
+              cat release_notes.md
+            else
+              echo "No changelog section found for $VERSION, using default"
+              echo "## Release ${{ github.ref_name }}" > release_notes.md
+            fi
+          else
+            echo "No CHANGELOG.md found, using default"
+            echo "## Release ${{ github.ref_name }}" > release_notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          files: |
+            dist/*
+            hooks-${{ github.ref_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
