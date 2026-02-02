@@ -3,20 +3,23 @@
 # Or: brew install lefthook && lefthook install
 
 pre-commit:
-  parallel: true
+  parallel: false
   commands:
     ruff-check:
       glob: "*.py"
+      root: "src/"
       run: uv run ruff check {staged_files} --fix
       stage_fixed: true
 
     ruff-format:
       glob: "*.py"
+      root: "src/"
       run: uv run ruff format {staged_files}
       stage_fixed: true
 
     mypy:
       glob: "*.py"
+      root: "src/"
       run: uv run mypy {staged_files} --ignore-missing-imports
       skip:
         - merge
@@ -24,6 +27,7 @@ pre-commit:
 
     bandit:
       glob: "*.py"
+      root: "src/"
       run: uv run bandit -c pyproject.toml {staged_files}
       skip:
         - merge
