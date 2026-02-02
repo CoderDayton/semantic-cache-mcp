@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-02-01
+## [1.0.0] - 2026-02-01
 
 ### Added
 - Claude Code hooks system with install script for automatic token savings
@@ -69,8 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Token counting with o200k_base tokenizer
 - MCP server implementation
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CoderDayton/semantic-cache-mcp/releases/tag/v0.1.0
