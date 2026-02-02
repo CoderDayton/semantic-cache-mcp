@@ -16,6 +16,10 @@ from .similarity import (
     cosine_similarity_batch,
     cosine_similarity_batch_matrix,
     top_k_similarities,
+    quantize_embedding,
+    dequantize_embedding,
+    similarity_from_quantized_blob,
+    top_k_from_quantized,
 )
 from .text import (
     generate_diff,
@@ -45,6 +49,10 @@ __all__ = [
     "cosine_similarity_batch",
     "cosine_similarity_batch_matrix",
     "top_k_similarities",
+    "quantize_embedding",
+    "dequantize_embedding",
+    "similarity_from_quantized_blob",
+    "top_k_from_quantized",
     "count_tokens",
     "generate_diff",
     "truncate_smart",
