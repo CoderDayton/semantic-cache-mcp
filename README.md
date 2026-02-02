@@ -43,6 +43,16 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 
 Restart Claude Code. Done.
 
+### Optional: Install Read Hook
+
+For automatic token savings on *all* file reads (not just MCP tool calls):
+
+```bash
+./hooks/install.sh
+```
+
+This intercepts Claude's built-in `Read` tool and returns cached content when available. See [Hooks Documentation](docs/hooks.md) for details.
+
 ---
 
 ## 🚀 Usage
@@ -180,6 +190,7 @@ See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis
 | ------------------------------------------ | ------------------------------------------ |
 | [Architecture](docs/architecture.md)       | Component design, algorithms, data flow    |
 | [Performance](docs/performance.md)         | Optimization techniques, memory efficiency |
+| [Hooks](docs/hooks.md)                     | Custom actions on cache events             |
 | [Advanced Usage](docs/advanced-usage.md)   | Programmatic API, custom storage backends  |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging               |
 
