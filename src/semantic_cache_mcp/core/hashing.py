@@ -14,11 +14,8 @@ Features:
 from __future__ import annotations
 
 import hashlib
-from functools import lru_cache
-from typing import Optional, Tuple, List, Dict, Any
 import threading
-
-from ..types import ChunkHash as ChunkHashType, ContentHash as ContentHashType
+from functools import lru_cache
 
 # Optional: use blake3 if available (faster than BLAKE2b)
 try:
@@ -77,9 +74,9 @@ def _get_hasher(digest_size: int = 32) -> object:
     if DEFAULT_CONFIG.USE_BLAKE3:
         try:
             return blake3.blake3()
-        except Exception:
-            pass
-    
+        except (ImportError, AttributeError, OSError):
+            pass  # BLAKE3 not available, use fallback
+
     # Fallback to BLAKE2b (always available)
     return hashlib.blake2b(digest_size=digest_size)
 
@@ -89,9 +86,9 @@ def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
     if DEFAULT_CONFIG.USE_BLAKE3:
         try:
             return blake3.blake3(data).digest()
-        except Exception:
-            pass
-    
+        except (ImportError, AttributeError, OSError):
+            pass  # BLAKE3 not available, use fallback
+
     # Fallback
     return hashlib.blake2b(data, digest_size=digest_size).digest()
 
@@ -132,7 +129,7 @@ class CollisionTracker:
     """Thread-safe collision detection for hash deduplication."""
 
     def __init__(self, max_size: int = DEFAULT_CONFIG.COLLISION_CACHE_SIZE):
-        self._hash_to_data: Dict[str, bytes] = {}
+        self._hash_to_data: dict[str, bytes] = {}
         self._lock = threading.Lock()
         self._max_size = max_size
         self._collision_count = 0
@@ -200,7 +197,7 @@ def hash_chunk_binary(data: bytes) -> Fingerprint:
     return _hash_bytes(data, DEFAULT_CONFIG.CHUNK_DIGEST_SIZE)
 
 
-def hash_chunk_with_collision_check(data: bytes) -> Tuple[ChunkHash, bool]:
+def hash_chunk_with_collision_check(data: bytes) -> tuple[ChunkHash, bool]:
     """
     Hash chunk and check for collisions.
 
@@ -265,7 +262,7 @@ class StreamingHasher:
             try:
                 self._hasher = blake3.blake3()
                 self._use_blake3 = True
-            except Exception:
+            except (ImportError, AttributeError, OSError):
                 self._hasher = hashlib.blake2b(digest_size=digest_size)
                 self._use_blake3 = False
         else:
@@ -315,7 +312,7 @@ def hash_file_streaming(file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_
     return hasher.finalize()
 
 
-def hash_chunks_streaming(chunks_iter, combine: bool = True) -> Tuple[List[ChunkHash], Optional[ContentHash]]:
+def hash_chunks_streaming(chunks_iter, combine: bool = True) -> tuple[list[ChunkHash], ContentHash | None]:
     """
     Hash a stream of chunks and optionally combine into content hash.
 
@@ -357,9 +354,9 @@ class HierarchicalHasher:
 
     def __init__(self, block_size: int = DEFAULT_CONFIG.BLOCK_SIZE):
         self._block_size = block_size
-        self._chunks: List[bytes] = []
-        self._chunk_hashes: List[ChunkHash] = []
-        self._blocks: List[BlockHash] = []
+        self._chunks: list[bytes] = []
+        self._chunk_hashes: list[ChunkHash] = []
+        self._blocks: list[BlockHash] = []
 
     def add_chunk(self, chunk: bytes) -> ChunkHash:
         """Add chunk and return its hash."""
@@ -385,7 +382,7 @@ class HierarchicalHasher:
         self._chunks.clear()
         return block_hash
 
-    def finalize_content(self) -> Tuple[ContentHash, List[BlockHash], List[ChunkHash]]:
+    def finalize_content(self) -> tuple[ContentHash, list[BlockHash], list[ChunkHash]]:
         """
         Finalize content from all blocks.
 
@@ -417,7 +414,7 @@ class DeduplicateIndex:
     """
 
     def __init__(self, capacity: int = 1_000_000):
-        self._fingerprints: Dict[bytes, Tuple[int, int]] = {}  # fp → (chunk_id, size)
+        self._fingerprints: dict[bytes, tuple[int, int]] = {}  # fp → (chunk_id, size)
         self._capacity = capacity
         self._lock = threading.Lock()
 
@@ -443,7 +440,7 @@ class DeduplicateIndex:
             self._fingerprints[fp] = (chunk_id, size)
             return True  # Successfully added
 
-    def lookup(self, chunk: bytes) -> Optional[Tuple[int, int]]:
+    def lookup(self, chunk: bytes) -> tuple[int, int] | None:
         """
         Look up chunk fingerprint in index.
 
@@ -468,7 +465,7 @@ class DeduplicateIndex:
 # Diagnostics
 # ---------------------------------------------------------------------------
 
-def get_hash_stats() -> Dict[str, any]:
+def get_hash_stats() -> dict[str, any]:
     """Get hash function statistics."""
     return {
         "use_blake3": DEFAULT_CONFIG.USE_BLAKE3,

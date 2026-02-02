@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import array
 import atexit
 import json
 import logging
@@ -23,21 +22,20 @@ from ..config import (
     DB_PATH,
     LRU_K,
     MAX_CACHE_ENTRIES,
-    NEAR_DUPLICATE_THRESHOLD,
     SIMILARITY_THRESHOLD,
 )
 from ..core import (
     compress_adaptive,
+    count_tokens,
     decompress,
     dequantize_embedding,
     hash_chunk,
     hash_content,
     hypercdc_chunks,
-    count_tokens,
     quantize_embedding,
     top_k_from_quantized,
 )
-from ..types import CacheEntry, ChunkData, ChunkHash, EmbeddingVector
+from ..types import CacheEntry, ChunkHash, EmbeddingVector
 
 
 class ConnectionPool:
@@ -118,12 +116,12 @@ class ConnectionPool:
             # TRUNCATE mode ensures WAL is fully written to main database
             # Critical for connection pooling with WAL mode
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            # Rollback on error
+        except sqlite3.Error:
+            # Rollback on database error
             try:
                 conn.rollback()
-            except Exception:
-                pass
+            except sqlite3.Error:
+                logger.debug("Rollback failed during error recovery")
             raise
         finally:
             # Return connection to pool if not closed
@@ -134,8 +132,8 @@ class ConnectionPool:
                     # Pool full (shouldn't happen), close connection
                     try:
                         conn.close()
-                    except Exception:
-                        pass
+                    except sqlite3.Error:
+                        logger.debug("Failed to close overflow connection")
 
     def close_all(self) -> None:
         """Close all connections in pool."""
@@ -380,8 +378,17 @@ class SQLiteStorage:
 
         Returns:
             Decoded file content
+
+        Raises:
+            ValueError: If content cannot be decoded as UTF-8
         """
-        return self.load_chunks(entry.chunks).decode()
+        data = self.load_chunks(entry.chunks)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as e:
+            logger.error(f"Failed to decode cached content: {e}")
+            # Try with replacement characters for partial recovery
+            return data.decode("utf-8", errors="replace")
 
     def record_access(self, path: str) -> None:
         """Record access for LRU-K tracking.

@@ -20,8 +20,7 @@ import heapq
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from functools import lru_cache
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Set
@@ -62,8 +61,8 @@ class BPETokenizer:
         self.inverse_vocab: dict[bytes, int] = {}
         self.bpe_ranks: dict[tuple[bytes, bytes], int] = {}
         self.special_tokens: dict[str, int] = {}
-        self._pat: Any = None
-        
+        self._pat: re.Pattern[str] | None = None
+
         # Optimization: cache merge operations
         self._merge_cache: dict[bytes, list[bytes]] = {}
         self._pair_heap: list[tuple[int, bytes, bytes]] = []
@@ -77,7 +76,7 @@ class BPETokenizer:
         self.bpe_ranks.clear()
         self._merge_cache.clear()
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -111,9 +110,7 @@ class BPETokenizer:
                 prefix = token_bytes[:i]
                 suffix = token_bytes[i:]
                 if prefix in self.inverse_vocab and suffix in self.inverse_vocab:
-                    if best_split is None:
-                        best_split = (prefix, suffix)
-                    elif self.inverse_vocab[prefix] < self.inverse_vocab[best_split[0]]:
+                    if best_split is None or self.inverse_vocab[prefix] < self.inverse_vocab[best_split[0]]:
                         best_split = (prefix, suffix)
 
             if best_split:
@@ -184,8 +181,11 @@ class BPETokenizer:
         self._merge_cache[token_bytes] = parts
         return parts
 
-    def _compile_pattern(self) -> Any:
-        """Lazy compile regex pattern (only once)."""
+    def _compile_pattern(self) -> re.Pattern[str]:
+        """Lazy compile regex pattern (only once).
+
+        Returns re.Pattern or regex.Pattern (API compatible).
+        """
         if self._pat is not None:
             return self._pat
         try:
@@ -280,7 +280,8 @@ class BPETokenizer:
             end_tokens = len(self._encode_chunk(text[-sample_size:]))
             avg_rate = (start_tokens + end_tokens) / (sample_size * 2)
             return int(len(text) * avg_rate)
-        except Exception:
+        except (KeyError, ValueError, IndexError) as e:
+            logger.debug(f"Token estimation fallback: {e}")
             spaces = text.count(" ") + text.count("\n")
             return int((spaces + 1) * 1.3)
 
@@ -331,11 +332,13 @@ def _ensure_tokenizer() -> BPETokenizer | None:
                 return _tokenizer
             logger.warning("Hash verification failed, re-downloading")
             cache_file.unlink()
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            logger.warning(f"Failed to load cached tokenizer: {e}")
 
     try:
+        import urllib.error
         import urllib.request
+
         TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         urllib.request.urlretrieve(O200K_BASE_URL, cache_file)
 
@@ -345,7 +348,8 @@ def _ensure_tokenizer() -> BPETokenizer | None:
 
         _tokenizer = _init_tokenizer(cache_file)
         return _tokenizer
-    except Exception:
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        logger.warning(f"Failed to download tokenizer: {e}")
         return None
 
 
@@ -358,8 +362,8 @@ def count_tokens(content: str) -> int:
     if tokenizer and tokenizer.vocab:
         try:
             return tokenizer.count(content)
-        except Exception:
-            pass
+        except (KeyError, ValueError, IndexError) as e:
+            logger.warning(f"Token counting failed, using heuristic: {e}")
 
     # Fallback: words * 1.3 + chars * 0.1
     spaces = content.count(" ") + content.count("\n") + content.count("\t")

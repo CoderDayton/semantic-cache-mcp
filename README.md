@@ -190,7 +190,8 @@ See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis
 | ------------------------------------------ | ------------------------------------------ |
 | [Architecture](docs/architecture.md)       | Component design, algorithms, data flow    |
 | [Performance](docs/performance.md)         | Optimization techniques, memory efficiency |
-| [Hooks](docs/hooks.md)                     | Custom actions on cache events             |
+| [Hooks](docs/hooks.md)                     | Claude Code hooks for automatic caching    |
+| [Security](docs/security.md)               | Security considerations and threat model   |
 | [Advanced Usage](docs/advanced-usage.md)   | Programmatic API, custom storage backends  |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging               |
 

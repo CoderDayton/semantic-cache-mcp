@@ -32,7 +32,14 @@ async def app_lifespan(server: FastMCP):
     warmup()
 
     model_info = get_model_info()
-    logger.info(f"Embedding model ready: {model_info['model']}")
+    if not model_info.get("ready", False):
+        logger.error(
+            "Embedding model failed to initialize. "
+            "Semantic similarity features will be disabled. "
+            "Check network connectivity and disk space."
+        )
+    else:
+        logger.info(f"Embedding model ready: {model_info['model']}")
 
     # Initialize cache
     cache = SemanticCache()

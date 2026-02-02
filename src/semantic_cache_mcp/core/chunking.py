@@ -13,11 +13,10 @@ but implemented in clean, dependency-free Python for clarity.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Iterator, List, Tuple, Sequence
-import math
+
 import random
-import functools
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -68,11 +67,11 @@ TURBO_CONFIG = HyperCDCConfig(
 
 # Pre-computed Gear table (avoids function call overhead in hot loop)
 _rnd = random.Random(0x9E3779B97F4A7C15)  # golden-ratio-based seed
-_GEAR_TABLE: Tuple[int, ...] = tuple(_rnd.getrandbits(64) for _ in range(256))
+_GEAR_TABLE: tuple[int, ...] = tuple(_rnd.getrandbits(64) for _ in range(256))
 del _rnd
 
 
-def _gear_table() -> Tuple[int, ...]:
+def _gear_table() -> tuple[int, ...]:
     """Return pre-computed 64-bit Gear table."""
     return _GEAR_TABLE
 
@@ -148,9 +147,7 @@ def _snap_semantic_boundary(content: bytes, pos: int, window: int) -> int:
             cut = left + idx + tlen  # cut *after* token
             dist = abs(cut - pos)
             # Prefer closer cuts; if equal, prefer right side to avoid micro-chunks
-            if best_pos == pos and best_dist == 0:
-                best_pos, best_dist = cut, dist
-            elif dist < best_dist or (dist == best_dist and cut >= pos > best_pos):
+            if best_pos == pos and best_dist == 0 or dist < best_dist or (dist == best_dist and cut >= pos > best_pos):
                 best_pos, best_dist = cut, dist
             start = idx + 1
 
@@ -167,7 +164,7 @@ def hypercdc_boundaries_turbo(
     min_size: int = 2048,
     max_size: int = 65536,
     mask_bits: int = 13,
-) -> Iterator[Tuple[int, int]]:
+) -> Iterator[tuple[int, int]]:
     """Ultra-fast CDC using Gear hash with minimal overhead.
 
     Optimizations applied:
@@ -225,7 +222,7 @@ def hypercdc_boundaries_turbo(
 def hypercdc_boundaries(
     content: bytes,
     cfg: HyperCDCConfig = DEFAULT_CONFIG,
-) -> Iterator[Tuple[int, int]]:
+) -> Iterator[tuple[int, int]]:
     """
     Yield (start, end) byte indices for HyperCDC chunks.
 
@@ -277,9 +274,7 @@ def hypercdc_boundaries(
             mask = mask_strong
 
         cut = False
-        if (h & mask) == 0:
-            cut = True
-        elif chunk_len >= cfg.max_size:
+        if (h & mask) == 0 or chunk_len >= cfg.max_size:
             cut = True
 
         if cut:
@@ -357,7 +352,7 @@ def hierarchical_hypercdc_chunks(
     # Level 1 chunks
     level1_spans = list(hypercdc_boundaries(content, cfg_level1))
     if not level1_spans:
-        return iter(())  # type: ignore[return-value]
+        return  # Generator returns empty
 
     if cfg_level2 is None:
         # Coarser configuration: ~4x larger norm/max
