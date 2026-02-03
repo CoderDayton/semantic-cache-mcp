@@ -18,6 +18,14 @@ from .hashing import (
     hash_chunk_binary,
     hash_content,
 )
+from .lsh import (
+    DEFAULT_LSH_CONFIG,
+    LSHConfig,
+    LSHIndex,
+    compute_simhash,
+    create_lsh_index,
+    hamming_distance,
+)
 from .similarity import (
     cosine_similarity,
     cosine_similarity_batch,
@@ -44,6 +52,12 @@ __all__ = [
     "hypercdc_simd_chunks",
     "hypercdc_simd_boundaries",
     "get_optimal_chunker",
+    "LSHConfig",
+    "LSHIndex",
+    "compute_simhash",
+    "create_lsh_index",
+    "hamming_distance",
+    "DEFAULT_LSH_CONFIG",
     "compress_adaptive",
     "decompress",
     "estimate_entropy",
