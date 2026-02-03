@@ -1,6 +1,11 @@
 """Core algorithms for semantic caching."""
 
 from .chunking import hypercdc_chunks
+from .chunking_simd import (
+    get_optimal_chunker,
+    hypercdc_simd_boundaries,
+    hypercdc_simd_chunks,
+)
 from .compression import compress_adaptive, decompress, estimate_entropy
 from .embeddings import embed, embed_query, get_model_info
 from .embeddings import warmup as warmup_embeddings
@@ -36,6 +41,9 @@ from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 
 __all__ = [
     "hypercdc_chunks",
+    "hypercdc_simd_chunks",
+    "hypercdc_simd_boundaries",
+    "get_optimal_chunker",
     "compress_adaptive",
     "decompress",
     "estimate_entropy",
