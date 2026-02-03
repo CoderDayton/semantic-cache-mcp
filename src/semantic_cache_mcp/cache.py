@@ -5,11 +5,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
+
 from .config import DB_PATH, MAX_CONTENT_SIZE
 from .core import (
     count_tokens,
     diff_stats,
     generate_diff,
+    get_optimal_chunker,
+    summarize_semantic,
     truncate_semantic,
 )
 from .core.embeddings import embed
@@ -81,9 +85,11 @@ class SemanticCache:
         """Store file in cache."""
         tokens = count_tokens(content)
         content_bytes = content.encode()
-        from .core import hypercdc_chunks
 
-        chunks = sum(1 for _ in hypercdc_chunks(content_bytes))
+        # Use optimal chunker (SIMD if available, otherwise Gear hash)
+        chunker = get_optimal_chunker(prefer_simd=True)
+        chunks = sum(1 for _ in chunker(content_bytes))
+
         self._storage.put(path, content, mtime, embedding)
         logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
 
@@ -267,14 +273,28 @@ def smart_read(
                             semantic_match=similar_path,
                         )
 
-    # Strategy 4 & 5: Full read (with optional semantic truncation)
+    # Strategy 4 & 5: Full read (with optional semantic summarization)
     truncated = False
     final_content = content
 
     if len(content) > max_size:
-        # Use semantic truncation to preserve code structure
-        final_content = truncate_semantic(content, max_size)
-        truncated = True
+        # Use semantic summarization to preserve important content
+        # Falls back to simple truncation for very small limits
+        try:
+            # Convert EmbeddingVector to NDArray for summarization
+            def embed_fn(text: str):
+                emb = cache.get_embedding(text)
+                if emb is None:
+                    return None
+                # Convert array.array or list to numpy array
+                return np.asarray(emb, dtype=np.float32)
+
+            final_content = summarize_semantic(content, max_size, embed_fn=embed_fn)
+            truncated = True
+        except Exception as e:
+            logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
+            final_content = truncate_semantic(content, max_size)
+            truncated = True
 
     embedding = cache.get_embedding(content)
     cache.put(str(file_path), content, mtime, embedding)

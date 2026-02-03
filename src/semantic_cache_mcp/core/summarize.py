@@ -121,8 +121,9 @@ def extract_segments(
         start = boundary_lines[i]
         end = boundary_lines[i + 1]
 
-        # Skip very small segments (merge with next)
-        if end - start < config.min_segment_lines and i < len(boundary_lines) - 2:
+        # Skip very small segments (merge with next), but never skip first segment
+        # (often contains docstrings, imports, headers)
+        if end - start < config.min_segment_lines and i > 0 and i < len(boundary_lines) - 2:
             continue
 
         # Split large segments
@@ -320,7 +321,8 @@ def summarize_semantic(
 
     if len(segments) <= 1:
         # Can't summarize single segment - fall back to truncation
-        return content[: max_size - 30] + "\n\n// [TRUNCATED - file too large]\n"
+        marker = "\n\n// [TRUNCATED - file too large]\n"
+        return content[: max_size - len(marker)] + marker
 
     total_lines = content.count("\n") + 1
 
@@ -349,18 +351,26 @@ def summarize_semantic(
     scored = score_segments(segments, embeddings, total_lines, config)
 
     # Greedy selection: pick highest-scoring segments that fit
+    # Use 80% of max_size for content, leaving 20% buffer for markers
+    content_budget = int(max_size * 0.80)
     selected_indices: set[int] = set()
     current_size = 0
-    marker_size = 40  # Approximate size of "[N lines omitted]" marker
+
+    # Always include first segment if it fits (contains docstrings, imports, headers)
+    if segments and len(segments[0].content) < content_budget:
+        selected_indices.add(0)
+        current_size += len(segments[0].content)
 
     for seg_idx, base_score in scored:
+        # Skip if already selected
+        if seg_idx in selected_indices:
+            continue
+
         segment = segments[seg_idx]
         seg_size = len(segment.content)
 
-        # Check if adding this segment would exceed limit
-        projected_size = current_size + seg_size + marker_size * (len(selected_indices) + 1)
-
-        if projected_size > max_size:
+        # Check if adding this segment would exceed budget
+        if current_size + seg_size > content_budget:
             continue
 
         # Apply diversity penalty
@@ -400,9 +410,12 @@ def summarize_semantic(
 
     result = "".join(result_parts)
 
-    # Final size check
+    # Final size check - strictly enforce max_size
     if len(result) > max_size:
-        return result[: max_size - 30] + "\n\n// [TRUNCATED]\n"
+        # Ensure we have room for the truncation marker
+        marker = "\n// [TRUNCATED]\n"
+        cutoff = max(0, max_size - len(marker))
+        return result[:cutoff] + marker
 
     return result
 
