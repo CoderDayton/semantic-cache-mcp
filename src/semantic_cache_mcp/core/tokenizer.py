@@ -53,7 +53,10 @@ class BPETokenizer:
         "_processed_pairs",
     )
 
-    _GPT4_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+    _GPT4_PATTERN = (
+        r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}"""
+        r"""| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+    )
     _SIMPLE_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d|[A-Za-z]+|\d+|[^\sA-Za-z0-9]+|\s+"""
 
     def __init__(self) -> None:
@@ -109,12 +112,15 @@ class BPETokenizer:
             for i in range(1, len(token_bytes)):
                 prefix = token_bytes[:i]
                 suffix = token_bytes[i:]
-                if prefix in self.inverse_vocab and suffix in self.inverse_vocab:
-                    if (
+                if (
+                    prefix in self.inverse_vocab
+                    and suffix in self.inverse_vocab
+                    and (
                         best_split is None
                         or self.inverse_vocab[prefix] < self.inverse_vocab[best_split[0]]
-                    ):
-                        best_split = (prefix, suffix)
+                    )
+                ):
+                    best_split = (prefix, suffix)
 
             if best_split:
                 self.bpe_ranks[best_split] = rank
@@ -149,7 +155,7 @@ class BPETokenizer:
         parts = [bytes([b]) for b in token_bytes]
 
         # Build initial heap of all adjacent pairs
-        heap: list[tuple[int, int, bytes, bytes]] = []
+        heap: list[tuple[int | float, int, bytes, bytes]] = []
         for i in range(len(parts) - 1):
             pair = (parts[i], parts[i + 1])
             rank = self.bpe_ranks.get(pair, float("inf"))

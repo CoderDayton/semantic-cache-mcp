@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import array
 from dataclasses import dataclass, field
-from typing import TypeAlias
 
-# Type aliases
-EmbeddingVector: TypeAlias = array.array[float] | list[float]
-ChunkHash: TypeAlias = str
-ContentHash: TypeAlias = str
+# Type aliases (Python 3.12+)
+type EmbeddingVector = array.array[float] | list[float]
+type ChunkHash = str
+type ContentHash = str
 
 
 @dataclass(slots=True)

@@ -190,7 +190,7 @@ def hypercdc_boundaries_turbo(
     # Local references (critical for hot loop performance)
     gear = _GEAR_TABLE
     mask = (1 << mask_bits) - 1
-    MASK_64 = 0xFFFFFFFFFFFFFFFF
+    mask_64 = 0xFFFFFFFFFFFFFFFF
 
     chunk_start = 0
 
@@ -203,7 +203,7 @@ def hypercdc_boundaries_turbo(
 
         # Phase 1: Hash min_size bytes (no boundary checks)
         while i < end_min:
-            h = ((h << 1) + gear[content[i]]) & MASK_64
+            h = ((h << 1) + gear[content[i]]) & mask_64
             i += 1
 
         # Phase 2: Check for boundaries until max_size
@@ -212,7 +212,7 @@ def hypercdc_boundaries_turbo(
             end_max = n
 
         while i < end_max:
-            h = ((h << 1) + gear[content[i]]) & MASK_64
+            h = ((h << 1) + gear[content[i]]) & mask_64
             i += 1
             if (h & mask) == 0:
                 yield (chunk_start, i)
@@ -277,10 +277,7 @@ def hypercdc_boundaries(
             last_entropy_check_at = chunk_len
 
         # Region B & C: choose mask based on proximity to norm_size
-        if chunk_len < cfg.norm_size:
-            mask = mask_weak
-        else:
-            mask = mask_strong
+        mask = mask_weak if chunk_len < cfg.norm_size else mask_strong
 
         cut = False
         if (h & mask) == 0 or chunk_len >= cfg.max_size:
@@ -387,8 +384,8 @@ def hierarchical_hypercdc_chunks(
     # This preserves locality without re-hashing full content twice.
     l1_lengths = [end - start for start, end in level1_spans]
     prefix_sum = [0]
-    for L in l1_lengths:
-        prefix_sum.append(prefix_sum[-1] + L)
+    for length in l1_lengths:
+        prefix_sum.append(prefix_sum[-1] + length)
     total = prefix_sum[-1]
 
     # Run level-2 CDC on a virtual linear space [0, total).

@@ -16,6 +16,16 @@ from __future__ import annotations
 import hashlib
 import threading
 from functools import lru_cache
+from typing import Any, Protocol
+
+
+class _Hasher(Protocol):
+    """Protocol for hash objects (blake3 or blake2b)."""
+
+    def update(self, data: bytes, /) -> object: ...  # blake3 returns self, blake2b returns None
+    def hexdigest(self) -> str: ...
+    def digest(self) -> bytes: ...
+
 
 # Optional: use blake3 if available (faster than BLAKE2b)
 try:
@@ -264,6 +274,12 @@ class StreamingHasher:
     Allows hashing data in chunks without loading entire file into memory.
     """
 
+    __slots__ = ("_digest_size", "_hasher", "_use_blake3")
+
+    _hasher: _Hasher
+    _use_blake3: bool
+    _digest_size: int
+
     def __init__(self, digest_size: int = DEFAULT_CONFIG.CHUNK_DIGEST_SIZE):
         self._digest_size = digest_size
         if HAS_BLAKE3:
@@ -346,7 +362,7 @@ def hash_chunks_streaming(
             # Add chunk hash (not raw data) to content hash for efficiency
             content_hasher.update(ch.encode())
 
-    content_hash = content_hasher.finalize() if combine else None
+    content_hash = content_hasher.finalize() if content_hasher else None
     return chunk_hashes, content_hash
 
 
@@ -480,7 +496,7 @@ class DeduplicateIndex:
 # ---------------------------------------------------------------------------
 
 
-def get_hash_stats() -> dict[str, any]:
+def get_hash_stats() -> dict[str, Any]:
     """Get hash function statistics."""
     return {
         "use_blake3": DEFAULT_CONFIG.USE_BLAKE3,

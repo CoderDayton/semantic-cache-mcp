@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,6 @@ class ChunkDictionary:
 
     def __init__(self, config: CompressionConfig = DEFAULT_CONFIG):
         self._config = config
-        self._dict_data: bytes | None = None
         self._zstd_dict: object | None = None  # zstd.ZstdCompressionDict
         self._chunks: list[bytes] = []
         self._lock = threading.Lock()
@@ -240,17 +240,14 @@ class ChunkDictionary:
             return
 
         try:
-            # zstd.train_dictionary API
-            dict_data = zstd.train_dictionary(
+            # zstd.train_dictionary returns a ZstdCompressionDict directly
+            self._zstd_dict = zstd.train_dictionary(
                 dict_size=self._config.dict_size,
                 samples=self._chunks[-self._config.dict_window :],
             )
-            self._dict_data = dict_data
-            self._zstd_dict = zstd.ZstdCompressionDict(dict_data)
         except (ValueError, MemoryError, zstd.ZstdError) as e:
             # Training can fail on insufficient diversity or memory
             logger.debug(f"Dictionary training failed: {e}")
-            self._dict_data = None
             self._zstd_dict = None
 
     def add_chunk(self, chunk: bytes) -> None:
@@ -263,7 +260,7 @@ class ChunkDictionary:
             if len(self._chunks) % self._config.dict_window == 0:
                 self._train_dict()
 
-    def get_dict(self) -> object | None:
+    def get_dict(self) -> Any | None:
         """Get compiled dictionary for Zstd."""
         return self._zstd_dict
 
@@ -296,10 +293,10 @@ def _decompress_store(data: bytes) -> bytes:
 
 # Cached ZSTD compressors by level (avoid object creation in hot path)
 _ZSTD_COMPRESSORS: dict = {}
-_ZSTD_DECOMPRESSOR: object | None = None
+_ZSTD_DECOMPRESSOR: Any | None = None
 
 
-def _get_zstd_compressor(level: int, dict_obj: object | None = None) -> object:
+def _get_zstd_compressor(level: int, dict_obj: Any | None = None) -> Any:
     """Get or create cached ZSTD compressor."""
     if dict_obj is not None:
         # Can't cache with dictionary
@@ -309,7 +306,7 @@ def _get_zstd_compressor(level: int, dict_obj: object | None = None) -> object:
     return _ZSTD_COMPRESSORS[level]
 
 
-def _get_zstd_decompressor(dict_obj: object | None = None) -> object:
+def _get_zstd_decompressor(dict_obj: Any | None = None) -> Any:
     """Get or create cached ZSTD decompressor."""
     global _ZSTD_DECOMPRESSOR
     if dict_obj is not None:
@@ -319,7 +316,7 @@ def _get_zstd_decompressor(dict_obj: object | None = None) -> object:
     return _ZSTD_DECOMPRESSOR
 
 
-def _compress_zstd(data: bytes, level: int, dict_obj: object | None = None) -> bytes:
+def _compress_zstd(data: bytes, level: int, dict_obj: Any | None = None) -> bytes:
     """Compress with Zstd, optionally using dictionary."""
     if not HAS_ZSTD:
         raise RuntimeError("zstandard not installed")
@@ -327,7 +324,7 @@ def _compress_zstd(data: bytes, level: int, dict_obj: object | None = None) -> b
     return cctx.compress(data)
 
 
-def _decompress_zstd(data: bytes, dict_obj: object | None = None) -> bytes:
+def _decompress_zstd(data: bytes, dict_obj: Any | None = None) -> bytes:
     """Decompress Zstd data."""
     if not HAS_ZSTD:
         raise RuntimeError("zstandard not installed")
@@ -585,7 +582,7 @@ def decompress(data: bytes) -> bytes:
             return decompressor(remaining, None)
         return decompressor(remaining)
     except Exception as e:
-        raise ValueError(f"Decompression failed: {e}")
+        raise ValueError(f"Decompression failed: {e}") from e
 
 
 def _decompress_parallel(data: bytes, codec: Codec) -> bytes:

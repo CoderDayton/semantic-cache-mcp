@@ -134,7 +134,7 @@ def compute_delta(old: str, new: str) -> DiffDelta:
             # Could be modification or deletion+insertion
             if i2 - i1 == j2 - j1:
                 # Line-by-line modification
-                for i, j in zip(range(i1, i2), range(j1, j2)):
+                for i, j in zip(range(i1, i2), range(j1, j2), strict=True):
                     modifications.append(
                         (i1 + i - i1, old_lines[i].rstrip(), new_lines[j].rstrip())
                     )
@@ -376,8 +376,7 @@ def generate_diff_streaming(
 
     diff = unified_diff(old_lines, new_lines, fromfile=old_path, tofile=new_path, n=context_lines)
 
-    for line in diff:
-        yield line
+    yield from diff
 
 
 def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = True) -> str:

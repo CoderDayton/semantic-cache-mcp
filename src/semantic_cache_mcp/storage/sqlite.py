@@ -12,11 +12,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-logger = logging.getLogger(__name__)
-
 from ..config import (
     ACCESS_HISTORY_SIZE,
     DB_PATH,
@@ -36,6 +31,11 @@ from ..core import (
     top_k_from_quantized,
 )
 from ..types import CacheEntry, ChunkHash, EmbeddingVector
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionPool:
@@ -208,7 +208,8 @@ class SQLiteStorage:
                 ) WITHOUT ROWID;
 
                 CREATE INDEX IF NOT EXISTS idx_created ON files(created_at);
-                CREATE INDEX IF NOT EXISTS idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_embedding ON files(embedding)
+                    WHERE embedding IS NOT NULL;
             """)
 
     # -------------------------------------------------------------------------
@@ -263,7 +264,7 @@ class SQLiteStorage:
                 chunk_hashes,
             ).fetchall()
 
-        chunk_data = {h: data for h, data in rows}
+        chunk_data = dict(rows)
 
         return b"".join(decompress(chunk_data[h]) for h in chunk_hashes if h in chunk_data)
 
@@ -351,7 +352,8 @@ class SQLiteStorage:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO files
-                (path, content_hash, chunk_hashes, mtime, tokens, embedding, created_at, access_history)
+                (path, content_hash, chunk_hashes, mtime, tokens, embedding,
+                    created_at, access_history)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -524,7 +526,8 @@ class SQLiteStorage:
             ).fetchone()
 
             chunk_stats = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(LENGTH(data)), 0) FROM chunks"
+                "SELECT COUNT(*), COALESCE(SUM(size), 0), "
+                "COALESCE(SUM(LENGTH(data)), 0) FROM chunks"
             ).fetchone()
 
         db_size = self.db_path.stat().st_size if self.db_path.exists() else 0

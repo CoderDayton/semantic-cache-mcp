@@ -67,6 +67,8 @@ def read(
     max_size: int = MAX_CONTENT_SIZE,
     diff_mode: bool = True,
     force_full: bool = False,
+    offset: int | None = None,
+    limit: int | None = None,
 ) -> str:
     """Read files with 80%+ token reduction. Use INSTEAD of Read tool.
 
@@ -78,10 +80,34 @@ def read(
         max_size: Maximum content size to return (default: 100000)
         diff_mode: Return diff if file was previously read (default: true)
         force_full: Force full content even if cached (default: false)
+        offset: Line number to start reading from (1-based). Only provide if file is too large.
+        limit: Number of lines to read. Only provide if file is too large.
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
 
     try:
+        # If offset/limit specified, read specific lines (still caches full file)
+        if offset is not None or limit is not None:
+            result = smart_read(
+                cache=cache,
+                path=path,
+                max_size=max_size,
+                diff_mode=False,  # Line ranges bypass diff mode
+                force_full=True,
+            )
+            lines = result.content.splitlines(keepends=True)
+            start = (offset or 1) - 1  # Convert to 0-based
+            end = start + (limit or len(lines) - start)
+            selected = lines[start:end]
+
+            # Format with line numbers like built-in Read tool
+            numbered = []
+            for i, line in enumerate(selected, start=start + 1):
+                numbered.append(f"{i:6d}\t{line.rstrip()}")
+            content = "\n".join(numbered)
+
+            return f"{content}\n// [lines:{start + 1}-{min(end, len(lines))} of {len(lines)}]"
+
         result = smart_read(
             cache=cache,
             path=path,
@@ -117,17 +143,20 @@ def stats(ctx: Context) -> str:
 
     # Add embedding model info
     model_info = get_model_info()
-    cache_stats["embedding_model"] = model_info["model"]
-    cache_stats["embedding_ready"] = model_info["ready"]
+    result: dict[str, int | float | str | bool] = {
+        **cache_stats,
+        "embedding_model": model_info["model"],
+        "embedding_ready": model_info["ready"],
+    }
 
-    return json.dumps(cache_stats, indent=2)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 def clear(ctx: Context) -> str:
-    """Clear all entries from the semantic cache, including file content, diffs, and similarity indexes.
+    """Clear all cache entries including file content, diffs, and similarity indexes.
 
-    Use this tool when you need to reset the cache state, purge cached tokens, or start fresh.
+    Use this tool to reset cache state, purge cached tokens, or start fresh.
     Returns the number of entries removed.
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]

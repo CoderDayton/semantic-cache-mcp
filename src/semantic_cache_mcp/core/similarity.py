@@ -122,10 +122,7 @@ def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
 
     # Compute scale factor
     max_val = np.max(np.abs(arr))
-    if max_val == 0:
-        scale = 1.0
-    else:
-        scale = 127.0 / max_val
+    scale = 1.0 if max_val == 0 else 127.0 / max_val
 
     # Quantize to int8
     quantized = np.round(arr * scale).astype(np.int8)
@@ -423,6 +420,7 @@ def cosine_similarity_batch(
             v_arr = v_arr[dims]
 
         if use_quantization:
+            assert q_query is not None and s_query is not None
             q_v, s_v = _quantize_vector(v_arr)
             sim = _dequantize_scale(q_query, s_query, q_v, s_v)
         else:
