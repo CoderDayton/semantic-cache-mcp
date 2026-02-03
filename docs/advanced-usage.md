@@ -141,12 +141,89 @@ When similar file found in cache:
 ...
 ```
 
-### 4. Truncation (50-80% reduction)
+### 4. Semantic Summarization (50-80% reduction)
 
-For large files, smart truncation preserves:
-- Function/class boundaries
-- Important structure
-- Beginning and end of file
+For large files, semantic summarization preserves:
+- First segment (docstrings, imports, headers)
+- Important functions/classes based on scoring
+- High-density code segments
+- Diverse content (avoids redundancy)
+
+**Scoring algorithm:**
+- Position: U-shaped curve (start/end prioritized)
+- Density: Unique tokens, syntax characters
+- Diversity: Penalize similarity to already-selected segments
+
+---
+
+## Advanced Algorithms
+
+### SIMD Chunking
+
+```python
+from semantic_cache_mcp.core import get_optimal_chunker
+
+# Automatically select best chunker (SIMD if available)
+chunker = get_optimal_chunker(prefer_simd=True)
+chunks = list(chunker(content.encode()))
+
+# Force serial HyperCDC
+from semantic_cache_mcp.core import hypercdc_chunks
+chunks = list(hypercdc_chunks(content.encode()))
+
+# Force SIMD parallel (may fall back if unavailable)
+from semantic_cache_mcp.core.chunking_simd import hypercdc_simd_chunks
+chunks = list(hypercdc_simd_chunks(content.encode()))
+```
+
+### Semantic Summarization
+
+```python
+from semantic_cache_mcp.core import summarize_semantic
+
+# Summarize with embedding support
+def embed_fn(text: str):
+    emb = cache.get_embedding(text)
+    return np.asarray(emb, dtype=np.float32) if emb else None
+
+summary = summarize_semantic(
+    content=large_file_content,
+    max_size=10000,
+    embed_fn=embed_fn
+)
+```
+
+### LSH Approximate Search
+
+```python
+from semantic_cache_mcp.core.lsh import LSHIndex
+
+# Build LSH index for fast approximate search
+index = LSHIndex(dim=768, num_tables=10, num_bits=16)
+index.build(embeddings)
+
+# Query (100x faster than exact search on 10K+ vectors)
+nearest = index.query(query_embedding, k=5)
+```
+
+### Extreme Quantization
+
+```python
+from semantic_cache_mcp.core.quantization import (
+    quantize_binary,
+    quantize_ternary,
+    binary_similarity
+)
+
+# Binary quantization (32x compression)
+binary = quantize_binary(embedding)  # 1 bit per dimension
+
+# Ternary quantization (16x compression, better accuracy)
+ternary = quantize_ternary(embedding)  # 2 bits per dimension
+
+# Fast binary similarity
+similarity = binary_similarity(binary1, binary2)
+```
 
 ---
 

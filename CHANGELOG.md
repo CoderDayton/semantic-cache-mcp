@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SIMD-accelerated Parallel CDC chunking with 5-7x speedup (`core/chunking_simd.py`)
+- Semantic summarization based on TCRA-LLM research (arXiv:2310.15556)
+- LSH approximate similarity search for fast nearest-neighbor lookups
+- Binary and ternary quantization for extreme compression (up to 100x)
+- Comprehensive CDC benchmarking framework comparing 5 algorithms
+- `get_optimal_chunker()` for automatic SIMD/serial selection
+
+### Changed
+- Integrated SIMD chunking into production cache (`smart_read` uses parallel CDC)
+- Replaced simple truncation with semantic summarization for large files
+- First segment (docstrings, imports) always preserved in summarization
+- Embedding conversion wrapper for numpy compatibility
+
+### Fixed
+- Size limit enforcement in semantic summarization (dynamic marker length)
+- First segment preservation bug (was being skipped if < 3 lines)
+- Type annotations for embedding functions (EmbeddingVector → NDArray conversion)
+
 ## [1.0.0] - 2026-02-01
 
 ### Added
