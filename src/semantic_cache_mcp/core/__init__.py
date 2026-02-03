@@ -47,6 +47,15 @@ from .similarity import (
     top_k_from_quantized,
     top_k_similarities,
 )
+from .summarize import (
+    DEFAULT_SUMMARIZATION_CONFIG,
+    Segment,
+    SummarizationConfig,
+    extract_segments,
+    score_segments,
+    summarize_semantic,
+    truncate_with_summarization,
+)
 from .text import (
     DiffDelta,
     apply_delta,
@@ -111,4 +120,12 @@ __all__ = [
     "batch_dot_product_ternary",
     "quantize_hybrid",
     "evaluate_quantization_accuracy",
+    # Semantic summarization
+    "SummarizationConfig",
+    "DEFAULT_SUMMARIZATION_CONFIG",
+    "Segment",
+    "extract_segments",
+    "score_segments",
+    "summarize_semantic",
+    "truncate_with_summarization",
 ]
