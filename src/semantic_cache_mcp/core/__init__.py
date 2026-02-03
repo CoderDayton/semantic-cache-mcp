@@ -26,6 +26,17 @@ from .lsh import (
     create_lsh_index,
     hamming_distance,
 )
+from .quantization import (
+    batch_dot_product_ternary,
+    batch_hamming_similarity_binary,
+    dequantize_binary,
+    dequantize_ternary,
+    evaluate_quantization_accuracy,
+    hamming_similarity_binary,
+    quantize_binary,
+    quantize_hybrid,
+    quantize_ternary,
+)
 from .similarity import (
     cosine_similarity,
     cosine_similarity_batch,
@@ -90,4 +101,14 @@ __all__ = [
     "embed_query",
     "warmup_embeddings",
     "get_model_info",
+    # Extreme quantization (binary/ternary)
+    "quantize_binary",
+    "dequantize_binary",
+    "hamming_similarity_binary",
+    "batch_hamming_similarity_binary",
+    "quantize_ternary",
+    "dequantize_ternary",
+    "batch_dot_product_ternary",
+    "quantize_hybrid",
+    "evaluate_quantization_accuracy",
 ]
