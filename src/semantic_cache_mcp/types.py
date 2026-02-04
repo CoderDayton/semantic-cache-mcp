@@ -101,3 +101,155 @@ class EditResult:
     tokens_saved: int
     content_hash: ContentHash
     from_cache: bool
+
+
+# -----------------------------------------------------------------------------
+# Search tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SearchMatch:
+    """A single search result with similarity score."""
+
+    path: str
+    similarity: float  # 0.0-1.0
+    tokens: int
+    preview: str  # First 200 chars
+
+
+@dataclass(slots=True)
+class SearchResult:
+    """Result from semantic_search operation."""
+
+    query: str
+    matches: list[SearchMatch]
+    files_searched: int
+    cached_files: int
+
+
+# -----------------------------------------------------------------------------
+# Diff tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class DiffResult:
+    """Result from compare_files operation."""
+
+    path1: str
+    path2: str
+    diff_content: str
+    diff_stats: dict[str, int]  # insertions, deletions, modifications
+    tokens_saved: int
+    similarity: float  # Semantic similarity between files
+    from_cache: tuple[bool, bool]  # Which files came from cache
+
+
+# -----------------------------------------------------------------------------
+# Batch read tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class FileReadSummary:
+    """Summary of a single file read in batch."""
+
+    path: str
+    tokens: int
+    status: str  # "full", "diff", "truncated", "skipped"
+    from_cache: bool
+
+
+@dataclass(slots=True)
+class BatchReadResult:
+    """Result from batch_smart_read operation."""
+
+    files: list[FileReadSummary]
+    contents: dict[str, str]  # path -> content
+    total_tokens: int
+    tokens_saved: int
+    files_read: int
+    files_skipped: int
+
+
+# -----------------------------------------------------------------------------
+# Similar files tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SimilarFile:
+    """A file similar to the source."""
+
+    path: str
+    similarity: float
+    tokens: int
+
+
+@dataclass(slots=True)
+class SimilarFilesResult:
+    """Result from find_similar_files operation."""
+
+    source_path: str
+    source_tokens: int
+    similar_files: list[SimilarFile]
+    files_searched: int
+
+
+# -----------------------------------------------------------------------------
+# Glob tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class GlobMatch:
+    """A file matching glob pattern with cache status."""
+
+    path: str
+    cached: bool
+    tokens: int | None  # None if not cached
+    mtime: float
+
+
+@dataclass(slots=True)
+class GlobResult:
+    """Result from glob_with_cache_status operation."""
+
+    pattern: str
+    directory: str
+    matches: list[GlobMatch]
+    total_matches: int
+    cached_count: int
+    total_cached_tokens: int
+
+
+# -----------------------------------------------------------------------------
+# Multi-edit tool types
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SingleEditOutcome:
+    """Outcome of a single edit within a multi-edit batch."""
+
+    old_string: str
+    new_string: str
+    success: bool
+    line_number: int | None  # None if not found
+    error: str | None
+
+
+@dataclass(slots=True)
+class MultiEditResult:
+    """Result from smart_multi_edit operation."""
+
+    path: str
+    outcomes: list[SingleEditOutcome]
+    succeeded: int
+    failed: int
+    diff_content: str  # Combined diff of successful edits
+    diff_stats: dict[str, int]
+    tokens_saved: int
+    content_hash: ContentHash
+    from_cache: bool

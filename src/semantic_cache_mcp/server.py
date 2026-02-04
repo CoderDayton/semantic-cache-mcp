@@ -15,7 +15,18 @@ import logging
 from fastmcp import Context, FastMCP
 from fastmcp.server.lifespan import lifespan
 
-from .cache import SemanticCache, smart_edit, smart_read, smart_write
+from .cache import (
+    SemanticCache,
+    batch_smart_read,
+    compare_files,
+    find_similar_files,
+    glob_with_cache_status,
+    semantic_search,
+    smart_edit,
+    smart_multi_edit,
+    smart_read,
+    smart_write,
+)
 from .config import MAX_CONTENT_SIZE
 from .core.embeddings import get_model_info, warmup
 
@@ -70,10 +81,9 @@ def read(
     offset: int | None = None,
     limit: int | None = None,
 ) -> str:
-    """Read files with 80%+ token reduction. Use INSTEAD of Read tool.
+    """Read files with 80%+ token reduction.
 
-    Returns diffs for changed files, minimal response for unchanged files,
-    and can reference semantically similar cached files.
+    Returns diffs for changed files, minimal response for unchanged.
 
     Args:
         path: Path to the file to read
@@ -126,18 +136,7 @@ def read(
 
 @mcp.tool()
 def stats(ctx: Context) -> str:
-    """Retrieve comprehensive semantic cache statistics including:
-
-    - Number of files tracked in the cache
-    - Total and unique token counts
-    - Compression and deduplication ratios for stored file content
-    - Current cache size versus disk usage
-    - Embedding model status and readiness
-    - Performance metrics if available (e.g., hit/miss rates, recent cache savings)
-    - Additional implementation-specific details, if exposed by the cache backend
-
-    Use this tool to monitor cache health, efficiency, and performance over time.
-    """
+    """Get cache statistics: files tracked, tokens, hit rates, compression ratios, embedding status."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
     cache_stats = cache.get_stats()
 
@@ -154,11 +153,7 @@ def stats(ctx: Context) -> str:
 
 @mcp.tool()
 def clear(ctx: Context) -> str:
-    """Clear all cache entries including file content, diffs, and similarity indexes.
-
-    Use this tool to reset cache state, purge cached tokens, or start fresh.
-    Returns the number of entries removed.
-    """
+    """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
     count = cache.clear()
     return f"Cleared {count} cache entries"
@@ -331,6 +326,362 @@ def edit(
     except Exception:
         logger.exception("Unexpected error in edit")
         return "Error: Internal error occurred while editing file"
+
+
+@mcp.tool()
+def multi_edit(
+    ctx: Context,
+    path: str,
+    edits: str,
+    dry_run: bool = False,
+) -> str:
+    """Apply multiple independent edits to a file.
+
+    Each edit is processed independently - some can succeed while others fail.
+    Partial success: successful edits are applied even if some fail.
+
+    Args:
+        path: Absolute path to file
+        edits: JSON array of [old, new] pairs or {"old": ..., "new": ...} objects
+        dry_run: Preview without writing (default: false)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        # Parse edits JSON
+        edits_str = edits.strip()
+        if not edits_str.startswith("["):
+            return "Error: edits must be a JSON array of [old, new] pairs"
+
+        edit_list = json.loads(edits_str)
+        if not isinstance(edit_list, list):
+            return "Error: edits must be a JSON array"
+
+        # Convert to list of tuples
+        edit_tuples: list[tuple[str, str]] = []
+        for item in edit_list:
+            if isinstance(item, list) and len(item) == 2:
+                edit_tuples.append((str(item[0]), str(item[1])))
+            elif isinstance(item, dict) and "old" in item and "new" in item:
+                edit_tuples.append((str(item["old"]), str(item["new"])))
+            else:
+                return "Error: Each edit must be [old, new] or {old, new}"
+
+        result = smart_multi_edit(
+            cache=cache,
+            path=path,
+            edits=edit_tuples,
+            dry_run=dry_run,
+        )
+
+        # Format output
+        lines: list[str] = []
+        lines.append(f"// Multi-edit: {result.path}")
+        lines.append(f"// Results: {result.succeeded} succeeded, {result.failed} failed")
+
+        if result.tokens_saved > 0:
+            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached read)")
+
+        lines.append("")
+
+        # Per-edit outcomes
+        for o in result.outcomes:
+            old_preview = o.old_string[:30].replace("\n", "\\n")
+            new_preview = o.new_string[:30].replace("\n", "\\n")
+            if o.success:
+                lines.append(f'✓ Line {o.line_number}: "{old_preview}" → "{new_preview}"')
+            else:
+                lines.append(f'✗ "{old_preview}" → "{new_preview}" ({o.error})')
+
+        # Diff
+        if result.diff_content:
+            lines.append("")
+            lines.append(result.diff_content)
+
+        # Stats
+        stats = result.diff_stats
+        lines.append(
+            f"\n// Stats: +{stats.get('insertions', 0)} "
+            f"-{stats.get('deletions', 0)} "
+            f"~{stats.get('modifications', 0)} lines"
+        )
+        lines.append(f"// Hash: {result.content_hash[:16]}...")
+        lines.append(
+            f"// [succeeded:{result.succeeded} failed:{result.failed} "
+            f"dry_run:{dry_run} cached:{result.from_cache}]"
+        )
+
+        return "\n".join(lines)
+
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON in edits - {e}"
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except PermissionError as e:
+        return f"Error: Permission denied - {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception:
+        logger.exception("Unexpected error in multi_edit")
+        return "Error: Internal error occurred while editing file"
+
+
+@mcp.tool()
+def search(
+    ctx: Context,
+    query: str,
+    k: int = 10,
+    directory: str | None = None,
+) -> str:
+    """Search cached files by semantic meaning. Only searches previously-read files.
+
+    Better than grep for concepts - finds by meaning, not keywords.
+
+    Args:
+        query: Search query (what you're looking for)
+        k: Max results (default: 10, max: 100)
+        directory: Optional directory to limit search
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = semantic_search(cache, query, k=k, directory=directory)
+
+        if not result.matches:
+            return f"// No matches for: {query}\n// [files:0 cached:{result.cached_files}]"
+
+        lines: list[str] = []
+        lines.append(
+            f'// Search: "{query}" ({len(result.matches)} matches in {result.cached_files} cached)'
+        )
+
+        for i, m in enumerate(result.matches, 1):
+            lines.append(f"{i}. {m.path} ({m.similarity:.2f}) - {m.tokens:,} tokens")
+            lines.append(f"   {m.preview}...")
+
+        meta = f"k:{k}"
+        if directory:
+            meta += f" directory:{directory}"
+        lines.append(f"// [{meta}]")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.exception("Error in search")
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def diff(
+    ctx: Context,
+    path1: str,
+    path2: str,
+    context_lines: int = 3,
+) -> str:
+    """Compare two files using cache.
+
+    Avoids reading both files if cached. Shows unified diff with stats.
+
+    Args:
+        path1: First file path
+        path2: Second file path
+        context_lines: Lines of context in diff (default: 3)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = compare_files(cache, path1, path2, context_lines=context_lines)
+
+        lines: list[str] = []
+        lines.append(f"// Diff: {result.path1} vs {result.path2}")
+
+        stats = result.diff_stats
+        lines.append(
+            f"// Stats: +{stats.get('insertions', 0)} "
+            f"-{stats.get('deletions', 0)} "
+            f"~{stats.get('modifications', 0)} lines"
+        )
+        lines.append(f"// Similarity: {result.similarity:.2f}")
+
+        if result.tokens_saved > 0:
+            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached)")
+
+        lines.append(result.diff_content)
+
+        cached_str = f"{result.from_cache[0]},{result.from_cache[1]}"
+        lines.append(f"// [context:{context_lines} cached:{cached_str}]")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        logger.exception("Error in diff")
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def batch_read(
+    ctx: Context,
+    paths: str,
+    max_total_tokens: int = 50000,
+) -> str:
+    """Read multiple files with token budget. Skips files if budget exceeded.
+
+    Single call reduces overhead vs reading one-by-one.
+
+    Args:
+        paths: Comma-separated paths or JSON array
+        max_total_tokens: Token budget (default: 50000, max: 200000)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        # Parse paths (comma-separated or JSON array)
+        paths_str = paths.strip()
+        if paths_str.startswith("["):
+            path_list = json.loads(paths_str)
+        else:
+            path_list = [p.strip() for p in paths_str.split(",") if p.strip()]
+
+        result = batch_smart_read(cache, path_list, max_total_tokens=max_total_tokens)
+
+        lines: list[str] = []
+        cached_count = sum(1 for f in result.files if f.from_cache)
+        lines.append(
+            f"// Batch read: {result.files_read} files "
+            f"({cached_count} cached, {result.files_read - cached_count} new)"
+        )
+        lines.append(
+            f"// Total: {result.total_tokens:,} tokens | Saved: {result.tokens_saved:,} tokens"
+        )
+
+        for f in result.files:
+            if f.status == "skipped":
+                lines.append(f"\n## {f.path} (skipped)")
+            else:
+                lines.append(f"\n## {f.path} ({f.status}, {f.tokens:,} tokens)")
+                if f.path in result.contents:
+                    lines.append(result.contents[f.path])
+
+        lines.append(
+            f"\n// [files:{len(result.files)} tokens:{result.total_tokens} "
+            f"saved:{result.tokens_saved} skipped:{result.files_skipped}]"
+        )
+
+        return "\n".join(lines)
+
+    except json.JSONDecodeError:
+        return "Error: Invalid paths format. Use comma-separated or JSON array."
+    except Exception as e:
+        logger.exception("Error in batch_read")
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def similar(
+    ctx: Context,
+    path: str,
+    k: int = 5,
+) -> str:
+    """Find cached files semantically similar to given file.
+
+    Searches only cached files. Useful for finding related code, tests, or docs.
+
+    Args:
+        path: Source file path
+        k: Max results (default: 5, max: 50)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = find_similar_files(cache, path, k=k)
+
+        if not result.similar_files:
+            return (
+                f"// Similar to: {result.source_path}\n"
+                f"// No similar files found in {result.files_searched} cached\n"
+                f"// [k:{k}]"
+            )
+
+        lines: list[str] = []
+        lines.append(f"// Similar to: {result.source_path} ({result.source_tokens:,} tokens)")
+        lines.append(
+            f"// Found {len(result.similar_files)} similar in {result.files_searched} cached"
+        )
+
+        for i, f in enumerate(result.similar_files, 1):
+            lines.append(f"{i}. {f.path} ({f.similarity:.2f}) - {f.tokens:,} tokens")
+
+        lines.append(f"// [k:{k} searched:{result.files_searched}]")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        logger.exception("Error in similar")
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def glob(
+    ctx: Context,
+    pattern: str,
+    directory: str = ".",
+) -> str:
+    """Find files by pattern with cache status. Max 1000 matches, 5s timeout.
+
+    Shows which files are cached and their token counts.
+
+    Args:
+        pattern: Glob pattern (e.g., "**/*.py")
+        directory: Base directory (default: current)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = glob_with_cache_status(cache, pattern, directory=directory)
+
+        if not result.matches:
+            return (
+                f"// Glob: {pattern} in {result.directory}\n// No matches\n// [pattern:{pattern}]"
+            )
+
+        lines: list[str] = []
+        lines.append(f"// Glob: {pattern} in {result.directory}")
+        lines.append(
+            f"// Found {result.total_matches} files "
+            f"({result.cached_count} cached, {result.total_matches - result.cached_count} new)"
+        )
+
+        # Group by cached status
+        cached = [m for m in result.matches if m.cached]
+        not_cached = [m for m in result.matches if not m.cached]
+
+        if cached:
+            lines.append(f"\nCached ({len(cached)} files, {result.total_cached_tokens:,} tokens):")
+            for m in cached[:20]:  # Limit display
+                lines.append(f"  {m.path} ({m.tokens:,} tokens)")
+            if len(cached) > 20:
+                lines.append(f"  ... and {len(cached) - 20} more")
+
+        if not_cached:
+            lines.append(f"\nNot cached ({len(not_cached)} files):")
+            for m in not_cached[:20]:
+                lines.append(f"  {m.path}")
+            if len(not_cached) > 20:
+                lines.append(f"  ... and {len(not_cached) - 20} more")
+
+        lines.append(
+            f"\n// [pattern:{pattern} matches:{result.total_matches} cached:{result.cached_count}]"
+        )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.exception("Error in glob")
+        return f"Error: {e}"
 
 
 def main() -> None:
