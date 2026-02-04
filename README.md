@@ -81,7 +81,9 @@ Add to your `~/.claude/CLAUDE.md` to enforce semantic-cache usage globally:
 - semantic-cache: MUST use instead of native file tools (80%+ token savings)
   - `read` → replaces Read tool (returns diffs, not full content)
   - `write` → replaces Write tool (caches result, returns diff on overwrite)
+    - `auto_format=true` → runs formatter after write (ruff/prettier/gofmt)
   - `edit` → replaces Edit tool (uses cached read, returns diff)
+    - `auto_format=true` → runs formatter after edit
 ```
 
 This tells Claude to prefer semantic-cache tools over the built-in Read, Write, and Edit tools, maximizing token savings across all file operations.
@@ -95,9 +97,9 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 | Tool | Description |
 |------|-------------|
 | `read` | Smart file reading with diffs (99% savings unchanged, 80-95% changed) |
-| `write` | Write files, returns diff on overwrite |
-| `edit` | Find/replace using cached reads (zero token read cost) |
-| `multi_edit` | Batch find/replace, partial success supported |
+| `write` | Write files, returns diff on overwrite. `auto_format=true` runs formatter |
+| `edit` | Find/replace using cached reads (zero token read cost). `auto_format=true` runs formatter |
+| `multi_edit` | Batch find/replace, partial success supported. `auto_format=true` runs formatter |
 
 ### Discovery Tools
 
@@ -133,17 +135,19 @@ read path="/src/app.py"
 
 ```bash
 write path="/src/app.py" content="..."
+write path="/src/app.py" content="..." auto_format=true
 ```
 
-Returns diff of changes, updates cache for instant reads.
+Returns diff of changes, updates cache for instant reads. With `auto_format=true`, runs formatter (ruff/prettier/gofmt) after write.
 
 #### edit
 
 ```bash
 edit path="/src/app.py" old_string="old" new_string="new"
+edit path="/src/app.py" old_string="old" new_string="new" auto_format=true
 ```
 
-Uses cached content (no token cost), returns diff. Use `replace_all=true` for multiple matches.
+Uses cached content (no token cost), returns diff. Use `replace_all=true` for multiple matches. With `auto_format=true`, runs formatter after edit.
 
 #### multi_edit
 
