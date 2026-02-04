@@ -3,7 +3,18 @@
 ## Programmatic API
 
 ```python
-from semantic_cache_mcp.cache import SemanticCache, smart_read, smart_write, smart_edit
+from semantic_cache_mcp.cache import (
+    SemanticCache,
+    smart_read,
+    smart_write,
+    smart_edit,
+    smart_multi_edit,
+    semantic_search,
+    compare_files,
+    batch_smart_read,
+    find_similar_files,
+    glob_with_cache_status,
+)
 
 # Initialize cache (embeddings handled automatically)
 cache = SemanticCache()
@@ -46,6 +57,69 @@ edit_result = smart_edit(
 print(f"Matches found: {edit_result.matches_found}")
 print(f"Lines modified: {edit_result.line_numbers}")
 print(f"Tokens saved: {edit_result.tokens_saved}")
+
+# Multi-edit (batch find/replace)
+multi_result = smart_multi_edit(
+    cache=cache,
+    path="/path/to/file.py",
+    edits=[("old1", "new1"), ("old2", "new2")],
+    dry_run=False,
+)
+
+print(f"Succeeded: {multi_result.succeeded}")
+print(f"Failed: {multi_result.failed}")
+
+# Semantic search across cached files
+search_result = semantic_search(
+    cache=cache,
+    query="authentication logic",
+    k=10,
+    directory="/src",
+)
+
+for match in search_result.matches:
+    print(f"{match.path}: {match.similarity:.2f}")
+
+# Compare two files
+diff_result = compare_files(
+    cache=cache,
+    path1="/path/to/old.py",
+    path2="/path/to/new.py",
+    context_lines=3,
+)
+
+print(f"Similarity: {diff_result.similarity:.2f}")
+print(diff_result.diff_content)
+
+# Batch read multiple files
+batch_result = batch_smart_read(
+    cache=cache,
+    paths=["/src/a.py", "/src/b.py", "/src/c.py"],
+    max_total_tokens=50000,
+)
+
+print(f"Files read: {batch_result.files_read}")
+print(f"Tokens saved: {batch_result.tokens_saved}")
+
+# Find similar files
+similar_result = find_similar_files(
+    cache=cache,
+    path="/src/auth.py",
+    k=5,
+)
+
+for f in similar_result.similar_files:
+    print(f"{f.path}: {f.similarity:.2f}")
+
+# Glob with cache status
+glob_result = glob_with_cache_status(
+    cache=cache,
+    pattern="**/*.py",
+    directory="/src",
+)
+
+print(f"Total: {glob_result.total_matches}")
+print(f"Cached: {glob_result.cached_count}")
 ```
 
 ---
@@ -167,6 +241,94 @@ The `smart_edit` function returns an `EditResult` with these fields:
 | `tokens_saved` | `int` | Tokens saved by cached read |
 | `content_hash` | `str` | BLAKE3 hash of new content |
 | `from_cache` | `bool` | Whether content came from cache |
+
+---
+
+## MultiEditResult Object
+
+The `smart_multi_edit` function returns a `MultiEditResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | `str` | Resolved absolute path to edited file |
+| `succeeded` | `int` | Number of successful edits |
+| `failed` | `int` | Number of failed edits |
+| `outcomes` | `list[SingleEditOutcome]` | Per-edit results with success/error |
+| `diff_content` | `str` | Combined unified diff |
+| `diff_stats` | `dict` | Insertions, deletions, modifications |
+| `tokens_saved` | `int` | Tokens saved by cached read |
+| `content_hash` | `str` | BLAKE3 hash of final content |
+| `from_cache` | `bool` | Whether content came from cache |
+
+---
+
+## SearchResult Object
+
+The `semantic_search` function returns a `SearchResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `matches` | `list[SearchMatch]` | Ranked matches with path, similarity, preview |
+| `cached_files` | `int` | Total files in cache that were searched |
+
+---
+
+## DiffResult Object
+
+The `compare_files` function returns a `DiffResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path1` | `str` | First file path |
+| `path2` | `str` | Second file path |
+| `diff_content` | `str` | Unified diff |
+| `diff_stats` | `dict` | Insertions, deletions, modifications |
+| `similarity` | `float` | Semantic similarity (0.0-1.0) |
+| `tokens_saved` | `int` | Tokens saved by cache |
+| `from_cache` | `tuple[bool, bool]` | Cache status for each file |
+
+---
+
+## BatchReadResult Object
+
+The `batch_smart_read` function returns a `BatchReadResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `files` | `list[FileReadSummary]` | Per-file status and token counts |
+| `contents` | `dict[str, str]` | Path to content mapping |
+| `files_read` | `int` | Number of files successfully read |
+| `files_skipped` | `int` | Files skipped (budget exceeded) |
+| `total_tokens` | `int` | Total tokens returned |
+| `tokens_saved` | `int` | Tokens saved by caching |
+
+---
+
+## SimilarFilesResult Object
+
+The `find_similar_files` function returns a `SimilarFilesResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source_path` | `str` | Source file path |
+| `source_tokens` | `int` | Token count of source file |
+| `similar_files` | `list[SimilarFile]` | Ranked similar files |
+| `files_searched` | `int` | Total cached files searched |
+
+---
+
+## GlobResult Object
+
+The `glob_with_cache_status` function returns a `GlobResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pattern` | `str` | Glob pattern used |
+| `directory` | `str` | Base directory |
+| `matches` | `list[GlobMatch]` | Files with cache status |
+| `total_matches` | `int` | Total files matched |
+| `cached_count` | `int` | Files in cache |
+| `total_cached_tokens` | `int` | Total tokens of cached files |
 
 ---
 

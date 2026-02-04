@@ -18,6 +18,20 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 ---
 
+## ✨ Features
+
+- **80%+ Token Reduction** — Returns diffs instead of full files when content changes
+- **Cached Write/Edit** — File modifications use cache for reading, return diffs
+- **Local Embeddings** — No API keys needed, runs entirely offline
+- **Semantic Similarity** — Finds related files using fast vector search
+- **Content-Addressable Storage** — Efficient deduplication and delta compression
+- **Smart Truncation** — Preserves code structure when cutting large files
+- **LRU-K Eviction** — Keeps frequently accessed files in cache
+- **Accurate Token Counting** — GPT-4o compatible tokenizer
+- **DoS Protection** — Size limits and match count validation
+
+---
+
 ## 📦 Installation
 
 ```bash
@@ -43,15 +57,19 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 
 Restart Claude Code. Done.
 
-### Optional: Install Read Hook
+### Recommended: Block Native Tools
 
-For automatic token savings on *all* file reads (not just MCP tool calls):
+Add to `~/.claude/settings.json` to force semantic-cache usage:
 
-```bash
-./hooks/install.sh
+```json
+{
+  "permissions": {
+    "deny": ["Read", "Write", "Edit"]
+  }
+}
 ```
 
-This intercepts Claude's built-in `Read` tool and returns cached content when available. See [Hooks Documentation](docs/hooks.md) for details.
+This blocks native file tools, ensuring Claude uses semantic-cache MCP tools for all file operations.
 
 ### Recommended: CLAUDE.md Configuration
 
@@ -72,7 +90,7 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 
 ## 🚀 Usage
 
-The server provides five tools that Claude can use:
+The server provides eleven tools:
 
 ### `read` — Smart File Reading
 
@@ -177,25 +195,70 @@ edit path="/src/app.py" old_string="old_value" new_string="new_value"
 }
 ```
 
+### `multi_edit` — Batch Find/Replace
+
+```bash
+multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]'
+```
+
+Apply multiple independent edits. Each can succeed/fail independently—partial success applies working edits.
+
+### `search` — Semantic Search
+
+```bash
+search query="authentication logic" k=10
+```
+
+Search cached files by meaning, not keywords. Returns ranked matches with similarity scores.
+
+### `similar` — Find Related Files
+
+```bash
+similar path="/src/auth.py" k=5
+```
+
+Find cached files semantically similar to a given file. Great for finding tests, implementations, or related modules.
+
+### `diff` — Compare Files
+
+```bash
+diff path1="/src/old.py" path2="/src/new.py"
+```
+
+Compare two files using cache. Returns unified diff with similarity score.
+
+### `batch_read` — Read Multiple Files
+
+```bash
+batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
+```
+
+Read multiple files with token budget. Skips files if budget exceeded.
+
+### `glob` — Find Files by Pattern
+
+```bash
+glob pattern="**/*.py" directory="./src"
+```
+
+Find files matching pattern. Shows cache status and token counts. Max 1000 matches, 5s timeout.
+
+### `stats` — Cache Metrics
+
+```json
+{
+  "files_cached": 42,
+  "total_tokens_cached": 125000,
+  "compression_ratio": 0.19,
+  "dedup_ratio": 5.3
+}
+```
+
 ### `clear` — Reset Cache
 
 ```text/plain
 Cleared 42 cache entries
 ```
-
----
-
-## ✨ Features
-
-- **80%+ Token Reduction** — Returns diffs instead of full files when content changes
-- **Cached Write/Edit** — File modifications use cache for reading, return diffs
-- **Local Embeddings** — No API keys needed, runs entirely offline
-- **Semantic Similarity** — Finds related files using fast vector search
-- **Content-Addressable Storage** — Efficient deduplication and delta compression
-- **Smart Truncation** — Preserves code structure when cutting large files
-- **LRU-K Eviction** — Keeps frequently accessed files in cache
-- **Accurate Token Counting** — GPT-4o compatible tokenizer
-- **DoS Protection** — Size limits and match count validation
 
 ---
 
@@ -274,7 +337,7 @@ See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis
 | ------------------------------------------ | ------------------------------------------ |
 | [Architecture](docs/architecture.md)       | Component design, algorithms, data flow    |
 | [Performance](docs/performance.md)         | Optimization techniques, memory efficiency |
-| [Hooks](docs/hooks.md)                     | Claude Code hooks for automatic caching    |
+
 | [Security](docs/security.md)               | Security considerations and threat model   |
 | [Advanced Usage](docs/advanced-usage.md)   | Programmatic API, custom storage backends  |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging               |
