@@ -5,9 +5,9 @@
 ```
 semantic_cache_mcp/
 ├── config.py           # Configuration constants
-├── types.py            # Data models (CacheEntry, ReadResult)
-├── cache.py            # SemanticCache facade (orchestration)
-├── server.py           # FastMCP tools (read, stats, clear)
+├── types.py            # Data models (CacheEntry, ReadResult, WriteResult, EditResult)
+├── cache.py            # SemanticCache facade + smart_read/write/edit functions
+├── server.py           # FastMCP tools (read, write, edit, stats, clear)
 ├── core/               # Core algorithms (single responsibility)
 │   ├── chunking.py     # HyperCDC gear-hash chunking
 │   ├── chunking_simd.py # SIMD-accelerated parallel CDC (5-7x faster)
@@ -293,6 +293,8 @@ Uses the K-th most recent access time (K=2) for eviction decisions:
 
 ## Data Flow
 
+### Read Operations
+
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 │   Client    │────▶│  smart_read  │────▶│    Cache    │
@@ -311,6 +313,27 @@ Uses the K-th most recent access time (K=2) for eviction decisions:
     │ Unchanged│    │   Diff   │    │ Semantic │
     │  (99%)   │    │ (80-95%) │    │  Match   │
     └──────────┘    └──────────┘    └──────────┘
+```
+
+### Write/Edit Operations
+
+```
+┌─────────────┐     ┌───────────────────┐     ┌─────────────┐
+│   Client    │────▶│ smart_write/edit  │────▶│    Cache    │
+│  (Claude)   │     │  (no Read needed) │     │  (cached)   │
+└─────────────┘     └───────────────────┘     └─────────────┘
+                              │                      │
+                              ▼                      ▼
+                       ┌─────────────┐        ┌─────────────┐
+                       │  File I/O   │        │ Cache Update│
+                       │  (write)    │        │ (new hash)  │
+                       └─────────────┘        └─────────────┘
+                              │
+                              ▼
+                       ┌─────────────┐
+                       │ Diff Output │
+                       │ (not full!) │
+                       └─────────────┘
 ```
 
 ---

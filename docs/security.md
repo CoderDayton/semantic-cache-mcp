@@ -26,9 +26,27 @@ Semantic Cache MCP is designed as a **single-user, local cache** for Claude Code
 
 2. **Symlink Handling**: Symlinks are followed and resolved to their target. This is intentional for developer workflows but logged at DEBUG level.
 
-3. **Binary File Detection**: Binary files (containing null bytes) are rejected to prevent unintended data exposure or processing issues.
+3. **Binary File Detection**: Binary files are rejected using multiple detection methods:
+   - Null byte detection in first 8KB
+   - Magic number signatures (PNG, JPEG, GIF, ZIP, GZIP, ELF, MZ/PE, PDF, OLE)
+   - High-entropy detection (>30% non-printable characters)
 
 4. **File Type Validation**: Only regular files are cached. Directories, devices, and other special files are rejected.
+
+### DoS Protection
+
+1. **Size Limits**: Write and edit operations enforce size limits to prevent memory exhaustion:
+   - `MAX_WRITE_SIZE`: 10MB maximum for write operations
+   - `MAX_EDIT_SIZE`: 10MB maximum for edit operations
+   - `MAX_CONTENT_SIZE`: 100KB default return size
+
+2. **Match Count Limits**: The edit tool limits replacements to prevent CPU exhaustion:
+   - `MAX_MATCHES`: 10,000 maximum occurrences for `replace_all`
+
+3. **Input Validation**: All operations validate inputs before I/O:
+   - Empty string checks for edit operations
+   - Identical string detection (old_string == new_string)
+   - Path validation before file access
 
 ### Data Storage
 
@@ -70,8 +88,6 @@ Semantic Cache MCP is designed as a **single-user, local cache** for Claude Code
 1. **No Encryption**: Cached content is stored unencrypted. Use filesystem-level encryption if required.
 
 2. **No Access Logging**: File accesses are logged at DEBUG level but not designed for audit purposes.
-
-3. **No Rate Limiting**: No built-in rate limiting for cache operations.
 
 ## Reporting Security Issues
 

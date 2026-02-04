@@ -3,7 +3,7 @@
 ## Programmatic API
 
 ```python
-from semantic_cache_mcp import SemanticCache, smart_read
+from semantic_cache_mcp.cache import SemanticCache, smart_read, smart_write, smart_edit
 
 # Initialize cache (embeddings handled automatically)
 cache = SemanticCache()
@@ -19,6 +19,33 @@ result = smart_read(
 print(f"Tokens saved: {result.tokens_saved}")
 print(f"From cache: {result.from_cache}")
 print(f"Is diff: {result.is_diff}")
+
+# Smart write with cache integration
+write_result = smart_write(
+    cache=cache,
+    path="/path/to/file.py",
+    content="new file content",
+    create_parents=True,
+    dry_run=False,
+)
+
+print(f"Created: {write_result.created}")
+print(f"Tokens saved: {write_result.tokens_saved}")
+print(f"Hash: {write_result.content_hash}")
+
+# Smart edit (find/replace) using cached reads
+edit_result = smart_edit(
+    cache=cache,
+    path="/path/to/file.py",
+    old_string="old_value",
+    new_string="new_value",
+    replace_all=False,
+    dry_run=False,
+)
+
+print(f"Matches found: {edit_result.matches_found}")
+print(f"Lines modified: {edit_result.line_numbers}")
+print(f"Tokens saved: {edit_result.tokens_saved}")
 ```
 
 ---
@@ -104,6 +131,42 @@ The `smart_read` function returns a `ReadResult` with these fields:
 | `truncated` | `bool` | Whether content was truncated |
 | `compression_ratio` | `float` | Size ratio (returned/original) |
 | `semantic_match` | `str \| None` | Path of similar file if matched |
+
+---
+
+## WriteResult Object
+
+The `smart_write` function returns a `WriteResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | `str` | Resolved absolute path to written file |
+| `bytes_written` | `int` | Number of bytes written |
+| `tokens_written` | `int` | Token count of written content |
+| `created` | `bool` | True if new file, False if overwrite |
+| `diff_content` | `str \| None` | Unified diff from old content |
+| `diff_stats` | `dict \| None` | Insertions, deletions, modifications |
+| `tokens_saved` | `int` | Tokens saved by returning diff |
+| `content_hash` | `str` | BLAKE3 hash for verification |
+| `from_cache` | `bool` | Whether old content came from cache |
+
+---
+
+## EditResult Object
+
+The `smart_edit` function returns an `EditResult` with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | `str` | Resolved absolute path to edited file |
+| `matches_found` | `int` | Total occurrences of old_string |
+| `replacements_made` | `int` | Number of replacements performed |
+| `line_numbers` | `list[int]` | Lines where replacements occurred |
+| `diff_content` | `str` | Unified diff of changes |
+| `diff_stats` | `dict` | Insertions, deletions, modifications |
+| `tokens_saved` | `int` | Tokens saved by cached read |
+| `content_hash` | `str` | BLAKE3 hash of new content |
+| `from_cache` | `bool` | Whether content came from cache |
 
 ---
 

@@ -57,7 +57,7 @@ This intercepts Claude's built-in `Read` tool and returns cached content when av
 
 ## 🚀 Usage
 
-The server provides three tools that Claude can use:
+The server provides five tools that Claude can use:
 
 ### `read` — Smart File Reading
 
@@ -93,6 +93,64 @@ read path="/src/app.py"
 // [cache:true diff:true saved:950]
 ```
 
+### `write` — Smart File Writing
+
+```bash
+write path="/src/app.py" content="new file content"
+```
+
+**What happens:**
+
+- New file: Creates and caches, returns metadata
+- Existing file: Returns diff of changes (not full content!)
+- Updates cache for instant subsequent reads
+
+**Example output for update:**
+
+```diff
+// Updated: /src/app.py
+// Stats: +5 -2 ~1 lines
+// Tokens saved: 890 (diff vs full content)
+// Hash: a1b2c3d4e5f6...
+--- old
++++ new
+@@ -10,3 +10,6 @@
+ unchanged line
+-removed line
++added line
+// [created:false dry_run:false cached:true]
+```
+
+### `edit` — Smart Find/Replace
+
+```bash
+edit path="/src/app.py" old_string="old_value" new_string="new_value"
+```
+
+**What happens:**
+
+- Uses cached content for reading (no token cost!)
+- Returns diff showing exactly what changed
+- Validates match uniqueness (use `replace_all=true` for multiple)
+
+**Example output:**
+
+```diff
+// Edited: /src/app.py
+// Replaced 1 of 1 match at line 42
+// Stats: +1 -1 ~1 lines
+// Tokens saved: 1,234 (cached read)
+// Hash: a1b2c3d4e5f6...
+--- old
++++ new
+@@ -40,5 +40,5 @@
+ context before
+-    old_value
++    new_value
+ context after
+// [replace_all:false dry_run:false cached:true]
+```
+
 ### `stats` — Cache Metrics
 
 ```json
@@ -115,12 +173,14 @@ Cleared 42 cache entries
 ## ✨ Features
 
 - **80%+ Token Reduction** — Returns diffs instead of full files when content changes
+- **Cached Write/Edit** — File modifications use cache for reading, return diffs
 - **Local Embeddings** — No API keys needed, runs entirely offline
 - **Semantic Similarity** — Finds related files using fast vector search
 - **Content-Addressable Storage** — Efficient deduplication and delta compression
 - **Smart Truncation** — Preserves code structure when cutting large files
 - **LRU-K Eviction** — Keeps frequently accessed files in cache
 - **Accurate Token Counting** — GPT-4o compatible tokenizer
+- **DoS Protection** — Size limits and match count validation
 
 ---
 
@@ -139,6 +199,14 @@ Cache settings in `config.py`:
 | `MAX_CONTENT_SIZE`     | 100KB   | Maximum content size returned          |
 | `MAX_CACHE_ENTRIES`    | 10,000  | LRU-K eviction threshold               |
 | `SIMILARITY_THRESHOLD` | 0.85    | Minimum cosine similarity for matching |
+
+Safety limits in `cache.py`:
+
+| Setting          | Default | Description                            |
+| ---------------- | ------- | -------------------------------------- |
+| `MAX_WRITE_SIZE` | 10MB    | Maximum content size for write tool    |
+| `MAX_EDIT_SIZE`  | 10MB    | Maximum file size for edit tool        |
+| `MAX_MATCHES`    | 10,000  | Maximum occurrences for replace_all    |
 
 ---
 

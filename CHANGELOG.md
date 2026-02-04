@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `write` MCP tool for file writing with cache integration
+- `edit` MCP tool for find/replace operations using cached reads
+- `WriteResult` and `EditResult` dataclasses for operation results
+- `smart_write()` and `smart_edit()` functions in cache module
+- Size limits for DoS protection (MAX_WRITE_SIZE, MAX_EDIT_SIZE: 10MB, MAX_MATCHES: 10K)
+- Enhanced binary file detection with magic numbers and entropy analysis
+- `dry_run` mode for previewing write/edit changes without modification
+- Content hash (BLAKE3) returned with all write/edit operations
+- Comprehensive test suite for write/edit operations (23 tests)
+
+### Changed
+- Optimized line number lookup using `bisect.bisect_right` for O(log N) performance
+- Improved exception handling with specific types (no stack trace leaks)
+- Input validation ordering: fail-fast checks before any I/O operations
+- Token savings only counted when content actually came from cache
+
+### Security
+- Size limits prevent memory exhaustion attacks via large files
+- Match count limits prevent CPU exhaustion via many replacements
+- Binary file detection prevents corruption of non-text files
+
 ## [1.0.0] - 2026-02-03
 
 ### Added
