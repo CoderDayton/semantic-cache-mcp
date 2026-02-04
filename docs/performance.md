@@ -46,9 +46,10 @@ embedding = [0.1, 0.2, 0.3]
 embedding = array.array('f', [0.1, 0.2, 0.3])  # 6x reduction
 ```
 
-For a 1536-dimension embedding:
-- `list[float]`: ~12KB per embedding
-- `array.array('f')`: ~6KB per embedding (50% reduction)
+For a 768-dimension embedding (nomic-embed-text-v1.5):
+- `list[float]`: ~6KB per embedding
+- `array.array('f')`: ~3KB per embedding (50% reduction)
+- `int8 quantized`: ~772 bytes (22x reduction)
 
 ### Dataclasses with `__slots__`
 
@@ -204,7 +205,7 @@ mmap_size = 268435456     -- 256MB memory-mapped I/O
 
 ## Similarity Search Performance
 
-Batch similarity with optional int8 quantization (1000 vectors, 384D embeddings):
+Batch similarity with int8 quantization (1000 vectors, 768D nomic embeddings):
 
 | Method | Time | Speedup |
 |--------|------|---------|
@@ -280,6 +281,41 @@ delta = compute_delta(old, new)
 // Stats: +5 -2 ~3 lines, 12.3% size
 // Diff for file.py (changed since cache):
 ```
+
+---
+
+## New Tools Performance
+
+### Semantic Search (`search`)
+
+- Searches only cached files (no disk I/O for search)
+- Uses pre-quantized int8 embeddings for fast similarity
+- Max 100 results, returns ranked by similarity score
+
+### Batch Read (`batch_read`)
+
+- Single tool call overhead vs N individual reads
+- Token budget prevents context overflow
+- Files read in parallel where possible
+
+### Similar Files (`similar`)
+
+- Uses `top_k_from_quantized()` for batch SIMD similarity
+- Max 50 results from cached files only
+- Source file cached if not already present
+
+### Glob (`glob`)
+
+- 5-second timeout prevents runaway scans
+- Max 1000 matches returned
+- Shows cache status without reading file contents
+
+### Multi-Edit (`multi_edit`)
+
+- Single cached read for all edits (zero token cost)
+- Bottom-to-top application preserves line numbers
+- Partial success: working edits applied even if some fail
+- Max 50 edits per call
 
 ---
 
