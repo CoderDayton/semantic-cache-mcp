@@ -88,177 +88,112 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 
 ---
 
-## 🚀 Usage
+## 🚀 Tools
 
-The server provides eleven tools:
+### Core Tools
 
-### `read` — Smart File Reading
+| Tool | Description |
+|------|-------------|
+| `read` | Smart file reading with diffs (99% savings unchanged, 80-95% changed) |
+| `write` | Write files, returns diff on overwrite |
+| `edit` | Find/replace using cached reads (zero token read cost) |
+| `multi_edit` | Batch find/replace, partial success supported |
+
+### Discovery Tools
+
+| Tool | Description |
+|------|-------------|
+| `search` | Semantic search across cached files by meaning |
+| `similar` | Find files semantically similar to a given file |
+| `glob` | Find files by pattern with cache status |
+| `batch_read` | Read multiple files with token budget |
+| `diff` | Compare two files using cache |
+
+### Management Tools
+
+| Tool | Description |
+|------|-------------|
+| `stats` | Cache metrics (files, tokens, compression ratio) |
+| `clear` | Reset all cache entries |
+
+<details>
+<summary><strong>Tool Examples</strong></summary>
+
+#### read
 
 ```bash
 read path="/src/app.py"
 ```
 
-**What happens:**
+- First read → full content, cached
+- Unchanged → `// File unchanged (1,234 tokens cached)`
+- Modified → unified diff only
 
-- First read: Full content returned, cached for future
-- Same file again: "File unchanged" (99% token savings)
-- File modified: Unified diff only (80-95% savings)
-- Similar file exists: Diff from similar file (70-90% savings)
-
-**Example output for unchanged file:**
+#### write
 
 ```bash
-// File unchanged: /src/app.py (1,234 tokens cached)
-// [cache:true diff:false saved:1,200]
+write path="/src/app.py" content="..."
 ```
 
-**Example output for modified file:**
+Returns diff of changes, updates cache for instant reads.
 
-```diff
-// Diff for /src/app.py (changed since cache):
-// Stats: +3 -1 ~2 lines, 8.5% size
---- cached
-+++ current
-@@ -42,7 +42,7 @@
- def process():
--    return old_value
-+    return new_value
-// [cache:true diff:true saved:950]
-```
-
-### `write` — Smart File Writing
+#### edit
 
 ```bash
-write path="/src/app.py" content="new file content"
+edit path="/src/app.py" old_string="old" new_string="new"
 ```
 
-**What happens:**
+Uses cached content (no token cost), returns diff. Use `replace_all=true` for multiple matches.
 
-- New file: Creates and caches, returns metadata
-- Existing file: Returns diff of changes (not full content!)
-- Updates cache for instant subsequent reads
-
-**Example output for update:**
-
-```diff
-// Updated: /src/app.py
-// Stats: +5 -2 ~1 lines
-// Tokens saved: 890 (diff vs full content)
-// Hash: a1b2c3d4e5f6...
---- old
-+++ new
-@@ -10,3 +10,6 @@
- unchanged line
--removed line
-+added line
-// [created:false dry_run:false cached:true]
-```
-
-### `edit` — Smart Find/Replace
-
-```bash
-edit path="/src/app.py" old_string="old_value" new_string="new_value"
-```
-
-**What happens:**
-
-- Uses cached content for reading (no token cost!)
-- Returns diff showing exactly what changed
-- Validates match uniqueness (use `replace_all=true` for multiple)
-
-**Example output:**
-
-```diff
-// Edited: /src/app.py
-// Replaced 1 of 1 match at line 42
-// Stats: +1 -1 ~1 lines
-// Tokens saved: 1,234 (cached read)
-// Hash: a1b2c3d4e5f6...
---- old
-+++ new
-@@ -40,5 +40,5 @@
- context before
--    old_value
-+    new_value
- context after
-// [replace_all:false dry_run:false cached:true]
-```
-
-### `stats` — Cache Metrics
-
-```json
-{
-  "files_cached": 42,
-  "total_tokens_cached": 125000,
-  "compression_ratio": 0.19,
-  "dedup_ratio": 5.3
-}
-```
-
-### `multi_edit` — Batch Find/Replace
+#### multi_edit
 
 ```bash
 multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]'
 ```
 
-Apply multiple independent edits. Each can succeed/fail independently—partial success applies working edits.
+Independent edits—some can fail while others succeed.
 
-### `search` — Semantic Search
+#### search
 
 ```bash
 search query="authentication logic" k=10
 ```
 
-Search cached files by meaning, not keywords. Returns ranked matches with similarity scores.
+Searches cached files by semantic meaning, not keywords.
 
-### `similar` — Find Related Files
+#### similar
 
 ```bash
 similar path="/src/auth.py" k=5
 ```
 
-Find cached files semantically similar to a given file. Great for finding tests, implementations, or related modules.
+Finds related code, tests, or documentation.
 
-### `diff` — Compare Files
-
-```bash
-diff path1="/src/old.py" path2="/src/new.py"
-```
-
-Compare two files using cache. Returns unified diff with similarity score.
-
-### `batch_read` — Read Multiple Files
+#### batch_read
 
 ```bash
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
 ```
 
-Read multiple files with token budget. Skips files if budget exceeded.
+Skips files if budget exceeded.
 
-### `glob` — Find Files by Pattern
+#### glob
 
 ```bash
 glob pattern="**/*.py" directory="./src"
 ```
 
-Find files matching pattern. Shows cache status and token counts. Max 1000 matches, 5s timeout.
+Max 1000 matches, 5s timeout. Shows which files are cached.
 
-### `stats` — Cache Metrics
+#### diff
 
-```json
-{
-  "files_cached": 42,
-  "total_tokens_cached": 125000,
-  "compression_ratio": 0.19,
-  "dedup_ratio": 5.3
-}
+```bash
+diff path1="/src/old.py" path2="/src/new.py"
 ```
 
-### `clear` — Reset Cache
+Returns unified diff with similarity score.
 
-```text/plain
-Cleared 42 cache entries
-```
+</details>
 
 ---
 
@@ -337,7 +272,6 @@ See [Performance Docs](docs/performance.md) for benchmarks and detailed analysis
 | ------------------------------------------ | ------------------------------------------ |
 | [Architecture](docs/architecture.md)       | Component design, algorithms, data flow    |
 | [Performance](docs/performance.md)         | Optimization techniques, memory efficiency |
-
 | [Security](docs/security.md)               | Security considerations and threat model   |
 | [Advanced Usage](docs/advanced-usage.md)   | Programmatic API, custom storage backends  |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging               |
