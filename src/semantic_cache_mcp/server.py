@@ -136,7 +136,7 @@ def read(
 
 @mcp.tool()
 def stats(ctx: Context) -> str:
-    """Get cache statistics: files tracked, tokens, hit rates, compression ratios, embedding status."""
+    """Get cache statistics: files tracked, tokens, compression ratios, embedding status."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
     cache_stats = cache.get_stats()
 
@@ -166,6 +166,7 @@ def write(
     content: str,
     create_parents: bool = True,
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> str:
     """Write file with semantic cache integration.
 
@@ -177,6 +178,7 @@ def write(
         content: Content to write
         create_parents: Create parent directories (default: true)
         dry_run: Preview changes without writing (default: false)
+        auto_format: Run formatter after write (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
 
@@ -187,6 +189,7 @@ def write(
             content=content,
             create_parents=create_parents,
             dry_run=dry_run,
+            auto_format=auto_format,
         )
 
         # Format output
@@ -247,6 +250,7 @@ def edit(
     new_string: str,
     replace_all: bool = False,
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> str:
     """Edit file using find/replace with cached reads.
 
@@ -259,6 +263,7 @@ def edit(
         new_string: Replacement string
         replace_all: Replace all occurrences (default: false)
         dry_run: Preview without writing (default: false)
+        auto_format: Run formatter after edit (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
 
@@ -270,6 +275,7 @@ def edit(
             new_string=new_string,
             replace_all=replace_all,
             dry_run=dry_run,
+            auto_format=auto_format,
         )
 
         # Format output
@@ -334,6 +340,7 @@ def multi_edit(
     path: str,
     edits: str,
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> str:
     """Apply multiple independent edits to a file.
 
@@ -344,6 +351,7 @@ def multi_edit(
         path: Absolute path to file
         edits: JSON array of [old, new] pairs or {"old": ..., "new": ...} objects
         dry_run: Preview without writing (default: false)
+        auto_format: Run formatter after edits (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
 
@@ -372,6 +380,7 @@ def multi_edit(
             path=path,
             edits=edit_tuples,
             dry_run=dry_run,
+            auto_format=auto_format,
         )
 
         # Format output

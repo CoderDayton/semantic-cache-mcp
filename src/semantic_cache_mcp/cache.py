@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import bisect
 import logging
+import shutil
 import signal
+import subprocess  # nosec B404 - used for formatter execution with hardcoded commands
 from pathlib import Path
 
 import numpy as np
@@ -338,6 +340,66 @@ MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10MB max content size for write
 MAX_EDIT_SIZE = 10 * 1024 * 1024  # 10MB max file size for edit
 MAX_MATCHES = 10000  # Max occurrences for replace_all
 
+# Auto-format configuration: extension -> (command, args...)
+# Command must accept file path as final argument
+FORMATTERS: dict[str, tuple[str, ...]] = {
+    ".py": ("ruff", "format"),
+    ".pyi": ("ruff", "format"),
+    ".js": ("prettier", "--write"),
+    ".ts": ("prettier", "--write"),
+    ".tsx": ("prettier", "--write"),
+    ".jsx": ("prettier", "--write"),
+    ".json": ("prettier", "--write"),
+    ".css": ("prettier", "--write"),
+    ".scss": ("prettier", "--write"),
+    ".md": ("prettier", "--write"),
+    ".yaml": ("prettier", "--write"),
+    ".yml": ("prettier", "--write"),
+    ".go": ("gofmt", "-w"),
+    ".rs": ("rustfmt",),
+}
+
+
+def _format_file(path: Path) -> bool:
+    """Format file in-place using appropriate formatter.
+
+    Args:
+        path: Path to file to format
+
+    Returns:
+        True if formatted successfully, False if formatter not found or failed
+    """
+    formatter = FORMATTERS.get(path.suffix.lower())
+    if not formatter:
+        return False
+
+    cmd_name = formatter[0]
+    # Check if formatter is installed
+    if not shutil.which(cmd_name):
+        logger.debug(f"Formatter not found: {cmd_name}")
+        return False
+
+    try:
+        cmd = [*formatter, str(path)]
+        result = subprocess.run(  # nosec B603 - commands from hardcoded FORMATTERS dict
+            cmd,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.debug(f"Formatted {path} with {cmd_name}")
+            return True
+        else:
+            logger.warning(f"Formatter {cmd_name} failed: {result.stderr.decode()[:200]}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Formatter {cmd_name} timed out on {path}")
+        return False
+    except OSError as e:
+        logger.warning(f"Failed to run {cmd_name}: {e}")
+        return False
+
 
 def _is_binary_content(data: bytes) -> bool:
     """Check if content is binary using multiple heuristics.
@@ -420,6 +482,7 @@ def smart_write(
     content: str,
     create_parents: bool = True,
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> WriteResult:
     """Write file with cache integration.
 
@@ -427,6 +490,7 @@ def smart_write(
     - Returns diff instead of echoing content (token savings)
     - Updates cache for future reads
     - Tracks operation metadata
+    - Optional auto-formatting after write
 
     Args:
         cache: SemanticCache instance
@@ -434,6 +498,7 @@ def smart_write(
         content: Content to write
         create_parents: Create parent directories if missing
         dry_run: Preview changes without writing
+        auto_format: Run formatter after write (default: false)
 
     Returns:
         WriteResult with diff and metadata
@@ -528,11 +593,33 @@ def smart_write(
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
-        # Update cache with new content
+        # Auto-format if requested
+        formatted = False
+        if auto_format:
+            formatted = _format_file(file_path)
+            if formatted:
+                # Re-read formatted content
+                content = file_path.read_text(encoding="utf-8")
+                content_bytes = content.encode("utf-8")
+                bytes_written = len(content_bytes)
+                tokens_written = count_tokens(content)
+                content_hash = hash_content(content_bytes)
+
+                # Re-compute diff against original (before format)
+                if old_content is not None and old_content != content:
+                    diff_content = generate_diff(old_content, content)
+                    diff_stats_result = diff_stats(old_content, content)
+                    diff_tokens = count_tokens(diff_content) if diff_content else 0
+                    tokens_saved = max(0, tokens_written - diff_tokens)
+
+        # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(content)
         cache.put(str(file_path), content, mtime, embedding)
-        logger.info(f"{'Created' if created else 'Updated'} and cached: {path}")
+        action = "Created" if created else "Updated"
+        if formatted:
+            action += " and formatted"
+        logger.info(f"{action} and cached: {path}")
 
     return WriteResult(
         path=str(file_path),
@@ -554,6 +641,7 @@ def smart_edit(
     new_string: str,
     replace_all: bool = False,
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> EditResult:
     """Edit file using find/replace with cached read.
 
@@ -561,6 +649,7 @@ def smart_edit(
     - Uses cache for reading (no token cost!)
     - Returns diff instead of confirmation
     - Tracks line numbers of changes
+    - Optional auto-formatting after edit
 
     Args:
         cache: SemanticCache instance
@@ -569,6 +658,7 @@ def smart_edit(
         new_string: Replacement string
         replace_all: Replace all occurrences
         dry_run: Preview changes without writing
+        auto_format: Run formatter after edit (default: false)
 
     Returns:
         EditResult with diff and match locations
@@ -690,11 +780,27 @@ def smart_edit(
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
-        # Update cache with new content
+        # Auto-format if requested
+        formatted = False
+        if auto_format:
+            formatted = _format_file(file_path)
+            if formatted:
+                # Re-read formatted content
+                new_content = file_path.read_text(encoding="utf-8")
+                content_hash = hash_content(new_content.encode("utf-8"))
+
+                # Re-compute diff against original (before format)
+                diff_content = generate_diff(content, new_content)
+                diff_stats_result = diff_stats(content, new_content)
+
+        # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content)
         cache.put(str(file_path), new_content, mtime, embedding)
-        logger.info(f"Edited and cached: {path} ({replacements_made} replacement(s))")
+        action = f"Edited ({replacements_made} replacement(s))"
+        if formatted:
+            action += " and formatted"
+        logger.info(f"{action} and cached: {path}")
 
     return EditResult(
         path=str(file_path),
@@ -1142,6 +1248,7 @@ def smart_multi_edit(
     path: str,
     edits: list[tuple[str, str]],
     dry_run: bool = False,
+    auto_format: bool = False,
 ) -> MultiEditResult:
     """Apply multiple independent edits to a file.
 
@@ -1153,6 +1260,7 @@ def smart_multi_edit(
         path: Absolute path to file
         edits: List of (old_string, new_string) tuples
         dry_run: Preview changes without writing
+        auto_format: Run formatter after edits (default: false)
 
     Returns:
         MultiEditResult with per-edit outcomes and combined diff
@@ -1292,11 +1400,27 @@ def smart_multi_edit(
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
-        # Update cache
+        # Auto-format if requested
+        formatted = False
+        if auto_format:
+            formatted = _format_file(file_path)
+            if formatted:
+                # Re-read formatted content
+                new_content = file_path.read_text(encoding="utf-8")
+                content_hash = hash_content(new_content.encode("utf-8"))
+
+                # Re-compute diff against original (before format)
+                diff_content = generate_diff(original_content, new_content)
+                stats = diff_stats(original_content, new_content)
+
+        # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content)
         cache.put(str(file_path), new_content, mtime, embedding)
-        logger.info(f"Multi-edit: {path} ({succeeded} succeeded, {failed} failed)")
+        action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
+        if formatted:
+            action += " and formatted"
+        logger.info(f"{action}: {path}")
 
     return MultiEditResult(
         path=str(file_path),

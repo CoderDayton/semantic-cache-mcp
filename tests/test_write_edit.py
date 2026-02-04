@@ -342,3 +342,60 @@ class TestTokenSavings:
 
         # Should save tokens from not returning full content
         assert result.tokens_saved > 0
+
+
+class TestAutoFormat:
+    """Tests for auto_format feature."""
+
+    def test_write_auto_format_no_formatter(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Auto-format with no formatter available writes content unchanged."""
+        file_path = temp_dir / "test.txt"  # .txt has no formatter
+        content = "unformatted   content"
+
+        result = smart_write(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            content,
+            auto_format=True,
+        )
+
+        assert result.created is True
+        assert file_path.read_text() == content
+
+    def test_write_auto_format_false_default(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Auto-format defaults to False."""
+        file_path = temp_dir / "test.py"
+        # Intentionally badly formatted Python
+        content = "x=1\ny=2\n"
+
+        result = smart_write(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            content,
+        )
+
+        # Should be written as-is without formatting
+        assert file_path.read_text() == content
+        assert result.created is True
+
+    def test_edit_auto_format_no_formatter(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Auto-format with no formatter available edits content unchanged."""
+        file_path = temp_dir / "test.txt"
+        file_path.write_text("old content")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            "old",
+            "new",
+            auto_format=True,
+        )
+
+        assert file_path.read_text() == "new content"
+        assert result.replacements_made == 1
