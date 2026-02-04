@@ -53,6 +53,21 @@ For automatic token savings on *all* file reads (not just MCP tool calls):
 
 This intercepts Claude's built-in `Read` tool and returns cached content when available. See [Hooks Documentation](docs/hooks.md) for details.
 
+### Recommended: CLAUDE.md Configuration
+
+Add to your `~/.claude/CLAUDE.md` to enforce semantic-cache usage globally:
+
+```markdown
+## External Tools
+
+- semantic-cache: MUST use instead of native file tools (80%+ token savings)
+  - `read` → replaces Read tool (returns diffs, not full content)
+  - `write` → replaces Write tool (caches result, returns diff on overwrite)
+  - `edit` → replaces Edit tool (uses cached read, returns diff)
+```
+
+This tells Claude to prefer semantic-cache tools over the built-in Read, Write, and Edit tools, maximizing token savings across all file operations.
+
 ---
 
 ## 🚀 Usage
