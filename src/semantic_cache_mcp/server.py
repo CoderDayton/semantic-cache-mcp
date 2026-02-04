@@ -15,7 +15,7 @@ import logging
 from fastmcp import Context, FastMCP
 from fastmcp.server.lifespan import lifespan
 
-from .cache import SemanticCache, smart_read
+from .cache import SemanticCache, smart_edit, smart_read, smart_write
 from .config import MAX_CONTENT_SIZE
 from .core.embeddings import get_model_info, warmup
 
@@ -162,6 +162,175 @@ def clear(ctx: Context) -> str:
     cache: SemanticCache = ctx.lifespan_context["cache"]
     count = cache.clear()
     return f"Cleared {count} cache entries"
+
+
+@mcp.tool()
+def write(
+    ctx: Context,
+    path: str,
+    content: str,
+    create_parents: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Write file with semantic cache integration.
+
+    Returns diff of changes (not full content) for massive token savings.
+    Updates cache so subsequent reads are instant.
+
+    Args:
+        path: Absolute path to file
+        content: Content to write
+        create_parents: Create parent directories (default: true)
+        dry_run: Preview changes without writing (default: false)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = smart_write(
+            cache=cache,
+            path=path,
+            content=content,
+            create_parents=create_parents,
+            dry_run=dry_run,
+        )
+
+        # Format output
+        lines: list[str] = []
+
+        if result.created:
+            lines.append(
+                f"// Created: {result.path} "
+                f"({result.bytes_written:,} bytes, {result.tokens_written:,} tokens)"
+            )
+        else:
+            lines.append(f"// Updated: {result.path}")
+            if result.diff_stats:
+                stats = result.diff_stats
+                lines.append(
+                    f"// Stats: +{stats.get('insertions', 0)} "
+                    f"-{stats.get('deletions', 0)} "
+                    f"~{stats.get('modifications', 0)} lines"
+                )
+            if result.tokens_saved > 0:
+                lines.append(f"// Tokens saved: {result.tokens_saved:,} (diff vs full content)")
+
+        lines.append(f"// Hash: {result.content_hash[:16]}...")
+
+        # Include diff for updates
+        if result.diff_content:
+            lines.append(result.diff_content)
+
+        # Metadata footer
+        meta_parts = [
+            f"created:{result.created}",
+            f"dry_run:{dry_run}",
+            f"cached:{result.from_cache}",
+        ]
+        lines.append(f"// [{' '.join(meta_parts)}]")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except PermissionError as e:
+        return f"Error: Permission denied - {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except OSError as e:
+        logger.warning(f"I/O error in write: {e}")
+        return f"Error: I/O operation failed - {e}"
+    except Exception:
+        logger.exception("Unexpected error in write")
+        return "Error: Internal error occurred while writing file"
+
+
+@mcp.tool()
+def edit(
+    ctx: Context,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Edit file using find/replace with cached reads.
+
+    Uses semantic cache for reading - no token cost for the read phase!
+    Returns diff showing exactly what changed.
+
+    Args:
+        path: Absolute path to file
+        old_string: Exact string to find (whitespace-sensitive)
+        new_string: Replacement string
+        replace_all: Replace all occurrences (default: false)
+        dry_run: Preview without writing (default: false)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+
+    try:
+        result = smart_edit(
+            cache=cache,
+            path=path,
+            old_string=old_string,
+            new_string=new_string,
+            replace_all=replace_all,
+            dry_run=dry_run,
+        )
+
+        # Format output
+        lines: list[str] = []
+
+        lines.append(f"// Edited: {result.path}")
+
+        # Match info
+        if result.matches_found == 1:
+            lines.append(f"// Replaced 1 of 1 match at line {result.line_numbers[0]}")
+        else:
+            lines.append(
+                f"// Replaced {result.replacements_made} of {result.matches_found} "
+                f"matches at lines {result.line_numbers}"
+            )
+
+        # Stats
+        stats = result.diff_stats
+        lines.append(
+            f"// Stats: +{stats.get('insertions', 0)} "
+            f"-{stats.get('deletions', 0)} "
+            f"~{stats.get('modifications', 0)} lines"
+        )
+
+        # Token savings from cached read
+        if result.tokens_saved > 0:
+            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached read)")
+
+        lines.append(f"// Hash: {result.content_hash[:16]}...")
+
+        # Include diff
+        lines.append(result.diff_content)
+
+        # Metadata footer
+        meta_parts = [
+            f"replace_all:{replace_all}",
+            f"dry_run:{dry_run}",
+            f"cached:{result.from_cache}",
+        ]
+        lines.append(f"// [{' '.join(meta_parts)}]")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except PermissionError as e:
+        return f"Error: Permission denied - {e}"
+    except ValueError as e:
+        # ValueError messages are user-friendly (from smart_edit validation)
+        return f"Error: {e}"
+    except OSError as e:
+        logger.warning(f"I/O error in edit: {e}")
+        return f"Error: I/O operation failed - {e}"
+    except Exception:
+        logger.exception("Unexpected error in edit")
+        return "Error: Internal error occurred while editing file"
 
 
 def main() -> None:
