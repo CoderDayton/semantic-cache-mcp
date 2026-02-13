@@ -324,6 +324,7 @@ class SQLiteStorage:
         content: str,
         mtime: float,
         embedding: EmbeddingVector | None = None,
+        tokens: int | None = None,
     ) -> None:
         """Store file in cache.
 
@@ -332,6 +333,7 @@ class SQLiteStorage:
             content: File content
             mtime: Modification time
             embedding: Optional embedding vector
+            tokens: Pre-computed token count (avoids redundant re-counting)
         """
         content_hash = hash_content(content)
         content_bytes = content.encode()
@@ -342,7 +344,8 @@ class SQLiteStorage:
             self.release_chunks(old_entry.chunks)
 
         chunk_hashes = self.store_chunks(content_bytes)
-        tokens = count_tokens(content)
+        if tokens is None:
+            tokens = count_tokens(content)
         # Store embedding in quantized binary format (22x smaller than JSON)
         embedding_blob = quantize_embedding(embedding) if embedding else None
 

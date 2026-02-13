@@ -9,16 +9,21 @@ import array
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
-from ..config import CACHE_DIR
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # Model configuration
 FASTEMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
-FASTEMBED_CACHE_DIR = CACHE_DIR / "models"
+_DEFAULT_CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp" / "models"
+
+# Set via configure() or defaults to ~/.cache/semantic-cache-mcp/models
+_cache_dir: Path = _DEFAULT_CACHE_DIR
 
 # Singleton instance
 _embedding_model: TextEmbedding | None = None
@@ -33,14 +38,14 @@ def _get_model() -> TextEmbedding:
         from fastembed import TextEmbedding
 
         logger.info(f"Loading embedding model: {FASTEMBED_MODEL}")
-        logger.info(f"Model cache directory: {FASTEMBED_CACHE_DIR}")
+        logger.info(f"Model cache directory: {_cache_dir}")
 
         # Ensure cache directory exists
-        FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_dir.mkdir(parents=True, exist_ok=True)
 
         _embedding_model = TextEmbedding(
             model_name=FASTEMBED_MODEL,
-            cache_dir=str(FASTEMBED_CACHE_DIR),
+            cache_dir=str(_cache_dir),
             lazy_load=False,  # Load immediately for predictable startup
         )
         logger.info("Embedding model loaded successfully")
@@ -87,7 +92,10 @@ def embed(text: str) -> array.array[float] | None:
 
         embeddings = list(model.embed([prefixed_text]))
         if embeddings:
-            return array.array("f", embeddings[0].tolist())
+            vec = np.ascontiguousarray(embeddings[0], dtype=np.float32)
+            result = array.array("f")
+            result.frombytes(vec.tobytes())
+            return result
         return None
 
     except Exception as e:
@@ -114,7 +122,10 @@ def embed_query(text: str) -> array.array[float] | None:
 
         embeddings = list(model.embed([prefixed_text]))
         if embeddings:
-            return array.array("f", embeddings[0].tolist())
+            vec = np.ascontiguousarray(embeddings[0], dtype=np.float32)
+            result = array.array("f")
+            result.frombytes(vec.tobytes())
+            return result
         return None
 
     except Exception as e:
@@ -130,6 +141,17 @@ def get_model_info() -> dict[str, str | int]:
     """
     return {
         "model": FASTEMBED_MODEL,
-        "cache_dir": str(FASTEMBED_CACHE_DIR),
+        "cache_dir": str(_cache_dir),
         "ready": _model_ready,
     }
+
+
+def configure(cache_dir: Path | str | None = None) -> None:
+    """Configure embedding module before first use.
+
+    Args:
+        cache_dir: Directory for model downloads. Defaults to ~/.cache/semantic-cache-mcp/models
+    """
+    global _cache_dir
+    if cache_dir is not None:
+        _cache_dir = Path(cache_dir)

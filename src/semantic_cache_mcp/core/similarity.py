@@ -17,6 +17,7 @@ For typical RAG/embedding search:
 from __future__ import annotations
 
 import array
+import struct
 
 import numpy as np
 
@@ -112,8 +113,6 @@ def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
     Returns:
         Binary blob: struct.pack('<f', scale) + int8_array.tobytes()
     """
-    import struct
-
     # Convert to numpy
     if isinstance(v, array.array):
         arr = np.frombuffer(v, dtype=np.float32).copy()
@@ -141,18 +140,17 @@ def dequantize_embedding(blob: bytes) -> array.array:
     Returns:
         Reconstructed embedding as array.array
     """
-    import struct
-
     # Unpack scale (first 4 bytes)
     scale = struct.unpack("<f", blob[:4])[0]
 
     # Unpack quantized vector
     quantized = np.frombuffer(blob[4:], dtype=np.int8)
 
-    # Dequantize
-    arr = quantized.astype(np.float32) / scale
-
-    return array.array("f", arr.tolist())
+    # Dequantize and convert via memcpy (not .tolist())
+    arr = (quantized.astype(np.float32) / scale).astype(np.float32)
+    result = array.array("f")
+    result.frombytes(arr.tobytes())
+    return result
 
 
 def similarity_from_quantized_blob(
@@ -172,8 +170,6 @@ def similarity_from_quantized_blob(
     Returns:
         Array of similarity scores
     """
-    import struct
-
     if not quantized_blobs:
         return np.array([], dtype=np.float32)
 

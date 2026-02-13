@@ -27,7 +27,8 @@ from .cache import (
     smart_read,
     smart_write,
 )
-from .config import MAX_CONTENT_SIZE
+from .config import CACHE_DIR, MAX_CONTENT_SIZE
+from .core.embeddings import configure as configure_embeddings
 from .core.embeddings import get_model_info, warmup
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,9 @@ async def app_lifespan(server: FastMCP):
     """Initialize cache and embedding model on startup."""
     logger.info("Semantic cache MCP server starting...")
 
-    # Warmup embedding model (downloads if needed, loads into memory)
+    # Configure and warmup embedding model (downloads if needed, loads into memory)
     logger.info("Initializing embedding model...")
+    configure_embeddings(cache_dir=CACHE_DIR / "models")
     warmup()
 
     model_info = get_model_info()
