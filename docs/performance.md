@@ -29,6 +29,11 @@
 | **Batch SQL operations** | 2-5x faster updates | `executemany` + `IN` clause |
 | **WITHOUT ROWID tables** | 20-30% space savings | Text primary keys optimized |
 | **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
+| **frombytes() array conversion** | ~100x faster | Direct memcpy vs tolist() iteration in embeddings/similarity |
+| **Batch DB queries in glob** | N→1 round-trips | Single `SELECT ... WHERE IN` replaces per-file cache lookups |
+| **Pre-computed tokens in put()** | Avoid double work | Callers pass token count, skip redundant `count_tokens()` |
+| **Batch read dedup** | 2x fewer lookups | Pre-computed cached set eliminates double cache.get() in sort |
+| **Module-level struct import** | Reduce call overhead | Single import vs per-call import in similarity hot paths |
 | **Generator expressions** | Avoid intermediate lists | Used in hot paths |
 | **`__slots__` on dataclasses** | Eliminate `__dict__` | Memory-efficient models |
 
@@ -296,6 +301,7 @@ delta = compute_delta(old, new)
 
 - Single tool call overhead vs N individual reads
 - Token budget prevents context overflow
+- Pre-computed cache set for sort ordering (eliminates double lookup)
 - Files read in parallel where possible
 
 ### Similar Files (`similar`)
@@ -306,8 +312,9 @@ delta = compute_delta(old, new)
 
 ### Glob (`glob`)
 
-- 5-second timeout prevents runaway scans
+- Thread-safe 5-second timeout using `threading.Timer` (cross-platform, works on Windows and in thread pools)
 - Max 1000 matches returned
+- Batch DB query for cache status (single `SELECT ... WHERE IN` instead of N individual lookups, with chunking for >900 paths)
 - Shows cache status without reading file contents
 
 ### Multi-Edit (`multi_edit`)

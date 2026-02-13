@@ -143,11 +143,16 @@ cache._storage = custom_storage
 
 ```python
 from semantic_cache_mcp.core.embeddings import (
+    configure,
     warmup,
     embed,
     embed_query,
     get_model_info,
 )
+
+# Configure model directory (optional, defaults to ~/.cache/semantic-cache-mcp/models)
+# Call before warmup() when using embeddings outside the MCP server
+configure(cache_dir="/path/to/custom/models")
 
 # Warmup model (called automatically at server start)
 warmup()
@@ -475,7 +480,8 @@ cache.put(
     path="/path/to/file.py",
     content="file content here",
     mtime=1234567890.0,
-    embedding=cache.get_embedding("file content here")
+    embedding=cache.get_embedding("file content here"),
+    tokens=42,  # pass pre-computed token count to avoid redundant tokenization
 )
 
 # Get cached entry

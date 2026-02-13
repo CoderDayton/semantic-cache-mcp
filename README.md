@@ -187,7 +187,7 @@ Skips files if budget exceeded.
 glob pattern="**/*.py" directory="./src"
 ```
 
-Max 1000 matches, 5s timeout. Shows which files are cached.
+Max 1000 matches, 5s thread-safe timeout (cross-platform). Shows which files are cached.
 
 #### diff
 
@@ -260,6 +260,9 @@ Recent optimizations deliver **5-22x improvements** across core operations:
 | Component | Improvement | Details |
 |-----------|-------------|---------|
 | **Embeddings** | 22x smaller | int8 quantization (772 vs 17KB/vector) |
+| **Array conversion** | ~100x faster | frombytes() memcpy replaces tolist() iteration |
+| **Glob queries** | N→1 DB calls | Batch `SELECT ... WHERE IN` replaces per-file lookups |
+| **Batch read** | 2x fewer lookups | Pre-computed cache set eliminates double lookup |
 | **Chunking** | 5-7x faster | SIMD-accelerated parallel CDC |
 | **Similarity** | 1.7x faster | Pre-quantized binary search |
 | **Summarization** | 50-80% savings | Semantic segment selection preserves structure |

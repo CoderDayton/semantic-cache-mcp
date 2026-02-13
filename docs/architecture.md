@@ -139,6 +139,8 @@ Local text embeddings using FastEmbed with nomic-embed-text-v1.5.
 - 768-dimensional embeddings
 - 8192 token context window
 - Uses `search_document:` and `search_query:` prefixes
+- `configure(cache_dir=...)` API for standalone use (decoupled from config.py)
+- Defaults to `~/.cache/semantic-cache-mcp/models` when used outside the server
 
 ### Similarity (`core/similarity.py`)
 
@@ -259,6 +261,7 @@ Content-addressable chunk store (like Git).
 - File metadata with chunk references
 - LRU-K eviction (frequency-aware cache management)
 - Batch operations with `executemany`
+- `put()` accepts optional `tokens` parameter to avoid redundant tokenization
 
 ### Schema
 
