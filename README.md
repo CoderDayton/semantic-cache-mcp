@@ -79,11 +79,19 @@ Add to your `~/.claude/CLAUDE.md` to enforce semantic-cache usage globally:
 ## External Tools
 
 - semantic-cache: MUST use instead of native file tools (80%+ token savings)
-  - `read` → replaces Read tool (returns diffs, not full content)
+  - `read` → single-file inspection (diffs by default)
+    - `diff_mode=true` → keep during iteration
+    - `force_full=true` → only when full file context is required
+    - `offset`/`limit` → only after narrowing to target lines
+  - `batch_read` → use for 2+ files (better than repeated `read`)
   - `write` → replaces Write tool (caches result, returns diff on overwrite)
     - `auto_format=true` → runs formatter after write (ruff/prettier/gofmt)
+    - Prefer for full rewrites/create; use `edit` for targeted substitutions
   - `edit` → replaces Edit tool (uses cached read, returns diff)
     - `auto_format=true` → runs formatter after edit
+  - `multi_edit` → use for 2+ edits in one file (better than repeated `edit`)
+  - `search`/`similar` → use after cache is seeded via `read`/`batch_read`
+    - Start with small `k` (3-5), increase only if needed
 ```
 
 This tells Claude to prefer semantic-cache tools over the built-in Read, Write, and Edit tools, maximizing token savings across all file operations.
@@ -100,6 +108,8 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 | `write` | Write files, returns diff on overwrite. `auto_format=true` runs formatter |
 | `edit` | Find/replace using cached reads (zero token read cost). `auto_format=true` runs formatter |
 | `multi_edit` | Batch find/replace, partial success supported. `auto_format=true` runs formatter |
+
+All tools return JSON. Response detail and token cap are controlled globally via environment variables.
 
 ### Discovery Tools
 
@@ -125,11 +135,13 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 
 ```bash
 read path="/src/app.py"
+read path="/src/app.py" offset=120 limit=80
 ```
 
 - First read → full content, cached
 - Unchanged → `// File unchanged (1,234 tokens cached)`
 - Modified → unified diff only
+- Use `offset`/`limit` after identifying a target region
 
 #### write
 
@@ -145,14 +157,17 @@ Returns diff of changes, updates cache for instant reads. With `auto_format=true
 ```bash
 edit path="/src/app.py" old_string="old" new_string="new"
 edit path="/src/app.py" old_string="old" new_string="new" auto_format=true
+edit path="/src/app.py" old_string="old" new_string="new" dry_run=true
 ```
 
 Uses cached content (no token cost), returns diff. Use `replace_all=true` for multiple matches. With `auto_format=true`, runs formatter after edit.
+Use `multi_edit` when applying 2+ independent edits in one file.
 
 #### multi_edit
 
 ```bash
 multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]'
+multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]' dry_run=true
 ```
 
 Independent edits—some can fail while others succeed.
@@ -160,10 +175,11 @@ Independent edits—some can fail while others succeed.
 #### search
 
 ```bash
-search query="authentication logic" k=10
+search query="authentication logic" k=5
 ```
 
 Searches cached files by semantic meaning, not keywords.
+Seed cache first with `read` or `batch_read`.
 
 #### similar
 
@@ -172,14 +188,17 @@ similar path="/src/auth.py" k=5
 ```
 
 Finds related code, tests, or documentation.
+Use after source and nearby files have been cached.
 
 #### batch_read
 
 ```bash
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
+batch_read paths='["/src/a.py","/src/b.py","/src/c.py"]' max_total_tokens=30000
 ```
 
 Skips files if budget exceeded.
+Use for 2+ files; start with smaller budget and increase only if needed.
 
 #### glob
 
@@ -206,16 +225,21 @@ Returns unified diff with similarity score.
 | Environment Variable | Default | Description                                             |
 | -------------------- | ------- | ------------------------------------------------------- |
 | `LOG_LEVEL`          | `INFO`  | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `TOOL_OUTPUT_MODE`   | `compact` | Tool response detail level (`compact`, `normal`, `debug`) |
+| `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response cap (`0` disables cap) |
+| `MAX_CONTENT_SIZE`   | `100000` | Default max bytes returned by `read`/`smart_read` |
+| `MAX_CACHE_ENTRIES`  | `10000` | Max cache entries before LRU-K eviction |
+
+Environment example:
+
+```bash
+TOOL_OUTPUT_MODE=compact
+TOOL_MAX_RESPONSE_TOKENS=6000
+MAX_CONTENT_SIZE=100000
+MAX_CACHE_ENTRIES=10000
+```
 
 **Embeddings:** Uses local [FastEmbed](https://github.com/qdrant/fastembed) with `nomic-ai/nomic-embed-text-v1.5` model. No API keys or external services needed.
-
-Cache settings in `config.py`:
-
-| Setting                | Default | Description                            |
-| ---------------------- | ------- | -------------------------------------- |
-| `MAX_CONTENT_SIZE`     | 100KB   | Maximum content size returned          |
-| `MAX_CACHE_ENTRIES`    | 10,000  | LRU-K eviction threshold               |
-| `SIMILARITY_THRESHOLD` | 0.85    | Minimum cosine similarity for matching |
 
 Safety limits in `cache.py`:
 

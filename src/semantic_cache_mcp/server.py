@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.lifespan import lifespan
@@ -27,11 +28,68 @@ from .cache import (
     smart_read,
     smart_write,
 )
-from .config import CACHE_DIR, MAX_CONTENT_SIZE
-from .core.embeddings import configure as configure_embeddings
+from .config import MAX_CONTENT_SIZE, TOOL_MAX_RESPONSE_TOKENS, TOOL_OUTPUT_MODE
+from .core import count_tokens
 from .core.embeddings import get_model_info, warmup
+from .core.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+_MODE_NORMAL = {"normal", "debug"}
+_MODE_DEBUG = "debug"
+
+
+def _response_mode() -> str:
+    """Global response mode from environment-backed config."""
+    return TOOL_OUTPUT_MODE
+
+
+def _response_token_cap() -> int | None:
+    """Global response token cap from environment-backed config."""
+    return TOOL_MAX_RESPONSE_TOKENS if TOOL_MAX_RESPONSE_TOKENS > 0 else None
+
+
+def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build minimal JSON payload when response exceeds token budget."""
+    keep_order = (
+        "ok",
+        "tool",
+        "status",
+        "path",
+        "path1",
+        "path2",
+        "files_read",
+        "files_skipped",
+        "succeeded",
+        "failed",
+        "message",
+        "error",
+    )
+    minimal: dict[str, Any] = {}
+    for key in keep_order:
+        if key in payload:
+            minimal[key] = payload[key]
+    minimal["truncated"] = True
+    if "message" not in minimal:
+        minimal["message"] = "Response truncated by max_response_tokens"
+    return minimal
+
+
+def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -> str:
+    """Render tool response as compact JSON with optional token cap."""
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if max_response_tokens is not None and max_response_tokens > 0:
+        if count_tokens(body) > max_response_tokens:
+            body = json.dumps(_minimal_payload(payload), separators=(",", ":"), ensure_ascii=False)
+        if count_tokens(body) > max_response_tokens:
+            body = json.dumps({"ok": False, "truncated": True}, separators=(",", ":"))
+    return body
+
+
+def _render_error(tool: str, message: str, max_response_tokens: int | None) -> str:
+    """Render consistent error responses."""
+    payload = {"ok": False, "tool": tool, "error": message}
+    return _render_response(payload, max_response_tokens)
 
 
 @lifespan
@@ -39,9 +97,12 @@ async def app_lifespan(server: FastMCP):
     """Initialize cache and embedding model on startup."""
     logger.info("Semantic cache MCP server starting...")
 
-    # Configure and warmup embedding model (downloads if needed, loads into memory)
+    # Warmup tokenizer (loads 200K vocab from disk, ~600ms one-time cost)
+    logger.info("Initializing tokenizer...")
+    get_tokenizer()
+
+    # Warmup embedding model (downloads if needed, loads into memory)
     logger.info("Initializing embedding model...")
-    configure_embeddings(cache_dir=CACHE_DIR / "models")
     warmup()
 
     model_info = get_model_info()
@@ -83,9 +144,13 @@ def read(
     offset: int | None = None,
     limit: int | None = None,
 ) -> str:
-    """Read files with 80%+ token reduction.
+    """Read files with token-efficient caching and diffs.
 
-    Returns diffs for changed files, minimal response for unchanged.
+    Timing guidance:
+    - Use for single-file inspection and verification.
+    - For 2+ files, prefer batch_read first.
+    - Keep diff_mode=true during iteration; use force_full only when full file context is required.
+    - Use offset/limit only after narrowing to target lines.
 
     Args:
         path: Path to the file to read
@@ -96,6 +161,8 @@ def read(
         limit: Number of lines to read. Only provide if file is too large.
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         # If offset/limit specified, read specific lines (still caches full file)
@@ -117,8 +184,25 @@ def read(
             for i, line in enumerate(selected, start=start + 1):
                 numbered.append(f"{i:6d}\t{line.rstrip()}")
             content = "\n".join(numbered)
+            line_info = {
+                "start": start + 1,
+                "end": min(end, len(lines)),
+                "total": len(lines),
+            }
+            payload: dict[str, Any] = {
+                "ok": True,
+                "tool": "read",
+                "path": path,
+                "content": content,
+                "lines": line_info,
+            }
+            if mode in _MODE_NORMAL:
+                payload["truncated"] = result.truncated
+            if mode == _MODE_DEBUG:
+                payload["from_cache"] = result.from_cache
+                payload["tokens_saved"] = result.tokens_saved
 
-            return f"{content}\n// [lines:{start + 1}-{min(end, len(lines))} of {len(lines)}]"
+            return _render_response(payload, max_response_tokens)
 
         result = smart_read(
             cache=cache,
@@ -127,19 +211,45 @@ def read(
             diff_mode=diff_mode,
             force_full=force_full,
         )
-        meta = f"[cache:{result.from_cache} diff:{result.is_diff} saved:{result.tokens_saved}]"
-        return f"{result.content}\n// {meta}"
+        payload = {
+            "ok": True,
+            "tool": "read",
+            "path": path,
+            "content": result.content,
+        }
+        if mode in _MODE_NORMAL:
+            payload["is_diff"] = result.is_diff
+            payload["truncated"] = result.truncated
+            payload["semantic_match"] = result.semantic_match
+        if mode == _MODE_DEBUG:
+            payload["from_cache"] = result.from_cache
+            payload["tokens_saved"] = result.tokens_saved
+            payload["tokens_original"] = result.tokens_original
+            payload["tokens_returned"] = result.tokens_returned
+            payload["params"] = {
+                "max_size": max_size,
+                "diff_mode": diff_mode,
+                "force_full": force_full,
+                "offset": offset,
+                "limit": limit,
+            }
+
+        return _render_response(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("read", str(e), max_response_tokens)
     except Exception as e:
-        return f"Error reading file: {e}"
+        return _render_error("read", f"reading failed: {e}", max_response_tokens)
 
 
 @mcp.tool()
-def stats(ctx: Context) -> str:
+def stats(
+    ctx: Context,
+) -> str:
     """Get cache statistics: files tracked, tokens, compression ratios, embedding status."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
     cache_stats = cache.get_stats()
 
     # Add embedding model info
@@ -149,16 +259,37 @@ def stats(ctx: Context) -> str:
         "embedding_model": model_info["model"],
         "embedding_ready": model_info["ready"],
     }
+    payload: dict[str, Any] = {"ok": True, "tool": "stats"}
+    if mode == "compact":
+        payload.update(
+            {
+                "files_cached": result["files_cached"],
+                "total_tokens_cached": result["total_tokens_cached"],
+                "embedding_ready": result["embedding_ready"],
+            }
+        )
+    elif mode == "normal":
+        payload.update(result)
+    else:
+        payload.update(result)
+        payload["output_mode"] = mode
 
-    return json.dumps(result, indent=2)
+    return _render_response(payload, max_response_tokens)
 
 
 @mcp.tool()
-def clear(ctx: Context) -> str:
+def clear(
+    ctx: Context,
+) -> str:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
     count = cache.clear()
-    return f"Cleared {count} cache entries"
+    payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
+    if mode == _MODE_DEBUG:
+        payload["output_mode"] = mode
+    return _render_response(payload, max_response_tokens)
 
 
 @mcp.tool()
@@ -170,10 +301,12 @@ def write(
     dry_run: bool = False,
     auto_format: bool = False,
 ) -> str:
-    """Write file with semantic cache integration.
+    """Write full file content with cache integration.
 
-    Returns diff of changes (not full content) for massive token savings.
-    Updates cache so subsequent reads are instant.
+    Timing guidance:
+    - Use when creating files or replacing most/all content.
+    - For focused substitutions, prefer edit or multi_edit.
+    - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
     Args:
         path: Absolute path to file
@@ -183,6 +316,8 @@ def write(
         auto_format: Run formatter after write (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = smart_write(
@@ -194,54 +329,42 @@ def write(
             auto_format=auto_format,
         )
 
-        # Format output
-        lines: list[str] = []
-
-        if result.created:
-            lines.append(
-                f"// Created: {result.path} "
-                f"({result.bytes_written:,} bytes, {result.tokens_written:,} tokens)"
-            )
-        else:
-            lines.append(f"// Updated: {result.path}")
-            if result.diff_stats:
-                stats = result.diff_stats
-                lines.append(
-                    f"// Stats: +{stats.get('insertions', 0)} "
-                    f"-{stats.get('deletions', 0)} "
-                    f"~{stats.get('modifications', 0)} lines"
-                )
-            if result.tokens_saved > 0:
-                lines.append(f"// Tokens saved: {result.tokens_saved:,} (diff vs full content)")
-
-        lines.append(f"// Hash: {result.content_hash[:16]}...")
-
-        # Include diff for updates
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "write",
+            "status": "created" if result.created else "updated",
+            "path": result.path,
+        }
         if result.diff_content:
-            lines.append(result.diff_content)
+            payload["diff"] = result.diff_content
+        elif not result.created:
+            payload["diff_omitted"] = True
 
-        # Metadata footer
-        meta_parts = [
-            f"created:{result.created}",
-            f"dry_run:{dry_run}",
-            f"cached:{result.from_cache}",
-        ]
-        lines.append(f"// [{' '.join(meta_parts)}]")
+        if mode in _MODE_NORMAL:
+            payload["created"] = result.created
+            payload["dry_run"] = dry_run
+            payload["tokens_saved"] = result.tokens_saved
+        if mode == _MODE_DEBUG:
+            payload["bytes_written"] = result.bytes_written
+            payload["tokens_written"] = result.tokens_written
+            payload["diff_stats"] = result.diff_stats
+            payload["content_hash"] = result.content_hash
+            payload["from_cache"] = result.from_cache
 
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("write", str(e), max_response_tokens)
     except PermissionError as e:
-        return f"Error: Permission denied - {e}"
+        return _render_error("write", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return f"Error: {e}"
+        return _render_error("write", str(e), max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in write: {e}")
-        return f"Error: I/O operation failed - {e}"
+        return _render_error("write", f"I/O operation failed - {e}", max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in write")
-        return "Error: Internal error occurred while writing file"
+        return _render_error("write", "Internal error occurred while writing file", max_response_tokens)
 
 
 @mcp.tool()
@@ -256,8 +379,10 @@ def edit(
 ) -> str:
     """Edit file using find/replace with cached reads.
 
-    Uses semantic cache for reading - no token cost for the read phase!
-    Returns diff showing exactly what changed.
+    Timing guidance:
+    - Use for a single targeted replacement.
+    - For 2+ independent replacements in one file, use multi_edit.
+    - Use dry_run when validating match uniqueness before committing edits.
 
     Args:
         path: Absolute path to file
@@ -268,6 +393,8 @@ def edit(
         auto_format: Run formatter after edit (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = smart_edit(
@@ -280,60 +407,45 @@ def edit(
             auto_format=auto_format,
         )
 
-        # Format output
-        lines: list[str] = []
-
-        lines.append(f"// Edited: {result.path}")
-
-        # Match info
-        if result.matches_found == 1:
-            lines.append(f"// Replaced 1 of 1 match at line {result.line_numbers[0]}")
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "edit",
+            "status": "edited",
+            "path": result.path,
+            "matches_found": result.matches_found,
+            "replacements_made": result.replacements_made,
+        }
+        if result.diff_content:
+            payload["diff"] = result.diff_content
         else:
-            lines.append(
-                f"// Replaced {result.replacements_made} of {result.matches_found} "
-                f"matches at lines {result.line_numbers}"
-            )
+            payload["diff_omitted"] = True
+        if mode in _MODE_NORMAL:
+            payload["line_numbers"] = result.line_numbers
+            payload["tokens_saved"] = result.tokens_saved
+        if mode == _MODE_DEBUG:
+            payload["diff_stats"] = result.diff_stats
+            payload["content_hash"] = result.content_hash
+            payload["from_cache"] = result.from_cache
+            payload["params"] = {
+                "replace_all": replace_all,
+                "dry_run": dry_run,
+                "auto_format": auto_format,
+            }
 
-        # Stats
-        stats = result.diff_stats
-        lines.append(
-            f"// Stats: +{stats.get('insertions', 0)} "
-            f"-{stats.get('deletions', 0)} "
-            f"~{stats.get('modifications', 0)} lines"
-        )
-
-        # Token savings from cached read
-        if result.tokens_saved > 0:
-            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached read)")
-
-        lines.append(f"// Hash: {result.content_hash[:16]}...")
-
-        # Include diff
-        lines.append(result.diff_content)
-
-        # Metadata footer
-        meta_parts = [
-            f"replace_all:{replace_all}",
-            f"dry_run:{dry_run}",
-            f"cached:{result.from_cache}",
-        ]
-        lines.append(f"// [{' '.join(meta_parts)}]")
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return f"Error: Permission denied - {e}"
+        return _render_error("edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        # ValueError messages are user-friendly (from smart_edit validation)
-        return f"Error: {e}"
+        return _render_error("edit", str(e), max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
-        return f"Error: I/O operation failed - {e}"
+        return _render_error("edit", f"I/O operation failed - {e}", max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in edit")
-        return "Error: Internal error occurred while editing file"
+        return _render_error("edit", "Internal error occurred while editing file", max_response_tokens)
 
 
 @mcp.tool()
@@ -346,8 +458,10 @@ def multi_edit(
 ) -> str:
     """Apply multiple independent edits to a file.
 
-    Each edit is processed independently - some can succeed while others fail.
-    Partial success: successful edits are applied even if some fail.
+    Timing guidance:
+    - Use when applying 2+ edits to the same file in one step.
+    - More token-efficient than repeated edit calls on the same file.
+    - Use dry_run when testing risky edit batches.
 
     Args:
         path: Absolute path to file
@@ -356,16 +470,22 @@ def multi_edit(
         auto_format: Run formatter after edits (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         # Parse edits JSON
         edits_str = edits.strip()
         if not edits_str.startswith("["):
-            return "Error: edits must be a JSON array of [old, new] pairs"
+            return _render_error(
+                "multi_edit",
+                "edits must be a JSON array of [old, new] pairs",
+                max_response_tokens,
+            )
 
         edit_list = json.loads(edits_str)
         if not isinstance(edit_list, list):
-            return "Error: edits must be a JSON array"
+            return _render_error("multi_edit", "edits must be a JSON array", max_response_tokens)
 
         # Convert to list of tuples
         edit_tuples: list[tuple[str, str]] = []
@@ -375,7 +495,11 @@ def multi_edit(
             elif isinstance(item, dict) and "old" in item and "new" in item:
                 edit_tuples.append((str(item["old"]), str(item["new"])))
             else:
-                return "Error: Each edit must be [old, new] or {old, new}"
+                return _render_error(
+                    "multi_edit",
+                    "Each edit must be [old, new] or {old, new}",
+                    max_response_tokens,
+                )
 
         result = smart_multi_edit(
             cache=cache,
@@ -385,56 +509,53 @@ def multi_edit(
             auto_format=auto_format,
         )
 
-        # Format output
-        lines: list[str] = []
-        lines.append(f"// Multi-edit: {result.path}")
-        lines.append(f"// Results: {result.succeeded} succeeded, {result.failed} failed")
-
-        if result.tokens_saved > 0:
-            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached read)")
-
-        lines.append("")
-
-        # Per-edit outcomes
-        for o in result.outcomes:
-            old_preview = o.old_string[:30].replace("\n", "\\n")
-            new_preview = o.new_string[:30].replace("\n", "\\n")
-            if o.success:
-                lines.append(f'✓ Line {o.line_number}: "{old_preview}" → "{new_preview}"')
-            else:
-                lines.append(f'✗ "{old_preview}" → "{new_preview}" ({o.error})')
-
-        # Diff
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "multi_edit",
+            "status": "edited",
+            "path": result.path,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+        }
         if result.diff_content:
-            lines.append("")
-            lines.append(result.diff_content)
+            payload["diff"] = result.diff_content
+        else:
+            payload["diff_omitted"] = True
+        if mode in _MODE_NORMAL:
+            payload["tokens_saved"] = result.tokens_saved
+        if mode == _MODE_DEBUG:
+            payload["outcomes"] = [
+                {
+                    "old": o.old_string,
+                    "new": o.new_string,
+                    "success": o.success,
+                    "line_number": o.line_number,
+                    "error": o.error,
+                }
+                for o in result.outcomes
+            ]
+            payload["diff_stats"] = result.diff_stats
+            payload["content_hash"] = result.content_hash
+            payload["from_cache"] = result.from_cache
+            payload["params"] = {"dry_run": dry_run, "auto_format": auto_format}
 
-        # Stats
-        stats = result.diff_stats
-        lines.append(
-            f"\n// Stats: +{stats.get('insertions', 0)} "
-            f"-{stats.get('deletions', 0)} "
-            f"~{stats.get('modifications', 0)} lines"
-        )
-        lines.append(f"// Hash: {result.content_hash[:16]}...")
-        lines.append(
-            f"// [succeeded:{result.succeeded} failed:{result.failed} "
-            f"dry_run:{dry_run} cached:{result.from_cache}]"
-        )
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except json.JSONDecodeError as e:
-        return f"Error: Invalid JSON in edits - {e}"
+        return _render_error("multi_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("multi_edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return f"Error: Permission denied - {e}"
+        return _render_error("multi_edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return f"Error: {e}"
+        return _render_error("multi_edit", str(e), max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in multi_edit")
-        return "Error: Internal error occurred while editing file"
+        return _render_error(
+            "multi_edit",
+            "Internal error occurred while editing file",
+            max_response_tokens,
+        )
 
 
 @mcp.tool()
@@ -444,9 +565,12 @@ def search(
     k: int = 10,
     directory: str | None = None,
 ) -> str:
-    """Search cached files by semantic meaning. Only searches previously-read files.
+    """Search cached files by semantic meaning.
 
-    Better than grep for concepts - finds by meaning, not keywords.
+    Timing guidance:
+    - Seed cache first via read or batch_read.
+    - Start with k=3 to k=5 and increase only if recall is insufficient.
+    - Use directory filter early to limit response size.
 
     Args:
         query: Search query (what you're looking for)
@@ -454,32 +578,39 @@ def search(
         directory: Optional directory to limit search
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = semantic_search(cache, query, k=k, directory=directory)
 
-        if not result.matches:
-            return f"// No matches for: {query}\n// [files:0 cached:{result.cached_files}]"
+        match_payload: list[dict[str, Any]] = []
+        for m in result.matches:
+            item: dict[str, Any] = {"path": m.path, "similarity": round(m.similarity, 4)}
+            if mode in _MODE_NORMAL:
+                item["tokens"] = m.tokens
+                item["preview"] = m.preview
+            match_payload.append(item)
 
-        lines: list[str] = []
-        lines.append(
-            f'// Search: "{query}" ({len(result.matches)} matches in {result.cached_files} cached)'
-        )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "search",
+            "query": query,
+            "matches": match_payload,
+        }
+        if mode in _MODE_NORMAL:
+            payload["count"] = len(match_payload)
+            payload["cached_files"] = result.cached_files
+        if mode == _MODE_DEBUG:
+            payload["files_searched"] = result.files_searched
+            payload["k"] = k
+            payload["directory"] = directory
 
-        for i, m in enumerate(result.matches, 1):
-            lines.append(f"{i}. {m.path} ({m.similarity:.2f}) - {m.tokens:,} tokens")
-            lines.append(f"   {m.preview}...")
-
-        meta = f"k:{k}"
-        if directory:
-            meta += f" directory:{directory}"
-        lines.append(f"// [{meta}]")
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except Exception as e:
         logger.exception("Error in search")
-        return f"Error: {e}"
+        return _render_error("search", str(e), max_response_tokens)
 
 
 @mcp.tool()
@@ -491,7 +622,10 @@ def diff(
 ) -> str:
     """Compare two files using cache.
 
-    Avoids reading both files if cached. Shows unified diff with stats.
+    Timing guidance:
+    - Use only for explicit two-file comparisons.
+    - Prefer read for normal iterative file updates.
+    - Lower context_lines for tighter outputs when reviewing many diffs.
 
     Args:
         path1: First file path
@@ -499,36 +633,34 @@ def diff(
         context_lines: Lines of context in diff (default: 3)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = compare_files(cache, path1, path2, context_lines=context_lines)
 
-        lines: list[str] = []
-        lines.append(f"// Diff: {result.path1} vs {result.path2}")
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "diff",
+            "path1": result.path1,
+            "path2": result.path2,
+            "diff": result.diff_content,
+        }
+        if mode in _MODE_NORMAL:
+            payload["similarity"] = round(result.similarity, 4)
+            payload["diff_stats"] = result.diff_stats
+        if mode == _MODE_DEBUG:
+            payload["tokens_saved"] = result.tokens_saved
+            payload["from_cache"] = result.from_cache
+            payload["context_lines"] = context_lines
 
-        stats = result.diff_stats
-        lines.append(
-            f"// Stats: +{stats.get('insertions', 0)} "
-            f"-{stats.get('deletions', 0)} "
-            f"~{stats.get('modifications', 0)} lines"
-        )
-        lines.append(f"// Similarity: {result.similarity:.2f}")
-
-        if result.tokens_saved > 0:
-            lines.append(f"// Tokens saved: {result.tokens_saved:,} (cached)")
-
-        lines.append(result.diff_content)
-
-        cached_str = f"{result.from_cache[0]},{result.from_cache[1]}"
-        lines.append(f"// [context:{context_lines} cached:{cached_str}]")
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("diff", str(e), max_response_tokens)
     except Exception as e:
         logger.exception("Error in diff")
-        return f"Error: {e}"
+        return _render_error("diff", str(e), max_response_tokens)
 
 
 @mcp.tool()
@@ -537,15 +669,20 @@ def batch_read(
     paths: str,
     max_total_tokens: int = 50000,
 ) -> str:
-    """Read multiple files with token budget. Skips files if budget exceeded.
+    """Read multiple files under a token budget.
 
-    Single call reduces overhead vs reading one-by-one.
+    Timing guidance:
+    - Prefer over repeated read calls when working with 2+ files.
+    - Start with a tight max_total_tokens budget, then increase only if needed.
+    - Use this early to seed cache before search/similar operations.
 
     Args:
         paths: Comma-separated paths or JSON array
         max_total_tokens: Token budget (default: 50000, max: 200000)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         # Parse paths (comma-separated or JSON array)
@@ -557,36 +694,39 @@ def batch_read(
 
         result = batch_smart_read(cache, path_list, max_total_tokens=max_total_tokens)
 
-        lines: list[str] = []
-        cached_count = sum(1 for f in result.files if f.from_cache)
-        lines.append(
-            f"// Batch read: {result.files_read} files "
-            f"({cached_count} cached, {result.files_read - cached_count} new)"
-        )
-        lines.append(
-            f"// Total: {result.total_tokens:,} tokens | Saved: {result.tokens_saved:,} tokens"
-        )
-
+        file_items: list[dict[str, Any]] = []
         for f in result.files:
-            if f.status == "skipped":
-                lines.append(f"\n## {f.path} (skipped)")
-            else:
-                lines.append(f"\n## {f.path} ({f.status}, {f.tokens:,} tokens)")
-                if f.path in result.contents:
-                    lines.append(result.contents[f.path])
+            item: dict[str, Any] = {"path": f.path, "status": f.status}
+            if f.path in result.contents and f.status != "skipped":
+                item["content"] = result.contents[f.path]
+            if mode in _MODE_NORMAL:
+                item["tokens"] = f.tokens
+                item["from_cache"] = f.from_cache
+            file_items.append(item)
 
-        lines.append(
-            f"\n// [files:{len(result.files)} tokens:{result.total_tokens} "
-            f"saved:{result.tokens_saved} skipped:{result.files_skipped}]"
-        )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "batch_read",
+            "files": file_items,
+            "files_read": result.files_read,
+            "files_skipped": result.files_skipped,
+        }
+        if mode in _MODE_NORMAL:
+            payload["total_tokens"] = result.total_tokens
+            payload["tokens_saved"] = result.tokens_saved
+            payload["max_total_tokens"] = max_total_tokens
 
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except json.JSONDecodeError:
-        return "Error: Invalid paths format. Use comma-separated or JSON array."
+        return _render_error(
+            "batch_read",
+            "Invalid paths format. Use comma-separated or JSON array.",
+            max_response_tokens,
+        )
     except Exception as e:
         logger.exception("Error in batch_read")
-        return f"Error: {e}"
+        return _render_error("batch_read", str(e), max_response_tokens)
 
 
 @mcp.tool()
@@ -597,42 +737,47 @@ def similar(
 ) -> str:
     """Find cached files semantically similar to given file.
 
-    Searches only cached files. Useful for finding related code, tests, or docs.
+    Timing guidance:
+    - Use after reading source and likely neighbors into cache.
+    - Start with small k (3-5) and increase only if needed.
+    - Prefer this after a focused read to find adjacent implementation/test files.
 
     Args:
         path: Source file path
         k: Max results (default: 5, max: 50)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = find_similar_files(cache, path, k=k)
 
-        if not result.similar_files:
-            return (
-                f"// Similar to: {result.source_path}\n"
-                f"// No similar files found in {result.files_searched} cached\n"
-                f"// [k:{k}]"
-            )
+        similar_payload = [
+            {"path": f.path, "similarity": round(f.similarity, 4)}
+            if mode == "compact"
+            else {"path": f.path, "similarity": round(f.similarity, 4), "tokens": f.tokens}
+            for f in result.similar_files
+        ]
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "similar",
+            "source_path": result.source_path,
+            "similar_files": similar_payload,
+        }
+        if mode in _MODE_NORMAL:
+            payload["source_tokens"] = result.source_tokens
+            payload["files_searched"] = result.files_searched
+        if mode == _MODE_DEBUG:
+            payload["k"] = k
 
-        lines: list[str] = []
-        lines.append(f"// Similar to: {result.source_path} ({result.source_tokens:,} tokens)")
-        lines.append(
-            f"// Found {len(result.similar_files)} similar in {result.files_searched} cached"
-        )
-
-        for i, f in enumerate(result.similar_files, 1):
-            lines.append(f"{i}. {f.path} ({f.similarity:.2f}) - {f.tokens:,} tokens")
-
-        lines.append(f"// [k:{k} searched:{result.files_searched}]")
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return f"Error: {e}"
+        return _render_error("similar", str(e), max_response_tokens)
     except Exception as e:
         logger.exception("Error in similar")
-        return f"Error: {e}"
+        return _render_error("similar", str(e), max_response_tokens)
 
 
 @mcp.tool()
@@ -643,56 +788,46 @@ def glob(
 ) -> str:
     """Find files by pattern with cache status. Max 1000 matches, 5s timeout.
 
-    Shows which files are cached and their token counts.
+    Timing guidance:
+    - Use early to shortlist candidate files before reading content.
+    - Follow with batch_read on selected files instead of reading all matches.
+    - Keep patterns specific to avoid large low-value result lists.
 
     Args:
         pattern: Glob pattern (e.g., "**/*.py")
         directory: Base directory (default: current)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
 
     try:
         result = glob_with_cache_status(cache, pattern, directory=directory)
+        matches_payload = []
+        for m in result.matches:
+            item: dict[str, Any] = {"path": m.path, "cached": m.cached}
+            if mode in _MODE_NORMAL:
+                item["tokens"] = m.tokens
+                item["mtime"] = m.mtime
+            matches_payload.append(item)
 
-        if not result.matches:
-            return (
-                f"// Glob: {pattern} in {result.directory}\n// No matches\n// [pattern:{pattern}]"
-            )
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "glob",
+            "pattern": pattern,
+            "directory": result.directory,
+            "matches": matches_payload,
+            "total_matches": result.total_matches,
+            "cached_count": result.cached_count,
+        }
+        if mode == _MODE_DEBUG:
+            payload["total_cached_tokens"] = result.total_cached_tokens
 
-        lines: list[str] = []
-        lines.append(f"// Glob: {pattern} in {result.directory}")
-        lines.append(
-            f"// Found {result.total_matches} files "
-            f"({result.cached_count} cached, {result.total_matches - result.cached_count} new)"
-        )
-
-        # Group by cached status
-        cached = [m for m in result.matches if m.cached]
-        not_cached = [m for m in result.matches if not m.cached]
-
-        if cached:
-            lines.append(f"\nCached ({len(cached)} files, {result.total_cached_tokens:,} tokens):")
-            for m in cached[:20]:  # Limit display
-                lines.append(f"  {m.path} ({m.tokens:,} tokens)")
-            if len(cached) > 20:
-                lines.append(f"  ... and {len(cached) - 20} more")
-
-        if not_cached:
-            lines.append(f"\nNot cached ({len(not_cached)} files):")
-            for m in not_cached[:20]:
-                lines.append(f"  {m.path}")
-            if len(not_cached) > 20:
-                lines.append(f"  ... and {len(not_cached) - 20} more")
-
-        lines.append(
-            f"\n// [pattern:{pattern} matches:{result.total_matches} cached:{result.cached_count}]"
-        )
-
-        return "\n".join(lines)
+        return _render_response(payload, max_response_tokens)
 
     except Exception as e:
         logger.exception("Error in glob")
-        return f"Error: {e}"
+        return _render_error("glob", str(e), max_response_tokens)
 
 
 def main() -> None:

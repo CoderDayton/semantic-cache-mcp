@@ -7,6 +7,8 @@ from .config import (
     MAX_CACHE_ENTRIES,
     MAX_CONTENT_SIZE,
     SIMILARITY_THRESHOLD,
+    TOOL_MAX_RESPONSE_TOKENS,
+    TOOL_OUTPUT_MODE,
 )
 from .server import mcp
 from .types import CacheEntry, ReadResult
@@ -28,4 +30,6 @@ __all__ = [
     "MAX_CACHE_ENTRIES",
     "MAX_CONTENT_SIZE",
     "SIMILARITY_THRESHOLD",
+    "TOOL_OUTPUT_MODE",
+    "TOOL_MAX_RESPONSE_TOKENS",
 ]

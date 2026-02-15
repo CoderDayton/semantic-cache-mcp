@@ -112,10 +112,6 @@ class ConnectionPool:
             yield conn
             # Commit on success (matches sqlite3.connect context manager)
             conn.commit()
-            # Checkpoint WAL to ensure other connections see changes immediately
-            # TRUNCATE mode ensures WAL is fully written to main database
-            # Critical for connection pooling with WAL mode
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
             # Rollback on database error
             try:
@@ -324,34 +320,57 @@ class SQLiteStorage:
         content: str,
         mtime: float,
         embedding: EmbeddingVector | None = None,
-        tokens: int | None = None,
     ) -> None:
         """Store file in cache.
+
+        Single-transaction put: chunks, file entry, and eviction all happen
+        in one commit to avoid 3-5 separate fsync calls.
 
         Args:
             path: Absolute file path
             content: File content
             mtime: Modification time
             embedding: Optional embedding vector
-            tokens: Pre-computed token count (avoids redundant re-counting)
         """
         content_hash = hash_content(content)
         content_bytes = content.encode()
-
-        # Release old chunks if updating
-        old_entry = self.get(path)
-        if old_entry:
-            self.release_chunks(old_entry.chunks)
-
-        chunk_hashes = self.store_chunks(content_bytes)
-        if tokens is None:
-            tokens = count_tokens(content)
-        # Store embedding in quantized binary format (22x smaller than JSON)
+        tokens = count_tokens(content)
         embedding_blob = quantize_embedding(embedding) if embedding else None
 
-        logger.debug(f"Stored {len(chunk_hashes)} chunks for {path}")
+        # Prepare chunks outside transaction (CPU-bound, no I/O)
+        chunks_data: list[tuple[str, bytes, int]] = []
+        for chunk in hypercdc_chunks(content_bytes):
+            chunk_hash = hash_chunk(chunk)
+            compressed = compress_adaptive(chunk)
+            chunks_data.append((chunk_hash, compressed, len(chunk)))
+
+        chunk_hashes = [h for h, _, _ in chunks_data]
+        now = time.time()
 
         with self._pool.get_connection() as conn:
+            # Release old chunks if updating
+            old_row = conn.execute(
+                "SELECT chunk_hashes FROM files WHERE path = ?", (path,)
+            ).fetchone()
+            if old_row:
+                old_hashes = json.loads(old_row[0])
+                conn.executemany(
+                    "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
+                    ((h,) for h in old_hashes),
+                )
+                conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
+
+            # Store chunks
+            conn.executemany(
+                """
+                INSERT INTO chunks (hash, data, size, ref_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
+                """,
+                chunks_data,
+            )
+
+            # Store file entry
             conn.execute(
                 """
                 INSERT OR REPLACE INTO files
@@ -366,12 +385,43 @@ class SQLiteStorage:
                     mtime,
                     tokens,
                     embedding_blob,
-                    time.time(),
-                    json.dumps([time.time()]),
+                    now,
+                    json.dumps([now]),
                 ),
             )
 
-        self._evict_if_needed()
+            # Inline eviction check (avoids separate transaction)
+            count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            if count > MAX_CACHE_ENTRIES:
+                evict_count = max(1, count // 10)
+                rows = conn.execute(
+                    "SELECT path, chunk_hashes, access_history FROM files"
+                ).fetchall()
+
+                entries_with_score: list[tuple[float, str, list[str]]] = []
+                for p, chunks_json, history_json in rows:
+                    history = json.loads(history_json)
+                    score = history[-LRU_K] if len(history) >= LRU_K else history[0]
+                    entries_with_score.append((score, p, json.loads(chunks_json)))
+
+                entries_with_score.sort()
+                evict_paths = [p for _, p, _ in entries_with_score[:evict_count]]
+                evict_chunks = [
+                    c for _, _, cs in entries_with_score[:evict_count] for c in cs
+                ]
+
+                placeholders = ",".join("?" * len(evict_paths))
+                conn.execute(
+                    f"DELETE FROM files WHERE path IN ({placeholders})", evict_paths
+                )
+                conn.executemany(
+                    "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
+                    ((h,) for h in evict_chunks),
+                )
+                conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
+                logger.info(f"Cache eviction: removed {evict_count} entries")
+
+        logger.debug(f"Stored {len(chunks_data)} chunks for {path}")
 
     def get_content(self, entry: CacheEntry) -> str:
         """Get full content for a cache entry.

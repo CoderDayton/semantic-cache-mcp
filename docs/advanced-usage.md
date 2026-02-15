@@ -2,6 +2,17 @@
 
 ## Programmatic API
 
+### Timing Policy (Token-Efficient)
+
+- Use `read` for single-file iteration and verification.
+- Use `batch_smart_read` for 2+ files instead of repeated `smart_read`.
+- Keep `diff_mode=True` while iterating; use `force_full=True` only when full context is required.
+- Use `smart_edit` for one targeted replacement; use `smart_multi_edit` for 2+ edits in one file.
+- Seed cache before `semantic_search` and `find_similar_files`.
+- Start search/similar with lower `k` (3-5), then increase only if recall is insufficient.
+- Use `compare_files` only for explicit two-file comparisons.
+- Use `glob_with_cache_status` to shortlist, then `batch_smart_read` for content retrieval.
+
 ```python
 from semantic_cache_mcp.cache import (
     SemanticCache,
@@ -51,7 +62,7 @@ edit_result = smart_edit(
     old_string="old_value",
     new_string="new_value",
     replace_all=False,
-    dry_run=False,
+    dry_run=True,  # validate before committing
 )
 
 print(f"Matches found: {edit_result.matches_found}")
@@ -63,7 +74,7 @@ multi_result = smart_multi_edit(
     cache=cache,
     path="/path/to/file.py",
     edits=[("old1", "new1"), ("old2", "new2")],
-    dry_run=False,
+    dry_run=False,  # prefer this for 2+ replacements in same file
 )
 
 print(f"Succeeded: {multi_result.succeeded}")
@@ -73,7 +84,7 @@ print(f"Failed: {multi_result.failed}")
 search_result = semantic_search(
     cache=cache,
     query="authentication logic",
-    k=10,
+    k=5,  # start small, increase only if needed
     directory="/src",
 )
 
@@ -85,7 +96,7 @@ diff_result = compare_files(
     cache=cache,
     path1="/path/to/old.py",
     path2="/path/to/new.py",
-    context_lines=3,
+    context_lines=2,
 )
 
 print(f"Similarity: {diff_result.similarity:.2f}")
@@ -95,7 +106,7 @@ print(diff_result.diff_content)
 batch_result = batch_smart_read(
     cache=cache,
     paths=["/src/a.py", "/src/b.py", "/src/c.py"],
-    max_total_tokens=50000,
+    max_total_tokens=30000,  # start tighter, increase if necessary
 )
 
 print(f"Files read: {batch_result.files_read}")
@@ -105,7 +116,7 @@ print(f"Tokens saved: {batch_result.tokens_saved}")
 similar_result = find_similar_files(
     cache=cache,
     path="/src/auth.py",
-    k=5,
+    k=5,  # start 3-5, then expand
 )
 
 for f in similar_result.similar_files:
@@ -114,7 +125,7 @@ for f in similar_result.similar_files:
 # Glob with cache status
 glob_result = glob_with_cache_status(
     cache=cache,
-    pattern="**/*.py",
+    pattern="**/*auth*.py",  # prefer specific patterns
     directory="/src",
 )
 

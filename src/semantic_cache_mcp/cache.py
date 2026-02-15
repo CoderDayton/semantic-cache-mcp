@@ -5,8 +5,8 @@ from __future__ import annotations
 import bisect
 import logging
 import shutil
+import signal
 import subprocess  # nosec B404 - used for formatter execution with hardcoded commands
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,7 @@ from .core import (
     count_tokens,
     diff_stats,
     generate_diff,
+    get_optimal_chunker,
     summarize_semantic,
     truncate_semantic,
 )
@@ -103,14 +104,17 @@ class SemanticCache:
         content: str,
         mtime: float,
         embedding: EmbeddingVector | None = None,
-        tokens: int | None = None,
     ) -> None:
         """Store file in cache."""
-        if tokens is None:
-            tokens = count_tokens(content)
+        tokens = count_tokens(content)
+        content_bytes = content.encode()
 
-        self._storage.put(path, content, mtime, embedding, tokens=tokens)
-        logger.info(f"Cached file: {path} ({tokens} tokens)")
+        # Use optimal chunker (SIMD if available, otherwise Gear hash)
+        chunker = get_optimal_chunker(prefer_simd=True)
+        chunks = sum(1 for _ in chunker(content_bytes))
+
+        self._storage.put(path, content, mtime, embedding)
+        logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
 
     def get_content(self, entry: CacheEntry) -> str:
         """Get full content from cache entry."""
@@ -127,8 +131,32 @@ class SemanticCache:
         return self._storage.find_similar(embedding, exclude_path)
 
     def get_stats(self) -> dict[str, int | float]:
-        """Get cache statistics."""
-        return self._storage.get_stats()
+        """Get cache statistics including memory usage."""
+        stats = self._storage.get_stats()
+
+        # Add process memory stats
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        stats["process_rss_mb"] = round(int(line.split()[1]) / 1024, 1)
+                        break
+        except OSError:
+            pass
+
+        # Add merge cache stats
+        from .core.tokenizer import _tokenizer
+        if _tokenizer is not None:
+            stats["merge_cache_entries"] = len(_tokenizer._merge_cache)
+            stats["merge_cache_maxsize"] = _tokenizer._merge_cache_maxsize
+
+        # Add embedding model readiness
+        from .core.embeddings import _execution_provider, _model_ready
+
+        stats["embedding_ready"] = _model_ready
+        stats["embedding_provider"] = _execution_provider
+
+        return stats
 
     def clear(self) -> int:
         """Clear all cache entries."""
@@ -239,7 +267,7 @@ def smart_read(
             )
             result_content = f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
             embedding = cache.get_embedding(content)
-            cache.put(str(file_path), content, mtime, embedding, tokens=tokens_original)
+            cache.put(str(file_path), content, mtime, embedding)
 
             tokens_returned = count_tokens(result_content)
             return ReadResult(
@@ -277,7 +305,7 @@ def smart_read(
                             f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
-                        cache.put(str(file_path), content, mtime, embedding, tokens=tokens_original)
+                        cache.put(str(file_path), content, mtime, embedding)
 
                         tokens_returned = count_tokens(result_content)
                         return ReadResult(
@@ -316,7 +344,7 @@ def smart_read(
             truncated = True
 
     embedding = cache.get_embedding(content)
-    cache.put(str(file_path), content, mtime, embedding, tokens=tokens_original)
+    cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
     return ReadResult(
@@ -335,6 +363,8 @@ def smart_read(
 MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10MB max content size for write
 MAX_EDIT_SIZE = 10 * 1024 * 1024  # 10MB max file size for edit
 MAX_MATCHES = 10000  # Max occurrences for replace_all
+MAX_RETURN_DIFF_TOKENS = 8000  # Hard cap for emitted diff payloads
+MAX_DIFF_TO_FULL_RATIO = 0.9  # Suppress diff payloads near full-content size
 
 # Auto-format configuration: extension -> (command, args...)
 # Command must accept file path as final argument
@@ -472,6 +502,63 @@ def _find_match_line_numbers(content: str, search_string: str) -> list[int]:
     return line_numbers
 
 
+def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
+    """Pick the response payload with the smallest token count."""
+    best_kind = ""
+    best_content = ""
+    best_tokens: int | None = None
+
+    for kind, content in options.items():
+        tokens = count_tokens(content)
+        if best_tokens is None or tokens < best_tokens:
+            best_kind = kind
+            best_content = content
+            best_tokens = tokens
+
+    return best_kind, best_content, best_tokens or 0
+
+
+def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | None:
+    """Suppress large diff payloads to optimize returned token count."""
+    if not diff_content:
+        return None
+
+    diff_tokens = count_tokens(diff_content)
+    full_tokens = max(full_tokens, 1)
+
+    # Preserve diffs for small files where readability is more useful than suppression.
+    if full_tokens <= 200:
+        return diff_content
+
+    if diff_tokens > MAX_RETURN_DIFF_TOKENS:
+        return None
+    if diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO):
+        return None
+
+    return diff_content
+
+
+def _fit_content_to_max_size(
+    content: str, max_size: int, cache: SemanticCache
+) -> tuple[str, bool]:
+    """Bound returned content to max_size using semantic summarization when needed."""
+    if len(content) <= max_size:
+        return content, False
+
+    try:
+        # Keep summarization embed_fn local to avoid extra allocations when unneeded.
+        def embed_fn(text: str):
+            emb = cache.get_embedding(text)
+            if emb is None:
+                return None
+            return np.asarray(emb, dtype=np.float32)
+
+        return summarize_semantic(content, max_size, embed_fn=embed_fn), True
+    except Exception as e:
+        logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
+        return truncate_semantic(content, max_size), True
+
+
 def smart_write(
     cache: SemanticCache,
     path: str,
@@ -578,6 +665,7 @@ def smart_write(
     if old_content is not None and old_content != content:
         diff_content = generate_diff(old_content, content)
         diff_stats_result = diff_stats(old_content, content)
+        diff_content = _suppress_large_diff(diff_content, tokens_written)
         # Token savings: diff vs full content in response
         diff_tokens = count_tokens(diff_content) if diff_content else 0
         tokens_saved = max(0, tokens_written - diff_tokens)
@@ -605,13 +693,14 @@ def smart_write(
                 if old_content is not None and old_content != content:
                     diff_content = generate_diff(old_content, content)
                     diff_stats_result = diff_stats(old_content, content)
+                    diff_content = _suppress_large_diff(diff_content, tokens_written)
                     diff_tokens = count_tokens(diff_content) if diff_content else 0
                     tokens_saved = max(0, tokens_written - diff_tokens)
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(content)
-        cache.put(str(file_path), content, mtime, embedding, tokens=tokens_written)
+        cache.put(str(file_path), content, mtime, embedding)
         action = "Created" if created else "Updated"
         if formatted:
             action += " and formatted"
@@ -760,10 +849,11 @@ def smart_edit(
     # Generate diff
     diff_content = generate_diff(content, new_content)
     diff_stats_result = diff_stats(content, new_content)
+    content_tokens = count_tokens(content)
+    diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
     # Calculate token savings from cached read
     # Only count as saved if content actually came from cache
-    content_tokens = count_tokens(content)
     tokens_saved = content_tokens if from_cache else 0
 
     # Calculate new content hash
@@ -788,11 +878,12 @@ def smart_edit(
                 # Re-compute diff against original (before format)
                 diff_content = generate_diff(content, new_content)
                 diff_stats_result = diff_stats(content, new_content)
+                diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content)
-        cache.put(str(file_path), new_content, mtime, embedding, tokens=count_tokens(new_content))
+        cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
             action += " and formatted"
@@ -825,17 +916,15 @@ MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
 
-def _make_timeout_event(seconds: int) -> threading.Event:
-    """Create a threading.Event that gets set after `seconds`.
+class _TimeoutError(Exception):
+    """Raised when operation times out."""
 
-    Thread-safe alternative to signal.SIGALRM — works from any thread,
-    which is required because FastMCP runs sync tools in a thread pool.
-    """
-    event = threading.Event()
-    timer = threading.Timer(seconds, event.set)
-    timer.daemon = True
-    timer.start()
-    return event
+    pass
+
+
+def _timeout_handler(signum: int, frame: object) -> None:
+    """Signal handler for glob timeout."""
+    raise _TimeoutError("Operation timed out")
 
 
 def semantic_search(
@@ -1014,10 +1103,19 @@ def batch_smart_read(
     paths = paths[:MAX_BATCH_FILES]
     max_total_tokens = min(max_total_tokens, MAX_BATCH_TOKENS)
 
-    # Pre-compute cached set in one pass (avoids N redundant DB queries in sort key)
-    resolved = {p: str(Path(p).expanduser().resolve()) for p in paths}
-    cached_set = {p for p, rp in resolved.items() if cache.get(rp) is not None}
-    paths_sorted = sorted(paths, key=lambda p: (p not in cached_set, p))
+    # Sort by estimated response size (smallest first) to maximize files under budget.
+    def estimate_min_tokens(p: str) -> int:
+        resolved = Path(p).expanduser().resolve()
+        cached = cache.get(str(resolved))
+        if cached and resolved.exists() and cached.mtime >= resolved.stat().st_mtime:
+            unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
+            return min(cached.tokens, count_tokens(unchanged_msg))
+        if not resolved.exists() or not resolved.is_file():
+            return 1
+        # Rough estimate for uncached content: ~4 characters per token.
+        return max(1, int(resolved.stat().st_size / 4))
+
+    paths_sorted = sorted(paths, key=lambda p: (estimate_min_tokens(p), p))
 
     files: list[FileReadSummary] = []
     contents: dict[str, str] = {}
@@ -1106,7 +1204,7 @@ def find_similar_files(
         source_embedding = cache.get_embedding(content)
         source_tokens = count_tokens(content)
         mtime = file_path.stat().st_mtime
-        cache.put(str(file_path), content, mtime, source_embedding, tokens=source_tokens)
+        cache.put(str(file_path), content, mtime, source_embedding)
 
     if source_embedding is None:
         return SimilarFilesResult(
@@ -1178,55 +1276,49 @@ def glob_with_cache_status(
     cached_count = 0
     total_cached_tokens = 0
 
-    # Thread-safe timeout (works from FastMCP's thread pool)
-    timed_out = _make_timeout_event(GLOB_TIMEOUT_SECONDS)
+    # Set up timeout (Unix only, skip on Windows)
+    use_timeout = hasattr(signal, "SIGALRM")
+    if use_timeout:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(GLOB_TIMEOUT_SECONDS)
 
-    # Phase 1: Collect file paths and mtimes (no DB queries)
-    file_entries: list[tuple[str, float]] = []  # (path_str, mtime)
-    for file_path in dir_path.glob(pattern):
-        if len(file_entries) >= MAX_GLOB_MATCHES or timed_out.is_set():
-            if timed_out.is_set():
-                logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
-            break
-        if not file_path.is_file():
-            continue
-        file_entries.append((str(file_path), file_path.stat().st_mtime))
+    try:
+        count = 0
+        for file_path in dir_path.glob(pattern):
+            if count >= MAX_GLOB_MATCHES:
+                break
+            if not file_path.is_file():
+                continue
 
-    # Phase 2: Batch DB lookup — single query instead of N round-trips
-    cached_tokens: dict[str, int] = {}
-    if file_entries:
-        storage = cache._storage
-        all_paths = [p for p, _ in file_entries]
-        with storage._pool.get_connection() as conn:
-            # SQLite handles up to ~999 params; chunk if needed
-            for i in range(0, len(all_paths), 900):
-                batch = all_paths[i : i + 900]
-                placeholders = ",".join("?" * len(batch))
-                rows = conn.execute(
-                    f"SELECT path, tokens FROM files WHERE path IN ({placeholders})",
-                    batch,
-                ).fetchall()
-                for path, tokens in rows:
-                    cached_tokens[path] = tokens
+            count += 1
+            path_str = str(file_path)
+            mtime = file_path.stat().st_mtime
 
-    # Phase 3: Build matches from collected data
-    for path_str, mtime in file_entries:
-        is_cached = path_str in cached_tokens
-        tokens = cached_tokens.get(path_str)
+            # Check cache status
+            cached = cache.get(path_str)
+            is_cached = cached is not None
+            tokens = cached.tokens if cached else None
 
-        if is_cached:
-            cached_count += 1
-            if tokens:
-                total_cached_tokens += tokens
+            if is_cached:
+                cached_count += 1
+                if tokens:
+                    total_cached_tokens += tokens
 
-        matches.append(
-            GlobMatch(
-                path=path_str,
-                cached=is_cached,
-                tokens=tokens,
-                mtime=mtime,
+            matches.append(
+                GlobMatch(
+                    path=path_str,
+                    cached=is_cached,
+                    tokens=tokens,
+                    mtime=mtime,
+                )
             )
-        )
+
+    except _TimeoutError:
+        logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
+    finally:
+        if use_timeout:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     # Sort: cached first, then by path
     matches.sort(key=lambda m: (not m.cached, m.path))
@@ -1384,10 +1476,11 @@ def smart_multi_edit(
     # Generate combined diff
     diff_content = generate_diff(original_content, new_content)
     stats = diff_stats(original_content, new_content)
+    original_tokens = count_tokens(original_content)
+    diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
     # Calculate token savings from cached read
-    content_tokens = count_tokens(original_content)
-    tokens_saved = content_tokens if from_cache else 0
+    tokens_saved = original_tokens if from_cache else 0
 
     # Calculate content hash
     content_hash = hash_content(new_content.encode("utf-8"))
@@ -1414,11 +1507,12 @@ def smart_multi_edit(
                 # Re-compute diff against original (before format)
                 diff_content = generate_diff(original_content, new_content)
                 stats = diff_stats(original_content, new_content)
+                diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content)
-        cache.put(str(file_path), new_content, mtime, embedding, tokens=count_tokens(new_content))
+        cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
             action += " and formatted"

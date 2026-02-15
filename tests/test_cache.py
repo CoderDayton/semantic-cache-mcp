@@ -86,6 +86,23 @@ class TestSmartReadChangedFile:
         assert entry2 is not None
         assert entry1.content_hash != entry2.content_hash
 
+    def test_changed_file_respects_max_size_when_full_is_cheapest(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Changed cached reads should still respect max_size when full beats diff."""
+        file_path = temp_dir / "large_changed.txt"
+        file_path.write_text("A" * 120_000)
+
+        # Prime cache with original content.
+        smart_read(semantic_cache_no_embeddings, str(file_path))
+
+        # Rewrite completely so diff is expensive; bounded full content should win.
+        file_path.write_text("B" * 120_000)
+        result = smart_read(semantic_cache_no_embeddings, str(file_path), max_size=5_000)
+
+        assert result.truncated is True
+        assert len(result.content) <= 5_000
+
 
 class TestSmartReadSemanticMatch:
     """Tests for smart_read with semantic similarity."""
@@ -114,6 +131,32 @@ class TestSmartReadSemanticMatch:
             result = smart_read(cache, str(file2))
             # The result should indicate it processed the file
             assert result.content is not None
+
+    def test_semantic_diff_includes_base_file_context(
+        self, temp_dir: Path, mock_embeddings: EmbeddingVector
+    ) -> None:
+        """Semantic diff responses should include the base cached path."""
+        db_path = temp_dir / "semantic_context.db"
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
+            cache = SemanticCache(db_path=db_path)
+
+            base = temp_dir / "base.py"
+            variant = temp_dir / "variant.py"
+
+            base_lines = [f"line {i}\n" for i in range(250)]
+            variant_lines = base_lines.copy()
+            variant_lines[123] = "line 123 changed\n"
+
+            base.write_text("".join(base_lines))
+            variant.write_text("".join(variant_lines))
+
+            smart_read(cache, str(base))
+            result = smart_read(cache, str(variant))
+
+            assert result.is_diff is True
+            assert result.semantic_match == str(base)
+            assert f"// Similar to cached: {base}" in result.content
 
 
 class TestSmartReadLargeFile:
