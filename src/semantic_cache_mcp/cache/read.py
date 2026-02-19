@@ -19,9 +19,7 @@ MAX_BATCH_FILES = 50
 MAX_BATCH_TOKENS = 200_000
 
 
-def _fit_content_to_max_size(
-    content: str, max_size: int, cache: SemanticCache
-) -> tuple[str, bool]:
+def _fit_content_to_max_size(content: str, max_size: int, cache: SemanticCache) -> tuple[str, bool]:
     """Bound returned content to max_size using semantic summarization when needed."""
     if len(content) <= max_size:
         return content, False

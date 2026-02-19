@@ -256,7 +256,7 @@ class SQLiteStorage:
         with self._pool.get_connection() as conn:
             placeholders = ",".join("?" * len(chunk_hashes))
             rows = conn.execute(
-                f"SELECT hash, data FROM chunks WHERE hash IN ({placeholders})",
+                f"SELECT hash, data FROM chunks WHERE hash IN ({placeholders})",  # nosec B608 — placeholders is "?,?,?" built from count, data is parameterized
                 chunk_hashes,
             ).fetchall()
 
@@ -406,13 +406,12 @@ class SQLiteStorage:
 
                 entries_with_score.sort()
                 evict_paths = [p for _, p, _ in entries_with_score[:evict_count]]
-                evict_chunks = [
-                    c for _, _, cs in entries_with_score[:evict_count] for c in cs
-                ]
+                evict_chunks = [c for _, _, cs in entries_with_score[:evict_count] for c in cs]
 
                 placeholders = ",".join("?" * len(evict_paths))
                 conn.execute(
-                    f"DELETE FROM files WHERE path IN ({placeholders})", evict_paths
+                    f"DELETE FROM files WHERE path IN ({placeholders})",
+                    evict_paths,  # nosec B608 — placeholders is "?,?,?" built from count, data is parameterized
                 )
                 conn.executemany(
                     "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
@@ -551,7 +550,7 @@ class SQLiteStorage:
 
             # Batch delete files
             placeholders = ",".join("?" * len(evict_paths))
-            conn.execute(f"DELETE FROM files WHERE path IN ({placeholders})", evict_paths)
+            conn.execute(f"DELETE FROM files WHERE path IN ({placeholders})", evict_paths)  # nosec B608 — placeholders is "?,?,?" built from count, data is parameterized
 
             # Batch update chunk ref counts
             conn.executemany(

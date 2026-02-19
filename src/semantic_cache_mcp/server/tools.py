@@ -35,6 +35,7 @@ from .response import (
 
 logger = logging.getLogger(__name__)
 
+
 @mcp.tool(
     meta={
         "version": "1.0.0",
@@ -149,6 +150,8 @@ def read(
         return _render_error("read", str(e), max_response_tokens)
     except Exception as e:
         return _render_error("read", f"reading failed: {e}", max_response_tokens)
+
+
 @mcp.tool()
 def stats(
     ctx: Context,
@@ -182,6 +185,8 @@ def stats(
         payload["output_mode"] = mode
 
     return _render_response(payload, max_response_tokens)
+
+
 @mcp.tool()
 def clear(
     ctx: Context,
@@ -195,6 +200,8 @@ def clear(
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
     return _render_response(payload, max_response_tokens)
+
+
 @mcp.tool()
 def write(
     ctx: Context,
@@ -280,6 +287,8 @@ def write(
         return _render_error(
             "write", "Internal error occurred while writing file", max_response_tokens
         )
+
+
 @mcp.tool()
 def edit(
     ctx: Context,
@@ -365,6 +374,8 @@ def edit(
         return _render_error(
             "edit", "Internal error occurred while editing file", max_response_tokens
         )
+
+
 @mcp.tool()
 def batch_edit(
     ctx: Context,
@@ -448,11 +459,7 @@ def batch_edit(
             # Surface failure details so LLM can retry without a separate debug call
             payload["failures"] = [
                 {
-                    "old": (
-                        o.old_string[:60] + "..."
-                        if len(o.old_string) > 60
-                        else o.old_string
-                    ),
+                    "old": (o.old_string[:60] + "..." if len(o.old_string) > 60 else o.old_string),
                     "error": o.error,
                 }
                 for o in result.outcomes
@@ -496,6 +503,8 @@ def batch_edit(
             "Internal error occurred while editing file",
             max_response_tokens,
         )
+
+
 @mcp.tool()
 def search(
     ctx: Context,
@@ -554,6 +563,8 @@ def search(
     except Exception as e:
         logger.exception("Error in search")
         return _render_error("search", str(e), max_response_tokens)
+
+
 @mcp.tool()
 def diff(
     ctx: Context,
@@ -604,6 +615,8 @@ def diff(
     except Exception as e:
         logger.exception("Error in diff")
         return _render_error("diff", str(e), max_response_tokens)
+
+
 @mcp.tool()
 def batch_read(
     ctx: Context,
@@ -656,7 +669,10 @@ def batch_read(
                 priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
 
         result = batch_smart_read(
-            cache, path_list, max_total_tokens=max_total_tokens, priority=priority_list,
+            cache,
+            path_list,
+            max_total_tokens=max_total_tokens,
+            priority=priority_list,
             diff_mode=diff_mode,
         )
 
@@ -713,6 +729,8 @@ def batch_read(
     except Exception as e:
         logger.exception("Error in batch_read")
         return _render_error("batch_read", str(e), max_response_tokens)
+
+
 @mcp.tool()
 def similar(
     ctx: Context,
@@ -764,6 +782,8 @@ def similar(
     except Exception as e:
         logger.exception("Error in similar")
         return _render_error("similar", str(e), max_response_tokens)
+
+
 @mcp.tool()
 def glob(
     ctx: Context,
@@ -790,7 +810,10 @@ def glob(
 
     try:
         result = glob_with_cache_status(
-            cache, pattern, directory=directory, cached_only=cached_only,
+            cache,
+            pattern,
+            directory=directory,
+            cached_only=cached_only,
         )
         matches_payload = []
         for m in result.matches:
@@ -817,6 +840,8 @@ def glob(
     except Exception as e:
         logger.exception("Error in glob")
         return _render_error("glob", str(e), max_response_tokens)
+
+
 def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
     """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
     expanded: list[str] = []

@@ -187,9 +187,8 @@ def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | No
     if full_tokens <= 200:
         return diff_content
 
-    should_suppress = (
-        diff_tokens > MAX_RETURN_DIFF_TOKENS
-        or diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO)
+    should_suppress = diff_tokens > MAX_RETURN_DIFF_TOKENS or diff_tokens >= int(
+        full_tokens * MAX_DIFF_TO_FULL_RATIO
     )
     if should_suppress:
         # Count added/removed lines and hunks from unified diff

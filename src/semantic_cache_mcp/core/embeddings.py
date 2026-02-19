@@ -78,11 +78,14 @@ def _get_model() -> TextEmbedding:
             #   for max sequence length; headroom for attention matmul spikes
             # - cudnn_conv_algo_search: HEURISTIC avoids cuDNN workspace bloat
             init_kwargs["providers"] = [
-                ("CUDAExecutionProvider", {
-                    "arena_extend_strategy": "kSameAsRequested",
-                    "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4GB
-                    "cudnn_conv_algo_search": "HEURISTIC",
-                }),
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "arena_extend_strategy": "kSameAsRequested",
+                        "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4GB
+                        "cudnn_conv_algo_search": "HEURISTIC",
+                    },
+                ),
             ]
 
         try:
@@ -103,9 +106,7 @@ def _get_model() -> TextEmbedding:
             # Backward compatibility: some fastembed versions may not accept providers.
             if "providers" not in init_kwargs:
                 raise
-            logger.warning(
-                "TextEmbedding does not accept providers arg, falling back"
-            )
+            logger.warning("TextEmbedding does not accept providers arg, falling back")
             init_kwargs.pop("providers", None)
             _embedding_model = TextEmbedding(**init_kwargs)
             _execution_provider = "CPUExecutionProvider"

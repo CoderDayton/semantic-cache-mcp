@@ -402,7 +402,7 @@ def _ensure_tokenizer() -> BPETokenizer | None:
         import urllib.request
 
         TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(O200K_BASE_URL, cache_file)
+        urllib.request.urlretrieve(O200K_BASE_URL, cache_file)  # nosec B310 — compile-time constant URL, hash-verified post-download
 
         if not _verify_hash(cache_file, O200K_BASE_SHA256):
             cache_file.unlink()

@@ -49,6 +49,7 @@ class SemanticCache:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
             # By call time the cache package is fully initialized in sys.modules.
             from . import embed as _embed  # noqa: PLC0415
+
             result = _embed(text)
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")

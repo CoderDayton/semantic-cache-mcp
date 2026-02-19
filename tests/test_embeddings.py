@@ -41,7 +41,9 @@ class TestEmbeddingProviders:
                 return []
 
         monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
-        monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding))
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+        )
 
         embeddings._get_model()
 
@@ -67,7 +69,9 @@ class TestEmbeddingProviders:
                 return []
 
         monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: False)
-        monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding))
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+        )
 
         embeddings._get_model()
 
@@ -91,7 +95,9 @@ class TestEmbeddingProviders:
                 return []
 
         monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
-        monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding))
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+        )
 
         embeddings._get_model()
 

@@ -19,6 +19,7 @@ import array
 import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -310,6 +311,23 @@ class LSHIndex:
         self._embeddings.pop(item_id, None)
 
         return True
+
+    @overload
+    def query(
+        self,
+        embedding: array.array | list | NDArray,
+        k: int = ...,
+        *,
+        return_distances: Literal[True],
+    ) -> list[tuple[int, float]]: ...
+
+    @overload
+    def query(
+        self,
+        embedding: array.array | list | NDArray,
+        k: int = ...,
+        return_distances: Literal[False] = ...,
+    ) -> list[int]: ...
 
     def query(
         self,

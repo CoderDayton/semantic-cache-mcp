@@ -246,7 +246,10 @@ class TestGlobWithCacheStatus:
 
         # Glob for all files but only cached
         result = glob_with_cache_status(
-            cache, "*", directory=str(temp_dir), cached_only=True,
+            cache,
+            "*",
+            directory=str(temp_dir),
+            cached_only=True,
         )
 
         # Only the cached file should appear

@@ -7,24 +7,24 @@ pre-commit:
   commands:
     ruff-check:
       glob: "*.py"
-      run: uv run ruff check src/ tests/ --fix --ignore E501,N806,SIM108,SIM102,F841,B904,B905,UP028,W293,UP040,E402,C416
+      run: uv run python -m ruff check src/ tests/ --fix --ignore E501,N806,SIM108,SIM102,F841,B904,B905,UP028,W293,UP040,E402,C416
       stage_fixed: true
 
     ruff-format:
       glob: "*.py"
-      run: uv run ruff format src/ tests/
+      run: uv run python -m ruff format src/ tests/
       stage_fixed: true
 
     mypy:
       glob: "*.py"
-      run: uv run mypy src/ || echo "Mypy found type errors (non-blocking)"
+      run: uv run python -m mypy src/ || echo "Mypy found type errors (non-blocking)"
       skip:
         - merge
         - rebase
 
     bandit:
       glob: "*.py"
-      run: uv run bandit -c pyproject.toml -r src/
+      run: uv run python -m bandit -c pyproject.toml -r src/
       skip:
         - merge
         - rebase
@@ -33,13 +33,13 @@ pre-push:
   parallel: false
   commands:
     tests:
-      run: uv run pytest tests/ -x -q
+      run: uv run python -m pytest tests/ -x -q
       skip:
         - merge
         - rebase
 
     type-check:
-      run: uv run mypy src/ || echo "Mypy found type errors (non-blocking)"
+      run: uv run python -m mypy src/ || echo "Mypy found type errors (non-blocking)"
       skip:
         - merge
         - rebase

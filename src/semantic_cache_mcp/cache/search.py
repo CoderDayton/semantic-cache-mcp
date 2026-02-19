@@ -89,6 +89,7 @@ def _top_k_with_lsh(
     # candidates: list of (item_id, similarity) already sorted by similarity
     return [(idx, sim) for idx, sim in candidates[:k]]
 
+
 def semantic_search(
     cache: SemanticCache,
     query: str,
@@ -164,6 +165,8 @@ def semantic_search(
         files_searched=len(paths),
         cached_files=len(rows),
     )
+
+
 def compare_files(
     cache: SemanticCache,
     path1: str,
@@ -245,6 +248,7 @@ def compare_files(
         from_cache=(from_cache1, from_cache2),
     )
 
+
 def find_similar_files(
     cache: SemanticCache,
     path: str,
@@ -324,6 +328,8 @@ def find_similar_files(
         similar_files=similar_files,
         files_searched=len(paths),
     )
+
+
 def glob_with_cache_status(
     cache: SemanticCache,
     pattern: str,

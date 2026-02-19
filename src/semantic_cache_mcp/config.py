@@ -15,6 +15,7 @@ logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 CACHE_DIR: Final = Path.home() / ".cache" / "semantic-cache-mcp"
 DB_PATH: Final = CACHE_DIR / "cache.db"
 
+
 def _env_int(name: str, default: int) -> int:
     """Read positive integer env var with fallback."""
     raw = environ.get(name)

@@ -456,9 +456,7 @@ class TestSmartWriteAppend:
         """Append to non-existent file creates it."""
         file_path = temp_dir / "append_new.txt"
 
-        result = smart_write(
-            semantic_cache_no_embeddings, str(file_path), "chunk1\n", append=True
-        )
+        result = smart_write(semantic_cache_no_embeddings, str(file_path), "chunk1\n", append=True)
 
         assert result.created is True
         assert file_path.read_text() == "chunk1\n"
@@ -470,9 +468,7 @@ class TestSmartWriteAppend:
         file_path = temp_dir / "append_cat.txt"
         file_path.write_text("chunk1\n")
 
-        smart_write(
-            semantic_cache_no_embeddings, str(file_path), "chunk2\n", append=True
-        )
+        smart_write(semantic_cache_no_embeddings, str(file_path), "chunk2\n", append=True)
 
         assert file_path.read_text() == "chunk1\nchunk2\n"
 
@@ -483,12 +479,8 @@ class TestSmartWriteAppend:
         file_path = temp_dir / "append_multi.txt"
 
         smart_write(semantic_cache_no_embeddings, str(file_path), "line1\n")
-        smart_write(
-            semantic_cache_no_embeddings, str(file_path), "line2\n", append=True
-        )
-        smart_write(
-            semantic_cache_no_embeddings, str(file_path), "line3\n", append=True
-        )
+        smart_write(semantic_cache_no_embeddings, str(file_path), "line2\n", append=True)
+        smart_write(semantic_cache_no_embeddings, str(file_path), "line3\n", append=True)
 
         assert file_path.read_text() == "line1\nline2\nline3\n"
 
