@@ -80,9 +80,8 @@ Add to your `~/.claude/CLAUDE.md` to enforce semantic-cache usage globally:
 
 - semantic-cache: MUST use instead of native file tools (80%+ token savings)
   - `read` → single-file inspection (diffs by default)
-    - `diff_mode=true` → keep during iteration
-    - `force_full=true` → only when full file context is required
-    - `offset`/`limit` → only after narrowing to target lines
+    - `diff_mode=true` → keep during iteration; set `false` only when full uncached content is needed
+    - `offset`/`limit` → read specific line ranges without loading full content into context
   - `batch_read` → use for 2+ files (better than repeated `read`)
   - `write` → replaces Write tool (caches result, returns diff on overwrite)
     - `auto_format=true` → runs formatter after write (ruff/prettier/gofmt)

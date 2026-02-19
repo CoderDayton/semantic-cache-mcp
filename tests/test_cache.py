@@ -196,24 +196,24 @@ class TestSmartReadLargeFile:
         assert any(marker in content_lower for marker in ["truncated", "omitted", "lines omitted"])
 
 
-class TestSmartReadForceFullBypass:
-    """Tests for smart_read with force_full option."""
+class TestSmartReadDiffModeDisabled:
+    """Tests for smart_read with diff_mode=False to get full content."""
 
-    def test_force_full_bypasses_cache(
+    def test_diff_mode_false_bypasses_cache(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
-        """force_full=True should return full content even if cached."""
+        """diff_mode=False should return full content even if cached."""
         file_path = sample_files["python"]
         content = file_path.read_text()
 
         # First read to cache
         smart_read(semantic_cache_no_embeddings, str(file_path))
 
-        # Force full read
+        # Read with diff_mode=False to get full content
         result = smart_read(
             semantic_cache_no_embeddings,
             str(file_path),
-            force_full=True,
+            diff_mode=False,
         )
         assert result.content == content
         assert result.is_diff is False

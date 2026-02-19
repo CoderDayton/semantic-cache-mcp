@@ -140,7 +140,6 @@ def read(
     path: str,
     max_size: int = MAX_CONTENT_SIZE,
     diff_mode: bool = True,
-    force_full: bool = False,
     offset: int | None = None,
     limit: int | None = None,
 ) -> str:
@@ -149,14 +148,13 @@ def read(
     Timing guidance:
     - Use for single-file inspection and verification.
     - For 2+ files, prefer batch_read first.
-    - Keep diff_mode=true during iteration; use force_full only when full file context is required.
-    - Use offset/limit only after narrowing to target lines.
+    - Keep diff_mode=true during iteration; set false only for full uncached content.
+    - Use offset/limit to read specific line ranges without loading full content into context.
 
     Args:
         path: Path to the file to read
         max_size: Maximum content size to return (default: 100000)
-        diff_mode: Return diff if file was previously read (default: true)
-        force_full: Force full content even if cached (default: false)
+        diff_mode: Return diff if previously read (default: true). Set false for full content.
         offset: Line number to start reading from (1-based). Only provide if file is too large.
         limit: Number of lines to read. Only provide if file is too large.
     """
@@ -209,7 +207,6 @@ def read(
             path=path,
             max_size=max_size,
             diff_mode=diff_mode,
-            force_full=force_full,
         )
         payload = {
             "ok": True,
@@ -229,7 +226,6 @@ def read(
             payload["params"] = {
                 "max_size": max_size,
                 "diff_mode": diff_mode,
-                "force_full": force_full,
                 "offset": offset,
                 "limit": limit,
             }
@@ -364,7 +360,9 @@ def write(
         return _render_error("write", f"I/O operation failed - {e}", max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in write")
-        return _render_error("write", "Internal error occurred while writing file", max_response_tokens)
+        return _render_error(
+            "write", "Internal error occurred while writing file", max_response_tokens
+        )
 
 
 @mcp.tool()
@@ -445,7 +443,9 @@ def edit(
         return _render_error("edit", f"I/O operation failed - {e}", max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in edit")
-        return _render_error("edit", "Internal error occurred while editing file", max_response_tokens)
+        return _render_error(
+            "edit", "Internal error occurred while editing file", max_response_tokens
+        )
 
 
 @mcp.tool()

@@ -81,16 +81,18 @@ class TestFullCacheLifecycle:
         assert result.is_diff is True
         assert result.tokens_saved > 0
 
-    def test_force_full_bypasses_cache(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
-        """force_full=True should return full content even if cached."""
+    def test_diff_mode_false_bypasses_cache(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """diff_mode=False should return full content even if cached."""
         test_file = temp_dir / "test.py"
         test_file.write_text("def hello():\n    return 'world'\n")
 
         # First read
         smart_read(semantic_cache, str(test_file))
 
-        # Second read with force_full
-        result = smart_read(semantic_cache, str(test_file), force_full=True)
+        # Second read with diff_mode=False
+        result = smart_read(semantic_cache, str(test_file), diff_mode=False)
 
         assert "def hello():" in result.content
         assert result.is_diff is False

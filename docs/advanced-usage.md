@@ -6,7 +6,7 @@
 
 - Use `read` for single-file iteration and verification.
 - Use `batch_smart_read` for 2+ files instead of repeated `smart_read`.
-- Keep `diff_mode=True` while iterating; use `force_full=True` only when full context is required.
+- Keep `diff_mode=True` while iterating; use `diff_mode=False` only when you need full uncached content.
 - Use `smart_edit` for one targeted replacement; use `smart_multi_edit` for 2+ edits in one file.
 - Seed cache before `semantic_search` and `find_similar_files`.
 - Start search/similar with lower `k` (3-5), then increase only if recall is insufficient.
@@ -473,9 +473,6 @@ similarity = binary_similarity(binary1, binary2)
 ```python
 # Disable diff mode (always return full content)
 result = smart_read(cache, path, diff_mode=False)
-
-# Force full content even if cached
-result = smart_read(cache, path, force_full=True)
 
 # Limit content size
 result = smart_read(cache, path, max_size=50000)

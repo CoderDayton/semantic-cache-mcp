@@ -130,9 +130,9 @@ class SemanticCache:
         """Find semantically similar cached file."""
         return self._storage.find_similar(embedding, exclude_path)
 
-    def get_stats(self) -> dict[str, int | float]:
+    def get_stats(self) -> dict[str, int | float | str | bool]:
         """Get cache statistics including memory usage."""
-        stats = self._storage.get_stats()
+        stats: dict[str, int | float | str | bool] = {**self._storage.get_stats()}
 
         # Add process memory stats
         try:
