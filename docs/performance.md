@@ -1,60 +1,183 @@
 # Performance
 
-## Token Reduction
+## Token Reduction by Strategy
 
-| Strategy | Savings | When Used |
-|----------|---------|-----------|
-| Unchanged file | 99% | File mtime matches cache |
-| Diff (changed) | 80-95% | File modified since cache |
-| Semantic match | 70-90% | Similar file in cache |
-| Truncation | 50-80% | Large files > 100KB |
+| Strategy          | Savings | Trigger                           |
+|-------------------|---------|-----------------------------------|
+| Unchanged (mtime) | ~99%    | File mtime matches cached entry   |
+| Diff (changed)    | 80–95%  | File modified since last cache    |
+| Semantic match    | 70–90%  | Similar file found in cache       |
+| Summarized        | 50–80%  | File exceeds `MAX_CONTENT_SIZE`   |
 
 ---
 
-## Optimization Techniques
+## Optimization Summary
 
-| Technique | Benefit | Implementation |
-|-----------|---------|----------------|
-| **HyperCDC chunking** | 2.7x faster than Rabin | Gear hash with skip-min optimization |
-| **Cached ZSTD compressors** | 2x faster compression | Avoid object creation per call |
-| **O(1) magic detection** | 15-20x faster detection | First-byte lookup table |
-| **Native ZSTD threading** | 19x faster large files | Use ZSTD threads, not Python |
-| **BLAKE3 hashing** | 3.8-4.9x faster than BLAKE2b | Hardware-accelerated, parallelizable |
-| **LRU cache for hashing** | Skip repeated hashing | 16K chunks, 4K blocks, 2K content |
-| **Priority queue tokenizer** | O(N log M) vs O(N²) | Heap-based BPE merging |
-| **SQLite WAL mode** | Better read concurrency | No reader locks, parallel access |
-| **Connection pooling** | Eliminate connection overhead | Queue-based pool, 5-10ms savings per query |
-| **WAL checkpointing** | Read-after-write consistency | TRUNCATE mode after commits |
-| **Partial indexes** | Faster filtered scans | Index on `embedding IS NOT NULL` |
-| **Batch SQL operations** | 2-5x faster updates | `executemany` + `IN` clause |
-| **WITHOUT ROWID tables** | 20-30% space savings | Text primary keys optimized |
-| **array.array for embeddings** | ~50% less memory | Typed arrays vs Python lists |
-| **frombytes() array conversion** | ~100x faster | Direct memcpy vs tolist() iteration in embeddings/similarity |
-| **Batch DB queries in glob** | N→1 round-trips | Single `SELECT ... WHERE IN` replaces per-file cache lookups |
-| **Pre-computed tokens in put()** | Avoid double work | Callers pass token count, skip redundant `count_tokens()` |
-| **Batch read dedup** | 2x fewer lookups | Pre-computed cached set eliminates double cache.get() in sort |
-| **Module-level struct import** | Reduce call overhead | Single import vs per-call import in similarity hot paths |
-| **Generator expressions** | Avoid intermediate lists | Used in hot paths |
-| **`__slots__` on dataclasses** | Eliminate `__dict__` | Memory-efficient models |
+| Technique                          | Benefit                     | Details                                                       |
+|------------------------------------|-----------------------------|---------------------------------------------------------------|
+| **SIMD parallel CDC chunking**     | 5–7× faster                 | Boundary detection across CPU cores; ~70–95 MB/s on 4-core   |
+| **Serial HyperCDC (Gear hash)**    | 2.7× vs Rabin               | Skip-min optimization; ~13–14 MB/s                           |
+| **int8 quantized embeddings**      | 22× storage reduction       | 772 bytes vs 17KB per 768D vector; <0.3% accuracy loss       |
+| **LSH approximate search**         | O(1) candidate retrieval     | Ephemeral SimHash index for caches ≥100 files                |
+| **BLAKE3 hashing**                 | 3.8–4.9× vs BLAKE2b         | Hardware-accelerated on 8KB+ chunks                          |
+| **LRU hash cache**                 | Avoid re-hashing             | 16K chunks, 4K blocks, 2K content hashes                     |
+| **Adaptive ZSTD compression**      | Entropy-matched codec        | STORE/ZSTD-1/ZSTD-3/ZSTD-9 selected per chunk               |
+| **Cached ZSTD compressors**        | 2× faster compression        | Avoid object creation overhead per call                      |
+| **O(1) magic-byte detection**      | 15–20× faster                | First-byte table skips already-compressed data               |
+| **Native ZSTD multi-threading**    | 19× faster large files       | Uses ZSTD threads, not Python threads; triggered at >4MB     |
+| **O(N log M) BPE tokenizer**       | vs O(N²) naive               | Priority-queue merge with memoization                        |
+| **Batch matrix similarity**        | 6–14× vs per-vector loop     | Single SIMD operation over all cached embeddings             |
+| **frombytes() array conversion**   | ~100× faster                 | Direct memcpy vs tolist() for embedding deserialization       |
+| **Batch SQL IN clause**            | N→1 DB round-trips           | Single `SELECT ... WHERE IN` replaces per-file lookups       |
+| **Pre-computed cache set in batch**| 2× fewer lookups             | Eliminates double cache.get() in batch_smart_read sort       |
+| **Partial index on embedding**     | Faster similarity scans      | Indexes only rows with `embedding IS NOT NULL`               |
+| **WITHOUT ROWID tables**           | 20–30% space savings         | Text primary keys stored directly in B-tree                  |
+| **SQLite WAL mode**                | Concurrent reads             | Reads never block; multiple readers + one writer             |
+| **Connection pooling**             | Eliminate ~5–10ms overhead   | Queue-based pool, 5 connections; reused across requests      |
+| **WAL checkpoint (TRUNCATE)**      | Read-after-write consistency | Ensures reads see latest commits                             |
+| **array.array for embeddings**     | ~50% less memory             | Typed arrays vs Python lists                                 |
+| **`__slots__` on dataclasses**     | Eliminate `__dict__`         | Memory-efficient data models                                 |
+| **Generator expressions**          | Avoid intermediate lists     | Used in hot paths (chunk iteration, similarity ranking)      |
+| **Semantic summarization**         | 50–80% savings on large files | Segment scoring + greedy selection preserves structure      |
+
+---
+
+## Chunking
+
+### SIMD Parallel CDC
+
+**5–7× speedup** via CPU-core-level parallelism:
+
+1. Divide content into N segments (one per core)
+2. Each worker independently finds CDC boundaries in its segment
+3. Merge overlapping boundaries at segment edges
+
+```python
+# Hot path
+boundaries = _parallel_cdc_boundaries(content, num_threads=4)
+chunks = [content[start:end] for start, end in boundaries]
+```
+
+**Benchmarks (10MB file, 4 cores):**
+
+| Method              | Throughput    | Time     |
+|---------------------|---------------|----------|
+| Serial HyperCDC     | ~13–14 MB/s   | ~750 ms  |
+| SIMD Parallel CDC   | ~70–95 MB/s   | ~110 ms  |
+| **Speedup**         |               | **5–7×** |
+
+Falls back to serial HyperCDC automatically if SIMD is unavailable.
+
+### Serial HyperCDC (Gear Hash)
+
+**2.7× faster than Rabin fingerprinting:**
+
+```python
+# Pre-computed gear table; skip-min skips first 2KB per chunk
+h = ((h << 1) + gear[content[i]]) & 0xFFFFFFFFFFFFFFFF
+if (h & mask) == 0:
+    # boundary found
+```
+
+- ~8KB average chunk size (configurable via mask bits)
+- ~13–14 MB/s throughput
+- Content-defined boundaries → similar files share chunks even when bytes shift
+
+---
+
+## Hashing
+
+BLAKE3 vs BLAKE2b (no cache hits):
+
+| Chunk Size | BLAKE2b    | BLAKE3     | Speedup  |
+|------------|------------|------------|----------|
+| 256 B      | 543 MB/s   | 468 MB/s   | 0.86×    |
+| 8 KB       | 1,094 MB/s | 4,195 MB/s | **3.8×** |
+| 64 KB      | 1,150 MB/s | 5,597 MB/s | **4.9×** |
+| 1 MB (stream) | 1,140 MB/s | 5,121 MB/s | **4.5×** |
+
+BLAKE3 dominates on typical CDC chunk sizes (8KB+). The slight regression at 256B is due to the larger digest size (32 vs 20 bytes) — irrelevant in practice since chunks are rarely that small.
+
+`DeduplicateIndex`: ~966K lookups/sec using thread-safe binary fingerprints.
+
+---
+
+## Compression
+
+Adaptive codec selection based on fast entropy estimation:
+
+```python
+# Ultra-fast entropy approximation (80× faster than Shannon entropy)
+def _fast_entropy(data: bytes) -> float:
+    unique = len(set(data[:256]))
+    return (unique.bit_length() - 1) + (unique & (unique - 1) > 0) * 0.5
+```
+
+| Entropy  | Codec    | Level | Write Throughput |
+|----------|----------|-------|-----------------|
+| > 7.5    | STORE    | —     | 29 GB/s         |
+| > 6.5    | ZSTD     | 1     | 6.9 GB/s        |
+| > 4.0    | ZSTD     | 3     | 5.3 GB/s        |
+| ≤ 4.0    | ZSTD     | 9     | 4.8 GB/s        |
+
+Source code (low entropy) uses ZSTD-9. Already-compressed binary files use STORE to avoid wasted CPU.
+
+---
+
+## Embeddings and Similarity
+
+### int8 Quantization
+
+768-dimensional float32 embedding → int8 quantized:
+
+```
+float32: 768 dims × 4 bytes = 3,072 bytes
+int8:    768 dims × 1 byte  = 768 bytes → stored as 772-byte blob
+Reduction: 4× in raw bytes; 22× vs original Python list[float] (~17KB)
+```
+
+Accuracy: <0.3% mean error vs exact float32 cosine similarity.
+
+### Batch Matrix Operations
+
+```
+1000 vectors, 768D (nomic-embed-text-v1.5):
+
+Per-vector loop:               ~5.0 ms  (1×)
+Batch matrix (float32):        ~0.8 ms  (6×)
+Batch matrix (int8 quantized): ~0.6 ms  (8×)
+Quantized + dimension pruning: ~0.35 ms (14×)
+```
+
+### LSH Approximate Search
+
+For caches ≥100 files, `_top_k_with_lsh()` builds an ephemeral SimHash index:
+
+1. Project each vector onto random hyperplanes (64 bits, 4 tables, band_size=8)
+2. Query retrieves candidates in O(1) per table
+3. Exact cosine re-ranking on candidates (4× k)
+
+This eliminates the O(N) exhaustive scan for large caches without persisting index state.
 
 ---
 
 ## Memory Efficiency
 
-### Embeddings
+### Embedding Storage
+
+| Format                | Size (768D) | Notes                           |
+|-----------------------|-------------|---------------------------------|
+| `list[float]`         | ~17 KB      | CPython list overhead           |
+| `array.array('f')`    | ~3 KB       | 6× reduction                   |
+| `int8 quantized blob` | ~772 B      | 22× reduction, <0.3% error     |
 
 ```python
-# Before: list[float] — 72 bytes for 3 floats
-embedding = [0.1, 0.2, 0.3]
+# Before: Python list (one float = 28 bytes in CPython)
+embedding = [0.1, 0.2, 0.3]  # 3 floats = ~84 bytes overhead
 
-# After: array.array('f') — 12 bytes for 3 floats
-embedding = array.array('f', [0.1, 0.2, 0.3])  # 6x reduction
+# After: typed array (4 bytes/float, no per-element overhead)
+embedding = array.array('f', [0.1, 0.2, 0.3])  # 12 bytes
 ```
-
-For a 768-dimension embedding (nomic-embed-text-v1.5):
-- `list[float]`: ~6KB per embedding
-- `array.array('f')`: ~3KB per embedding (50% reduction)
-- `int8 quantized`: ~772 bytes (22x reduction)
 
 ### Dataclasses with `__slots__`
 
@@ -63,191 +186,69 @@ For a 768-dimension embedding (nomic-embed-text-v1.5):
 class CacheEntry:
     path: str
     content_hash: str
-    # ... no __dict__ overhead
+    tokens: int
+    # No __dict__ per instance — significant savings at scale
 ```
 
 ---
 
-## Chunking Performance
+## SQLite
 
-### SIMD-Accelerated Parallel CDC
+### PRAGMA Configuration
 
-**5-7x speedup** over serial HyperCDC through boundary-level parallelism:
-
-```python
-# Hot path - parallel boundary detection across segments
-boundaries = _parallel_find_boundaries(content, num_threads=4)
-chunks = [content[start:end] for start, end in boundaries]
-```
-
-**Benchmarks** (10MB file, 4 cores):
-- Serial HyperCDC: ~13-14 MB/s (~750ms)
-- Parallel CDC: ~70-95 MB/s (~105-140ms)
-- Speedup: 5-7x on multi-core systems
-
-**Fallback:** Gracefully falls back to serial HyperCDC if SIMD unavailable.
-
-### Serial HyperCDC (Gear Hash)
-
-2.7x faster than Rabin fingerprinting:
-
-```python
-# Hot path - pre-computed gear table, skip min_size bytes
-h = ((h << 1) + gear[content[i]]) & 0xFFFFFFFFFFFFFFFF
-if (h & mask) == 0:
-    # Boundary found
-```
-
-**Benchmarks** (representative, not guaranteed):
-- Throughput: ~13-14 MB/s
-- Average chunk size: ~8KB (configurable via mask bits)
-- 1MB file: ~75ms chunking time
-
----
-
-## SQLite Optimizations
-
-### Batch Inserts
-
-```python
-# Instead of individual inserts
-cursor.executemany(
-    "INSERT OR IGNORE INTO chunks VALUES (?, ?, ?, ?)",
-    chunks_data
-)
-```
-
-### Efficient Lookups
-
-```python
-# Use IN clause for batch fetches
-placeholders = ",".join("?" * len(hashes))
-cursor.execute(f"SELECT * FROM chunks WHERE hash IN ({placeholders})", hashes)
-```
-
----
-
-## Compression Strategy
-
-Multi-codec adaptive compression with ZSTD (primary), LZ4, and Brotli fallbacks:
-
-```python
-# Ultra-fast entropy approximation (80x faster than Shannon)
-def _fast_entropy(data: bytes) -> float:
-    unique = len(set(data[:256]))
-    return (unique.bit_length() - 1) + (unique & (unique - 1) > 0) * 0.5
-```
-
-| Entropy | Codec | Level | Throughput |
-|---------|-------|-------|------------|
-| > 7.5 | STORE | - | 29 GB/s |
-| > 6.5 | ZSTD | 1 | 6.9 GB/s |
-| > 4.0 | ZSTD | 3 | 5.3 GB/s |
-| <= 4.0 | ZSTD | 9 | 4.8 GB/s |
-
-**Features:**
-- Cached ZSTD compressors (avoid object creation)
-- Native multi-threading for files > 4MB
-- O(1) magic-byte detection for pre-compressed data
-- Automatic codec fallback (ZSTD → Brotli → LZ4 → STORE)
-
----
-
-## Hashing Performance
-
-BLAKE3 vs BLAKE2b throughput (no cache):
-
-| Chunk Size | BLAKE2b | BLAKE3 | Speedup |
-|------------|---------|--------|---------|
-| 256B | 543 MB/s | 468 MB/s | 0.86x |
-| 8KB | 1,094 MB/s | 4,195 MB/s | **3.83x** |
-| 64KB | 1,150 MB/s | 5,597 MB/s | **4.87x** |
-
-**Streaming (1MB file):** 1,140 → 5,121 MB/s (**4.5x faster**)
-
-BLAKE3 excels on typical CDC chunk sizes (8KB+). The slight overhead on tiny chunks (<256B) is due to larger digest size (32 bytes vs 20 bytes).
-
-**DeduplicateIndex:** ~966K lookups/sec with thread-safe binary fingerprints.
-
----
-
-## SQLite Query Optimization
-
-**WAL Mode Benefits:**
-- No reader locks: Reads never block reads or writes
-- Better concurrency: Multiple readers + one writer simultaneously
-- Faster writes: Asynchronous checkpointing
-
-**PRAGMA Settings:**
 ```sql
-journal_mode = WAL        -- Write-Ahead Logging
-synchronous = NORMAL      -- Safe in WAL mode, 2-3x faster writes
-cache_size = -64000       -- 64MB cache (vs 2MB default)
-temp_store = MEMORY       -- Avoid disk I/O for temp tables
-mmap_size = 268435456     -- 256MB memory-mapped I/O
+PRAGMA journal_mode  = WAL;         -- concurrent reads, no reader locks
+PRAGMA synchronous   = NORMAL;      -- safe in WAL, 2-3× faster writes
+PRAGMA cache_size    = -64000;      -- 64MB page cache (vs 2MB default)
+PRAGMA temp_store    = MEMORY;      -- avoid temp disk I/O
+PRAGMA mmap_size     = 268435456;   -- 256MB memory-mapped I/O
 ```
 
-**Index Optimizations:**
-- **Partial index**: `CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL`
-  - Only indexes rows with embeddings (saves space, faster scans)
-  - Similarity search uses index for filtered `SELECT`
-- **WITHOUT ROWID**: Tables with text primary keys use B-tree directly (20-30% space savings)
+### Schema Optimizations
 
-**Query Patterns:**
-- Batch deletes: `DELETE FROM files WHERE path IN (?, ?, ...)` vs individual deletes
-- Batch updates: `executemany()` for bulk ref_count changes
-- Order by created_at: Prioritize recent files in similarity search
+```sql
+-- WITHOUT ROWID: 20-30% space savings for text-keyed tables
+CREATE TABLE chunks (...) WITHOUT ROWID;
+CREATE TABLE files  (...) WITHOUT ROWID;
 
-**Connection Pooling:**
-- Queue-based pool with bounded size (default: 5 connections)
-- Eliminates connection creation overhead (~5-10ms per connection)
-- `check_same_thread=False` allows cross-thread connection reuse
-- `PRAGMA wal_checkpoint(TRUNCATE)` after commits ensures read-after-write consistency
-- Thread-safe via `queue.Queue` for checkout/checkin
-- Automatic cleanup on shutdown
+-- Partial index: only index rows with embeddings
+CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;
+```
 
----
+### Query Patterns
 
-## Similarity Search Performance
+```python
+# Batch fetch (1 round-trip vs N)
+placeholders = ",".join("?" * len(hashes))
+conn.execute(f"SELECT hash, data FROM chunks WHERE hash IN ({placeholders})", hashes)
 
-Batch similarity with int8 quantization (1000 vectors, 768D nomic embeddings):
+# Batch insert
+conn.executemany("INSERT OR IGNORE INTO chunks VALUES (?, ?, ?, ?)", chunks_data)
 
-| Method | Time | Speedup |
-|--------|------|---------|
-| Per-vector loop | ~5ms | baseline |
-| Batch matrix (float32) | ~0.8ms | 6x |
-| Batch matrix (int8 quantized) | ~0.6ms | 8x |
-| Quantized + dimension pruning | ~0.35ms | 14x |
-
-**Quantization accuracy:** <0.3% error vs exact computation.
-
-**find_similar() optimization:**
-- Before: O(N) individual `cosine_similarity()` calls
-- After: Single `top_k_similarities()` SIMD matrix operation
+# Batch delete
+conn.execute(f"DELETE FROM files WHERE path IN ({placeholders})", paths)
+```
 
 ---
 
-## Text Processing Optimizations
+## Semantic Summarization
 
-### Semantic Summarization
-
-**Research-based** content selection (TCRA-LLM approach, arXiv:2310.15556):
+Research-based content selection (TCRA-LLM, arXiv:2310.15556) for large files:
 
 **Algorithm:**
-1. Segment file by semantic boundaries (functions, classes, paragraphs)
-2. Score segments by position, information density, and diversity
-3. Greedily select highest-scoring segments that fit budget
-4. Always preserve first segment (docstrings, imports, headers)
+1. Split at semantic boundaries (function/class definitions, paragraphs)
+2. Score each segment:
+   - **Position**: U-shaped curve — high at start and end, low in middle
+   - **Density**: unique token ratio + syntax density + non-whitespace ratio
+   - **Diversity**: cosine penalty for similarity to already-selected segments
+3. Greedily select highest-scoring segments that fit the budget
+4. Always preserve the first segment (module docstring, imports)
 5. Reassemble with omission markers
 
-**Performance:**
-- **50-80% token savings** on large files vs simple truncation
-- Preserves structural integrity (first/last segments prioritized)
-- Language-agnostic boundary detection (Python, TS, Go, Rust, etc.)
+**Output example (10KB budget, 25KB file):**
 
-**Example (10KB limit on 25KB file):**
 ```python
-"""Module docstring."""  # Always preserved
+"""Module docstring."""   # always preserved
 
 def func_0():
     pass
@@ -258,82 +259,24 @@ def func_999():
     pass
 ```
 
-**Benefits over simple truncation:**
-- Preserves docstrings and imports
-- Maintains code skeleton (function signatures)
-- LLM can understand file structure
-- U-shaped priority curve (high value at start/end)
-
-### Delta Compression
-
-Delta compression and diff generation for efficient change tracking:
-
-| Feature | Benefit | Use Case |
-|---------|---------|----------|
-| **Delta compression** | 10-100x smaller | Minimal changes to large files |
-| **Semantic summarization** | 50-80% savings | Large file truncation |
-| **Diff stats** | Track changes | Metadata for cache decisions |
-
-**Delta compression example:**
-```python
-# 15KB file with 5 line changes
-delta = compute_delta(old, new)
-# Result: 245 bytes (98% compression)
-```
-
-**Cache diff output:**
-```
-// Stats: +5 -2 ~3 lines, 12.3% size
-// Diff for file.py (changed since cache):
-```
+**Result:** 50–80% token savings vs simple truncation, while preserving code structure and intent.
 
 ---
 
-## New Tools Performance
-
-### Semantic Search (`search`)
-
-- Searches only cached files (no disk I/O for search)
-- Uses pre-quantized int8 embeddings for fast similarity
-- Max 100 results, returns ranked by similarity score
-
-### Batch Read (`batch_read`)
-
-- Single tool call overhead vs N individual reads
-- Token budget prevents context overflow
-- Pre-computed cache set for sort ordering (eliminates double lookup)
-- Files read in parallel where possible
-
-### Similar Files (`similar`)
-
-- Uses `top_k_from_quantized()` for batch SIMD similarity
-- Max 50 results from cached files only
-- Source file cached if not already present
-
-### Glob (`glob`)
-
-- Thread-safe 5-second timeout using `threading.Timer` (cross-platform, works on Windows and in thread pools)
-- Max 1000 matches returned
-- Batch DB query for cache status (single `SELECT ... WHERE IN` instead of N individual lookups, with chunking for >900 paths)
-- Shows cache status without reading file contents
-
-### Batch Edit (`batch_edit`)
-
-- Single cached read for all edits (zero token cost)
-- Bottom-to-top application preserves line numbers
-- Partial success: working edits applied even if some fail
-- Max 50 edits per call
-
----
-
-## Profiling Tips
+## Profiling
 
 ```bash
-# Profile with py-spy
-py-spy record -o profile.svg -- semantic-cache-mcp
+# CPU profiling
+python -m cProfile -o profile.prof -m semantic_cache_mcp
+python -m pstats profile.prof
 
 # Memory profiling
+pip install memory-profiler
 python -m memory_profiler your_script.py
+
+# Line-level profiling (hot paths)
+pip install line-profiler
+kernprof -l -v your_script.py
 ```
 
 ---

@@ -1,342 +1,328 @@
 # Architecture
 
-## Component-Based Structure
+## Package Structure
 
 ```
-semantic_cache_mcp/
-├── config.py           # Configuration constants
-├── types.py            # Data models (CacheEntry, ReadResult, WriteResult, EditResult)
-├── cache.py            # SemanticCache facade + smart_read/write/edit functions
-├── server.py           # FastMCP tools (read, write, edit, stats, clear)
-├── core/               # Core algorithms (single responsibility)
-│   ├── chunking.py     # HyperCDC gear-hash chunking
-│   ├── chunking_simd.py # SIMD-accelerated parallel CDC (5-7x faster)
-│   ├── compression.py  # Multi-codec (ZSTD/LZ4/Brotli)
-│   ├── embeddings.py   # FastEmbed local embeddings
-│   ├── hashing.py      # BLAKE3 with BLAKE2b fallback
-│   ├── lsh.py          # LSH approximate similarity search
-│   ├── quantization.py # Binary/ternary extreme quantization
-│   ├── similarity.py   # Cosine similarity (NumPy optimized)
-│   ├── summarize.py    # Semantic summarization (TCRA-LLM based)
-│   ├── tokenizer.py    # o200k_base BPE tokenizer
-│   └── text.py         # Diff generation, delta compression
-└── storage/            # Persistence layer
-    └── sqlite.py       # SQLite content-addressable storage
+src/semantic_cache_mcp/
+├── config.py               # Constants and environment-variable configuration
+├── types.py                # All shared data models (ReadResult, WriteResult, etc.)
+├── cache/                  # Orchestration facade — coordinates all components
+│   ├── __init__.py         # Public API re-exports
+│   ├── store.py            # SemanticCache class (thin wrapper over SQLiteStorage)
+│   ├── read.py             # smart_read, batch_smart_read
+│   ├── write.py            # smart_write, smart_edit, smart_batch_edit
+│   ├── search.py           # semantic_search, find_similar_files, glob_with_cache_status, compare_files
+│   └── _helpers.py         # Internal utilities: _suppress_large_diff, formatter dispatch
+├── server/                 # MCP interface — thin translation layer only
+│   ├── __init__.py
+│   ├── _mcp.py             # FastMCP app instance, lifespan, startup warmup
+│   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
+│   └── tools.py            # All 12 MCP tool definitions
+├── core/                   # Pure algorithms — stateless, zero I/O
+│   ├── __init__.py         # Flat re-exports from all sub-packages
+│   ├── chunking/           # Content-defined chunking
+│   │   ├── __init__.py
+│   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
+│   │   └── _simd.py        # SIMD-accelerated parallel CDC
+│   ├── compression.py      # Adaptive multi-codec (ZSTD/LZ4/Brotli)
+│   ├── embeddings.py       # FastEmbed local embeddings
+│   ├── hashing.py          # BLAKE3/BLAKE2b, DeduplicateIndex, HierarchicalHasher
+│   ├── similarity/         # Cosine similarity, LSH, and quantization
+│   │   ├── __init__.py
+│   │   ├── _cosine.py      # cosine_similarity, int8 quantization, top_k_from_quantized
+│   │   ├── _lsh.py         # LSHIndex, LSHConfig, SimHash projections
+│   │   └── _quantization.py # Binary/ternary quantization
+│   ├── text/               # Diff generation and semantic summarization
+│   │   ├── __init__.py
+│   │   ├── _diff.py        # generate_diff, compute_delta, diff_stats
+│   │   └── _summarize.py   # summarize_semantic (TCRA-LLM based)
+│   └── tokenizer.py        # BPE token counting (o200k_base)
+└── storage/                # Persistence layer
+    ├── __init__.py
+    └── sqlite.py           # SQLiteStorage: content-addressable + LRU-K eviction
 ```
 
 ## Design Principles
 
-- **Single Responsibility** — Each module has one clear purpose
-- **Facade Pattern** — `SemanticCache` coordinates all components
-- **Dependency Inversion** — Storage backend is swappable
-- **Performance First** — Optimized hot paths, minimal allocations
-- **Type Safety** — Strict typing with domain type aliases
+- **Separation of concerns** — `core/` is stateless pure algorithms; `storage/` is persistence only; `cache/` orchestrates; `server/` translates MCP ↔ Python
+- **Dependency injection** — storage and config are passed explicitly; no hidden globals
+- **Facade pattern** — `cache/` exposes a clean API; callers never touch `storage/` directly
+- **Performance first in hot paths** — chunking, hashing, similarity, and tokenization are optimized; everything else prioritizes clarity
+- **Type safety** — strict mypy, `@overload` for conditional return types, no `Any` in public APIs
 
 ---
 
 ## Core Algorithms
 
-### Chunking (`core/chunking.py` and `core/chunking_simd.py`)
+### Chunking (`core/chunking/`)
 
-#### SIMD-Accelerated Parallel CDC (`chunking_simd.py`)
+#### Serial HyperCDC — `_gear.py`
 
-**5-7x speedup** through boundary-level parallelism:
+Content-defined chunking using a Gear hash rolling window.
 
-1. Divide content into N segments (one per CPU core)
-2. Each worker finds boundaries in its segment independently
-3. Merge overlapping boundaries at segment edges
-4. Stitch together final chunk boundaries
+- Pre-computed 256-entry gear table for O(1) byte lookups
+- Rolling hash: `h = ((h << 1) + gear[byte]) & MASK_64`
+- Boundary when `(h & mask) == 0` (normalized chunking)
+- Skip-min: no boundary checks in first 2KB per chunk
+- ~8KB average chunk size, ~13–14 MB/s throughput
+- **2.7× faster than Rabin fingerprinting**
 
-**Performance:** ~70-95 MB/s on 4-core systems
+Key property: similar files produce identical chunks even when bytes shift position, enabling cross-file deduplication.
 
-**Benefits:**
-- Near-linear scaling with CPU cores
-- Falls back to serial HyperCDC if unavailable
-- Automatic via `get_optimal_chunker(prefer_simd=True)`
+#### SIMD Parallel CDC — `_simd.py`
 
-**API:**
-- `hypercdc_simd_chunks(content)` — Parallel chunking
-- `get_optimal_chunker(prefer_simd=True)` — Auto-selects best chunker
+**5–7× faster** than serial via boundary-level CPU parallelism:
 
-#### Serial HyperCDC (`chunking.py`)
+1. Divide content into N segments (one per available core)
+2. Each worker finds CDC boundaries in its segment independently
+3. Merge and de-duplicate overlapping boundaries at segment edges
+4. Stitch final chunk list
 
-HyperCDC with Gear hash for high-performance content-defined chunking (CDC).
-
-**How it works:**
-1. Pre-computed 256-entry gear table for fast byte lookups
-2. Rolling hash: `h = ((h << 1) + gear[byte]) & MASK_64`
-3. Split when `(h & mask) == 0` (normalized chunking)
-4. Skip-min optimization: no boundary checks in first 2KB
-5. Results in ~8KB average chunks that align on content boundaries
-
-**Performance:** ~13-14 MB/s (2.7x faster than Rabin fingerprinting)
-
-**Benefits:**
-- Similar files share chunks even if bytes shift
-- Enables efficient deduplication across files
-- Gear hash is simpler and faster than Rabin polynomial
-
-### Compression (`core/compression.py`)
-
-Multi-codec adaptive compression with ZSTD (primary), LZ4, and Brotli.
-
-| Entropy Level | Codec | Level | Throughput |
-|---------------|-------|-------|------------|
-| Very High (>7.5) | STORE | - | 29 GB/s |
-| High (>6.5) | ZSTD | 1 | 6.9 GB/s |
-| Medium (>4.0) | ZSTD | 3 | 5.3 GB/s |
-| Low (<=4.0) | ZSTD | 9 | 4.8 GB/s |
-
-**Features:**
-- Cached compressors (avoid object creation overhead)
-- Native ZSTD multi-threading for large files (>4MB)
-- O(1) magic-byte detection for pre-compressed data
-- Automatic codec fallback chain
-
-### Hashing (`core/hashing.py`)
-
-BLAKE3 hashing (with BLAKE2b fallback) for high-performance content addressing.
-
-| Feature | Description |
-|---------|-------------|
-| **BLAKE3** | 3.8-4.9x faster than BLAKE2b on 8KB+ chunks |
-| **LRU caching** | 16K chunks, 4K blocks, 2K content hashes |
-| **Streaming** | Memory-efficient hashing for large files |
-| **Hierarchical** | Chunk → block → content multi-level hashing |
-| **DeduplicateIndex** | Fast fingerprint-based dedup lookups (~1M ops/sec) |
-
-**API:**
-- `hash_chunk(data)` — Hash CDC chunk (cached)
-- `hash_content(content)` — Hash full content (str or bytes)
-- `DeduplicateIndex` — Fast dedup with binary fingerprints
-- `HierarchicalHasher` — Multi-level chunk→block→content hashing
-- `StreamingHasher` — Incremental hashing for large files
-
-### Tokenizer (`core/tokenizer.py`)
-
-Optimized BPE tokenizer with O(N log M) merge algorithm.
-
-| Feature | Description |
-|---------|-------------|
-| **Priority queue merging** | O(N log M) vs O(N²) naive search |
-| **Merge caching** | Memoize BPE operations |
-| **Fast path** | Single-byte tokens skip BPE |
-| **Sample estimation** | O(1) token count for >50KB text |
-| **Lazy compilation** | Regex pattern compiled once |
-
-**Compatibility:**
-- OpenAI o200k_base encoding (GPT-4o)
-- Auto-downloads tiktoken file (~3.5MB)
-- SHA256 verification
-- Heuristic fallback if unavailable
-
-### Embeddings (`core/embeddings.py`)
-
-Local text embeddings using FastEmbed with nomic-embed-text-v1.5.
-
-- Singleton model instance (loaded once, reused)
-- Warmup at startup for predictable latency
-- 768-dimensional embeddings
-- 8192 token context window
-- Uses `search_document:` and `search_query:` prefixes
-- `configure(cache_dir=...)` API for standalone use (decoupled from config.py)
-- Defaults to `~/.cache/semantic-cache-mcp/models` when used outside the server
-
-### Similarity (`core/similarity.py`)
-
-SIMD-optimized similarity with optional int8 quantization and dimension pruning.
-
-| Feature | Speedup | Description |
-|---------|---------|-------------|
-| **NumPy baseline** | 19-27x vs Python | Vectorized dot product |
-| **int8 quantization** | 4-8x additional | Scale to [-128,127], SIMD int8 ops |
-| **Dimension pruning** | 20-40% additional | Skip low-magnitude dims (PDX) |
-| **Batch matrix ops** | Eliminates loop | Single SIMD operation for N vectors |
-
-**API:**
-- `cosine_similarity(a, b)` — Single pair comparison
-- `cosine_similarity_batch_matrix(query, vectors)` — SIMD batch
-- `top_k_similarities(query, vectors, k)` — Efficient top-K retrieval
-
-**Benchmarks (1000 vectors, 384D):**
-- Baseline: ~5ms
-- Quantized: ~0.6ms (8x faster)
-- Quantized + pruned: ~0.35ms (14x faster)
-
-### LSH Approximate Search (`core/lsh.py`)
-
-Locality-Sensitive Hashing for fast approximate nearest-neighbor search.
-
-| Feature | Description |
-|---------|-------------|
-| **Random projections** | Hash vectors to binary codes |
-| **Multiple hash tables** | Increase recall via redundancy |
-| **Hamming distance** | Fast binary similarity metric |
-| **Configurable tradeoffs** | Adjust num_tables for speed/accuracy |
-
-**API:**
-- `LSHIndex` — Build and query LSH index
-- `build()` — Index vectors with binary hashing
-- `query(vector, k, max_candidates)` — Fast approximate k-NN
-
-**Performance:** ~100x faster than exact search for large datasets (10K+ vectors)
-
-### Extreme Quantization (`core/quantization.py`)
-
-Binary and ternary quantization for massive compression.
-
-| Method | Compression | Accuracy | Use Case |
-|--------|-------------|----------|----------|
-| **Binary** | 32x | 80-85% | Approximate search |
-| **Ternary** | 16x | 85-90% | Better accuracy vs binary |
-| **int8** | 4x | 99%+ | Production similarity |
-
-**API:**
-- `quantize_binary(embedding)` — 1 bit per dimension
-- `quantize_ternary(embedding)` — 2 bits per dimension
-- `binary_similarity(a, b)` — Hamming-based similarity
-
-**Benefits:**
-- Extreme memory reduction (100x for binary)
-- Fast bitwise operations
-- Useful for pre-filtering in two-stage search
-
-### Semantic Summarization (`core/summarize.py`)
-
-Research-based content summarization preserving important segments (TCRA-LLM, arXiv:2310.15556).
-
-| Feature | Description |
-|---------|-------------|
-| **Segment extraction** | Split at semantic boundaries (functions, classes) |
-| **Importance scoring** | Position + density + diversity |
-| **Diversity penalty** | Avoid redundant segments |
-| **Structure preservation** | Always include first segment (docstrings, imports) |
-
-**Scoring algorithm:**
-1. **Position score:** U-shaped curve (high at start/end, low in middle)
-2. **Density score:** Unique tokens, syntax characters, non-whitespace ratio
-3. **Diversity penalty:** Cosine similarity to already-selected segments
-
-**API:**
-- `summarize_semantic(content, max_size, embed_fn)` — Smart summarization
-- `extract_segments(content)` — Boundary detection
-- `score_segments(segments)` — Importance ranking
-
-**Performance:** 50-80% token savings on large files vs simple truncation
-
-### Text Processing (`core/text.py`)
-
-Advanced diff and truncation with delta compression and syntax awareness.
-
-| Feature | Description |
-|---------|-------------|
-| **Delta compression** | Store changes only (10-100x smaller) |
-| **Semantic truncation** | Cut at function/class boundaries |
-| **Diff statistics** | Track insertions/deletions/modifications |
-| **Streaming diff** | Memory-efficient for multi-GB files |
-| **Language detection** | Python, TypeScript, Go support |
-
-**API:**
-- `generate_diff(old, new)` — Unified diff with stats
-- `compute_delta(old, new)` — Compressed change representation
-- `truncate_semantic(content, max_size)` — Syntax-aware truncation
-- `diff_stats(old, new)` — Change metrics
-
-**Example:**
-```python
-delta = compute_delta(old, new)
-# Delta: 245 bytes vs 15KB original (98% compression)
-```
+- ~70–95 MB/s on 4-core systems (vs ~13–14 MB/s serial)
+- `get_optimal_chunker(prefer_simd=True)` auto-selects; falls back gracefully to serial HyperCDC
 
 ---
 
-## Storage Layer
+### Compression (`core/compression.py`)
 
-### SQLiteStorage (`storage/sqlite.py`)
+Adaptive multi-codec compression. Codec and level are chosen per chunk based on a fast entropy estimate:
 
-Content-addressable chunk store (like Git).
+| Entropy  | Codec   | Level | Write Throughput |
+|----------|---------|-------|-----------------|
+| > 7.5    | STORE   | —     | 29 GB/s         |
+| > 6.5    | ZSTD    | 1     | 6.9 GB/s        |
+| > 4.0    | ZSTD    | 3     | 5.3 GB/s        |
+| ≤ 4.0    | ZSTD    | 9     | 4.8 GB/s        |
 
-**Features:**
-- Chunks stored by BLAKE2b hash (deduplication)
-- File metadata with chunk references
-- LRU-K eviction (frequency-aware cache management)
-- Batch operations with `executemany`
-- `put()` accepts optional `tokens` parameter to avoid redundant tokenization
+Key optimizations:
+- Compressor instances are cached to avoid object creation per call
+- Native ZSTD multi-threading for files > 4MB
+- O(1) magic-byte detection skips already-compressed data
+- Fallback chain: ZSTD → Brotli → LZ4 → STORE
+
+---
+
+### Hashing (`core/hashing.py`)
+
+BLAKE3 primary, BLAKE2b fallback.
+
+| Chunk Size | BLAKE2b   | BLAKE3    | Speedup |
+|------------|-----------|-----------|---------|
+| 256 B      | 543 MB/s  | 468 MB/s  | 0.86×   |
+| 8 KB       | 1,094 MB/s | 4,195 MB/s | **3.8×** |
+| 64 KB      | 1,150 MB/s | 5,597 MB/s | **4.9×** |
+
+LRU cache: 16K chunks, 4K blocks, 2K content hashes — avoids re-hashing identical data.
+
+Additional components:
+- `DeduplicateIndex` — fast fingerprint-based dedup (~966K lookups/sec)
+- `HierarchicalHasher` — chunk → block → content multi-level hashing
+- `StreamingHasher` — incremental hashing for large files
+
+---
+
+### Tokenizer (`core/tokenizer.py`)
+
+GPT-4o compatible (o200k_base) BPE tokenizer.
+
+- **O(N log M)** priority-queue merge algorithm vs O(N²) naive
+- Merge results memoized to skip repeated BPE sequences
+- Single-byte tokens skip BPE entirely (fast path)
+- Files > 50KB use sampling for O(1) estimate
+- Auto-downloads tiktoken file (~3.5MB), SHA256-verified
+- Heuristic fallback (chars / 4) when model unavailable
+
+---
+
+### Embeddings (`core/embeddings.py`)
+
+Local text embeddings via FastEmbed (nomic-embed-text-v1.5).
+
+- 768-dimensional, 8192 token context window
+- Singleton model instance — loaded once, reused
+- Warmup pass at server startup for predictable first-request latency
+- `search_document:` prefix for indexed content; `search_query:` for queries
+- `configure(cache_dir=...)` decouples from config.py for standalone use
+- Model stored in `~/.cache/semantic-cache-mcp/models/`
+- No API keys; fully offline after initial download
+
+---
+
+### Similarity (`core/similarity/`)
+
+#### `_cosine.py` — int8 Quantized Cosine Similarity
+
+int8 quantization stores embeddings as 772 bytes instead of 17KB (22× reduction) with < 0.3% accuracy loss:
+
+1. Scale 768-dim float32 vector to `[-128, 127]` int8 range
+2. Store as raw bytes blob in SQLite
+3. At query time: load blob, dequantize, compute cosine via SIMD batch matrix op
+
+Performance (1000 vectors, 768D):
+
+| Method                    | Time    | Speedup |
+|---------------------------|---------|---------|
+| Per-vector loop           | ~5 ms   | 1×      |
+| Batch matrix (float32)    | ~0.8 ms | 6×      |
+| Batch matrix (int8)       | ~0.6 ms | 8×      |
+| Quantized + dim pruning   | ~0.35 ms | 14×    |
+
+#### `_lsh.py` — LSH Approximate Search
+
+SimHash-based Locality-Sensitive Hashing for fast approximate nearest-neighbor search.
+
+**How it works:**
+1. Project each vector onto random hyperplanes → binary signature (SimHash)
+2. Index signatures in multiple hash tables (band decomposition for recall)
+3. At query time: compute query signature, retrieve candidates from all tables, run exact cosine only on candidates
+
+- `@overload` decorators provide precise return types: `Literal[True]` → `list[tuple[int, float]]`, `Literal[False]` → `list[int]`
+- Ephemeral index built at query time from DB rows (not persisted)
+- `_top_k_with_lsh()` in `cache/search.py` applies the 100-file threshold:
+  - n < 100: exhaustive `top_k_from_quantized` (already fast at this scale)
+  - n ≥ 100: LSH candidates (4× k), then exact re-ranking on candidates
+
+#### `_quantization.py` — Binary and Ternary Quantization
+
+For extreme compression or pre-filtering in two-stage search:
+
+| Method   | Compression | Accuracy | Primary Use         |
+|----------|-------------|----------|---------------------|
+| int8     | 4×          | 99.7%    | Production similarity |
+| Ternary  | 16×         | 85–90%   | Approximate pre-filter |
+| Binary   | 32×         | 80–85%   | Coarse pre-filter     |
+
+---
+
+### Text (`core/text/`)
+
+#### `_diff.py` — Diff and Delta Compression
+
+- Unified diffs via Python `difflib` with diff statistics (insertions, deletions, modifications)
+- Delta compression: store only changed lines (10–100× smaller for small edits to large files)
+- `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow
+
+#### `_summarize.py` — Semantic Summarization
+
+Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files exceed the size budget:
+
+**Algorithm:**
+1. Split file at semantic boundaries (function/class definitions, paragraphs)
+2. Score each segment:
+   - **Position score**: U-shaped curve — highest at start and end, lowest in middle
+   - **Density score**: unique token ratio + syntax character density + non-whitespace ratio
+   - **Diversity penalty**: cosine similarity to already-selected segments (avoids redundancy)
+3. Greedily select highest-scoring segments that fit the budget
+4. Always preserve the first segment (docstrings, imports, module header)
+5. Reassemble with `# ... [N lines omitted] ...` markers
+
+**Result:** 50–80% token savings on large files vs simple truncation, while preserving code skeleton and intent.
+
+---
+
+## Storage (`storage/sqlite.py`)
+
+Content-addressable chunk store — conceptually similar to Git's object store.
 
 ### Schema
 
 ```sql
 CREATE TABLE chunks (
-    hash TEXT PRIMARY KEY,
-    data BLOB NOT NULL,
-    size INTEGER NOT NULL,
-    ref_count INTEGER DEFAULT 1
-);
+    hash     TEXT PRIMARY KEY,   -- BLAKE3 hex digest
+    data     BLOB NOT NULL,      -- compressed chunk bytes
+    size     INTEGER NOT NULL,   -- uncompressed size
+    ref_count INTEGER DEFAULT 1  -- number of files referencing this chunk
+) WITHOUT ROWID;
 
 CREATE TABLE files (
-    path TEXT PRIMARY KEY,
-    content_hash TEXT NOT NULL,
-    chunk_hashes TEXT NOT NULL,  -- JSON array
-    mtime REAL NOT NULL,
-    tokens INTEGER NOT NULL,
-    embedding BLOB,              -- array.array('f') serialized
-    created_at REAL NOT NULL,
-    access_history TEXT NOT NULL -- JSON array for LRU-K
-);
+    path          TEXT PRIMARY KEY,
+    content_hash  TEXT NOT NULL,
+    chunk_hashes  TEXT NOT NULL,  -- JSON array of chunk hashes
+    mtime         REAL NOT NULL,
+    tokens        INTEGER NOT NULL,
+    embedding     BLOB,           -- int8 quantized, array.array('b') serialized
+    created_at    REAL NOT NULL,
+    access_history TEXT NOT NULL  -- JSON array of access timestamps (LRU-K)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;
 ```
 
-### LRU-K Eviction
+### LRU-K Eviction (K=2)
 
-Uses the K-th most recent access time (K=2) for eviction decisions:
-- Files accessed only once are evicted first
-- Frequently accessed files are retained
-- More accurate than simple LRU for workloads with scans
+Uses the **K-th most recent** access time rather than the most recent, making eviction decisions robust against sequential scans:
+
+- A file accessed only once has no second access time → evicted first
+- A file accessed regularly has a recent second access time → retained
+- This correctly handles large one-time reads (e.g., grepping) without polluting the cache
+
+### SQLite Optimizations
+
+```sql
+PRAGMA journal_mode = WAL;       -- concurrent reads + writes
+PRAGMA synchronous   = NORMAL;   -- safe in WAL, 2-3× faster commits
+PRAGMA cache_size    = -64000;   -- 64MB page cache
+PRAGMA temp_store    = MEMORY;   -- avoid disk I/O for temp tables
+PRAGMA mmap_size     = 268435456; -- 256MB memory-mapped I/O
+```
+
+- **WITHOUT ROWID** tables: 20–30% space savings for text-keyed tables
+- **Partial index** on `embedding IS NOT NULL`: faster similarity scans skip null rows
+- **Connection pool** (queue-based, 5 connections): eliminates ~5–10ms connection overhead per request
+- **Batch operations**: `executemany` for inserts; `IN` clause for multi-path fetches/deletes
+- **WAL checkpoint** (`TRUNCATE` mode) after commits for read-after-write consistency
 
 ---
 
 ## Data Flow
 
-### Read Operations
+### Read
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Client    │────▶│  smart_read  │────▶│    Cache    │
-│  (Claude)   │     │   (facade)   │     │   Lookup    │
-└─────────────┘     └──────────────┘     └─────────────┘
-                           │                    │
-                           ▼                    ▼
-                    ┌──────────────┐     ┌─────────────┐
-                    │   Strategy   │     │   SQLite    │
-                    │   Selection  │     │   Storage   │
-                    └──────────────┘     └─────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-    ┌──────────┐    ┌──────────┐    ┌──────────┐
-    │ Unchanged│    │   Diff   │    │ Semantic │
-    │  (99%)   │    │ (80-95%) │    │  Match   │
-    └──────────┘    └──────────┘    └──────────┘
+Client ──→ smart_read(path, diff_mode=True)
+                │
+                ▼
+         cache.get(path)
+                │
+        ┌───────┴────────────┬──────────────────┐
+        │                    │                  │
+        ▼                    ▼                  ▼
+  mtime match          hash changed          not found
+  "unchanged"          compute diff          read disk
+  (99% savings)        (80-95% savings)      store + return
 ```
 
-### Write/Edit Operations
+After context compression, call with `diff_mode=False` to bypass the "unchanged" path and always receive full content.
+
+### Write / Edit
 
 ```
-┌─────────────┐     ┌───────────────────┐     ┌─────────────┐
-│   Client    │────▶│ smart_write/edit  │────▶│    Cache    │
-│  (Claude)   │     │  (no Read needed) │     │  (cached)   │
-└─────────────┘     └───────────────────┘     └─────────────┘
-                              │                      │
-                              ▼                      ▼
-                       ┌─────────────┐        ┌─────────────┐
-                       │  File I/O   │        │ Cache Update│
-                       │  (write)    │        │ (new hash)  │
-                       └─────────────┘        └─────────────┘
-                              │
-                              ▼
-                       ┌─────────────┐
-                       │ Diff Output │
-                       │ (not full!) │
-                       └─────────────┘
+Client ──→ smart_write(path, content)
+                │
+      read existing content (cache → disk)
+                │
+         apply new content
+                │
+        ┌───────┴──────────┐
+        ▼                  ▼
+   write to disk      update cache
+        │
+   return diff (not full content)
+```
+
+### Semantic Search
+
+```
+query ──→ embed_query() ──→ query_vec (768D float32)
+                                    │
+                   ┌────────────────┴────────────────┐
+                   │ n < 100 files                   │ n ≥ 100 files
+                   │ exhaustive cosine scan           │ LSH candidate retrieval
+                   │ top_k_from_quantized()           │ → exact re-rank top 4k
+                   └────────────────┬────────────────┘
+                                    │
+                               top-k results
+                            (path, similarity score)
 ```
 
 ---
