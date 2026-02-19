@@ -307,9 +307,9 @@ def write(
     - For focused substitutions, prefer edit or multi_edit.
     - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
-    For files too large to write in a single output, write in two steps:
-      1. write(path, first_portion)
-      2. edit(path, last_line, last_line + remainder)  # last_line must be unique
+    For files too large to write in a single output, use a skeleton + fill pattern:
+      1. write(path, skeleton_with_placeholders)  # e.g. "# SECTION_1\n# SECTION_2"
+      2. multi_edit(path, [["# SECTION_1", content1], ["# SECTION_2", content2]])
 
     Args:
         path: Absolute path to file
