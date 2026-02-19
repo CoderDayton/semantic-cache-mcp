@@ -5,8 +5,8 @@ from __future__ import annotations
 import bisect
 import logging
 import shutil
-import signal
 import subprocess  # nosec B404 - used for formatter execution with hardcoded commands
+import time
 from pathlib import Path
 
 import numpy as np
@@ -916,17 +916,6 @@ MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
 
-class _TimeoutError(Exception):
-    """Raised when operation times out."""
-
-    pass
-
-
-def _timeout_handler(signum: int, frame: object) -> None:
-    """Signal handler for glob timeout."""
-    raise _TimeoutError("Operation timed out")
-
-
 def semantic_search(
     cache: SemanticCache,
     query: str,
@@ -1326,49 +1315,40 @@ def glob_with_cache_status(
     cached_count = 0
     total_cached_tokens = 0
 
-    # Set up timeout (Unix only, skip on Windows)
-    use_timeout = hasattr(signal, "SIGALRM")
-    if use_timeout:
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(GLOB_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + GLOB_TIMEOUT_SECONDS
 
-    try:
-        count = 0
-        for file_path in dir_path.glob(pattern):
-            if count >= MAX_GLOB_MATCHES:
-                break
-            if not file_path.is_file():
-                continue
+    count = 0
+    for file_path in dir_path.glob(pattern):
+        if count >= MAX_GLOB_MATCHES:
+            break
+        if time.monotonic() > deadline:
+            logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
+            break
+        if not file_path.is_file():
+            continue
 
-            count += 1
-            path_str = str(file_path)
-            mtime = file_path.stat().st_mtime
+        count += 1
+        path_str = str(file_path)
+        mtime = file_path.stat().st_mtime
 
-            # Check cache status
-            cached = cache.get(path_str)
-            is_cached = cached is not None
-            tokens = cached.tokens if cached else None
+        # Check cache status
+        cached = cache.get(path_str)
+        is_cached = cached is not None
+        tokens = cached.tokens if cached else None
 
-            if is_cached:
-                cached_count += 1
-                if tokens:
-                    total_cached_tokens += tokens
+        if is_cached:
+            cached_count += 1
+            if tokens:
+                total_cached_tokens += tokens
 
-            matches.append(
-                GlobMatch(
-                    path=path_str,
-                    cached=is_cached,
-                    tokens=tokens,
-                    mtime=mtime,
-                )
+        matches.append(
+            GlobMatch(
+                path=path_str,
+                cached=is_cached,
+                tokens=tokens,
+                mtime=mtime,
             )
-
-    except _TimeoutError:
-        logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
-    finally:
-        if use_timeout:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
+        )
 
     # Sort: cached first, then by path
     matches.sort(key=lambda m: (not m.cached, m.path))
