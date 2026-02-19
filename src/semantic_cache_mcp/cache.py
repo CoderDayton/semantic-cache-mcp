@@ -1384,7 +1384,7 @@ def glob_with_cache_status(
 
 
 # DoS limits for batch_edit
-MAX_MULTI_EDITS = 50
+MAX_BATCH_EDITS = 50
 
 
 def smart_batch_edit(
@@ -1419,7 +1419,7 @@ def smart_batch_edit(
         raise ValueError("No edits provided")
 
     # DoS protection
-    edits = edits[:MAX_MULTI_EDITS]
+    edits = edits[:MAX_BATCH_EDITS]
 
     file_path = Path(path).expanduser().resolve()
 

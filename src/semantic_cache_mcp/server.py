@@ -463,12 +463,16 @@ def batch_edit(
     dry_run: bool = False,
     auto_format: bool = False,
 ) -> str:
-    """Apply multiple independent edits to a file.
+    """Apply multiple independent edits to a file in one call.
 
     Timing guidance:
     - Use when applying 2+ edits to the same file in one step.
     - More token-efficient than repeated edit calls on the same file.
     - Use dry_run when testing risky edit batches.
+
+    Partial success: each edit is applied independently. When edits fail, the
+    response includes a failures list with the old_string and error for each —
+    use these to retry or correct without a separate debug call.
 
     Args:
         path: Absolute path to file
@@ -516,20 +520,39 @@ def batch_edit(
             auto_format=auto_format,
         )
 
+        status = (
+            "edited"
+            if result.failed == 0
+            else ("partial" if result.succeeded > 0 else "no_changes")
+        )
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "batch_edit",
-            "status": "edited",
+            "status": status,
             "path": result.path,
             "succeeded": result.succeeded,
-            "failed": result.failed,
         }
+        # Omit failed when 0 — saves tokens in the common all-succeed case
+        if result.failed:
+            payload["failed"] = result.failed
+            # Surface failure details so LLM can retry without a separate debug call
+            payload["failures"] = [
+                {
+                    "old": (
+                        o.old_string[:60] + "..."
+                        if len(o.old_string) > 60
+                        else o.old_string
+                    ),
+                    "error": o.error,
+                }
+                for o in result.outcomes
+                if not o.success
+            ]
         if result.diff_content:
             payload["diff"] = result.diff_content
         else:
             payload["diff_omitted"] = True
-        if mode in _MODE_NORMAL:
-            payload["tokens_saved"] = result.tokens_saved
+        payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["outcomes"] = [
                 {
