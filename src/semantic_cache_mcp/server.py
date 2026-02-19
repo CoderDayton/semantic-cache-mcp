@@ -389,6 +389,9 @@ def edit(
     - For 2+ independent replacements in one file, use batch_edit.
     - Use dry_run when validating match uniqueness before committing edits.
 
+    Multiple matches: if old_string appears more than once, the call fails with
+    a hint to add more context or use replace_all=true.
+
     Args:
         path: Absolute path to file
         old_string: Exact string to find (whitespace-sensitive)
@@ -417,16 +420,15 @@ def edit(
             "tool": "edit",
             "status": "edited",
             "path": result.path,
-            "matches_found": result.matches_found,
-            "replacements_made": result.replacements_made,
+            # matches_found always equals replacements_made — collapse to one field
+            "replaced": result.replacements_made,
+            "line_numbers": result.line_numbers,
         }
         if result.diff_content:
             payload["diff"] = result.diff_content
         else:
             payload["diff_omitted"] = True
-        if mode in _MODE_NORMAL:
-            payload["line_numbers"] = result.line_numbers
-            payload["tokens_saved"] = result.tokens_saved
+        payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["diff_stats"] = result.diff_stats
             payload["content_hash"] = result.content_hash
