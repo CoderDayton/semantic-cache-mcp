@@ -600,30 +600,6 @@ class SQLiteStorage:
             "db_size_mb": round(db_size / 1024 / 1024, 2),
         }
 
-    def remove(self, path: str) -> bool:
-        """Remove a single file entry and its unreferenced chunks.
-
-        Args:
-            path: Absolute file path to remove from cache
-
-        Returns:
-            True if entry existed and was removed, False otherwise
-        """
-        with self._pool.get_connection() as conn:
-            row = conn.execute(
-                "SELECT chunk_hashes FROM files WHERE path = ?", (path,)
-            ).fetchone()
-            if not row:
-                return False
-            old_hashes: list[str] = json.loads(row[0])
-            conn.executemany(
-                "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
-                ((h,) for h in old_hashes),
-            )
-            conn.execute("DELETE FROM chunks WHERE ref_count <= 0")
-            conn.execute("DELETE FROM files WHERE path = ?", (path,))
-        return True
-
     def clear(self) -> int:
         """Clear all cache entries.
 

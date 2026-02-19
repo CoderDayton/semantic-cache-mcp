@@ -18,7 +18,6 @@ from semantic_cache_mcp.cache import (
     SemanticCache,
     smart_read,
     smart_write,
-    smart_append,
     smart_edit,
     smart_multi_edit,
     semantic_search,
@@ -55,11 +54,6 @@ write_result = smart_write(
 print(f"Created: {write_result.created}")
 print(f"Tokens saved: {write_result.tokens_saved}")
 print(f"Hash: {write_result.content_hash}")
-
-# Chunked write for large files
-smart_write(cache=cache, path="/path/to/large.py", content="<chunk1>")
-smart_append(cache=cache, path="/path/to/large.py", content="<chunk2>")
-smart_append(cache=cache, path="/path/to/large.py", content="<chunk3>", auto_format=True)
 
 # Smart edit (find/replace) using cached reads
 edit_result = smart_edit(
@@ -252,22 +246,6 @@ The `smart_write` function returns a `WriteResult` with these fields:
 | `tokens_saved` | `int` | Tokens saved by returning diff |
 | `content_hash` | `str` | BLAKE3 hash for verification |
 | `from_cache` | `bool` | Whether old content came from cache |
-
----
-
-## AppendResult Object
-
-The `smart_append` function returns an `AppendResult` with these fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | `str` | Resolved absolute path to the file |
-| `bytes_appended` | `int` | Number of bytes appended |
-| `total_bytes` | `int` | Total file size after append |
-| `tokens_appended` | `int` | Estimated token count of appended content |
-| `content_hash` | `str` | BLAKE3 hash of appended content chunk |
-| `created` | `bool` | True if file was created, False if appended |
-| `cache_invalidated` | `bool` | True if a stale cache entry was removed |
 
 ---
 

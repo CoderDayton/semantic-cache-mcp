@@ -77,29 +77,6 @@ class WriteResult:
 
 
 @dataclass(slots=True)
-class AppendResult:
-    """Result of an append operation.
-
-    Attributes:
-        path: Resolved absolute path to the file.
-        bytes_appended: Number of bytes appended.
-        total_bytes: Total file size after append.
-        tokens_appended: Estimated token count of appended content.
-        content_hash: BLAKE3 hash of appended content chunk.
-        created: True if file was created (didn't exist), False if appended.
-        cache_invalidated: True if a stale cache entry was removed.
-    """
-
-    path: str
-    bytes_appended: int
-    total_bytes: int
-    tokens_appended: int
-    content_hash: ContentHash
-    created: bool
-    cache_invalidated: bool
-
-
-@dataclass(slots=True)
 class EditResult:
     """Result of an edit (find/replace) operation.
 

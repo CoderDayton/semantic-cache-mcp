@@ -104,7 +104,7 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 | Tool | Description |
 |------|-------------|
 | `read` | Smart file reading with diffs (99% savings unchanged, 80-95% changed) |
-| `write` | Write files, returns diff on overwrite. `append=true` for chunked writes. `auto_format=true` runs formatter |
+| `write` | Write files, returns diff on overwrite. `auto_format=true` runs formatter |
 | `edit` | Find/replace using cached reads (zero token read cost). `auto_format=true` runs formatter |
 | `multi_edit` | Batch find/replace, partial success supported. `auto_format=true` runs formatter |
 
@@ -147,14 +147,9 @@ read path="/src/app.py" offset=120 limit=80
 ```bash
 write path="/src/app.py" content="..."
 write path="/src/app.py" content="..." auto_format=true
-
-# Chunked write for large files that exceed output limits:
-write path="/src/app.py" content="<chunk1>"                               # creates file
-write path="/src/app.py" content="<chunk2>" append=true                   # appends
-write path="/src/app.py" content="<chunk3>" append=true auto_format=true  # final chunk + format
 ```
 
-Returns diff of changes, updates cache for instant reads. With `auto_format=true`, runs formatter (ruff/prettier/gofmt) after write. Use `append=true` to write large files in chunks without reading the full file.
+Returns diff of changes, updates cache for instant reads. With `auto_format=true`, runs formatter (ruff/prettier/gofmt) after write.
 
 #### edit
 
