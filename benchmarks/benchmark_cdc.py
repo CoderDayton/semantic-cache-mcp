@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 # Import our implementations
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
-from semantic_cache_mcp.core.chunking_simd import hypercdc_simd_chunks
+from semantic_cache_mcp.core.chunking import hypercdc_simd_chunks
 from semantic_cache_mcp.core.hashing import hash_chunk
 
 # ---------------------------------------------------------------------------

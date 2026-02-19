@@ -7,7 +7,7 @@ import os
 import pytest
 
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
-from semantic_cache_mcp.core.chunking_simd import (
+from semantic_cache_mcp.core.chunking import (
     _parallel_cdc_boundaries,
     get_optimal_chunker,
     hypercdc_simd_boundaries,

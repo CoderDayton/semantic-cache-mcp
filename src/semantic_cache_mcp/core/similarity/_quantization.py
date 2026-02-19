@@ -295,7 +295,7 @@ def quantize_hybrid(
         (binary_blob, int8_blob) tuple
     """
     # Import here to avoid circular dependency
-    from .similarity import quantize_embedding
+    from ._cosine import quantize_embedding  # noqa: PLC0415
 
     binary_blob = quantize_binary(v)
     int8_blob = quantize_embedding(v)
@@ -365,7 +365,7 @@ def evaluate_quantization_accuracy(
     Returns:
         Dict with accuracy metrics
     """
-    from .similarity import quantize_embedding, similarity_from_quantized_blob
+    from ._cosine import quantize_embedding, similarity_from_quantized_blob  # noqa: PLC0415
 
     if len(embeddings) < 2:
         return {"error": "Need at least 2 embeddings"}

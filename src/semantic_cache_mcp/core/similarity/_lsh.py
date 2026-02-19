@@ -282,7 +282,7 @@ class LSHIndex:
 
         # Store quantized embedding for precise similarity
         if store_embedding:
-            from .similarity import quantize_embedding
+            from ._cosine import quantize_embedding  # noqa: PLC0415
 
             self._embeddings[item_id] = quantize_embedding(vec)
 
@@ -354,7 +354,7 @@ class LSHIndex:
             return []
 
         # Phase 2: Compute precise similarities for candidates
-        from .similarity import similarity_from_quantized_blob
+        from ._cosine import similarity_from_quantized_blob  # noqa: PLC0415
 
         candidate_list = list(candidates)
         blobs = [self._embeddings[cid] for cid in candidate_list if cid in self._embeddings]

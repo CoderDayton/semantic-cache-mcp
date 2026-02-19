@@ -195,7 +195,7 @@ def get_optimal_chunker(prefer_simd: bool = True):
     if prefer_simd:
         return hypercdc_simd_chunks
 
-    from .chunking import hypercdc_chunks
+    from ._gear import hypercdc_chunks  # noqa: PLC0415
 
     return hypercdc_chunks
 

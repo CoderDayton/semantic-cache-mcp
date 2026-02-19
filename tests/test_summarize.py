@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from semantic_cache_mcp.core.summarize import (
+from semantic_cache_mcp.core.text import (
     Segment,
     SummarizationConfig,
     extract_segments,

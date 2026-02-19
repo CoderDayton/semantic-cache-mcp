@@ -1,11 +1,4 @@
-"""FastMCP server for semantic file caching.
-
-Provides smart_read tool that achieves 80%+ token reduction through:
-- Content-addressable storage with deduplication
-- Semantic similarity for related file detection (local FastEmbed)
-- Diff-based updates for changed files
-- LRU-K eviction for optimal cache utilization
-"""
+"""MCP tool implementations."""
 
 from __future__ import annotations
 
@@ -14,10 +7,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastmcp import Context, FastMCP
-from fastmcp.server.lifespan import lifespan
+from fastmcp import Context
 
-from .cache import (
+from ..cache import (
     SemanticCache,
     batch_smart_read,
     compare_files,
@@ -29,107 +21,19 @@ from .cache import (
     smart_read,
     smart_write,
 )
-from .config import MAX_CONTENT_SIZE, TOOL_MAX_RESPONSE_TOKENS, TOOL_OUTPUT_MODE
-from .core import count_tokens
-from .core.embeddings import get_model_info, warmup
-from .core.tokenizer import get_tokenizer
+from ..config import MAX_CONTENT_SIZE
+from ..core.embeddings import get_model_info
+from ._mcp import mcp
+from .response import (
+    _MODE_DEBUG,
+    _MODE_NORMAL,
+    _render_error,
+    _render_response,
+    _response_mode,
+    _response_token_cap,
+)
 
 logger = logging.getLogger(__name__)
-
-_MODE_NORMAL = {"normal", "debug"}
-_MODE_DEBUG = "debug"
-
-
-def _response_mode() -> str:
-    """Global response mode from environment-backed config."""
-    return TOOL_OUTPUT_MODE
-
-
-def _response_token_cap() -> int | None:
-    """Global response token cap from environment-backed config."""
-    return TOOL_MAX_RESPONSE_TOKENS if TOOL_MAX_RESPONSE_TOKENS > 0 else None
-
-
-def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Build minimal JSON payload when response exceeds token budget."""
-    keep_order = (
-        "ok",
-        "tool",
-        "status",
-        "path",
-        "path1",
-        "path2",
-        "summary",
-        "skipped",
-        "files_read",
-        "files_skipped",
-        "succeeded",
-        "failed",
-        "message",
-        "error",
-    )
-    minimal: dict[str, Any] = {}
-    for key in keep_order:
-        if key in payload:
-            minimal[key] = payload[key]
-    minimal["truncated"] = True
-    if "message" not in minimal:
-        minimal["message"] = "Response truncated by max_response_tokens"
-    return minimal
-
-
-def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -> str:
-    """Render tool response as compact JSON with optional token cap."""
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    if max_response_tokens is not None and max_response_tokens > 0:
-        if count_tokens(body) > max_response_tokens:
-            body = json.dumps(_minimal_payload(payload), separators=(",", ":"), ensure_ascii=False)
-        if count_tokens(body) > max_response_tokens:
-            body = json.dumps({"ok": False, "truncated": True}, separators=(",", ":"))
-    return body
-
-
-def _render_error(tool: str, message: str, max_response_tokens: int | None) -> str:
-    """Render consistent error responses."""
-    payload = {"ok": False, "tool": tool, "error": message}
-    return _render_response(payload, max_response_tokens)
-
-
-@lifespan
-async def app_lifespan(server: FastMCP):
-    """Initialize cache and embedding model on startup."""
-    logger.info("Semantic cache MCP server starting...")
-
-    # Warmup tokenizer (loads 200K vocab from disk, ~600ms one-time cost)
-    logger.info("Initializing tokenizer...")
-    get_tokenizer()
-
-    # Warmup embedding model (downloads if needed, loads into memory)
-    logger.info("Initializing embedding model...")
-    warmup()
-
-    model_info = get_model_info()
-    if not model_info.get("ready", False):
-        logger.error(
-            "Embedding model failed to initialize. "
-            "Semantic similarity features will be disabled. "
-            "Check network connectivity and disk space."
-        )
-    else:
-        logger.info(f"Embedding model ready: {model_info['model']}")
-
-    # Initialize cache
-    cache = SemanticCache()
-    logger.info("Semantic cache MCP server started")
-
-    try:
-        yield {"cache": cache}
-    finally:
-        logger.info("Semantic cache MCP server stopped")
-
-
-mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
-
 
 @mcp.tool(
     meta={
@@ -239,8 +143,6 @@ def read(
         return _render_error("read", str(e), max_response_tokens)
     except Exception as e:
         return _render_error("read", f"reading failed: {e}", max_response_tokens)
-
-
 @mcp.tool()
 def stats(
     ctx: Context,
@@ -274,8 +176,6 @@ def stats(
         payload["output_mode"] = mode
 
     return _render_response(payload, max_response_tokens)
-
-
 @mcp.tool()
 def clear(
     ctx: Context,
@@ -289,8 +189,6 @@ def clear(
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
     return _render_response(payload, max_response_tokens)
-
-
 @mcp.tool()
 def write(
     ctx: Context,
@@ -370,8 +268,6 @@ def write(
         return _render_error(
             "write", "Internal error occurred while writing file", max_response_tokens
         )
-
-
 @mcp.tool()
 def edit(
     ctx: Context,
@@ -455,8 +351,6 @@ def edit(
         return _render_error(
             "edit", "Internal error occurred while editing file", max_response_tokens
         )
-
-
 @mcp.tool()
 def batch_edit(
     ctx: Context,
@@ -588,8 +482,6 @@ def batch_edit(
             "Internal error occurred while editing file",
             max_response_tokens,
         )
-
-
 @mcp.tool()
 def search(
     ctx: Context,
@@ -643,8 +535,6 @@ def search(
     except Exception as e:
         logger.exception("Error in search")
         return _render_error("search", str(e), max_response_tokens)
-
-
 @mcp.tool()
 def diff(
     ctx: Context,
@@ -693,54 +583,13 @@ def diff(
     except Exception as e:
         logger.exception("Error in diff")
         return _render_error("diff", str(e), max_response_tokens)
-
-
-def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
-    """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
-    expanded: list[str] = []
-    glob_chars = frozenset("*?[")
-    for p in raw_paths:
-        if any(c in p for c in glob_chars):
-            try:
-                # Split into directory + pattern for Path.glob
-                pp = Path(p)
-                if pp.is_absolute():
-                    # Find the first component with glob chars
-                    parts = pp.parts
-                    base_parts: list[str] = []
-                    pattern_parts: list[str] = []
-                    found_glob = False
-                    for part in parts:
-                        if not found_glob and not any(c in part for c in glob_chars):
-                            base_parts.append(part)
-                        else:
-                            found_glob = True
-                            pattern_parts.append(part)
-                    base = Path(*base_parts) if base_parts else Path("/")
-                    pattern = str(Path(*pattern_parts)) if pattern_parts else "*"
-                else:
-                    base = Path(".")
-                    pattern = p
-                if not base.is_dir():
-                    expanded.append(p)  # Base doesn't exist — treat as literal
-                else:
-                    matches = sorted(str(m) for m in base.glob(pattern) if m.is_file())
-                    expanded.extend(matches[: max_files - len(expanded)])
-            except (OSError, ValueError):
-                expanded.append(p)  # Treat invalid pattern as literal
-        else:
-            expanded.append(p)
-        if len(expanded) >= max_files:
-            break
-    return expanded[:max_files]
-
-
 @mcp.tool()
 def batch_read(
     ctx: Context,
     paths: str,
     max_total_tokens: int = 50000,
     priority: str = "",
+    diff_mode: bool = True,
 ) -> str:
     """Read multiple files under a token budget.
 
@@ -748,11 +597,15 @@ def batch_read(
     - Prefer over repeated read calls when working with 2+ files.
     - Start with a tight max_total_tokens budget, then increase only if needed.
     - Use this early to seed cache before search/similar operations.
+    - After context compression (when you no longer have file content in memory),
+      call with diff_mode=false to get full content in one batch instead of
+      making individual read calls for each file.
 
     Args:
         paths: Comma-separated paths or JSON array
         max_total_tokens: Token budget (default: 50000, max: 200000)
         priority: Comma-separated or JSON array of paths to read first (order preserved)
+        diff_mode: When false, always return full content (use after context compression)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -779,7 +632,8 @@ def batch_read(
                 priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
 
         result = batch_smart_read(
-            cache, path_list, max_total_tokens=max_total_tokens, priority=priority_list
+            cache, path_list, max_total_tokens=max_total_tokens, priority=priority_list,
+            diff_mode=diff_mode,
         )
 
         # Build restructured response — separate unchanged, skipped, and content files
@@ -835,8 +689,6 @@ def batch_read(
     except Exception as e:
         logger.exception("Error in batch_read")
         return _render_error("batch_read", str(e), max_response_tokens)
-
-
 @mcp.tool()
 def similar(
     ctx: Context,
@@ -886,8 +738,6 @@ def similar(
     except Exception as e:
         logger.exception("Error in similar")
         return _render_error("similar", str(e), max_response_tokens)
-
-
 @mcp.tool()
 def glob(
     ctx: Context,
@@ -936,12 +786,41 @@ def glob(
     except Exception as e:
         logger.exception("Error in glob")
         return _render_error("glob", str(e), max_response_tokens)
-
-
-def main() -> None:
-    """Run the MCP server."""
-    mcp.run()
-
-
-if __name__ == "__main__":
-    main()
+def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
+    """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
+    expanded: list[str] = []
+    glob_chars = frozenset("*?[")
+    for p in raw_paths:
+        if any(c in p for c in glob_chars):
+            try:
+                # Split into directory + pattern for Path.glob
+                pp = Path(p)
+                if pp.is_absolute():
+                    # Find the first component with glob chars
+                    parts = pp.parts
+                    base_parts: list[str] = []
+                    pattern_parts: list[str] = []
+                    found_glob = False
+                    for part in parts:
+                        if not found_glob and not any(c in part for c in glob_chars):
+                            base_parts.append(part)
+                        else:
+                            found_glob = True
+                            pattern_parts.append(part)
+                    base = Path(*base_parts) if base_parts else Path("/")
+                    pattern = str(Path(*pattern_parts)) if pattern_parts else "*"
+                else:
+                    base = Path(".")
+                    pattern = p
+                if not base.is_dir():
+                    expanded.append(p)  # Base doesn't exist — treat as literal
+                else:
+                    matches = sorted(str(m) for m in base.glob(pattern) if m.is_file())
+                    expanded.extend(matches[: max_files - len(expanded)])
+            except (OSError, ValueError):
+                expanded.append(p)  # Treat invalid pattern as literal
+        else:
+            expanded.append(p)
+        if len(expanded) >= max_files:
+            break
+    return expanded[:max_files]

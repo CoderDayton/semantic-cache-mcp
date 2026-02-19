@@ -112,7 +112,7 @@ def compute_delta(old: str, new: str) -> DiffDelta:
     For large files that change minimally, delta is 10-100× smaller than
     storing both full texts.
     """
-    from .hashing import hash_content
+    from ..hashing import hash_content  # noqa: PLC0415
 
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)

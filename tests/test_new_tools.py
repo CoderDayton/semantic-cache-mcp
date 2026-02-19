@@ -257,6 +257,26 @@ class TestBatchReadOptimizations:
         for f in result.files:
             assert f.status == "unchanged"
 
+    def test_batch_read_diff_mode_false_returns_content_after_cache(
+        self, cache: SemanticCache, sample_files: dict
+    ):
+        """diff_mode=False returns full content even for cached unchanged files (post-compression recovery)."""
+        paths = [str(sample_files["py"]), str(sample_files["txt"])]
+
+        # Seed cache
+        batch_smart_read(cache, paths)
+
+        # Simulate post-compression: files are cached but diff_mode=False forces full content
+        result = batch_smart_read(cache, paths, diff_mode=False)
+
+        # No files should be suppressed as "unchanged"
+        assert len(result.unchanged_paths) == 0
+        # All files should have content returned
+        assert len(result.contents) == 2
+        for path in paths:
+            assert path in result.contents
+            assert len(result.contents[path]) > 0
+
     def test_batch_read_priority_order(self, cache: SemanticCache, sample_files: dict):
         """Priority paths read before sorted remainder."""
         paths = [str(f) for f in sample_files.values()]

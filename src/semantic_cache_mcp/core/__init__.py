@@ -1,8 +1,8 @@
 """Core algorithms for semantic caching."""
 
-from .chunking import hypercdc_chunks
-from .chunking_simd import (
+from .chunking import (
     get_optimal_chunker,
+    hypercdc_chunks,
     hypercdc_simd_boundaries,
     hypercdc_simd_chunks,
 )
@@ -18,52 +18,46 @@ from .hashing import (
     hash_chunk_binary,
     hash_content,
 )
-from .lsh import (
+from .similarity import (
     DEFAULT_LSH_CONFIG,
     LSHConfig,
     LSHIndex,
-    compute_simhash,
-    create_lsh_index,
-    hamming_distance,
-)
-from .quantization import (
     batch_dot_product_ternary,
     batch_hamming_similarity_binary,
-    dequantize_binary,
-    dequantize_ternary,
-    evaluate_quantization_accuracy,
-    hamming_similarity_binary,
-    quantize_binary,
-    quantize_hybrid,
-    quantize_ternary,
-)
-from .similarity import (
+    compute_simhash,
     cosine_similarity,
     cosine_similarity_batch,
     cosine_similarity_batch_matrix,
+    create_lsh_index,
+    dequantize_binary,
     dequantize_embedding,
+    dequantize_ternary,
+    evaluate_quantization_accuracy,
+    hamming_distance,
+    hamming_similarity_binary,
+    quantize_binary,
     quantize_embedding,
+    quantize_hybrid,
+    quantize_ternary,
     similarity_from_quantized_blob,
     top_k_from_quantized,
     top_k_similarities,
 )
-from .summarize import (
+from .text import (
     DEFAULT_SUMMARIZATION_CONFIG,
+    DiffDelta,
     Segment,
     SummarizationConfig,
-    extract_segments,
-    score_segments,
-    summarize_semantic,
-    truncate_with_summarization,
-)
-from .text import (
-    DiffDelta,
     apply_delta,
     compute_delta,
     diff_stats,
+    extract_segments,
     generate_diff,
+    score_segments,
+    summarize_semantic,
     truncate_semantic,
     truncate_smart,
+    truncate_with_summarization,
 )
 from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 

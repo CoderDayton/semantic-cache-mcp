@@ -7,7 +7,7 @@ import array
 import numpy as np
 import pytest
 
-from semantic_cache_mcp.core.lsh import (
+from semantic_cache_mcp.core.similarity import (
     LSHConfig,
     LSHIndex,
     compute_simhash,
@@ -25,7 +25,7 @@ class TestSimHash:
 
     def test_deterministic(self) -> None:
         """Same embedding produces same hash."""
-        from semantic_cache_mcp.core.lsh import _generate_hyperplanes
+        from semantic_cache_mcp.core.similarity._lsh import _generate_hyperplanes
 
         vec = np.random.randn(384).astype(np.float32)
         hyperplanes = _generate_hyperplanes(384, 64, seed=42)
@@ -37,7 +37,7 @@ class TestSimHash:
 
     def test_similar_vectors_similar_hashes(self) -> None:
         """Similar vectors should have small Hamming distance."""
-        from semantic_cache_mcp.core.lsh import _generate_hyperplanes
+        from semantic_cache_mcp.core.similarity._lsh import _generate_hyperplanes
 
         # Create two similar vectors
         base = np.random.randn(384).astype(np.float32)
@@ -54,7 +54,7 @@ class TestSimHash:
 
     def test_different_vectors_different_hashes(self) -> None:
         """Very different vectors should have larger Hamming distance."""
-        from semantic_cache_mcp.core.lsh import _generate_hyperplanes
+        from semantic_cache_mcp.core.similarity._lsh import _generate_hyperplanes
 
         vec1 = np.random.randn(384).astype(np.float32)
         vec2 = np.random.randn(384).astype(np.float32)
@@ -70,7 +70,7 @@ class TestSimHash:
 
     def test_batch_matches_single(self) -> None:
         """Batch computation matches single computation."""
-        from semantic_cache_mcp.core.lsh import _generate_hyperplanes
+        from semantic_cache_mcp.core.similarity._lsh import _generate_hyperplanes
 
         vectors = [np.random.randn(384).astype(np.float32) for _ in range(10)]
         hyperplanes = _generate_hyperplanes(384, 64, seed=42)
@@ -86,7 +86,7 @@ class TestSimHash:
 
     def test_array_array_input(self) -> None:
         """Works with array.array input."""
-        from semantic_cache_mcp.core.lsh import _generate_hyperplanes
+        from semantic_cache_mcp.core.similarity._lsh import _generate_hyperplanes
 
         vec_np = np.random.randn(384).astype(np.float32)
         vec_arr = array.array("f", vec_np.tolist())

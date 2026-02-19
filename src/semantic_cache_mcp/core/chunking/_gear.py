@@ -379,9 +379,6 @@ def hierarchical_hypercdc_chunks(
         )
 
     # Build a synthetic "index stream" of first-level chunk IDs.
-    # For simplicity here, we just map consecutive L1 chunks into L2 groups
-    # based on approximate byte offsets computed from their lengths.
-    # This preserves locality without re-hashing full content twice.
     l1_lengths = [end - start for start, end in level1_spans]
     prefix_sum = [0]
     for length in l1_lengths:
@@ -389,12 +386,10 @@ def hierarchical_hypercdc_chunks(
     total = prefix_sum[-1]
 
     # Run level-2 CDC on a virtual linear space [0, total).
-    # We map virtual L2 boundaries back to contiguous ranges of L1 chunks.
     virtual = bytes(total)  # placeholder; we only use its length
     l2_spans = list(hypercdc_boundaries(virtual, cfg_level2))
 
     # Map virtual spans to concrete byte ranges in original content.
-    # For each [vs, ve), find L1 chunks whose cumulative offsets intersect it.
     def v2real(vpos: int) -> int:
         # Binary search prefix_sum to map virtual offset to real byte offset
         lo, hi = 0, len(prefix_sum) - 1

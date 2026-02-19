@@ -7,7 +7,7 @@ import array
 import numpy as np
 import pytest
 
-from semantic_cache_mcp.core.quantization import (
+from semantic_cache_mcp.core.similarity import (
     batch_dot_product_ternary,
     batch_hamming_similarity_binary,
     dequantize_binary,
