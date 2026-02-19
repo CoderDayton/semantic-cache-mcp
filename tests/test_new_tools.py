@@ -236,6 +236,24 @@ class TestGlobWithCacheStatus:
         assert result.total_matches == 0
         assert result.matches == []
 
+    def test_glob_cached_only(self, cache: SemanticCache, sample_files: dict, temp_dir: Path):
+        """cached_only=True only returns files in cache."""
+        # Cache just the py file
+        from semantic_cache_mcp.cache import smart_read
+
+        py_path = str(sample_files["py"])
+        smart_read(cache, py_path)
+
+        # Glob for all files but only cached
+        result = glob_with_cache_status(
+            cache, "*", directory=str(temp_dir), cached_only=True,
+        )
+
+        # Only the cached file should appear
+        result_paths = [m.path for m in result.matches]
+        assert py_path in result_paths
+        assert all(m.cached for m in result.matches)
+
 
 class TestBatchReadOptimizations:
     """Tests for batch_read optimizations: unchanged collapse, priority, est_tokens, globs."""

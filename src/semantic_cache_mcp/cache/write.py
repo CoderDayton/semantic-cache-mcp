@@ -32,6 +32,7 @@ def smart_write(
     create_parents: bool = True,
     dry_run: bool = False,
     auto_format: bool = False,
+    append: bool = False,
 ) -> WriteResult:
     """Write file with cache integration.
 
@@ -44,10 +45,11 @@ def smart_write(
     Args:
         cache: SemanticCache instance
         path: Absolute path to file
-        content: Content to write
+        content: Content to write (or append)
         create_parents: Create parent directories if missing
         dry_run: Preview changes without writing
         auto_format: Run formatter after write (default: false)
+        append: Append content to existing file instead of overwriting (default: false)
 
     Returns:
         WriteResult with diff and metadata
@@ -122,6 +124,14 @@ def smart_write(
             except UnicodeDecodeError:
                 old_content = file_path.read_text(encoding="utf-8", errors="replace")
                 logger.warning(f"File {path} contains non-UTF-8 characters")
+
+    # Append mode: concatenate new content onto existing
+    if append and old_content is not None:
+        content = old_content + content
+        content_bytes = content.encode("utf-8")
+        bytes_written = len(content_bytes)
+        tokens_written = count_tokens(content)
+        content_hash = hash_content(content_bytes)
 
     # Generate diff if overwriting
     diff_content: str | None = None

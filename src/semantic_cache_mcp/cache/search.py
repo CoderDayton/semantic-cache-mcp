@@ -6,11 +6,14 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
+
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.embeddings import embed_query
-from ..core.similarity import cosine_similarity, top_k_from_quantized
+from ..core.similarity import LSHConfig, LSHIndex, cosine_similarity, top_k_from_quantized
 from ..types import (
     DiffResult,
+    EmbeddingVector,
     GlobMatch,
     GlobResult,
     SearchMatch,
@@ -18,6 +21,7 @@ from ..types import (
     SimilarFile,
     SimilarFilesResult,
 )
+from ._helpers import _suppress_large_diff
 from .store import SemanticCache
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,62 @@ MAX_SEARCH_QUERY_LEN = 8000
 MAX_SIMILAR_K = 50
 MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
+
+# LSH acceleration threshold: use exhaustive scan below this, LSH above
+_LSH_THRESHOLD = 100
+
+
+def _top_k_with_lsh(
+    query_embedding: EmbeddingVector,
+    blobs: list[bytes],
+    k: int,
+) -> list[tuple[int, float]]:
+    """Top-k similarity using LSH candidate filtering for large collections.
+
+    For small collections (<_LSH_THRESHOLD), falls back to exhaustive scan.
+    For larger ones, builds an ephemeral LSH index to reduce candidate set,
+    then refines with exact cosine similarity.
+
+    Args:
+        query_embedding: Query vector
+        blobs: List of quantized embedding blobs from DB
+        k: Number of results
+
+    Returns:
+        List of (index, similarity) tuples sorted by descending similarity
+    """
+    n = len(blobs)
+    if n < _LSH_THRESHOLD:
+        return top_k_from_quantized(query_embedding, blobs, k=k)
+
+    # Build ephemeral LSH index from blobs
+    # Dequantize embeddings to add to LSH
+    from ..core.similarity import dequantize_embedding  # noqa: PLC0415
+
+    query_vec = np.asarray(query_embedding, dtype=np.float32)
+    dim = len(query_vec)
+
+    config = LSHConfig(
+        num_bits=64,
+        num_tables=4,
+        band_size=8,
+        similarity_threshold=0.0,  # Don't filter in LSH — we do it after
+    )
+    lsh = LSHIndex(config=config)
+
+    for idx, blob in enumerate(blobs):
+        vec = dequantize_embedding(blob)
+        if vec is not None and len(vec) == dim:
+            lsh.add(idx, vec, store_embedding=True)
+
+    # Query LSH for candidates (request more than k to improve recall)
+    candidates = lsh.query(query_vec, k=min(k * 4, n), return_distances=True)
+    if not candidates:
+        # LSH found nothing — fall back to exhaustive
+        return top_k_from_quantized(query_embedding, blobs, k=k)
+
+    # candidates: list of (item_id, similarity) already sorted by similarity
+    return [(idx, sim) for idx, sim in candidates[:k]]
 
 def semantic_search(
     cache: SemanticCache,
@@ -76,8 +136,8 @@ def semantic_search(
     tokens_list = [r[1] for r in rows]
     blobs = [r[2] for r in rows]
 
-    # Batch similarity using pre-quantized vectors (optimized)
-    top_results = top_k_from_quantized(query_embedding, blobs, k=k)
+    # Similarity: LSH-accelerated for large caches, exhaustive for small
+    top_results = _top_k_with_lsh(query_embedding, blobs, k=k)
 
     # Build matches with previews
     matches: list[SearchMatch] = []
@@ -152,9 +212,11 @@ def compare_files(
         emb2 = cache.get_embedding(content2)
         cache.put(str(file2), content2, mtime2, emb2)
 
-    # Generate diff
+    # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
     stats = diff_stats(content1, content2)
+    full_tokens = count_tokens(content1) + count_tokens(content2)
+    diff_content = _suppress_large_diff(diff_content, full_tokens) or ""
 
     # Compute semantic similarity between embeddings (normalized)
     similarity = 0.0
@@ -243,8 +305,8 @@ def find_similar_files(
     tokens_list = [r[1] for r in rows]
     blobs = [r[2] for r in rows]
 
-    # Batch similarity
-    top_results = top_k_from_quantized(source_embedding, blobs, k=k)
+    # Similarity: LSH-accelerated for large caches, exhaustive for small
+    top_results = _top_k_with_lsh(source_embedding, blobs, k=k)
 
     similar_files: list[SimilarFile] = []
     for idx, sim in top_results:
@@ -266,6 +328,7 @@ def glob_with_cache_status(
     cache: SemanticCache,
     pattern: str,
     directory: str = ".",
+    cached_only: bool = False,
 ) -> GlobResult:
     """Find files by pattern with cache status.
 
@@ -273,6 +336,7 @@ def glob_with_cache_status(
         cache: SemanticCache instance
         pattern: Glob pattern (e.g., "**/*.py")
         directory: Base directory
+        cached_only: Only return files already in cache (reduces noise for large codebases)
 
     Returns:
         GlobResult with matches and cache info
@@ -303,6 +367,10 @@ def glob_with_cache_status(
         cached = cache.get(path_str)
         is_cached = cached is not None
         tokens = cached.tokens if cached else None
+
+        # Skip uncached files when cached_only is set
+        if cached_only and not is_cached:
+            continue
 
         if is_cached:
             cached_count += 1

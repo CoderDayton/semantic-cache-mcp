@@ -445,3 +445,63 @@ class TestSuppressLargeDiff:
         diff = "@@ -1,3 +1,3 @@\n-old\n+new\n context line\n"
         result = _suppress_large_diff(diff, full_tokens=10)
         assert result == diff
+
+
+class TestSmartWriteAppend:
+    """Tests for append mode."""
+
+    def test_append_creates_new_file(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Append to non-existent file creates it."""
+        file_path = temp_dir / "append_new.txt"
+
+        result = smart_write(
+            semantic_cache_no_embeddings, str(file_path), "chunk1\n", append=True
+        )
+
+        assert result.created is True
+        assert file_path.read_text() == "chunk1\n"
+
+    def test_append_concatenates_content(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Append adds content to existing file."""
+        file_path = temp_dir / "append_cat.txt"
+        file_path.write_text("chunk1\n")
+
+        smart_write(
+            semantic_cache_no_embeddings, str(file_path), "chunk2\n", append=True
+        )
+
+        assert file_path.read_text() == "chunk1\nchunk2\n"
+
+    def test_append_multiple_chunks(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Multiple appends build up file incrementally."""
+        file_path = temp_dir / "append_multi.txt"
+
+        smart_write(semantic_cache_no_embeddings, str(file_path), "line1\n")
+        smart_write(
+            semantic_cache_no_embeddings, str(file_path), "line2\n", append=True
+        )
+        smart_write(
+            semantic_cache_no_embeddings, str(file_path), "line3\n", append=True
+        )
+
+        assert file_path.read_text() == "line1\nline2\nline3\n"
+
+    def test_append_returns_diff(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Append returns diff showing added content."""
+        file_path = temp_dir / "append_diff.txt"
+        file_path.write_text("existing\n")
+
+        result = smart_write(
+            semantic_cache_no_embeddings, str(file_path), "appended\n", append=True
+        )
+
+        assert result.diff_content is not None
+        assert "+appended" in result.diff_content

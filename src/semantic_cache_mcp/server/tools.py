@@ -50,20 +50,26 @@ def read(
     offset: int | None = None,
     limit: int | None = None,
 ) -> str:
-    """Read files with token-efficient caching and diffs.
+    """Read a file with token-efficient caching and diffs.
+
+    Behavior with diff_mode=true (default):
+    - First read: returns full content and caches it.
+    - Subsequent read, file unchanged: returns a short "unchanged" marker (no content).
+      If you need the actual content again (e.g. after context compression), set diff_mode=false.
+    - Subsequent read, file modified: returns a unified diff of changes.
 
     Timing guidance:
     - Use for single-file inspection and verification.
     - For 2+ files, prefer batch_read first.
-    - Keep diff_mode=true during iteration; set false only for full uncached content.
-    - Use offset/limit to read specific line ranges without loading full content into context.
+    - Keep diff_mode=true during iteration; set false when you need full content again.
+    - Use offset/limit to read specific line ranges of large files.
 
     Args:
         path: Path to the file to read
         max_size: Maximum content size to return (default: 100000)
         diff_mode: Return diff if previously read (default: true). Set false for full content.
-        offset: Line number to start reading from (1-based). Only provide if file is too large.
-        limit: Number of lines to read. Only provide if file is too large.
+        offset: Line number to start reading from (1-based)
+        limit: Number of lines to read from offset
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -197,24 +203,29 @@ def write(
     create_parents: bool = True,
     dry_run: bool = False,
     auto_format: bool = False,
+    append: bool = False,
 ) -> str:
-    """Write full file content with cache integration.
+    """Write file content with cache integration.
 
     Timing guidance:
     - Use when creating files or replacing most/all content.
     - For focused substitutions, prefer edit or batch_edit.
     - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
-    For files too large to write in a single output, use a skeleton + fill pattern:
-      1. write(path, skeleton_with_placeholders)  # e.g. "# SECTION_1\n# SECTION_2"
-      2. batch_edit(path, [["# SECTION_1", content1], ["# SECTION_2", content2]])
+    For large files that exceed output limits, use append=True to write in chunks:
+      write(path, chunk1)                               # creates file
+      write(path, chunk2, append=True)                   # appends
+      write(path, chunk3, append=True, auto_format=True) # final chunk + format
+
+    Response: returns a diff for overwrites/appends, or just status for new files.
 
     Args:
         path: Absolute path to file
-        content: Content to write
+        content: Content to write (or content to append when append=true)
         create_parents: Create parent directories (default: true)
         dry_run: Preview changes without writing (default: false)
         auto_format: Run formatter after write (default: false)
+        append: Append content to existing file instead of overwriting (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -228,6 +239,7 @@ def write(
             create_parents=create_parents,
             dry_run=dry_run,
             auto_format=auto_format,
+            append=append,
         )
 
         payload: dict[str, Any] = {
@@ -287,6 +299,8 @@ def edit(
 
     Multiple matches: if old_string appears more than once, the call fails with
     a hint to add more context or use replace_all=true.
+
+    Response: returns a unified diff of the change and the line numbers affected.
 
     Args:
         path: Absolute path to file
@@ -359,7 +373,7 @@ def batch_edit(
     dry_run: bool = False,
     auto_format: bool = False,
 ) -> str:
-    """Apply multiple independent edits to a file in one call.
+    """Apply multiple independent edits to a file in one call. Max 50 edits.
 
     Timing guidance:
     - Use when applying 2+ edits to the same file in one step.
@@ -489,17 +503,22 @@ def search(
     k: int = 10,
     directory: str | None = None,
 ) -> str:
-    """Search cached files by semantic meaning.
+    """Search cached files by semantic meaning using embeddings (not keyword matching).
+
+    IMPORTANT: Only searches files already in the cache. You must read or batch_read
+    files first before they become searchable. Returns nothing on an empty cache.
 
     Timing guidance:
-    - Seed cache first via read or batch_read.
+    - Seed cache first via read or batch_read — unseen files won't appear.
     - Start with k=3 to k=5 and increase only if recall is insufficient.
     - Use directory filter early to limit response size.
 
+    Response: ranked list of files with similarity scores and content previews.
+
     Args:
-        query: Search query (what you're looking for)
+        query: Natural language description of what you're looking for
         k: Max results (default: 10, max: 100)
-        directory: Optional directory to limit search
+        directory: Optional absolute directory path to limit search scope
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -542,12 +561,14 @@ def diff(
     path2: str,
     context_lines: int = 3,
 ) -> str:
-    """Compare two files using cache.
+    """Compare two files using cache. Returns unified diff and semantic similarity score.
 
     Timing guidance:
     - Use only for explicit two-file comparisons.
     - Prefer read for normal iterative file updates.
     - Lower context_lines for tighter outputs when reviewing many diffs.
+
+    Large diffs are automatically summarized to avoid excessive token usage.
 
     Args:
         path1: First file path
@@ -591,7 +612,7 @@ def batch_read(
     priority: str = "",
     diff_mode: bool = True,
 ) -> str:
-    """Read multiple files under a token budget.
+    """Read multiple files under a token budget. Supports glob patterns in paths.
 
     Timing guidance:
     - Prefer over repeated read calls when working with 2+ files.
@@ -601,8 +622,11 @@ def batch_read(
       call with diff_mode=false to get full content in one batch instead of
       making individual read calls for each file.
 
+    With diff_mode=true (default), previously read unchanged files return as
+    "unchanged" with no content. Set diff_mode=false to force full content.
+
     Args:
-        paths: Comma-separated paths or JSON array
+        paths: Comma-separated paths, JSON array, or glob patterns (e.g. "src/**/*.py")
         max_total_tokens: Token budget (default: 50000, max: 200000)
         priority: Comma-separated or JSON array of paths to read first (order preserved)
         diff_mode: When false, always return full content (use after context compression)
@@ -697,6 +721,8 @@ def similar(
 ) -> str:
     """Find cached files semantically similar to given file.
 
+    Only compares against files already in the cache. Read files into cache first.
+
     Timing guidance:
     - Use after reading source and likely neighbors into cache.
     - Start with small k (3-5) and increase only if needed.
@@ -743,6 +769,7 @@ def glob(
     ctx: Context,
     pattern: str,
     directory: str = ".",
+    cached_only: bool = False,
 ) -> str:
     """Find files by pattern with cache status. Max 1000 matches, 5s timeout.
 
@@ -750,17 +777,21 @@ def glob(
     - Use early to shortlist candidate files before reading content.
     - Follow with batch_read on selected files instead of reading all matches.
     - Keep patterns specific to avoid large low-value result lists.
+    - Use cached_only=true to see what files are already cached.
 
     Args:
         pattern: Glob pattern (e.g., "**/*.py")
         directory: Base directory (default: current)
+        cached_only: Only return files already in cache (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
 
     try:
-        result = glob_with_cache_status(cache, pattern, directory=directory)
+        result = glob_with_cache_status(
+            cache, pattern, directory=directory, cached_only=cached_only,
+        )
         matches_payload = []
         for m in result.matches:
             item: dict[str, Any] = {"path": m.path, "cached": m.cached}
