@@ -307,9 +307,9 @@ def write(
     - For focused substitutions, prefer edit or multi_edit.
     - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
-    For large files that exceed output limits, write in two steps:
-      1. write(path, first_half)          # creates file, caches it
-      2. edit(path, last_line, last_line + second_half)  # appends via find/replace
+    For files too large to write in a single output, write in two steps:
+      1. write(path, first_portion)
+      2. edit(path, last_line, last_line + remainder)  # last_line must be unique
 
     Args:
         path: Absolute path to file
