@@ -237,6 +237,133 @@ class TestGlobWithCacheStatus:
         assert result.matches == []
 
 
+class TestBatchReadOptimizations:
+    """Tests for batch_read optimizations: unchanged collapse, priority, est_tokens, globs."""
+
+    def test_batch_read_collapses_unchanged(self, cache: SemanticCache, sample_files: dict):
+        """Unchanged files → unchanged_paths, status='unchanged', no content."""
+        paths = [str(sample_files["py"]), str(sample_files["txt"])]
+
+        # First read caches the files
+        batch_smart_read(cache, paths)
+
+        # Second read: files haven't changed → should be "unchanged"
+        result = batch_smart_read(cache, paths)
+
+        assert len(result.unchanged_paths) == 2
+        # Unchanged files should NOT appear in contents
+        assert len(result.contents) == 0
+        # All files should have status "unchanged"
+        for f in result.files:
+            assert f.status == "unchanged"
+
+    def test_batch_read_priority_order(self, cache: SemanticCache, sample_files: dict):
+        """Priority paths read before sorted remainder."""
+        paths = [str(f) for f in sample_files.values()]
+        priority_path = str(sample_files["txt"])
+
+        result = batch_smart_read(cache, paths, priority=[priority_path])
+
+        # First file processed should be the priority file
+        assert result.files[0].path == priority_path
+
+    def test_batch_read_skipped_has_est_tokens(self, cache: SemanticCache, temp_dir: Path):
+        """Skipped files have est_tokens > 0."""
+        # Create files that exceed budget
+        for i in range(5):
+            f = temp_dir / f"big{i}.txt"
+            f.write_text("x" * 4000)  # ~1000 tokens each
+
+        paths = [str(temp_dir / f"big{i}.txt") for i in range(5)]
+        result = batch_smart_read(cache, paths, max_total_tokens=500)
+
+        # At least some files should be skipped
+        skipped = [f for f in result.files if f.status == "skipped"]
+        assert len(skipped) > 0
+        for f in skipped:
+            assert f.est_tokens is not None
+            assert f.est_tokens > 0
+
+    def test_batch_read_mixed_unchanged_and_new(
+        self, cache: SemanticCache, sample_files: dict, temp_dir: Path
+    ):
+        """Mix of cached-unchanged and new files works correctly."""
+        py_path = str(sample_files["py"])
+        # Pre-cache one file
+        smart_read(cache, py_path)
+
+        # Create a new file
+        new_file = temp_dir / "brand_new.py"
+        new_file.write_text("x = 42\n")
+
+        result = batch_smart_read(cache, [py_path, str(new_file)])
+
+        # py_path should be unchanged (cached, not diff)
+        assert py_path in result.unchanged_paths
+        # new file should have content
+        assert str(new_file) in result.contents
+
+    def test_batch_read_priority_does_not_override_budget(
+        self, cache: SemanticCache, temp_dir: Path
+    ):
+        """Priority controls order, not budget bypass."""
+        big = temp_dir / "big.txt"
+        big.write_text("x" * 40000)  # ~10000 tokens
+        small = temp_dir / "small.txt"
+        small.write_text("hi\n")
+
+        result = batch_smart_read(
+            cache,
+            [str(big), str(small)],
+            max_total_tokens=50,
+            priority=[str(big)],
+        )
+
+        # big should be skipped (over budget), small should be read
+        statuses = {f.path: f.status for f in result.files}
+        assert statuses[str(big)] == "skipped"
+
+
+class TestExpandGlobs:
+    """Tests for _expand_globs helper."""
+
+    def test_expand_globs_non_glob_passthrough(self, temp_dir: Path):
+        """Non-glob paths pass through unchanged."""
+        from semantic_cache_mcp.server import _expand_globs
+
+        paths = [str(temp_dir / "a.py"), str(temp_dir / "b.py")]
+        result = _expand_globs(paths)
+        assert result == paths
+
+    def test_expand_globs_expands_pattern(self, sample_files: dict, temp_dir: Path):
+        """Glob patterns expand to matching files."""
+        from semantic_cache_mcp.server import _expand_globs
+
+        pattern = str(temp_dir / "*.py")
+        result = _expand_globs([pattern])
+        assert len(result) >= 2  # example.py, example2.py at minimum
+        for p in result:
+            assert p.endswith(".py")
+
+    def test_expand_globs_respects_max_files(self, temp_dir: Path):
+        """Expansion respects max_files cap."""
+        from semantic_cache_mcp.server import _expand_globs
+
+        for i in range(10):
+            (temp_dir / f"f{i}.txt").write_text(f"file {i}")
+
+        pattern = str(temp_dir / "*.txt")
+        result = _expand_globs([pattern], max_files=3)
+        assert len(result) <= 3
+
+    def test_expand_globs_invalid_pattern_literal(self):
+        """Invalid glob pattern treated as literal path."""
+        from semantic_cache_mcp.server import _expand_globs
+
+        result = _expand_globs(["/nonexistent/path/[invalid"])
+        assert result == ["/nonexistent/path/[invalid"]
+
+
 class TestSmartMultiEdit:
     """Tests for smart_multi_edit function."""
 

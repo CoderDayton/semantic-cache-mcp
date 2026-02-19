@@ -9,7 +9,7 @@ from __future__ import annotations
 import array
 import logging
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
@@ -63,7 +63,7 @@ def _get_model() -> TextEmbedding:
         # Ensure cache directory exists
         FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        init_kwargs = {
+        init_kwargs: dict[str, Any] = {
             "model_name": FASTEMBED_MODEL,
             "cache_dir": str(FASTEMBED_CACHE_DIR),
             "lazy_load": False,  # Load immediately for predictable startup

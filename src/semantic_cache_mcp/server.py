@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -58,6 +59,8 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "path",
         "path1",
         "path2",
+        "summary",
+        "skipped",
         "files_read",
         "files_skipped",
         "succeeded",
@@ -663,11 +666,52 @@ def diff(
         return _render_error("diff", str(e), max_response_tokens)
 
 
+def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
+    """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
+    expanded: list[str] = []
+    glob_chars = frozenset("*?[")
+    for p in raw_paths:
+        if any(c in p for c in glob_chars):
+            try:
+                # Split into directory + pattern for Path.glob
+                pp = Path(p)
+                if pp.is_absolute():
+                    # Find the first component with glob chars
+                    parts = pp.parts
+                    base_parts: list[str] = []
+                    pattern_parts: list[str] = []
+                    found_glob = False
+                    for part in parts:
+                        if not found_glob and not any(c in part for c in glob_chars):
+                            base_parts.append(part)
+                        else:
+                            found_glob = True
+                            pattern_parts.append(part)
+                    base = Path(*base_parts) if base_parts else Path("/")
+                    pattern = str(Path(*pattern_parts)) if pattern_parts else "*"
+                else:
+                    base = Path(".")
+                    pattern = p
+                if not base.is_dir():
+                    expanded.append(p)  # Base doesn't exist — treat as literal
+                else:
+                    matches = sorted(str(m) for m in base.glob(pattern) if m.is_file())
+                    expanded.extend(matches[: max_files - len(expanded)])
+            except (OSError, ValueError):
+                expanded.append(p)  # Treat invalid pattern as literal
+        else:
+            expanded.append(p)
+        if len(expanded) >= max_files:
+            break
+    return expanded[:max_files]
+
+
 @mcp.tool()
 def batch_read(
     ctx: Context,
     paths: str,
     max_total_tokens: int = 50000,
+    priority: str = "",
 ) -> str:
     """Read multiple files under a token budget.
 
@@ -679,6 +723,7 @@ def batch_read(
     Args:
         paths: Comma-separated paths or JSON array
         max_total_tokens: Token budget (default: 50000, max: 200000)
+        priority: Comma-separated or JSON array of paths to read first (order preserved)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -688,33 +733,67 @@ def batch_read(
         # Parse paths (comma-separated or JSON array)
         paths_str = paths.strip()
         if paths_str.startswith("["):
-            path_list = json.loads(paths_str)
+            path_list: list[str] = json.loads(paths_str)
         else:
             path_list = [p.strip() for p in paths_str.split(",") if p.strip()]
 
-        result = batch_smart_read(cache, path_list, max_total_tokens=max_total_tokens)
+        # Expand glob patterns
+        path_list = _expand_globs(path_list)
 
+        # Parse priority
+        priority_list: list[str] | None = None
+        priority_str = priority.strip()
+        if priority_str:
+            if priority_str.startswith("["):
+                priority_list = json.loads(priority_str)
+            else:
+                priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
+
+        result = batch_smart_read(
+            cache, path_list, max_total_tokens=max_total_tokens, priority=priority_list
+        )
+
+        # Build restructured response — separate unchanged, skipped, and content files
+        summary: dict[str, Any] = {
+            "files_read": result.files_read,
+            "files_skipped": result.files_skipped,
+            "total_tokens": result.total_tokens,
+            "tokens_saved": result.tokens_saved,
+        }
+        if result.unchanged_paths:
+            summary["unchanged"] = result.unchanged_paths
+            summary["unchanged_count"] = len(result.unchanged_paths)
+
+        skipped_items: list[dict[str, Any]] = []
         file_items: list[dict[str, Any]] = []
         for f in result.files:
-            item: dict[str, Any] = {"path": f.path, "status": f.status}
-            if f.path in result.contents and f.status != "skipped":
-                item["content"] = result.contents[f.path]
-            if mode in _MODE_NORMAL:
-                item["tokens"] = f.tokens
-                item["from_cache"] = f.from_cache
-            file_items.append(item)
+            if f.status == "skipped":
+                skipped_item: dict[str, Any] = {"path": f.path}
+                if f.est_tokens is not None:
+                    skipped_item["est_tokens"] = f.est_tokens
+                skipped_item["hint"] = "use read with offset/limit"
+                skipped_items.append(skipped_item)
+            elif f.status == "unchanged":
+                # Already captured in summary.unchanged — no per-file entry needed
+                continue
+            else:
+                # full, diff, truncated — entries with actual content
+                item: dict[str, Any] = {"path": f.path, "status": f.status}
+                if f.path in result.contents:
+                    item["content"] = result.contents[f.path]
+                if mode == _MODE_DEBUG:
+                    item["tokens"] = f.tokens
+                    item["from_cache"] = f.from_cache
+                file_items.append(item)
 
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "batch_read",
-            "files": file_items,
-            "files_read": result.files_read,
-            "files_skipped": result.files_skipped,
+            "summary": summary,
         }
-        if mode in _MODE_NORMAL:
-            payload["total_tokens"] = result.total_tokens
-            payload["tokens_saved"] = result.tokens_saved
-            payload["max_total_tokens"] = max_total_tokens
+        if skipped_items:
+            payload["skipped"] = skipped_items
+        payload["files"] = file_items
 
         return _render_response(payload, max_response_tokens)
 

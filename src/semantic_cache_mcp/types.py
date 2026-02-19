@@ -157,8 +157,9 @@ class FileReadSummary:
 
     path: str
     tokens: int
-    status: str  # "full", "diff", "truncated", "skipped"
+    status: str  # "full", "diff", "truncated", "skipped", "unchanged"
     from_cache: bool
+    est_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -171,6 +172,7 @@ class BatchReadResult:
     tokens_saved: int
     files_read: int
     files_skipped: int
+    unchanged_paths: list[str] = field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------

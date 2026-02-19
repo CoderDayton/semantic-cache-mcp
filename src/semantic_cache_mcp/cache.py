@@ -1088,22 +1088,24 @@ def batch_smart_read(
     cache: SemanticCache,
     paths: list[str],
     max_total_tokens: int = 50000,
+    priority: list[str] | None = None,
 ) -> BatchReadResult:
-    """Read multiple files with token budget.
+    """Read multiple files with token budget, priority ordering, and unchanged detection.
 
     Args:
         cache: SemanticCache instance
         paths: List of file paths
         max_total_tokens: Token budget (capped at 200K)
+        priority: Paths to read first (order preserved). Does NOT override budget.
 
     Returns:
-        BatchReadResult with contents and summaries
+        BatchReadResult with contents, summaries, and unchanged_paths
     """
     # DoS protection
     paths = paths[:MAX_BATCH_FILES]
     max_total_tokens = min(max_total_tokens, MAX_BATCH_TOKENS)
 
-    # Sort by estimated response size (smallest first) to maximize files under budget.
+    # Estimate tokens for sorting and skipped-file enrichment.
     def estimate_min_tokens(p: str) -> int:
         resolved = Path(p).expanduser().resolve()
         cached = cache.get(str(resolved))
@@ -1115,21 +1117,61 @@ def batch_smart_read(
         # Rough estimate for uncached content: ~4 characters per token.
         return max(1, int(resolved.stat().st_size / 4))
 
-    paths_sorted = sorted(paths, key=lambda p: (estimate_min_tokens(p), p))
+    # Priority-aware ordering: priority paths first (in given order), then remainder smallest-first.
+    if priority:
+        priority_set = set(priority)
+        priority_ordered = [p for p in priority if p in set(paths)]
+        remainder = [p for p in paths if p not in priority_set]
+        remainder_sorted = sorted(remainder, key=lambda p: (estimate_min_tokens(p), p))
+        paths_sorted = priority_ordered + remainder_sorted
+    else:
+        paths_sorted = sorted(paths, key=lambda p: (estimate_min_tokens(p), p))
 
     files: list[FileReadSummary] = []
     contents: dict[str, str] = {}
+    unchanged_paths: list[str] = []
     total_tokens = 0
     tokens_saved = 0
     files_skipped = 0
+    processed = 0
 
     for path in paths_sorted:
+        processed += 1
+
         if total_tokens >= max_total_tokens:
-            files_skipped += len(paths_sorted) - len(files)
+            # Enrich remaining paths with est_tokens
+            for remaining in paths_sorted[processed - 1 :]:
+                est = estimate_min_tokens(remaining)
+                files.append(
+                    FileReadSummary(
+                        path=remaining,
+                        tokens=0,
+                        status="skipped",
+                        from_cache=False,
+                        est_tokens=est,
+                    )
+                )
+                files_skipped += 1
             break
 
         try:
             result = smart_read(cache, path, diff_mode=True, force_full=False)
+
+            # Unchanged detection: from_cache=True and is_diff=False means LLM already has content
+            if result.from_cache and not result.is_diff:
+                unchanged_paths.append(path)
+                files.append(
+                    FileReadSummary(
+                        path=path,
+                        tokens=result.tokens_returned,
+                        status="unchanged",
+                        from_cache=True,
+                    )
+                )
+                # Count toward budget but don't emit content
+                total_tokens += result.tokens_returned
+                tokens_saved += result.tokens_saved
+                continue
 
             # Determine status
             if result.truncated:
@@ -1141,8 +1183,15 @@ def batch_smart_read(
 
             # Check token budget
             if total_tokens + result.tokens_returned > max_total_tokens:
+                est = estimate_min_tokens(path)
                 files.append(
-                    FileReadSummary(path=path, tokens=0, status="skipped", from_cache=False)
+                    FileReadSummary(
+                        path=path,
+                        tokens=0,
+                        status="skipped",
+                        from_cache=False,
+                        est_tokens=est,
+                    )
                 )
                 files_skipped += 1
                 continue
@@ -1171,6 +1220,7 @@ def batch_smart_read(
         tokens_saved=tokens_saved,
         files_read=len(files) - files_skipped,
         files_skipped=files_skipped,
+        unchanged_paths=unchanged_paths,
     )
 
 

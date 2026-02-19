@@ -5,7 +5,7 @@
 ### Timing Policy (Token-Efficient)
 
 - Use `read` for single-file iteration and verification.
-- Use `batch_smart_read` for 2+ files instead of repeated `smart_read`.
+- Use `batch_smart_read` for 2+ files instead of repeated `smart_read`. Use `priority` to control read order.
 - Keep `diff_mode=True` while iterating; use `diff_mode=False` only when you need full uncached content.
 - Use `smart_edit` for one targeted replacement; use `smart_multi_edit` for 2+ edits in one file.
 - Seed cache before `semantic_search` and `find_similar_files`.
@@ -107,10 +107,17 @@ batch_result = batch_smart_read(
     cache=cache,
     paths=["/src/a.py", "/src/b.py", "/src/c.py"],
     max_total_tokens=30000,  # start tighter, increase if necessary
+    priority=["/src/a.py"],  # read a.py first regardless of size
 )
 
 print(f"Files read: {batch_result.files_read}")
 print(f"Tokens saved: {batch_result.tokens_saved}")
+print(f"Unchanged: {batch_result.unchanged_paths}")
+
+# Skipped files include est_tokens for budget planning
+for f in batch_result.files:
+    if f.status == "skipped" and f.est_tokens:
+        print(f"  {f.path}: ~{f.est_tokens} tokens (use read with offset/limit)")
 
 # Find similar files
 similar_result = find_similar_files(
@@ -312,11 +319,22 @@ The `batch_smart_read` function returns a `BatchReadResult` with these fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `files` | `list[FileReadSummary]` | Per-file status and token counts |
-| `contents` | `dict[str, str]` | Path to content mapping |
+| `contents` | `dict[str, str]` | Path to content mapping (excludes unchanged files) |
 | `files_read` | `int` | Number of files successfully read |
 | `files_skipped` | `int` | Files skipped (budget exceeded) |
 | `total_tokens` | `int` | Total tokens returned |
 | `tokens_saved` | `int` | Tokens saved by caching |
+| `unchanged_paths` | `list[str]` | Files that haven't changed since last read |
+
+### FileReadSummary Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | `str` | File path |
+| `tokens` | `int` | Tokens returned (0 for skipped) |
+| `status` | `str` | `"full"`, `"diff"`, `"truncated"`, `"skipped"`, or `"unchanged"` |
+| `from_cache` | `bool` | Whether content came from cache |
+| `est_tokens` | `int \| None` | Estimated tokens for skipped files (for budget planning) |
 
 ---
 

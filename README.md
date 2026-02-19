@@ -117,7 +117,7 @@ All tools return JSON. Response detail and token cap are controlled globally via
 | `search` | Semantic search across cached files by meaning |
 | `similar` | Find files semantically similar to a given file |
 | `glob` | Find files by pattern with cache status |
-| `batch_read` | Read multiple files with token budget |
+| `batch_read` | Read multiple files with token budget, priority ordering, glob expansion |
 | `diff` | Compare two files using cache |
 
 ### Management Tools
@@ -194,10 +194,14 @@ Use after source and nearby files have been cached.
 ```bash
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
 batch_read paths='["/src/a.py","/src/b.py","/src/c.py"]' max_total_tokens=30000
+batch_read paths="/src/*.py" priority="/src/main.py,/src/config.py"
 ```
 
-Skips files if budget exceeded.
-Use for 2+ files; start with smaller budget and increase only if needed.
+- **Glob expansion**: paths like `src/*.py` are expanded (max 50 files)
+- **Priority ordering**: `priority` paths are read first (order preserved), remainder sorted smallest-first
+- **Unchanged collapse**: previously-read unchanged files reported in `summary.unchanged` with no content (saves tokens)
+- **Skipped enrichment**: skipped files include `est_tokens` and a hint to use `read` with offset/limit
+- **Structured response**: `summary` (metadata), `skipped` (actionable), `files` (only entries with content)
 
 #### glob
 
