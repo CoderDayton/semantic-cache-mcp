@@ -25,6 +25,7 @@ from .core.hashing import hash_content
 from .core.similarity import cosine_similarity, top_k_from_quantized
 from .storage import SQLiteStorage
 from .types import (
+    AppendResult,
     BatchReadResult,
     CacheEntry,
     DiffResult,
@@ -157,6 +158,13 @@ class SemanticCache:
         stats["embedding_provider"] = _execution_provider
 
         return stats
+
+    def remove(self, path: str) -> bool:
+        """Remove a single cache entry. Returns True if existed."""
+        removed = self._storage.remove(path)
+        if removed:
+            logger.debug(f"Cache invalidated: {path}")
+        return removed
 
     def clear(self) -> int:
         """Clear all cache entries."""
@@ -519,7 +527,11 @@ def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
 
 
 def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | None:
-    """Suppress large diff payloads to optimize returned token count."""
+    """Suppress large diff payloads to optimize returned token count.
+
+    Returns the diff unchanged for small files, a summary string for large
+    diffs that exceed the token cap, or None for empty input.
+    """
     if not diff_content:
         return None
 
@@ -530,10 +542,26 @@ def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | No
     if full_tokens <= 200:
         return diff_content
 
-    if diff_tokens > MAX_RETURN_DIFF_TOKENS:
-        return None
-    if diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO):
-        return None
+    should_suppress = (
+        diff_tokens > MAX_RETURN_DIFF_TOKENS
+        or diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO)
+    )
+    if should_suppress:
+        # Count added/removed lines and hunks from unified diff
+        added = 0
+        removed = 0
+        hunks = 0
+        for line in diff_content.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+            elif line.startswith("@@"):
+                hunks += 1
+        return (
+            f"[diff suppressed: {diff_tokens} tokens > cap] "
+            f"+{added} -{removed} lines across {hunks} hunks"
+        )
 
     return diff_content
 
@@ -716,6 +744,133 @@ def smart_write(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+    )
+
+
+def smart_append(
+    cache: SemanticCache,
+    path: str,
+    content: str,
+    create_parents: bool = True,
+    dry_run: bool = False,
+    auto_format: bool = False,
+) -> AppendResult:
+    """Append content to a file with cache invalidation.
+
+    O(1) append — does not read the full file. Invalidates stale cache entry
+    so the next read() re-caches the complete content.
+
+    For large files that exceed LLM output limits, call write() for the first
+    chunk, then smart_append() for subsequent chunks.
+
+    Args:
+        cache: SemanticCache instance
+        path: Absolute path to file
+        content: Content to append
+        create_parents: Create parent directories if missing
+        dry_run: Preview changes without writing
+        auto_format: Run formatter after append (formats full file)
+
+    Returns:
+        AppendResult with metadata
+
+    Raises:
+        FileNotFoundError: Parent directory doesn't exist and create_parents=False
+        PermissionError: Insufficient permissions
+        ValueError: Binary file or content too large
+    """
+    # Empty content is a no-op — no cache invalidation, no I/O
+    if not content:
+        file_path = Path(path).expanduser().resolve()
+        existing = file_path.exists()
+        total = int(file_path.stat().st_size) if existing else 0
+        return AppendResult(
+            path=str(file_path),
+            bytes_appended=0,
+            total_bytes=total,
+            tokens_appended=0,
+            content_hash=hash_content(b""),
+            created=False,
+            cache_invalidated=False,
+        )
+
+    # Validate content size
+    if len(content) > MAX_WRITE_SIZE:
+        raise ValueError(
+            f"Content too large: {len(content):,} bytes exceeds {MAX_WRITE_SIZE:,} byte limit"
+        )
+
+    file_path = Path(path).expanduser().resolve()
+
+    # Validate existing file isn't binary
+    if file_path.exists():
+        if not file_path.is_file():
+            raise ValueError(f"Not a regular file: {path}")
+        try:
+            sample = file_path.read_bytes()[:8192]
+            if _is_binary_content(sample):
+                raise ValueError(
+                    f"Binary file not supported: {path}. Cannot append text to binary."
+                )
+        except OSError as e:
+            raise PermissionError(f"Cannot read existing file: {e}") from e
+
+    # Check parent directory
+    parent = file_path.parent
+    if not parent.exists():
+        if create_parents:
+            if not dry_run:
+                parent.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Created parent directories: {parent}")
+        else:
+            raise FileNotFoundError(f"Parent directory does not exist: {parent}")
+
+    content_bytes = content.encode("utf-8")
+    bytes_appended = len(content_bytes)
+    tokens_appended = count_tokens(content)
+    content_hash = hash_content(content_bytes)
+    created = not file_path.exists()
+
+    if dry_run:
+        # Estimate total_bytes without writing
+        existing_size = int(file_path.stat().st_size) if file_path.exists() else 0
+        return AppendResult(
+            path=str(file_path),
+            bytes_appended=bytes_appended,
+            total_bytes=existing_size + bytes_appended,
+            tokens_appended=tokens_appended,
+            content_hash=content_hash,
+            created=created,
+            cache_invalidated=False,
+        )
+
+    # Append (POSIX 'a' mode: creates file if it doesn't exist)
+    try:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as e:
+        raise PermissionError(f"Cannot write file: {e}") from e
+
+    # Auto-format if requested (formats full file, explicit cost)
+    if auto_format:
+        _format_file(file_path)
+
+    total_bytes = int(file_path.stat().st_size)
+
+    # Invalidate stale cache entry — next read() will re-cache
+    cache_invalidated = cache.remove(str(file_path))
+
+    action = "Created" if created else "Appended to"
+    logger.info(f"{action}: {path} (+{bytes_appended} bytes, {total_bytes} total)")
+
+    return AppendResult(
+        path=str(file_path),
+        bytes_appended=bytes_appended,
+        total_bytes=total_bytes,
+        tokens_appended=tokens_appended,
+        content_hash=content_hash,
+        created=created,
+        cache_invalidated=cache_invalidated,
     )
 
 

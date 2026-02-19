@@ -24,6 +24,7 @@ from .cache import (
     find_similar_files,
     glob_with_cache_status,
     semantic_search,
+    smart_append,
     smart_edit,
     smart_multi_edit,
     smart_read,
@@ -299,6 +300,7 @@ def write(
     create_parents: bool = True,
     dry_run: bool = False,
     auto_format: bool = False,
+    append: bool = False,
 ) -> str:
     """Write full file content with cache integration.
 
@@ -307,19 +309,52 @@ def write(
     - For focused substitutions, prefer edit or multi_edit.
     - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
+    For large files that exceed output limits, use append=True to write in chunks:
+      write(path, chunk1)                               # creates file
+      write(path, chunk2, append=True)                   # appends
+      write(path, chunk3, append=True, auto_format=True) # final chunk + format
+
     Args:
         path: Absolute path to file
         content: Content to write
         create_parents: Create parent directories (default: true)
         dry_run: Preview changes without writing (default: false)
         auto_format: Run formatter after write (default: false)
+        append: Append content instead of overwriting (default: false)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
 
     try:
-        result = smart_write(
+        if append:
+            result = smart_append(
+                cache=cache,
+                path=path,
+                content=content,
+                create_parents=create_parents,
+                dry_run=dry_run,
+                auto_format=auto_format,
+            )
+            payload: dict[str, Any] = {
+                "ok": True,
+                "tool": "write",
+                "status": "created" if result.created else "appended",
+                "path": result.path,
+                "bytes_appended": result.bytes_appended,
+                "total_bytes": result.total_bytes,
+            }
+            if mode in _MODE_NORMAL:
+                payload["created"] = result.created
+                payload["dry_run"] = dry_run
+                payload["cache_invalidated"] = result.cache_invalidated
+            if mode == _MODE_DEBUG:
+                payload["tokens_appended"] = result.tokens_appended
+                payload["content_hash"] = result.content_hash
+
+            return _render_response(payload, max_response_tokens)
+
+        write_result = smart_write(
             cache=cache,
             path=path,
             content=content,
@@ -328,27 +363,27 @@ def write(
             auto_format=auto_format,
         )
 
-        payload: dict[str, Any] = {
+        payload = {
             "ok": True,
             "tool": "write",
-            "status": "created" if result.created else "updated",
-            "path": result.path,
+            "status": "created" if write_result.created else "updated",
+            "path": write_result.path,
         }
-        if result.diff_content:
-            payload["diff"] = result.diff_content
-        elif not result.created:
+        if write_result.diff_content:
+            payload["diff"] = write_result.diff_content
+        elif not write_result.created:
             payload["diff_omitted"] = True
 
         if mode in _MODE_NORMAL:
-            payload["created"] = result.created
+            payload["created"] = write_result.created
             payload["dry_run"] = dry_run
-            payload["tokens_saved"] = result.tokens_saved
+            payload["tokens_saved"] = write_result.tokens_saved
         if mode == _MODE_DEBUG:
-            payload["bytes_written"] = result.bytes_written
-            payload["tokens_written"] = result.tokens_written
-            payload["diff_stats"] = result.diff_stats
-            payload["content_hash"] = result.content_hash
-            payload["from_cache"] = result.from_cache
+            payload["bytes_written"] = write_result.bytes_written
+            payload["tokens_written"] = write_result.tokens_written
+            payload["diff_stats"] = write_result.diff_stats
+            payload["content_hash"] = write_result.content_hash
+            payload["from_cache"] = write_result.from_cache
 
         return _render_response(payload, max_response_tokens)
 
