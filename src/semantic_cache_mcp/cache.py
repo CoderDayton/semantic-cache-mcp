@@ -25,6 +25,7 @@ from .core.hashing import hash_content
 from .core.similarity import cosine_similarity, top_k_from_quantized
 from .storage import SQLiteStorage
 from .types import (
+    BatchEditResult,
     BatchReadResult,
     CacheEntry,
     DiffResult,
@@ -33,7 +34,6 @@ from .types import (
     FileReadSummary,
     GlobMatch,
     GlobResult,
-    MultiEditResult,
     ReadResult,
     SearchMatch,
     SearchResult,
@@ -1383,17 +1383,17 @@ def glob_with_cache_status(
     )
 
 
-# DoS limits for multi_edit
+# DoS limits for batch_edit
 MAX_MULTI_EDITS = 50
 
 
-def smart_multi_edit(
+def smart_batch_edit(
     cache: SemanticCache,
     path: str,
     edits: list[tuple[str, str]],
     dry_run: bool = False,
     auto_format: bool = False,
-) -> MultiEditResult:
+) -> BatchEditResult:
     """Apply multiple independent edits to a file.
 
     Each edit is processed independently - some can succeed while others fail.
@@ -1407,7 +1407,7 @@ def smart_multi_edit(
         auto_format: Run formatter after edits (default: false)
 
     Returns:
-        MultiEditResult with per-edit outcomes and combined diff
+        BatchEditResult with per-edit outcomes and combined diff
 
     Raises:
         FileNotFoundError: File doesn't exist
@@ -1568,7 +1568,7 @@ def smart_multi_edit(
             action += " and formatted"
         logger.info(f"{action}: {path}")
 
-    return MultiEditResult(
+    return BatchEditResult(
         path=str(file_path),
         outcomes=outcomes,
         succeeded=succeeded,

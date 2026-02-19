@@ -88,7 +88,7 @@ Add to your `~/.claude/CLAUDE.md` to enforce semantic-cache usage globally:
     - Prefer for full rewrites/create; use `edit` for targeted substitutions
   - `edit` → replaces Edit tool (uses cached read, returns diff)
     - `auto_format=true` → runs formatter after edit
-  - `multi_edit` → use for 2+ edits in one file (better than repeated `edit`)
+  - `batch_edit` → use for 2+ edits in one file (better than repeated `edit`)
   - `search`/`similar` → use after cache is seeded via `read`/`batch_read`
     - Start with small `k` (3-5), increase only if needed
 ```
@@ -106,7 +106,7 @@ This tells Claude to prefer semantic-cache tools over the built-in Read, Write, 
 | `read` | Smart file reading with diffs (99% savings unchanged, 80-95% changed) |
 | `write` | Write files, returns diff on overwrite. `auto_format=true` runs formatter |
 | `edit` | Find/replace using cached reads (zero token read cost). `auto_format=true` runs formatter |
-| `multi_edit` | Batch find/replace, partial success supported. `auto_format=true` runs formatter |
+| `batch_edit` | Batch find/replace, partial success supported. `auto_format=true` runs formatter |
 
 All tools return JSON. Response detail and token cap are controlled globally via environment variables.
 
@@ -160,13 +160,13 @@ edit path="/src/app.py" old_string="old" new_string="new" dry_run=true
 ```
 
 Uses cached content (no token cost), returns diff. Use `replace_all=true` for multiple matches. With `auto_format=true`, runs formatter after edit.
-Use `multi_edit` when applying 2+ independent edits in one file.
+Use `batch_edit` when applying 2+ independent edits in one file.
 
-#### multi_edit
+#### batch_edit
 
 ```bash
-multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]'
-multi_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]' dry_run=true
+batch_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]'
+batch_edit path="/src/app.py" edits='[["old1", "new1"], ["old2", "new2"]]' dry_run=true
 ```
 
 Independent edits—some can fail while others succeed.

@@ -317,7 +317,7 @@ delta = compute_delta(old, new)
 - Batch DB query for cache status (single `SELECT ... WHERE IN` instead of N individual lookups, with chunking for >900 paths)
 - Shows cache status without reading file contents
 
-### Multi-Edit (`multi_edit`)
+### Batch Edit (`batch_edit`)
 
 - Single cached read for all edits (zero token cost)
 - Bottom-to-top application preserves line numbers

@@ -24,8 +24,8 @@ from .cache import (
     find_similar_files,
     glob_with_cache_status,
     semantic_search,
+    smart_batch_edit,
     smart_edit,
-    smart_multi_edit,
     smart_read,
     smart_write,
 )
@@ -304,12 +304,12 @@ def write(
 
     Timing guidance:
     - Use when creating files or replacing most/all content.
-    - For focused substitutions, prefer edit or multi_edit.
+    - For focused substitutions, prefer edit or batch_edit.
     - Keep auto_format=false during rapid iterations; enable at stabilization points.
 
     For files too large to write in a single output, use a skeleton + fill pattern:
       1. write(path, skeleton_with_placeholders)  # e.g. "# SECTION_1\n# SECTION_2"
-      2. multi_edit(path, [["# SECTION_1", content1], ["# SECTION_2", content2]])
+      2. batch_edit(path, [["# SECTION_1", content1], ["# SECTION_2", content2]])
 
     Args:
         path: Absolute path to file
@@ -386,7 +386,7 @@ def edit(
 
     Timing guidance:
     - Use for a single targeted replacement.
-    - For 2+ independent replacements in one file, use multi_edit.
+    - For 2+ independent replacements in one file, use batch_edit.
     - Use dry_run when validating match uniqueness before committing edits.
 
     Args:
@@ -456,7 +456,7 @@ def edit(
 
 
 @mcp.tool()
-def multi_edit(
+def batch_edit(
     ctx: Context,
     path: str,
     edits: str,
@@ -485,14 +485,14 @@ def multi_edit(
         edits_str = edits.strip()
         if not edits_str.startswith("["):
             return _render_error(
-                "multi_edit",
+                "batch_edit",
                 "edits must be a JSON array of [old, new] pairs",
                 max_response_tokens,
             )
 
         edit_list = json.loads(edits_str)
         if not isinstance(edit_list, list):
-            return _render_error("multi_edit", "edits must be a JSON array", max_response_tokens)
+            return _render_error("batch_edit", "edits must be a JSON array", max_response_tokens)
 
         # Convert to list of tuples
         edit_tuples: list[tuple[str, str]] = []
@@ -503,12 +503,12 @@ def multi_edit(
                 edit_tuples.append((str(item["old"]), str(item["new"])))
             else:
                 return _render_error(
-                    "multi_edit",
+                    "batch_edit",
                     "Each edit must be [old, new] or {old, new}",
                     max_response_tokens,
                 )
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache=cache,
             path=path,
             edits=edit_tuples,
@@ -518,7 +518,7 @@ def multi_edit(
 
         payload: dict[str, Any] = {
             "ok": True,
-            "tool": "multi_edit",
+            "tool": "batch_edit",
             "status": "edited",
             "path": result.path,
             "succeeded": result.succeeded,
@@ -549,17 +549,17 @@ def multi_edit(
         return _render_response(payload, max_response_tokens)
 
     except json.JSONDecodeError as e:
-        return _render_error("multi_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
+        return _render_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("multi_edit", str(e), max_response_tokens)
+        return _render_error("batch_edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("multi_edit", f"permission denied - {e}", max_response_tokens)
+        return _render_error("batch_edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("multi_edit", str(e), max_response_tokens)
+        return _render_error("batch_edit", str(e), max_response_tokens)
     except Exception:
-        logger.exception("Unexpected error in multi_edit")
+        logger.exception("Unexpected error in batch_edit")
         return _render_error(
-            "multi_edit",
+            "batch_edit",
             "Internal error occurred while editing file",
             max_response_tokens,
         )

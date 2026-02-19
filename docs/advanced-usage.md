@@ -7,7 +7,7 @@
 - Use `read` for single-file iteration and verification.
 - Use `batch_smart_read` for 2+ files instead of repeated `smart_read`. Use `priority` to control read order.
 - Keep `diff_mode=True` while iterating; use `diff_mode=False` only when you need full uncached content.
-- Use `smart_edit` for one targeted replacement; use `smart_multi_edit` for 2+ edits in one file.
+- Use `smart_edit` for one targeted replacement; use `smart_batch_edit` for 2+ edits in one file.
 - Seed cache before `semantic_search` and `find_similar_files`.
 - Start search/similar with lower `k` (3-5), then increase only if recall is insufficient.
 - Use `compare_files` only for explicit two-file comparisons.
@@ -19,7 +19,7 @@ from semantic_cache_mcp.cache import (
     smart_read,
     smart_write,
     smart_edit,
-    smart_multi_edit,
+    smart_batch_edit,
     semantic_search,
     compare_files,
     batch_smart_read,
@@ -70,7 +70,7 @@ print(f"Lines modified: {edit_result.line_numbers}")
 print(f"Tokens saved: {edit_result.tokens_saved}")
 
 # Multi-edit (batch find/replace)
-multi_result = smart_multi_edit(
+multi_result = smart_batch_edit(
     cache=cache,
     path="/path/to/file.py",
     edits=[("old1", "new1"), ("old2", "new2")],
@@ -267,9 +267,9 @@ The `smart_edit` function returns an `EditResult` with these fields:
 
 ---
 
-## MultiEditResult Object
+## BatchEditResult Object
 
-The `smart_multi_edit` function returns a `MultiEditResult` with these fields:
+The `smart_batch_edit` function returns a `BatchEditResult` with these fields:
 
 | Field | Type | Description |
 |-------|------|-------------|

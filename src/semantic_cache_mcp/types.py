@@ -243,8 +243,8 @@ class SingleEditOutcome:
 
 
 @dataclass(slots=True)
-class MultiEditResult:
-    """Result from smart_multi_edit operation."""
+class BatchEditResult:
+    """Result from smart_batch_edit operation."""
 
     path: str
     outcomes: list[SingleEditOutcome]

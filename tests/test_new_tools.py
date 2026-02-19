@@ -14,7 +14,7 @@ from semantic_cache_mcp.cache import (
     find_similar_files,
     glob_with_cache_status,
     semantic_search,
-    smart_multi_edit,
+    smart_batch_edit,
     smart_read,
 )
 
@@ -364,15 +364,15 @@ class TestExpandGlobs:
         assert result == ["/nonexistent/path/[invalid"]
 
 
-class TestSmartMultiEdit:
-    """Tests for smart_multi_edit function."""
+class TestSmartBatchEdit:
+    """Tests for smart_batch_edit function."""
 
-    def test_multi_edit_all_succeed(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_all_succeed(self, cache: SemanticCache, temp_dir: Path):
         """All edits succeed when all matches found."""
         f = temp_dir / "test.py"
         f.write_text("def foo():\n    pass\n\ndef bar():\n    pass\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -386,12 +386,12 @@ class TestSmartMultiEdit:
         assert "def new_foo" in f.read_text()
         assert "def new_bar" in f.read_text()
 
-    def test_multi_edit_partial_success(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_partial_success(self, cache: SemanticCache, temp_dir: Path):
         """Some edits succeed, some fail."""
         f = temp_dir / "test.py"
         f.write_text("def foo():\n    pass\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -404,12 +404,12 @@ class TestSmartMultiEdit:
         assert result.failed == 1
         assert "def new_foo" in f.read_text()
 
-    def test_multi_edit_all_fail(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_all_fail(self, cache: SemanticCache, temp_dir: Path):
         """No edits apply when none match."""
         f = temp_dir / "test.py"
         f.write_text("def foo():\n    pass\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -423,13 +423,13 @@ class TestSmartMultiEdit:
         # File should be unchanged
         assert f.read_text() == "def foo():\n    pass\n"
 
-    def test_multi_edit_dry_run(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_dry_run(self, cache: SemanticCache, temp_dir: Path):
         """Dry run shows changes without applying."""
         f = temp_dir / "test.py"
         original = "def foo():\n    pass\n"
         f.write_text(original)
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -442,7 +442,7 @@ class TestSmartMultiEdit:
         # File should be unchanged
         assert f.read_text() == original
 
-    def test_multi_edit_uses_cache(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_uses_cache(self, cache: SemanticCache, temp_dir: Path):
         """Multi-edit uses cached content."""
         f = temp_dir / "test.py"
         f.write_text("def foo():\n    pass\n")
@@ -450,7 +450,7 @@ class TestSmartMultiEdit:
         # Pre-cache the file
         smart_read(cache, str(f))
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -461,12 +461,12 @@ class TestSmartMultiEdit:
         assert result.from_cache is True
         assert result.tokens_saved > 0
 
-    def test_multi_edit_outcomes_have_line_numbers(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_outcomes_have_line_numbers(self, cache: SemanticCache, temp_dir: Path):
         """Successful edits report line numbers."""
         f = temp_dir / "test.py"
         f.write_text("line1\ndef foo():\n    pass\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -477,12 +477,12 @@ class TestSmartMultiEdit:
         assert result.outcomes[0].success is True
         assert result.outcomes[0].line_number == 2
 
-    def test_multi_edit_reports_errors(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_reports_errors(self, cache: SemanticCache, temp_dir: Path):
         """Failed edits report error messages."""
         f = temp_dir / "test.py"
         f.write_text("def foo():\n    pass\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
@@ -497,12 +497,12 @@ class TestSmartMultiEdit:
         assert "identical" in result.outcomes[1].error.lower()
         assert "not found" in result.outcomes[2].error.lower()
 
-    def test_multi_edit_preserves_line_positions(self, cache: SemanticCache, temp_dir: Path):
+    def test_batch_edit_preserves_line_positions(self, cache: SemanticCache, temp_dir: Path):
         """Edits at different positions don't interfere."""
         f = temp_dir / "test.py"
         f.write_text("AAA\nBBB\nCCC\nDDD\n")
 
-        result = smart_multi_edit(
+        result = smart_batch_edit(
             cache,
             str(f),
             [
