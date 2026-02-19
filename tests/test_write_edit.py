@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from semantic_cache_mcp.cache import SemanticCache, smart_edit, smart_read, smart_write
+from semantic_cache_mcp.cache import (
+    SemanticCache,
+    _suppress_large_diff,
+    smart_edit,
+    smart_read,
+    smart_write,
+)
 
 
 class TestSmartWriteNewFile:
@@ -399,3 +405,43 @@ class TestAutoFormat:
 
         assert file_path.read_text() == "new content"
         assert result.replacements_made == 1
+
+
+class TestSuppressLargeDiff:
+    """Tests for _suppress_large_diff function."""
+
+    def test_small_diff_passes_through(self) -> None:
+        """Small diffs are returned unchanged."""
+        diff = "@@ -1,3 +1,3 @@\n-old\n+new\n context\n"
+        result = _suppress_large_diff(diff, full_tokens=500)
+        assert result == diff
+
+    def test_large_diff_returns_summary(self) -> None:
+        """Large diffs return a summary string, not None."""
+        # Generate a diff large enough to exceed MAX_RETURN_DIFF_TOKENS (8000)
+        lines = []
+        lines.append("--- old\n+++ new")
+        lines.append("@@ -1,10000 +1,10000 @@")
+        for i in range(5000):
+            lines.append(f"-old line {i}")
+            lines.append(f"+new line {i}")
+        large_diff = "\n".join(lines)
+
+        result = _suppress_large_diff(large_diff, full_tokens=50000)
+
+        assert result is not None
+        assert "[diff suppressed:" in result
+        assert "+5000" in result
+        assert "-5000" in result
+        assert "1 hunks" in result
+
+    def test_none_input_returns_none(self) -> None:
+        """None input returns None."""
+        assert _suppress_large_diff(None, full_tokens=100) is None
+
+    def test_small_file_preserves_diff(self) -> None:
+        """Files <=200 tokens always get full diff regardless of ratio."""
+        # This diff is larger than the "file" (ratio > 0.9) but file is small
+        diff = "@@ -1,3 +1,3 @@\n-old\n+new\n context line\n"
+        result = _suppress_large_diff(diff, full_tokens=10)
+        assert result == diff

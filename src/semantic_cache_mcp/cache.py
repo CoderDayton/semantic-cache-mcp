@@ -519,7 +519,11 @@ def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
 
 
 def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | None:
-    """Suppress large diff payloads to optimize returned token count."""
+    """Suppress large diff payloads to optimize returned token count.
+
+    Returns the diff unchanged for small files, a summary string for large
+    diffs that exceed the token cap, or None for empty input.
+    """
     if not diff_content:
         return None
 
@@ -530,10 +534,26 @@ def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | No
     if full_tokens <= 200:
         return diff_content
 
-    if diff_tokens > MAX_RETURN_DIFF_TOKENS:
-        return None
-    if diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO):
-        return None
+    should_suppress = (
+        diff_tokens > MAX_RETURN_DIFF_TOKENS
+        or diff_tokens >= int(full_tokens * MAX_DIFF_TO_FULL_RATIO)
+    )
+    if should_suppress:
+        # Count added/removed lines and hunks from unified diff
+        added = 0
+        removed = 0
+        hunks = 0
+        for line in diff_content.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+            elif line.startswith("@@"):
+                hunks += 1
+        return (
+            f"[diff suppressed: {diff_tokens} tokens > cap] "
+            f"+{added} -{removed} lines across {hunks} hunks"
+        )
 
     return diff_content
 
