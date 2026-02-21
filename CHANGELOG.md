@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `lefthook` bandit hook updated to use `python -m bandit` — resolves binary spawn permission issue on some systems
 
+### Documentation
+
+- Rewrote all user-facing docs (README, architecture, performance, advanced-usage, security, troubleshooting) for accuracy and clarity
+- Fixed model references throughout: `BAAI/bge-small-en-v1.5` (33M params, 384D) replaces outdated `nomic-embed-text-v1.5`
+- Fixed model download size (~130MB) and resident memory (~200MB) — previous figures were from the nomic era (~500MB)
+- Documented persistent LSH index, `embed_batch` / `get_embeddings_batch` APIs, and batch pre-scan in `batch_smart_read`
+- Updated `cache.db` schema description to include `embeddings` and `lsh_index` tables
+- Added troubleshooting entry for LSH rebuild delay (self-healing, persisted to SQLite after first build)
+- Added `embed_batch` example and LSH persistence note to advanced-usage programmatic API section
+
 ## [1.0.0] - 2026-02-03
 
 ### Added
