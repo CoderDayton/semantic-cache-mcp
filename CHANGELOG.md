@@ -7,129 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Persistent LSH index — serialized to SQLite after first build, reloaded on subsequent searches and across server restarts; invalidated lazily on any `put()` or `clear()` so correctness is always maintained. Eliminates repeated O(N·dim) rebuild cost for read-heavy workloads.
-- `embed_batch()` in `core/embeddings.py` — batches N texts into a single `model.embed()` call, amortizing ONNX Runtime overhead
-- `SemanticCache.get_embeddings_batch()` — applies file-type semantic labels (same as `get_embedding`) then delegates to `embed_batch`; retrieval quality is identical to per-file embedding
-- Batch embed pre-scan in `batch_smart_read` — identifies new/changed files upfront, embeds them all in one model call before the main read loop; unchanged files are skipped
-- `SQLiteStorage.get_lsh_index()` / `set_lsh_index()` / `clear_lsh_index()` — LSH persistence layer backed by a singleton `lsh_index` table; `blob_count` column used to detect staleness after file additions
-- `diff_mode` parameter on `batch_read` tool — set `false` after LLM context compression to force full content delivery instead of diff-only responses
-- `append=True` mode on `write` tool for chunked large file writes; appends content to existing file rather than overwriting
-- `cached_only=True` filter on `glob` tool to return only files already present in cache
-- LSH acceleration for `search` and `similar` tools — O(1) candidate retrieval for caches ≥ 100 files, falls back to exhaustive O(N) scan for smaller caches
-- `@overload` decorators on `LSHIndex.query` for precise mypy type narrowing (`Literal[True]` → `list[tuple[int, float]]`, `Literal[False]` → `list[int]`)
-- `nosec` annotations for bandit false positives (B310 `urlretrieve`, B608 parameterized `IN`-clause queries)
-- Line-range editing for `edit` and `batch_edit` tools — two new modes: scoped find/replace (searches only within `start_line`/`end_line`) and direct line replacement (`old_string=None`, replaces range wholesale). Fully backward-compatible; existing callers unchanged. 28 new tests covering all modes, validation, and edge cases.
-
-### Changed
-
-- Restructured `cache.py` (1581 lines) into `cache/` package: `cache/__init__.py`, `cache/store.py`, `cache/read.py`, `cache/write.py`, `cache/search.py`, `cache/_helpers.py`
-- Restructured `server.py` (947 lines) into `server/` package: `server/__init__.py`, `server/_mcp.py`, `server/response.py`, `server/tools.py`
-- Restructured `core/` into focused sub-packages: `core/chunking/` (Gear hash + SIMD parallel CDC), `core/similarity/` (cosine + LSH + int8/binary/ternary quantization), `core/text/` (diff generation + semantic summarization)
-- Applied `_suppress_large_diff` to `diff` tool output — large diffs now auto-summarized within token budget
-- Rewrote all 11 tool docstrings for clarity, discoverability, and accurate parameter documentation
-
-### Fixed
-
-- `lefthook` bandit hook updated to use `python -m bandit` — resolves binary spawn permission issue on some systems
-
-### Documentation
-
-- Rewrote all user-facing docs (README, architecture, performance, advanced-usage, security, troubleshooting) for accuracy and clarity
-- Fixed model references throughout: `BAAI/bge-small-en-v1.5` (33M params, 384D) replaces outdated `nomic-embed-text-v1.5`
-- Fixed model download size (~130MB) and resident memory (~200MB) — previous figures were from the nomic era (~500MB)
-- Documented persistent LSH index, `embed_batch` / `get_embeddings_batch` APIs, and batch pre-scan in `batch_smart_read`
-- Updated `cache.db` schema description to include `embeddings` and `lsh_index` tables
-- Added troubleshooting entry for LSH rebuild delay (self-healing, persisted to SQLite after first build)
-- Added `embed_batch` example and LSH persistence note to advanced-usage programmatic API section
-
-## [1.0.0] - 2026-02-03
-
-### Added
-
-- SIMD-accelerated Parallel CDC chunking with 5–7x speedup (`core/chunking_simd.py`)
-- Semantic summarization based on TCRA-LLM research (arXiv:2310.15556)
-- LSH approximate similarity search for fast nearest-neighbor lookups
-- Binary and ternary quantization for extreme compression (up to 100x)
-- Comprehensive CDC benchmarking framework comparing 5 algorithms
-- `get_optimal_chunker()` for automatic SIMD/serial selection
-- Claude Code hooks system with install script for automatic token savings
-- Security documentation (`docs/security.md`)
-- Pre-commit hooks with lefthook (ruff, mypy, bandit, tests)
-- CI/CD workflows (GitHub Actions)
-- Dependabot configuration for automated updates
-- Config validation at module load time
-- Binary file detection with clear error messages
-- Path validation (is_file check, symlink logging)
-
-### Changed
-
-- Integrated SIMD chunking into production cache (`smart_read` uses parallel CDC)
-- Replaced simple truncation with semantic summarization for large files
-- First segment (docstrings, imports) always preserved in summarization
-- Embedding conversion wrapper for numpy compatibility
-- int8 quantized embeddings enabled by default (22x storage reduction)
-- Pre-quantized binary storage format for embeddings
-- Improved error handling with specific exception types
-- Better logging for fallback paths (tokenizer, compression, hashing)
-- Updated binary file error from `UnicodeDecodeError` to `ValueError`
-
-### Fixed
-
-- Size limit enforcement in semantic summarization (dynamic marker length)
-- First segment preservation bug (was being skipped if < 3 lines)
-- Type annotations for embedding functions (`EmbeddingVector` → `NDArray` conversion)
-- `UnicodeDecodeError` handling in chunk retrieval
-- Embedding model initialization validation on startup
-- Type annotations (removed `Any`, fixed `type: ignore`)
-- Explicit UTF-8 encoding for file reads
-- Thread pool and connection pool cleanup
-
-### Security
-
-- Added path traversal validation
-- Bandit security scanning in CI
-
-## [0.3.0] - 2026-01-28
-
-### Added
-
-- SQL optimizations with connection pooling and WAL mode
-- O(N log M) BPE tokenizer with priority queue optimization
-- HyperCDC chunking (2.7x faster than Rabin)
-- BLAKE3 hashing with BLAKE2b fallback (3.8x faster)
-- ZSTD adaptive compression with LZ4/Brotli fallbacks
-
-### Changed
-
-- Improved MCP tool descriptions and metadata
-- Enhanced documentation for performance optimizations
-
-## [0.2.0] - 2026-01-25
-
-### Added
-
-- Semantic similarity search using local FastEmbed
-- LRU-K cache eviction strategy
-- Content-addressable storage with deduplication
-- Diff-based responses for changed files
-
-### Changed
-
-- Upgraded to FastMCP 3.0
-
-## [0.1.0] - 2026-01-20
+## [0.1.0] - 2026-02-21
 
 ### Added
 
 - Initial release
-- Basic file caching with mtime tracking
-- Token counting with o200k_base tokenizer
-- MCP server implementation
+- 11 MCP tools: `read`, `write`, `edit`, `batch_edit`, `search`, `similar`, `glob`, `batch_read`, `diff`, `stats`, `clear`
+- Smart file reading with diff-mode — unchanged files cost ~5 tokens, modified files return unified diffs (80–95% savings)
+- Semantic similarity search via local ONNX embeddings (BAAI/bge-small-en-v1.5, no API keys)
+- Persistent LSH index for O(1) similarity lookups; serialized to SQLite, survives restarts
+- Batch embedding — all new/changed files in a `batch_read` are embedded in a single model call
+- Line-range editing for `edit` and `batch_edit` — scoped find/replace and direct line replacement
+- int8 quantized embedding storage (388 bytes/vector, 22x smaller than float32)
+- SIMD-parallel content-defined chunking (~70–95 MB/s), BLAKE3 hashing, ZSTD compression
+- LRU-K eviction with 10,000-entry default; DoS limits on write size, match count, and glob scope
+- `diff_mode=false` on `batch_read` for full content recovery after LLM context compression
+- `append=true` on `write` for chunked large file writes
+- `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.0...v1.0.0
-[0.3.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/CoderDayton/semantic-cache-mcp/releases/tag/v0.1.0

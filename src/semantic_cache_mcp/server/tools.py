@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 @mcp.tool(
     meta={
-        "version": "1.0.0",
+        "version": _pkg_version("semantic-cache-mcp"),
         "author": "Dayton Dunbar",
         "github": "https://github.com/CoderDayton/semantic-cache-mcp",
     }

@@ -1,5 +1,7 @@
 """Semantic Cache MCP - Lightweight semantic file caching with 80%+ token reduction."""
 
+from importlib.metadata import version as _pkg_version
+
 from .cache import SemanticCache, smart_read
 from .config import (
     CACHE_DIR,
@@ -13,7 +15,7 @@ from .config import (
 from .server import mcp
 from .types import CacheEntry, ReadResult
 
-__version__ = "0.4.0"
+__version__ = _pkg_version("semantic-cache-mcp")
 
 __all__ = [
     # Main classes
