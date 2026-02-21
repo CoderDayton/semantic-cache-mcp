@@ -37,7 +37,7 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 ## Installation
 
 ```bash
-uv tool install git+https://github.com/CoderDayton/semantic-cache-mcp.git
+uv tool install semantic-cache-mcp
 ```
 
 Add to Claude Code settings (`~/.claude/settings.json`):
