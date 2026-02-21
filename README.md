@@ -56,12 +56,27 @@ Restart Claude Code. Done.
 
 ### Block Native File Tools (Recommended)
 
-Force Claude to use semantic-cache for all file I/O:
+Disable the client's built-in file tools so all file I/O routes through semantic-cache.
+
+**Claude Code** — add to `~/.claude/settings.json`:
 
 ```json
 {
   "permissions": {
-    "deny": ["Read", "Write", "Edit"]
+    "deny": ["Read", "Edit", "Write"]
+  }
+}
+```
+
+**OpenCode** — add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": "deny",
+    "edit": "deny",
+    "write": "deny"
   }
 }
 ```
