@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent LSH index — serialized to SQLite after first build, reloaded on subsequent searches and across server restarts; invalidated lazily on any `put()` or `clear()` so correctness is always maintained. Eliminates repeated O(N·dim) rebuild cost for read-heavy workloads.
+- `embed_batch()` in `core/embeddings.py` — batches N texts into a single `model.embed()` call, amortizing ONNX Runtime overhead
+- `SemanticCache.get_embeddings_batch()` — applies file-type semantic labels (same as `get_embedding`) then delegates to `embed_batch`; retrieval quality is identical to per-file embedding
+- Batch embed pre-scan in `batch_smart_read` — identifies new/changed files upfront, embeds them all in one model call before the main read loop; unchanged files are skipped
+- `SQLiteStorage.get_lsh_index()` / `set_lsh_index()` / `clear_lsh_index()` — LSH persistence layer backed by a singleton `lsh_index` table; `blob_count` column used to detect staleness after file additions
 - `diff_mode` parameter on `batch_read` tool — set `false` after LLM context compression to force full content delivery instead of diff-only responses
 - `append=True` mode on `write` tool for chunked large file writes; appends content to existing file rather than overwriting
 - `cached_only=True` filter on `glob` tool to return only files already present in cache

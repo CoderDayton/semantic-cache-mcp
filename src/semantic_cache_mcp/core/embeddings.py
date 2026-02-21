@@ -196,6 +196,30 @@ def embed(text: str) -> array.array[float] | None:
         return None
 
 
+def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
+    """Generate embeddings for multiple texts in a single model call.
+
+    Amortizes ONNX Runtime overhead across N texts — critical for
+    batch_smart_read where N files need embedding on first cache miss.
+
+    Args:
+        texts: Texts to embed (each truncated to 8000 chars)
+
+    Returns:
+        List of embeddings (same length as input, None entries on failure)
+    """
+    if not texts:
+        return []
+    try:
+        model = _get_model()
+        truncated = [t[:8000] for t in texts]
+        results = list(model.embed(truncated))
+        return [array.array("f", r.tolist()) for r in results]
+    except Exception as e:
+        logger.warning(f"Batch embedding failed: {e}")
+        return [None] * len(texts)
+
+
 def embed_query(text: str) -> array.array[float] | None:
     """Generate embedding for a search query.
 

@@ -7,7 +7,7 @@ from .chunking import (
     hypercdc_simd_chunks,
 )
 from .compression import compress_adaptive, decompress, estimate_entropy
-from .embeddings import embed, embed_query, get_model_info
+from .embeddings import embed, embed_batch, embed_query, get_model_info
 from .embeddings import warmup as warmup_embeddings
 from .hashing import (
     DeduplicateIndex,
@@ -101,6 +101,7 @@ __all__ = [
     "BPETokenizer",
     "get_tokenizer",
     "embed",
+    "embed_batch",
     "embed_query",
     "warmup_embeddings",
     "get_model_info",

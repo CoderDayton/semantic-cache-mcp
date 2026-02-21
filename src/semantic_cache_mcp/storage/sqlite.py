@@ -206,6 +206,13 @@ class SQLiteStorage:
                 CREATE INDEX IF NOT EXISTS idx_created ON files(created_at);
                 CREATE INDEX IF NOT EXISTS idx_embedding ON files(embedding)
                     WHERE embedding IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS lsh_index (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    data BLOB NOT NULL,
+                    blob_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                ) WITHOUT ROWID;
             """)
 
     # -------------------------------------------------------------------------
@@ -512,6 +519,41 @@ class SQLiteStorage:
         return None
 
     # -------------------------------------------------------------------------
+    # LSH index persistence
+    # -------------------------------------------------------------------------
+
+    def get_lsh_index(self) -> tuple[bytes, int] | None:
+        """Load persisted LSH index blob and expected blob_count.
+
+        Returns:
+            (data, blob_count) if present, None otherwise
+        """
+        with self._pool.get_connection() as conn:
+            row = conn.execute("SELECT data, blob_count FROM lsh_index WHERE id = 1").fetchone()
+        return (row[0], row[1]) if row else None
+
+    def set_lsh_index(self, data: bytes, blob_count: int) -> None:
+        """Persist LSH index blob.
+
+        Args:
+            data: Serialized LSHIndex bytes
+            blob_count: Number of embeddings indexed (used to detect staleness)
+        """
+        with self._pool.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO lsh_index (id, data, blob_count, updated_at)
+                VALUES (1, ?, ?, ?)
+                """,
+                (data, blob_count, time.time()),
+            )
+
+    def clear_lsh_index(self) -> None:
+        """Delete persisted LSH index (called on any cache mutation)."""
+        with self._pool.get_connection() as conn:
+            conn.execute("DELETE FROM lsh_index WHERE id = 1")
+
+    # -------------------------------------------------------------------------
     # Eviction
     # -------------------------------------------------------------------------
 
@@ -607,5 +649,5 @@ class SQLiteStorage:
         """
         with self._pool.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            conn.executescript("DELETE FROM files; DELETE FROM chunks;")
+            conn.executescript("DELETE FROM files; DELETE FROM chunks; DELETE FROM lsh_index;")
         return count

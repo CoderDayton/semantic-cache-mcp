@@ -9,8 +9,8 @@ import numpy as np
 
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
-from ..types import BatchReadResult, FileReadSummary, ReadResult
-from .store import SemanticCache
+from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
+from .store import SemanticCache, _file_label
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ def smart_read(
     max_size: int = MAX_CONTENT_SIZE,
     diff_mode: bool = True,
     force_full: bool = False,
+    _embedding: EmbeddingVector | None = None,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
 
@@ -141,7 +142,7 @@ def smart_read(
                 f"{stats['compression_ratio']:.1%} size\n"
             )
             result_content = f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
-            embedding = cache.get_embedding(content, path)
+            embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
             cache.put(str(file_path), content, mtime, embedding)
 
             tokens_returned = count_tokens(result_content)
@@ -158,7 +159,7 @@ def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = cache.get_embedding(content, path)
+        embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
         if embedding:
             similar_path = cache.find_similar(embedding, str(file_path))
             if similar_path:
@@ -195,7 +196,7 @@ def smart_read(
                             semantic_match=similar_path,
                         )
 
-    # Strategy 4 & 5: Full read (with optional semantic summarization)
+    # Strategy 4 & 5: Full read (semantic summarization if large; uses pre-fetched embedding)
     truncated = False
     final_content = content
 
@@ -218,7 +219,7 @@ def smart_read(
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = cache.get_embedding(content, path)
+    embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
     cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
@@ -279,6 +280,38 @@ def batch_smart_read(
     else:
         paths_sorted = sorted(paths, key=lambda p: (estimate_min_tokens(p), p))
 
+    # Pre-scan: batch embed all new/changed files in a single model call.
+    # This amortizes ONNX Runtime inference overhead from N calls → 1.
+    # Files that are unchanged (cached + mtime match) are skipped since
+    # smart_read won't need an embedding for them.
+    _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
+    for _path in paths_sorted:
+        _resolved = Path(_path).expanduser().resolve()
+        _cached = cache.get(str(_resolved))
+        if _cached and _resolved.exists() and _cached.mtime >= _resolved.stat().st_mtime:
+            continue  # unchanged — no embedding needed
+        if not _resolved.exists() or not _resolved.is_file():
+            continue  # will error in smart_read, skip pre-scan
+        try:
+            _sample = _resolved.read_bytes()[:8192]
+            if b"\x00" in _sample:
+                continue  # binary file — smart_read will raise ValueError
+            _content = _resolved.read_text(encoding="utf-8")
+            _to_embed.append((_path, str(_resolved), _content))
+        except Exception:  # nosec B112 — pre-scan best-effort; smart_read handles real errors
+            continue
+
+    # Batch embed all candidates; fall back to per-file if anything fails
+    _prefetched: dict[str, EmbeddingVector] = {}
+    if _to_embed:
+        from ..core.embeddings import embed_batch as _embed_batch  # noqa: PLC0415
+
+        _texts = [(f"{_file_label(_rpath)}: {_cnt}")[:8000] for _, _rpath, _cnt in _to_embed]
+        _results = _embed_batch(_texts)
+        for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
+            if _emb is not None:
+                _prefetched[_rpath] = _emb
+
     files: list[FileReadSummary] = []
     contents: dict[str, str] = {}
     unchanged_paths: list[str] = []
@@ -307,7 +340,14 @@ def batch_smart_read(
             break
 
         try:
-            result = smart_read(cache, path, diff_mode=diff_mode, force_full=False)
+            _resolved_key = str(Path(path).expanduser().resolve())
+            result = smart_read(
+                cache,
+                path,
+                diff_mode=diff_mode,
+                force_full=False,
+                _embedding=_prefetched.get(_resolved_key),
+            )
 
             # Unchanged detection: from_cache=True and is_diff=False means LLM already has content
             if result.from_cache and not result.is_diff:

@@ -41,17 +41,20 @@ def _top_k_with_lsh(
     query_embedding: EmbeddingVector,
     blobs: list[bytes],
     k: int,
+    cache: SemanticCache | None = None,
 ) -> list[tuple[int, float]]:
     """Top-k similarity using LSH candidate filtering for large collections.
 
     For small collections (<_LSH_THRESHOLD), falls back to exhaustive scan.
-    For larger ones, builds an ephemeral LSH index to reduce candidate set,
-    then refines with exact cosine similarity.
+    For larger ones, uses a persistent LSH index (via cache) to reduce the
+    candidate set, then refines with exact cosine similarity. The index
+    survives server restarts and is rebuilt lazily after any cache mutation.
 
     Args:
         query_embedding: Query vector
-        blobs: List of quantized embedding blobs from DB
+        blobs: List of quantized embedding blobs from DB (IDs = positions)
         k: Number of results
+        cache: SemanticCache for persistent LSH; builds ephemerally if None
 
     Returns:
         List of (index, similarity) tuples sorted by descending similarity
@@ -60,25 +63,21 @@ def _top_k_with_lsh(
     if n < _LSH_THRESHOLD:
         return top_k_from_quantized(query_embedding, blobs, k=k)
 
-    # Build ephemeral LSH index from blobs
-    # Dequantize embeddings to add to LSH
-    from ..core.similarity import dequantize_embedding  # noqa: PLC0415
-
     query_vec = np.asarray(query_embedding, dtype=np.float32)
     dim = len(query_vec)
 
-    config = LSHConfig(
-        num_bits=64,
-        num_tables=4,
-        band_size=8,
-        similarity_threshold=0.0,  # Don't filter in LSH — we do it after
-    )
-    lsh = LSHIndex(config=config)
+    if cache is not None:
+        lsh = cache.get_or_build_lsh(blobs, dim)
+    else:
+        # Ephemeral fallback (e.g. tests that don't pass cache)
+        from ..core.similarity import dequantize_embedding  # noqa: PLC0415
 
-    for idx, blob in enumerate(blobs):
-        vec = dequantize_embedding(blob)
-        if vec is not None and len(vec) == dim:
-            lsh.add(idx, vec, store_embedding=True)
+        config = LSHConfig(num_bits=64, num_tables=4, band_size=8, similarity_threshold=0.0)
+        lsh = LSHIndex(config=config)
+        for idx, blob in enumerate(blobs):
+            vec = dequantize_embedding(blob)
+            if vec is not None and len(vec) == dim:
+                lsh.add(idx, vec, store_embedding=True)
 
     # Query LSH for candidates (request more than k to improve recall)
     candidates = lsh.query(query_vec, k=min(k * 4, n), return_distances=True)
@@ -86,7 +85,6 @@ def _top_k_with_lsh(
         # LSH found nothing — fall back to exhaustive
         return top_k_from_quantized(query_embedding, blobs, k=k)
 
-    # candidates: list of (item_id, similarity) already sorted by similarity
     return [(idx, sim) for idx, sim in candidates[:k]]
 
 
@@ -138,7 +136,7 @@ def semantic_search(
     blobs = [r[2] for r in rows]
 
     # Similarity: LSH-accelerated for large caches, exhaustive for small
-    top_results = _top_k_with_lsh(query_embedding, blobs, k=k)
+    top_results = _top_k_with_lsh(query_embedding, blobs, k=k, cache=cache)
 
     # Build matches with previews
     matches: list[SearchMatch] = []
@@ -310,7 +308,7 @@ def find_similar_files(
     blobs = [r[2] for r in rows]
 
     # Similarity: LSH-accelerated for large caches, exhaustive for small
-    top_results = _top_k_with_lsh(source_embedding, blobs, k=k)
+    top_results = _top_k_with_lsh(source_embedding, blobs, k=k, cache=cache)
 
     similar_files: list[SimilarFile] = []
     for idx, sim in top_results:

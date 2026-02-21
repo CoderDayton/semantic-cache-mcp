@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from ..config import DB_PATH
 from ..core import count_tokens, get_optimal_chunker
 from ..storage import SQLiteStorage
 from ..types import CacheEntry, EmbeddingVector
+
+if TYPE_CHECKING:
+    from ..core.similarity import LSHIndex
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +237,7 @@ class SemanticCache:
     - Caching strategies (diff, truncate, semantic match)
     """
 
-    __slots__ = ("_storage",)
+    __slots__ = ("_storage", "_lsh_index")
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         """Initialize cache.
@@ -242,6 +246,79 @@ class SemanticCache:
             db_path: Path to SQLite database
         """
         self._storage = SQLiteStorage(db_path)
+        self._lsh_index: LSHIndex | None = None
+
+    # -------------------------------------------------------------------------
+    # LSH persistence
+    # -------------------------------------------------------------------------
+
+    def _invalidate_lsh(self) -> None:
+        """Mark LSH stale after any cache mutation.
+
+        Clears both in-memory index and the persisted SQLite blob.
+        The next search call will rebuild from the current file set.
+        """
+        self._lsh_index = None
+        try:
+            self._storage.clear_lsh_index()
+        except Exception as e:
+            logger.warning(f"Failed to clear persisted LSH: {e}")
+
+    def get_or_build_lsh(self, blobs: list[bytes], dim: int) -> LSHIndex:
+        """Return an LSH index consistent with the current blob list.
+
+        Load order: in-memory → SQLite → fresh build.
+        Rebuilds (and re-persists) whenever blob_count has changed.
+
+        Args:
+            blobs: Ordered quantized embedding blobs from the current DB query.
+                   Item IDs 0..N-1 correspond to positions in this list.
+            dim: Embedding dimension (used to skip malformed blobs)
+
+        Returns:
+            LSHIndex populated with the current file set
+        """
+        from ..core.similarity import LSHConfig, LSHIndex, dequantize_embedding
+        from ..core.similarity._lsh import deserialize_lsh_index, serialize_lsh_index
+
+        n = len(blobs)
+
+        # Fast path: in-memory index matches current snapshot
+        if self._lsh_index is not None and len(self._lsh_index._signatures) == n:
+            return self._lsh_index
+
+        # Try loading from SQLite
+        stored = self._storage.get_lsh_index()
+        if stored is not None:
+            data, blob_count = stored
+            if blob_count == n:
+                try:
+                    lsh = deserialize_lsh_index(data)
+                    self._lsh_index = lsh
+                    logger.debug(f"Loaded persisted LSH index ({n} items)")
+                    return lsh
+                except Exception as e:
+                    logger.warning(f"Failed to deserialize LSH index: {e}")
+
+        # Build fresh from current blob snapshot
+        config = LSHConfig(num_bits=64, num_tables=4, band_size=8, similarity_threshold=0.0)
+        lsh = LSHIndex(config=config)
+        for idx, blob in enumerate(blobs):
+            vec = dequantize_embedding(blob)
+            if vec is not None and len(vec) == dim:
+                lsh.add(idx, vec, store_embedding=True)
+
+        self._lsh_index = lsh
+        logger.debug(f"Built LSH index ({n} items)")
+
+        # Persist for reuse across searches (and across restarts)
+        try:
+            data = serialize_lsh_index(lsh)
+            self._storage.set_lsh_index(data, n)
+        except Exception as e:
+            logger.warning(f"Failed to persist LSH index: {e}")
+
+        return lsh
 
     # -------------------------------------------------------------------------
     # Embedding
@@ -306,6 +383,7 @@ class SemanticCache:
         chunks = sum(1 for _ in chunker(content_bytes))
 
         self._storage.put(path, content, mtime, embedding)
+        self._invalidate_lsh()
         logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
 
     def get_content(self, entry: CacheEntry) -> str:
@@ -351,6 +429,29 @@ class SemanticCache:
 
         return stats
 
+    def get_embeddings_batch(
+        self, path_content_pairs: list[tuple[str, str]]
+    ) -> list[EmbeddingVector | None]:
+        """Get embeddings for multiple files in a single model call.
+
+        Prepends the file-type semantic label (same as get_embedding) before
+        batching, so retrieval quality is identical to single-file embedding.
+
+        Args:
+            path_content_pairs: List of (resolved_path, content) tuples
+
+        Returns:
+            Embeddings in the same order as input, None on individual failures
+        """
+        from . import embed_batch as _embed_batch  # noqa: PLC0415
+
+        texts = [
+            (f"{_file_label(path)}: {content}" if path else content)[:8000]
+            for path, content in path_content_pairs
+        ]
+        return cast(list[EmbeddingVector | None], _embed_batch(texts))
+
     def clear(self) -> int:
         """Clear all cache entries."""
+        self._invalidate_lsh()
         return self._storage.clear()
