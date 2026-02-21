@@ -24,6 +24,7 @@ from semantic_cache_mcp.cache import (
     batch_smart_read,
     glob_with_cache_status,
 )
+from semantic_cache_mcp.core.embeddings import embed_batch
 
 # Initialize cache
 cache = SemanticCache()
@@ -255,7 +256,31 @@ summary = summarize_semantic(
 )
 ```
 
+### Batch Embedding
+
+When embedding many files at once, amortize ONNX Runtime inference overhead with a single model call:
+
+```python
+from semantic_cache_mcp.core.embeddings import embed_batch
+
+texts = [
+    "python: def authenticate(user, password): ...",
+    "typescript: async function fetchUser(id: string): ...",
+    "rust: pub fn parse_config(path: &Path) -> Result<Config, Error>",
+]
+
+# Single ONNX Runtime call for N texts (much faster than N separate embed() calls)
+vectors = embed_batch(texts)  # list[array.array[float] | None]
+for text, vec in zip(texts, vectors):
+    if vec is not None:
+        print(f"Embedded {len(text)} chars → {len(vec)}-dim vector")
+```
+
+`batch_smart_read` calls this automatically for all new/changed files before the main read loop — you typically don't need to call it directly.
+
 ### LSH Approximate Search
+
+The LSH index is built on-demand and **persisted to SQLite** automatically — no manual management required. After the first build, subsequent queries load instantly from the database.
 
 ```python
 from semantic_cache_mcp.core import LSHIndex, LSHConfig

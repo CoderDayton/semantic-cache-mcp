@@ -3,13 +3,13 @@
 ## Embedding Model Issues
 
 **"Embedding model not loaded"**
-- **Cause:** First startup triggers a one-time download (~500MB)
-- **Fix:** Wait for download to complete. Progress is logged at INFO level. Subsequent starts are fast.
+- **Cause:** First startup triggers a one-time model download (~130MB for BAAI/bge-small-en-v1.5)
+- **Fix:** Wait for the download to complete — progress is logged at INFO level. Subsequent starts are fast (model is cached locally).
 - **Model location:** `~/.cache/semantic-cache-mcp/models/`
 
 **Slow first request after restart**
 - **Cause:** ONNX Runtime warms up the model on the first inference
-- **Fix:** The server performs a warmup pass at startup. If latency is still high on first use, check available memory — the model needs ~500MB resident.
+- **Fix:** The server performs a warmup pass at startup. If latency is still high on first use, check available memory — bge-small-en-v1.5 needs ~200MB resident (ONNX Runtime + model weights).
 
 **"Embedding failed" in logs**
 - **Cause:** Model not yet loaded, or ONNX Runtime error
@@ -56,16 +56,20 @@
 - **Cause:** These tools only search cached files. If the cache is empty or the relevant files haven't been read, nothing will match.
 - **Fix:** Seed the cache first with `read` or `batch_read`, then call `search` or `similar`.
 
+**`search` or `similar` results seem stale after adding many files**
+- **Cause:** The LSH index is lazily rebuilt when the cached blob count changes. On the very first query after a large `batch_read`, you may see a one-time rebuild delay.
+- **Fix:** This is normal and self-healing — the rebuilt index is persisted to SQLite so subsequent queries are instant. No action needed.
+
 ---
 
 ## Performance Issues
 
 **Slow first startup**
-- **Cause:** Embedding model download (~500MB) on first use, followed by ONNX initialization
+- **Cause:** Embedding model download (~130MB) on first use, followed by ONNX initialization
 - **Expected:** Normal on first use. Model is cached in `~/.cache/semantic-cache-mcp/models/`.
 
 **High memory usage**
-- **Cause:** Embedding model holds ~500MB resident + SQLite page cache (up to 64MB)
+- **Cause:** Embedding model holds ~200MB resident (ONNX Runtime + bge-small-en-v1.5 weights) + SQLite page cache (up to 64MB)
 - **Options:**
   - Use `clear` to evict cached entries and reduce DB size
   - Reduce `MAX_CACHE_ENTRIES` to lower the number of cached embeddings
@@ -92,9 +96,9 @@
 
 | Path                                         | Contents                     |
 |----------------------------------------------|------------------------------|
-| `~/.cache/semantic-cache-mcp/cache.db`       | SQLite database (chunks + file metadata) |
+| `~/.cache/semantic-cache-mcp/cache.db`       | SQLite database (chunks, embeddings, LSH index, file metadata) |
 | `~/.cache/semantic-cache-mcp/tokenizer/`     | o200k_base BPE tokenizer file |
-| `~/.cache/semantic-cache-mcp/models/`        | FastEmbed ONNX model (~500MB) |
+| `~/.cache/semantic-cache-mcp/models/`        | FastEmbed ONNX model (~130MB, BAAI/bge-small-en-v1.5) |
 
 ---
 

@@ -7,9 +7,9 @@ src/semantic_cache_mcp/
 ├── config.py               # Constants and environment-variable configuration
 ├── types.py                # All shared data models (ReadResult, WriteResult, etc.)
 ├── cache/                  # Orchestration facade — coordinates all components
-│   ├── __init__.py         # Public API re-exports
-│   ├── store.py            # SemanticCache class (thin wrapper over SQLiteStorage)
-│   ├── read.py             # smart_read, batch_smart_read
+│   ├── __init__.py         # Public API re-exports (including embed_batch)
+│   ├── store.py            # SemanticCache class: get_or_build_lsh(), get_embeddings_batch(), _invalidate_lsh()
+│   ├── read.py             # smart_read, batch_smart_read (batch pre-scan + embed)
 │   ├── write.py            # smart_write, smart_edit, smart_batch_edit
 │   ├── search.py           # semantic_search, find_similar_files, glob_with_cache_status, compare_files
 │   └── _helpers.py         # Internal utilities: _suppress_large_diff, formatter dispatch
@@ -17,20 +17,20 @@ src/semantic_cache_mcp/
 │   ├── __init__.py
 │   ├── _mcp.py             # FastMCP app instance, lifespan, startup warmup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
-│   └── tools.py            # All 12 MCP tool definitions
+│   └── tools.py            # All 11 MCP tool definitions
 ├── core/                   # Pure algorithms — stateless, zero I/O
-│   ├── __init__.py         # Flat re-exports from all sub-packages
+│   ├── __init__.py         # Flat re-exports from all sub-packages (includes embed_batch)
 │   ├── chunking/           # Content-defined chunking
 │   │   ├── __init__.py
 │   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
 │   │   └── _simd.py        # SIMD-accelerated parallel CDC
 │   ├── compression.py      # Adaptive multi-codec (ZSTD/LZ4/Brotli)
-│   ├── embeddings.py       # FastEmbed local embeddings
+│   ├── embeddings.py       # FastEmbed local embeddings (embed, embed_batch, embed_query)
 │   ├── hashing.py          # BLAKE3/BLAKE2b, DeduplicateIndex, HierarchicalHasher
 │   ├── similarity/         # Cosine similarity, LSH, and quantization
 │   │   ├── __init__.py
 │   │   ├── _cosine.py      # cosine_similarity, int8 quantization, top_k_from_quantized
-│   │   ├── _lsh.py         # LSHIndex, LSHConfig, SimHash projections
+│   │   ├── _lsh.py         # LSHIndex, LSHConfig, SimHash projections, serialize/deserialize
 │   │   └── _quantization.py # Binary/ternary quantization
 │   ├── text/               # Diff generation and semantic summarization
 │   │   ├── __init__.py
@@ -39,7 +39,7 @@ src/semantic_cache_mcp/
 │   └── tokenizer.py        # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
-    └── sqlite.py           # SQLiteStorage: content-addressable + LRU-K eviction
+    └── sqlite.py           # SQLiteStorage: content-addressable + LRU-K eviction + LSH persistence
 ```
 
 ## Design Principles
@@ -136,15 +136,30 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 
 ### Embeddings (`core/embeddings.py`)
 
-Local text embeddings via FastEmbed (nomic-embed-text-v1.5).
+Local text embeddings via FastEmbed with `BAAI/bge-small-en-v1.5`.
 
-- 768-dimensional, 8192 token context window
-- Singleton model instance — loaded once, reused
+- **384-dimensional**, 33M parameters, 512 token context window
+- Runs via ONNX Runtime — CPU by default, CUDA when available
+- Singleton model instance — loaded once, reused across all calls
 - Warmup pass at server startup for predictable first-request latency
-- `search_document:` prefix for indexed content; `search_query:` for queries
-- `configure(cache_dir=...)` decouples from config.py for standalone use
+- `"Represent this sentence for searching relevant passages:"` prefix for query embedding
+- File-type semantic labels prepended to document content before embedding (e.g., `"python source file: ..."`)
 - Model stored in `~/.cache/semantic-cache-mcp/models/`
-- No API keys; fully offline after initial download
+- No API keys; fully offline after initial download (~500MB)
+
+#### Batch Embedding
+
+`embed_batch(texts)` amortizes ONNX Runtime overhead across N texts in a single model call — critical for `batch_smart_read` where multiple files need embedding on first cache miss.
+
+**Pre-scan flow in `batch_smart_read`:**
+1. Before reading any file, scan all requested paths for new or changed files (mtime check)
+2. Collect their content and apply the same file-type label prefix used by single-file embedding
+3. Call `embed_batch()` once with all texts — a single ONNX inference pass
+4. Store prefetched embeddings; `smart_read` picks them up instead of calling the model individually
+
+This reduces N model calls (one per new file) to exactly 1, regardless of batch size.
+
+`SemanticCache.get_embeddings_batch(path_content_pairs)` provides the same optimization at the cache facade level, applying file-type labels automatically.
 
 ---
 
@@ -152,13 +167,13 @@ Local text embeddings via FastEmbed (nomic-embed-text-v1.5).
 
 #### `_cosine.py` — int8 Quantized Cosine Similarity
 
-int8 quantization stores embeddings as 772 bytes instead of 17KB (22× reduction) with < 0.3% accuracy loss:
+int8 quantization stores each 384-dimensional embedding as **388 bytes** instead of ~6KB (4× in raw bytes; 22× vs Python `list[float]`) with < 0.3% accuracy loss:
 
-1. Scale 768-dim float32 vector to `[-128, 127]` int8 range
-2. Store as raw bytes blob in SQLite
+1. Scale 384-dim float32 vector to `[-128, 127]` int8 range
+2. Store as `struct.pack('<f', scale) + quantized.tobytes()` — 4 bytes scale + 384 bytes int8 = 388 bytes total
 3. At query time: load blob, dequantize, compute cosine via SIMD batch matrix op
 
-Performance (1000 vectors, 768D):
+Performance (1000 vectors, 384D, bge-small-en-v1.5):
 
 | Method                    | Time    | Speedup |
 |---------------------------|---------|---------|
@@ -167,7 +182,7 @@ Performance (1000 vectors, 768D):
 | Batch matrix (int8)       | ~0.6 ms | 8×      |
 | Quantized + dim pruning   | ~0.35 ms | 14×    |
 
-#### `_lsh.py` — LSH Approximate Search
+#### `_lsh.py` — LSH Approximate Search (Persisted)
 
 SimHash-based Locality-Sensitive Hashing for fast approximate nearest-neighbor search.
 
@@ -176,11 +191,26 @@ SimHash-based Locality-Sensitive Hashing for fast approximate nearest-neighbor s
 2. Index signatures in multiple hash tables (band decomposition for recall)
 3. At query time: compute query signature, retrieve candidates from all tables, run exact cosine only on candidates
 
+**Persistence:** The LSH index is persisted to SQLite rather than rebuilt from scratch on every search. After building, it is serialized via `serialize_lsh_index()` and stored as a BLOB in the `lsh_index` table (SQLite singleton, `id=1`). On subsequent search calls or server restarts, `get_or_build_lsh()` loads the persisted index rather than rebuilding from embedding blobs.
+
+**Load order in `SemanticCache.get_or_build_lsh()`:**
+1. In-memory `_lsh_index` — if present and size matches, return immediately
+2. SQLite `lsh_index` row — if `blob_count` matches current file count, deserialize and return
+3. Fresh build — compute from all embedding BLOBs, persist to SQLite
+
+**Invalidation:** Any `put()` or `clear()` call invokes `_invalidate_lsh()`, which clears both the in-memory reference and the persisted SQLite row. The index is rebuilt lazily on the next `search` or `similar` call.
+
+`_LSH_THRESHOLD = 100` still applies:
+- n < 100: exhaustive `top_k_from_quantized()` (already fast at this scale)
+- n ≥ 100: LSH candidates (4× k), then exact cosine re-ranking on candidates
+
+`SemanticCache` details:
+- `__slots__ = ("_storage", "_lsh_index")`
+- `get_or_build_lsh(blobs, dim)` — returns consistent LSH index, loading from SQLite if available
+- `get_embeddings_batch(path_content_pairs)` — batch embed with file-type labels applied automatically
+- `_invalidate_lsh()` — clears in-memory index and SQLite row on any cache mutation
+
 - `@overload` decorators provide precise return types: `Literal[True]` → `list[tuple[int, float]]`, `Literal[False]` → `list[int]`
-- Ephemeral index built at query time from DB rows (not persisted)
-- `_top_k_with_lsh()` in `cache/search.py` applies the 100-file threshold:
-  - n < 100: exhaustive `top_k_from_quantized` (already fast at this scale)
-  - n ≥ 100: LSH candidates (4× k), then exact re-ranking on candidates
 
 #### `_quantization.py` — Binary and Ternary Quantization
 
@@ -240,12 +270,19 @@ CREATE TABLE files (
     chunk_hashes  TEXT NOT NULL,  -- JSON array of chunk hashes
     mtime         REAL NOT NULL,
     tokens        INTEGER NOT NULL,
-    embedding     BLOB,           -- int8 quantized, array.array('b') serialized
+    embedding     BLOB,           -- int8 quantized: 4B scale + 384×int8 = 388 bytes
     created_at    REAL NOT NULL,
     access_history TEXT NOT NULL  -- JSON array of access timestamps (LRU-K)
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;
+
+CREATE TABLE lsh_index (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
+    data       BLOB NOT NULL,                        -- serialize_lsh_index() output
+    blob_count INTEGER NOT NULL DEFAULT 0,           -- file count when built
+    updated_at REAL NOT NULL
+) WITHOUT ROWID;
 ```
 
 ### LRU-K Eviction (K=2)
@@ -294,6 +331,21 @@ Client ──→ smart_read(path, diff_mode=True)
 
 After context compression, call with `diff_mode=False` to bypass the "unchanged" path and always receive full content.
 
+### Batch Read
+
+```
+Client ──→ batch_smart_read(paths, diff_mode=True)
+                │
+         1. Pre-scan: filter new/changed paths (mtime check)
+                │
+         2. embed_batch([...all new/changed texts...])
+            ── single ONNX inference call ──
+                │
+         3. smart_read() per file (embedding prefetched, no model call)
+                │
+         4. Return BatchReadResult with per-file status
+```
+
 ### Write / Edit
 
 ```
@@ -306,6 +358,9 @@ Client ──→ smart_write(path, content)
         ┌───────┴──────────┐
         ▼                  ▼
    write to disk      update cache
+        │                  │
+        │             _invalidate_lsh()
+        │             (next search rebuilds index)
         │
    return diff (not full content)
 ```
@@ -313,12 +368,15 @@ Client ──→ smart_write(path, content)
 ### Semantic Search
 
 ```
-query ──→ embed_query() ──→ query_vec (768D float32)
+query ──→ embed_query() ──→ query_vec (384D float32)
                                     │
                    ┌────────────────┴────────────────┐
                    │ n < 100 files                   │ n ≥ 100 files
-                   │ exhaustive cosine scan           │ LSH candidate retrieval
-                   │ top_k_from_quantized()           │ → exact re-rank top 4k
+                   │ exhaustive cosine scan           │ get_or_build_lsh()
+                   │ top_k_from_quantized()           │   ├─ in-memory hit → reuse
+                   │                                  │   ├─ SQLite hit → deserialize
+                   │                                  │   └─ miss → build + persist
+                   │                                  │ LSH candidates (4×k) → exact re-rank
                    └────────────────┬────────────────┘
                                     │
                                top-k results

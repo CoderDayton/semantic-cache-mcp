@@ -13,32 +13,33 @@
 
 ## Optimization Summary
 
-| Technique                          | Benefit                     | Details                                                       |
-|------------------------------------|-----------------------------|---------------------------------------------------------------|
-| **SIMD parallel CDC chunking**     | 5–7× faster                 | Boundary detection across CPU cores; ~70–95 MB/s on 4-core   |
-| **Serial HyperCDC (Gear hash)**    | 2.7× vs Rabin               | Skip-min optimization; ~13–14 MB/s                           |
-| **int8 quantized embeddings**      | 22× storage reduction       | 772 bytes vs 17KB per 768D vector; <0.3% accuracy loss       |
-| **LSH approximate search**         | O(1) candidate retrieval     | Ephemeral SimHash index for caches ≥100 files                |
-| **BLAKE3 hashing**                 | 3.8–4.9× vs BLAKE2b         | Hardware-accelerated on 8KB+ chunks                          |
-| **LRU hash cache**                 | Avoid re-hashing             | 16K chunks, 4K blocks, 2K content hashes                     |
-| **Adaptive ZSTD compression**      | Entropy-matched codec        | STORE/ZSTD-1/ZSTD-3/ZSTD-9 selected per chunk               |
-| **Cached ZSTD compressors**        | 2× faster compression        | Avoid object creation overhead per call                      |
-| **O(1) magic-byte detection**      | 15–20× faster                | First-byte table skips already-compressed data               |
-| **Native ZSTD multi-threading**    | 19× faster large files       | Uses ZSTD threads, not Python threads; triggered at >4MB     |
-| **O(N log M) BPE tokenizer**       | vs O(N²) naive               | Priority-queue merge with memoization                        |
-| **Batch matrix similarity**        | 6–14× vs per-vector loop     | Single SIMD operation over all cached embeddings             |
-| **frombytes() array conversion**   | ~100× faster                 | Direct memcpy vs tolist() for embedding deserialization       |
-| **Batch SQL IN clause**            | N→1 DB round-trips           | Single `SELECT ... WHERE IN` replaces per-file lookups       |
-| **Pre-computed cache set in batch**| 2× fewer lookups             | Eliminates double cache.get() in batch_smart_read sort       |
-| **Partial index on embedding**     | Faster similarity scans      | Indexes only rows with `embedding IS NOT NULL`               |
-| **WITHOUT ROWID tables**           | 20–30% space savings         | Text primary keys stored directly in B-tree                  |
-| **SQLite WAL mode**                | Concurrent reads             | Reads never block; multiple readers + one writer             |
-| **Connection pooling**             | Eliminate ~5–10ms overhead   | Queue-based pool, 5 connections; reused across requests      |
-| **WAL checkpoint (TRUNCATE)**      | Read-after-write consistency | Ensures reads see latest commits                             |
-| **array.array for embeddings**     | ~50% less memory             | Typed arrays vs Python lists                                 |
-| **`__slots__` on dataclasses**     | Eliminate `__dict__`         | Memory-efficient data models                                 |
-| **Generator expressions**          | Avoid intermediate lists     | Used in hot paths (chunk iteration, similarity ranking)      |
-| **Semantic summarization**         | 50–80% savings on large files | Segment scoring + greedy selection preserves structure      |
+| Technique                          | Benefit                          | Details                                                        |
+|------------------------------------|----------------------------------|----------------------------------------------------------------|
+| **SIMD parallel CDC chunking**     | 5–7× faster                      | Boundary detection across CPU cores; ~70–95 MB/s on 4-core    |
+| **Serial HyperCDC (Gear hash)**    | 2.7× vs Rabin                    | Skip-min optimization; ~13–14 MB/s                            |
+| **int8 quantized embeddings**      | 22× storage reduction            | 388 bytes vs ~12KB per 384D vector; <0.3% accuracy loss       |
+| **Persistent LSH index**           | Eliminates per-search rebuild    | Serialized to SQLite; reloaded on next search or restart; O(N·dim) build amortized across all searches until next write |
+| **Batch embedding**                | N ONNX calls → 1                 | Pre-scan in `batch_smart_read` collects all new/changed files; single `model.embed()` call; unchanged files skipped entirely |
+| **LSH approximate search**         | O(1) candidate retrieval         | SimHash index for caches ≥ 100 files; persisted between sessions |
+| **BLAKE3 hashing**                 | 3.8–4.9× vs BLAKE2b              | Hardware-accelerated on 8KB+ chunks                           |
+| **LRU hash cache**                 | Avoid re-hashing                 | 16K chunks, 4K blocks, 2K content hashes                      |
+| **Adaptive ZSTD compression**      | Entropy-matched codec            | STORE/ZSTD-1/ZSTD-3/ZSTD-9 selected per chunk                |
+| **Cached ZSTD compressors**        | 2× faster compression            | Avoid object creation overhead per call                       |
+| **O(1) magic-byte detection**      | 15–20× faster                    | First-byte table skips already-compressed data                |
+| **Native ZSTD multi-threading**    | 19× faster large files           | Uses ZSTD threads, not Python threads; triggered at >4MB      |
+| **O(N log M) BPE tokenizer**       | vs O(N²) naive                   | Priority-queue merge with memoization                         |
+| **Batch matrix similarity**        | 6–14× vs per-vector loop         | Single SIMD operation over all cached embeddings              |
+| **frombytes() array conversion**   | ~100× faster                     | Direct memcpy vs tolist() for embedding deserialization        |
+| **Batch SQL IN clause**            | N→1 DB round-trips               | Single `SELECT ... WHERE IN` replaces per-file lookups        |
+| **Pre-computed cache set in batch**| 2× fewer lookups                 | Eliminates double cache.get() in batch_smart_read sort        |
+| **Partial index on embedding**     | Faster similarity scans          | Indexes only rows with `embedding IS NOT NULL`                |
+| **WITHOUT ROWID tables**           | 20–30% space savings             | Text primary keys stored directly in B-tree                   |
+| **SQLite WAL mode**                | Concurrent reads                 | Reads never block; multiple readers + one writer              |
+| **Connection pooling**             | Eliminate ~5–10ms overhead       | Queue-based pool, 5 connections; reused across requests       |
+| **array.array for embeddings**     | ~50% less memory                 | Typed arrays vs Python lists                                  |
+| **`__slots__` on dataclasses**     | Eliminate `__dict__`             | Memory-efficient data models                                  |
+| **Generator expressions**          | Avoid intermediate lists         | Used in hot paths (chunk iteration, similarity ranking)       |
+| **Semantic summarization**         | 50–80% savings on large files    | Segment scoring + greedy selection preserves structure        |
 
 ---
 
@@ -126,14 +127,18 @@ Source code (low entropy) uses ZSTD-9. Already-compressed binary files use STORE
 
 ## Embeddings and Similarity
 
+### Model
+
+`BAAI/bge-small-en-v1.5` — 384-dimensional, 33M parameters, 512 token context. Runs locally via FastEmbed (ONNX Runtime). CUDA is used automatically when a compatible GPU is present.
+
 ### int8 Quantization
 
-768-dimensional float32 embedding → int8 quantized:
+384-dimensional float32 embedding → int8 quantized:
 
 ```
-float32: 768 dims × 4 bytes = 3,072 bytes
-int8:    768 dims × 1 byte  = 768 bytes → stored as 772-byte blob
-Reduction: 4× in raw bytes; 22× vs original Python list[float] (~17KB)
+float32: 384 dims × 4 bytes = 1,536 bytes
+int8:    4 bytes (scale) + 384 bytes (int8) = 388 bytes
+Reduction: ~4× in raw bytes; ~22× vs Python list[float] (~12KB with CPython overhead)
 ```
 
 Accuracy: <0.3% mean error vs exact float32 cosine similarity.
@@ -141,7 +146,7 @@ Accuracy: <0.3% mean error vs exact float32 cosine similarity.
 ### Batch Matrix Operations
 
 ```
-1000 vectors, 768D (nomic-embed-text-v1.5):
+1000 vectors, 384D (BAAI/bge-small-en-v1.5):
 
 Per-vector loop:               ~5.0 ms  (1×)
 Batch matrix (float32):        ~0.8 ms  (6×)
@@ -149,15 +154,29 @@ Batch matrix (int8 quantized): ~0.6 ms  (8×)
 Quantized + dimension pruning: ~0.35 ms (14×)
 ```
 
-### LSH Approximate Search
+### Batch Embedding (`embed_batch`)
 
-For caches ≥100 files, `_top_k_with_lsh()` builds an ephemeral SimHash index:
+`batch_smart_read` pre-scans all requested paths before the main read loop:
+
+1. Identify new/changed files via mtime check (unchanged files need no embedding)
+2. Read content from disk and apply file-type semantic labels
+3. Call `embed_batch()` once — a single `model.embed(texts)` ONNX inference call
+4. Distribute results into `smart_read` via `_embedding=` parameter
+
+For a batch of 20 files where 12 are new: 12 model calls → 1. Unchanged files pay zero embedding cost.
+
+### LSH Approximate Search (Persisted)
+
+For caches ≥ 100 files, `_top_k_with_lsh()` uses a persisted SimHash index:
 
 1. Project each vector onto random hyperplanes (64 bits, 4 tables, band_size=8)
-2. Query retrieves candidates in O(1) per table
-3. Exact cosine re-ranking on candidates (4× k)
+2. Index persisted to SQLite after first build (`serialize_lsh_index()`)
+3. Query retrieves candidates in O(1) per table
+4. Exact cosine re-ranking on candidates (4× k)
 
-This eliminates the O(N) exhaustive scan for large caches without persisting index state.
+**Persistence benefit:** Without this, every `search` or `similar` call rebuilds the index from scratch (O(N·dim) to dequantize and hash all embeddings). With persistence, the rebuild cost is paid at most once per write session. For read-heavy workflows (read 100 files, search repeatedly), this eliminates the rebuild entirely between searches.
+
+**Invalidation:** Any `put()` or `clear()` clears both the in-memory `_lsh_index` and the SQLite row. The index rebuilds lazily on the next search call.
 
 ---
 
@@ -165,15 +184,15 @@ This eliminates the O(N) exhaustive scan for large caches without persisting ind
 
 ### Embedding Storage
 
-| Format                | Size (768D) | Notes                           |
+| Format                | Size (384D) | Notes                           |
 |-----------------------|-------------|---------------------------------|
-| `list[float]`         | ~17 KB      | CPython list overhead           |
-| `array.array('f')`    | ~3 KB       | 6× reduction                   |
-| `int8 quantized blob` | ~772 B      | 22× reduction, <0.3% error     |
+| `list[float]`         | ~12 KB      | CPython list + float overhead   |
+| `array.array('f')`    | ~1.5 KB     | 8× reduction                   |
+| `int8 quantized blob` | ~388 B      | 31× reduction, <0.3% error     |
 
 ```python
-# Before: Python list (one float = 28 bytes in CPython)
-embedding = [0.1, 0.2, 0.3]  # 3 floats = ~84 bytes overhead
+# Before: Python list (one float = ~32 bytes in CPython including GC overhead)
+embedding = [0.1, 0.2, 0.3]  # 3 floats ≈ 96 bytes in a list
 
 # After: typed array (4 bytes/float, no per-element overhead)
 embedding = array.array('f', [0.1, 0.2, 0.3])  # 12 bytes
@@ -210,6 +229,7 @@ PRAGMA mmap_size     = 268435456;   -- 256MB memory-mapped I/O
 -- WITHOUT ROWID: 20-30% space savings for text-keyed tables
 CREATE TABLE chunks (...) WITHOUT ROWID;
 CREATE TABLE files  (...) WITHOUT ROWID;
+CREATE TABLE lsh_index (...) WITHOUT ROWID;  -- singleton LSH persistence
 
 -- Partial index: only index rows with embeddings
 CREATE INDEX idx_embedding ON files(embedding) WHERE embedding IS NOT NULL;

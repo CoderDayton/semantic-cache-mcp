@@ -22,9 +22,10 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 - **80%+ Token Reduction** — Unchanged files cost ~0 tokens; changed files return diffs only
 - **Three-State Read Model** — First read (full + cache), unchanged (message only, 99% savings), modified (diff, 80–95% savings)
-- **Semantic Search** — Local embeddings via FastEmbed, no API keys, works offline
-- **LSH Acceleration** — O(1) candidate retrieval for caches ≥ 100 files (vs O(N) linear scan)
-- **int8 Quantization** — 22x smaller embeddings (772 bytes vs 17 KB/vector)
+- **Semantic Search** — Local embeddings via BAAI/bge-small-en-v1.5 (33M params, 384D, ONNX Runtime), no API keys, works offline
+- **LSH Acceleration** — Persistent SimHash index for O(1) candidate retrieval on caches ≥ 100 files; survives restarts, rebuilt lazily after writes
+- **Batch Embedding** — `batch_smart_read` pre-scans all new/changed files and embeds them in a single model call (N calls → 1)
+- **int8 Quantization** — 388 bytes per vector (4B scale + 384×int8), 22x smaller than raw float32
 - **SIMD-Parallel Chunking** — 5–7x faster content-defined deduplication (~70–95 MB/s)
 - **Adaptive Compression** — ZSTD primary (6.9 GB/s for text), LZ4 and Brotli fallbacks
 - **Content-Addressable Storage** — BLAKE3-hashed chunks, 3.8x faster than BLAKE2b
@@ -103,7 +104,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | `search` | Semantic/embedding search across cached files by meaning — not keywords. Seed cache first with `read` or `batch_read`. |
 | `similar` | Finds semantically similar cached files to a given path. Start with `k=3–5`. Only searches cached files. |
 | `glob` | Pattern matching with cache status per file. `cached_only=true` filters to already-cached files. Max 1000 matches, 5s timeout. |
-| `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Set `diff_mode=false` after context compression. |
+| `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Pre-scans and batch-embeds all new/changed files in a single model call. Set `diff_mode=false` after context compression. |
 | `diff` | Compare two files. Returns unified diff plus semantic similarity score. Large diffs are auto-summarized to stay within token budget. |
 
 ### Management
@@ -268,6 +269,7 @@ batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
 - **Priority ordering**: `priority` paths read first, remainder sorted smallest-first
 - **Token budget**: stops reading new files once `max_total_tokens` reached; skipped files include `est_tokens` hint
 - **Unchanged suppression**: unchanged files appear in `summary.unchanged` with no content (zero tokens)
+- **Batch embedding**: pre-scans all new/changed files and embeds them in a single model call before reading — N model calls reduced to 1
 - **Context compression recovery**: set `diff_mode=false` when Claude needs full content after losing context
 
 </details>
@@ -324,7 +326,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 }
 ```
 
-**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `nomic-ai/nomic-embed-text-v1.5`. Runs entirely locally — no API keys, no network calls during search.
+**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. CUDA acceleration is used automatically when available.
 
 **Cache location:** `~/.cache/semantic-cache-mcp/`
 
@@ -351,9 +353,9 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 
 1. **File unchanged** — mtime matches cache entry → return "no changes" message (~5 tokens)
 2. **File changed** — compute unified diff → return diff only (80–95% savings)
-3. **Semantically similar cached file** — return diff from nearest neighbor (LSH O(1) lookup ≥ 100 files)
+3. **Semantically similar cached file** — return diff from nearest neighbor (LSH O(1) lookup for caches ≥ 100 files; index persisted in SQLite, rebuilt lazily after writes)
 4. **Large file** — semantic summarization preserving docstrings and key function signatures
-5. **New file** — full content returned, stored via SIMD-accelerated HyperCDC chunking
+5. **New file** — full content returned, stored via SIMD-accelerated HyperCDC chunking; `batch_read` pre-scans and embeds all new files in a single model call before processing
 
 ---
 
@@ -361,8 +363,10 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 
 | Component | Improvement | Details |
 |-----------|-------------|---------|
-| Embeddings | 22x smaller | int8 quantization: 772 bytes vs 17 KB/vector |
+| Embeddings | 22x smaller | int8 quantization: 388 bytes vs 17 KB/vector (384D) |
 | Similarity search | O(1) lookup | LSH acceleration for caches ≥ 100 files |
+| Persistent LSH index | Survives restarts | Serialized to SQLite; invalidated on write, rebuilt lazily on next search |
+| Batch embedding | N model calls → 1 | `batch_smart_read` pre-scans all new/changed files; single `model.embed()` call |
 | Array conversion | ~100x faster | `frombytes()` memcpy replaces `tolist()` iteration |
 | Chunking | 5–7x faster | SIMD-parallel CDC at ~70–95 MB/s |
 | Hashing | 3.8x faster | BLAKE3 with BLAKE2b fallback |
@@ -381,10 +385,10 @@ See [docs/performance.md](docs/performance.md) for benchmarks and methodology.
 src/semantic_cache_mcp/
 ├── cache/              # Orchestration facade
 │   ├── __init__.py     # Public API
-│   ├── store.py        # Cache entry management
-│   ├── read.py         # smart_read logic
+│   ├── store.py        # SemanticCache class: get_or_build_lsh(), get_embeddings_batch()
+│   ├── read.py         # smart_read, batch_smart_read (batch pre-scan + embed)
 │   ├── write.py        # smart_write / smart_edit
-│   ├── search.py       # Embedding search + similar
+│   ├── search.py       # Embedding search + similar (_LSH_THRESHOLD = 100)
 │   └── _helpers.py     # Internal utilities
 ├── server/             # MCP interface (FastMCP 3.0)
 │   ├── __init__.py
@@ -393,9 +397,9 @@ src/semantic_cache_mcp/
 │   └── tools.py        # All 11 tool definitions
 ├── core/
 │   ├── chunking/       # HyperCDC (Gear hash) + SIMD parallel CDC
-│   ├── similarity/     # Cosine, LSH, int8/binary/ternary quantization
+│   ├── similarity/     # Cosine, LSH (serialize/deserialize), int8/binary/ternary quantization
 │   └── text/           # Diff generation, semantic summarization
-├── storage/            # SQLite content-addressable storage
+├── storage/            # SQLite content-addressable storage (chunks, files, lsh_index)
 ├── config.py           # Environment-driven configuration
 └── types.py            # Shared type definitions
 ```
@@ -437,10 +441,10 @@ This project uses Python 3.12+, strict type hints throughout, Ruff for formattin
 
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and:
 
-- [FastEmbed](https://github.com/qdrant/fastembed) — local embeddings (nomic-embed-text-v1.5)
+- [FastEmbed](https://github.com/qdrant/fastembed) — local ONNX embeddings (BAAI/bge-small-en-v1.5, 33M params, 384D)
 - SIMD-accelerated Parallel CDC — 5–7x faster than serial HyperCDC
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
-- LSH approximate nearest-neighbor search
+- LSH approximate nearest-neighbor search with SQLite persistence
 - int8/binary/ternary quantization for extreme compression
 - BLAKE3 cryptographic hashing
 - ZSTD/LZ4/Brotli adaptive compression

@@ -69,7 +69,7 @@ All inputs are validated before I/O:
 **Local only** — All cached content, embeddings, and metadata are stored in `~/.cache/semantic-cache-mcp/` with standard user-mode permissions (`700` for the directory).
 
 **No network transmission** — Cached file content and embeddings are never sent over the network. The only outbound network requests are:
-1. Embedding model download from HuggingFace Hub on first use (~500MB)
+1. Embedding model download from HuggingFace Hub on first use (~130MB for BAAI/bge-small-en-v1.5)
 2. Tokenizer file download from `openaipublic.blob.core.windows.net` on first use (~3.5MB)
 
 Both downloads are SHA256-verified before use. A corrupted or tampered download is detected and discarded.
@@ -78,7 +78,7 @@ Both downloads are SHA256-verified before use. A corrupted or tampered download 
 
 ### Embedding Model
 
-Embeddings are generated entirely locally using [FastEmbed](https://github.com/qdrant/fastembed) (nomic-embed-text-v1.5). No text is sent to external APIs for embedding.
+Embeddings are generated entirely locally using [FastEmbed](https://github.com/qdrant/fastembed) with the [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) model (33M parameters, 384 dimensions). No file content is ever sent to an external API for embedding — inference runs entirely on-device via ONNX Runtime.
 
 ---
 
