@@ -126,7 +126,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `stats` | Cache metrics: file count, token counts, hit rate, compression ratio. |
+| `stats` | Cache metrics, session usage (tokens saved, tool calls), and lifetime aggregates. |
 | `clear` | Reset all cache entries. |
 
 ---

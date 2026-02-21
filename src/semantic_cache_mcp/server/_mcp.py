@@ -44,6 +44,7 @@ async def app_lifespan(server: FastMCP):
     try:
         yield {"cache": cache}
     finally:
+        cache.metrics.persist()
         logger.info("Semantic cache MCP server stopped")
 
 

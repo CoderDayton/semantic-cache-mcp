@@ -213,6 +213,22 @@ class SQLiteStorage:
                     blob_count INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS session_metrics (
+                    session_id       TEXT PRIMARY KEY,
+                    started_at       REAL NOT NULL,
+                    ended_at         REAL,
+                    tokens_saved     INTEGER NOT NULL DEFAULT 0,
+                    tokens_original  INTEGER NOT NULL DEFAULT 0,
+                    tokens_returned  INTEGER NOT NULL DEFAULT 0,
+                    cache_hits       INTEGER NOT NULL DEFAULT 0,
+                    cache_misses     INTEGER NOT NULL DEFAULT 0,
+                    files_read       INTEGER NOT NULL DEFAULT 0,
+                    files_written    INTEGER NOT NULL DEFAULT 0,
+                    files_edited     INTEGER NOT NULL DEFAULT 0,
+                    diffs_served     INTEGER NOT NULL DEFAULT 0,
+                    tool_calls_json  TEXT NOT NULL DEFAULT '{}'
+                ) WITHOUT ROWID;
             """)
 
     # -------------------------------------------------------------------------
@@ -651,3 +667,79 @@ class SQLiteStorage:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             conn.executescript("DELETE FROM files; DELETE FROM chunks; DELETE FROM lsh_index;")
         return count
+
+    # -------------------------------------------------------------------------
+    # Session metrics persistence
+    # -------------------------------------------------------------------------
+
+    def save_session(self, data: dict[str, object]) -> None:
+        """Persist a session metrics snapshot.
+
+        Args:
+            data: Dict with session_id, started_at, ended_at, counters, tool_calls_json
+        """
+        with self._pool.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO session_metrics
+                (session_id, started_at, ended_at,
+                 tokens_saved, tokens_original, tokens_returned,
+                 cache_hits, cache_misses,
+                 files_read, files_written, files_edited,
+                 diffs_served, tool_calls_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data["session_id"],
+                    data["started_at"],
+                    data["ended_at"],
+                    data["tokens_saved"],
+                    data["tokens_original"],
+                    data["tokens_returned"],
+                    data["cache_hits"],
+                    data["cache_misses"],
+                    data["files_read"],
+                    data["files_written"],
+                    data["files_edited"],
+                    data["diffs_served"],
+                    data["tool_calls_json"],
+                ),
+            )
+
+    def get_lifetime_stats(self) -> dict[str, int]:
+        """Aggregate metrics across all completed sessions.
+
+        Returns:
+            Dict with total_sessions, sum of each counter
+        """
+        with self._pool.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(tokens_saved), 0),
+                    COALESCE(SUM(tokens_original), 0),
+                    COALESCE(SUM(tokens_returned), 0),
+                    COALESCE(SUM(cache_hits), 0),
+                    COALESCE(SUM(cache_misses), 0),
+                    COALESCE(SUM(files_read), 0),
+                    COALESCE(SUM(files_written), 0),
+                    COALESCE(SUM(files_edited), 0),
+                    COALESCE(SUM(diffs_served), 0)
+                FROM session_metrics
+                WHERE ended_at IS NOT NULL
+                """
+            ).fetchone()
+
+        return {
+            "total_sessions": row[0],
+            "tokens_saved": row[1],
+            "tokens_original": row[2],
+            "tokens_returned": row[3],
+            "cache_hits": row[4],
+            "cache_misses": row[5],
+            "files_read": row[6],
+            "files_written": row[7],
+            "files_edited": row[8],
+            "diffs_served": row[9],
+        }

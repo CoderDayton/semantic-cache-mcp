@@ -16,6 +16,7 @@ from ._helpers import (
     _is_binary_content,
     _suppress_large_diff,
 )
+from .metrics import SessionMetrics
 from .read import MAX_BATCH_FILES, MAX_BATCH_TOKENS, batch_smart_read, smart_read
 from .search import (
     MAX_GLOB_MATCHES,
@@ -33,6 +34,7 @@ from .write import MAX_BATCH_EDITS, smart_batch_edit, smart_edit, smart_write
 __all__ = [
     # Store
     "SemanticCache",
+    "SessionMetrics",
     # Read
     "smart_read",
     "batch_smart_read",

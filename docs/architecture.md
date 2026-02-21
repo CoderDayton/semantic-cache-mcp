@@ -283,7 +283,25 @@ CREATE TABLE lsh_index (
     blob_count INTEGER NOT NULL DEFAULT 0,           -- file count when built
     updated_at REAL NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE session_metrics (
+    session_id       TEXT PRIMARY KEY,               -- UUID per server session
+    started_at       REAL NOT NULL,
+    ended_at         REAL,                           -- NULL until persist()
+    tokens_saved     INTEGER NOT NULL DEFAULT 0,
+    tokens_original  INTEGER NOT NULL DEFAULT 0,
+    tokens_returned  INTEGER NOT NULL DEFAULT 0,
+    cache_hits       INTEGER NOT NULL DEFAULT 0,
+    cache_misses     INTEGER NOT NULL DEFAULT 0,
+    files_read       INTEGER NOT NULL DEFAULT 0,
+    files_written    INTEGER NOT NULL DEFAULT 0,
+    files_edited     INTEGER NOT NULL DEFAULT 0,
+    diffs_served     INTEGER NOT NULL DEFAULT 0,
+    tool_calls_json  TEXT NOT NULL DEFAULT '{}'      -- JSON: {"read": 5, "edit": 2, ...}
+) WITHOUT ROWID;
 ```
+
+> **Note:** `clear()` deletes `files`, `chunks`, and `lsh_index` — `session_metrics` is preserved so lifetime aggregates survive cache resets.
 
 ### LRU-K Eviction (K=2)
 

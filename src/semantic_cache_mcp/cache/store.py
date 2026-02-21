@@ -10,6 +10,7 @@ from ..config import DB_PATH
 from ..core import count_tokens, get_optimal_chunker
 from ..storage import SQLiteStorage
 from ..types import CacheEntry, EmbeddingVector
+from .metrics import SessionMetrics
 
 if TYPE_CHECKING:
     from ..core.similarity import LSHIndex
@@ -237,7 +238,7 @@ class SemanticCache:
     - Caching strategies (diff, truncate, semantic match)
     """
 
-    __slots__ = ("_storage", "_lsh_index")
+    __slots__ = ("_storage", "_lsh_index", "_metrics")
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         """Initialize cache.
@@ -247,6 +248,12 @@ class SemanticCache:
         """
         self._storage = SQLiteStorage(db_path)
         self._lsh_index: LSHIndex | None = None
+        self._metrics = SessionMetrics(self._storage._pool)
+
+    @property
+    def metrics(self) -> SessionMetrics:
+        """Current session metrics accumulator."""
+        return self._metrics
 
     # -------------------------------------------------------------------------
     # LSH persistence
@@ -400,9 +407,9 @@ class SemanticCache:
         """Find semantically similar cached file."""
         return self._storage.find_similar(embedding, exclude_path)
 
-    def get_stats(self) -> dict[str, int | float | str | bool]:
-        """Get cache statistics including memory usage."""
-        stats: dict[str, int | float | str | bool] = {**self._storage.get_stats()}
+    def get_stats(self) -> dict[str, object]:
+        """Get cache statistics including memory, session, and lifetime metrics."""
+        stats: dict[str, object] = {**self._storage.get_stats()}
 
         # Add process memory stats
         try:
@@ -415,17 +422,26 @@ class SemanticCache:
             pass
 
         # Add merge cache stats
-        from ..core.tokenizer import _tokenizer
+        from ..core.tokenizer import _tokenizer  # noqa: PLC0415
 
         if _tokenizer is not None:
             stats["merge_cache_entries"] = len(_tokenizer._merge_cache)
             stats["merge_cache_maxsize"] = _tokenizer._merge_cache_maxsize
 
         # Add embedding model readiness
-        from ..core.embeddings import _execution_provider, _model_ready
+        from ..core.embeddings import _execution_provider, _model_ready  # noqa: PLC0415
 
         stats["embedding_ready"] = _model_ready
         stats["embedding_provider"] = _execution_provider
+
+        # Session metrics
+        stats["session"] = self._metrics.snapshot()
+
+        # Lifetime metrics (aggregated from all completed sessions)
+        try:
+            stats["lifetime"] = self._storage.get_lifetime_stats()
+        except Exception as e:
+            logger.warning(f"Failed to load lifetime stats: {e}")
 
         return stats
 

@@ -217,6 +217,17 @@ print(f"Files cached:       {stats['files_cached']}")
 print(f"Total tokens:       {stats['total_tokens_cached']}")
 print(f"Compression ratio:  {stats['compression_ratio']:.1%}")
 print(f"Deduplication:      {stats['dedup_ratio']:.2f}×")
+
+# Session metrics (current session)
+session = stats["session"]
+print(f"Tokens saved:       {session['tokens_saved']}")
+print(f"Cache hits/misses:  {session['cache_hits']}/{session['cache_misses']}")
+print(f"Tool calls:         {session['tool_calls']}")
+
+# Lifetime metrics (aggregated across all completed sessions)
+lifetime = stats["lifetime"]
+print(f"Total sessions:     {lifetime['total_sessions']}")
+print(f"Lifetime saved:     {lifetime['tokens_saved']}")
 ```
 
 ---

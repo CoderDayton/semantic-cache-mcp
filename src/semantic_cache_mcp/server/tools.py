@@ -87,6 +87,7 @@ def read(
                 diff_mode=False,  # Line ranges bypass diff mode
                 force_full=True,
             )
+            cache.metrics.record("read", result)
             lines = result.content.splitlines(keepends=True)
             start = (offset or 1) - 1  # Convert to 0-based
             end = start + (limit or len(lines) - start)
@@ -123,6 +124,7 @@ def read(
             max_size=max_size,
             diff_mode=diff_mode,
         )
+        cache.metrics.record("read", result)
         payload = {
             "ok": True,
             "tool": "read",
@@ -165,7 +167,7 @@ def stats(
 
     # Add embedding model info
     model_info = get_model_info()
-    result: dict[str, int | float | str | bool] = {
+    result: dict[str, Any] = {
         **cache_stats,
         "embedding_model": model_info["model"],
         "embedding_ready": model_info["ready"],
@@ -197,6 +199,7 @@ def clear(
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
     count = cache.clear()
+    cache.metrics.record("clear", None)
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
@@ -249,6 +252,7 @@ def write(
             auto_format=auto_format,
             append=append,
         )
+        cache.metrics.record("write", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -350,6 +354,7 @@ def edit(
             start_line=start_line,
             end_line=end_line,
         )
+        cache.metrics.record("edit", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -476,6 +481,7 @@ def batch_edit(
             dry_run=dry_run,
             auto_format=auto_format,
         )
+        cache.metrics.record("batch_edit", result)
 
         status = (
             "edited"
@@ -572,6 +578,7 @@ def search(
 
     try:
         result = semantic_search(cache, query, k=k, directory=directory)
+        cache.metrics.record("search", result)
 
         match_payload: list[dict[str, Any]] = []
         for m in result.matches:
@@ -629,6 +636,7 @@ def diff(
 
     try:
         result = compare_files(cache, path1, path2, context_lines=context_lines)
+        cache.metrics.record("diff", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -712,6 +720,7 @@ def batch_read(
             priority=priority_list,
             diff_mode=diff_mode,
         )
+        cache.metrics.record("batch_read", result)
 
         # Build restructured response — separate unchanged, skipped, and content files
         summary: dict[str, Any] = {
@@ -794,6 +803,7 @@ def similar(
 
     try:
         result = find_similar_files(cache, path, k=k)
+        cache.metrics.record("similar", result)
 
         similar_payload = [
             {"path": f.path, "similarity": round(f.similarity, 4)}
@@ -853,6 +863,7 @@ def glob(
             directory=directory,
             cached_only=cached_only,
         )
+        cache.metrics.record("glob", result)
         matches_payload = []
         for m in result.matches:
             item: dict[str, Any] = {"path": m.path, "cached": m.cached}
