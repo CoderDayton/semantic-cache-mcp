@@ -364,7 +364,8 @@ def edit(
             payload["diff"] = result.diff_content
         else:
             payload["diff_omitted"] = True
-        payload["tokens_saved"] = result.tokens_saved
+        if mode in _MODE_NORMAL:
+            payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["diff_stats"] = result.diff_stats
             payload["content_hash"] = result.content_hash
@@ -504,7 +505,8 @@ def batch_edit(
             payload["diff"] = result.diff_content
         else:
             payload["diff_omitted"] = True
-        payload["tokens_saved"] = result.tokens_saved
+        if mode in _MODE_NORMAL:
+            payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["outcomes"] = [
                 {
@@ -715,9 +717,10 @@ def batch_read(
         summary: dict[str, Any] = {
             "files_read": result.files_read,
             "files_skipped": result.files_skipped,
-            "total_tokens": result.total_tokens,
-            "tokens_saved": result.tokens_saved,
         }
+        if mode in _MODE_NORMAL:
+            summary["total_tokens"] = result.total_tokens
+            summary["tokens_saved"] = result.tokens_saved
         if result.unchanged_paths:
             summary["unchanged"] = result.unchanged_paths
             summary["unchanged_count"] = len(result.unchanged_paths)

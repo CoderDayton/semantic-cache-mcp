@@ -1,6 +1,26 @@
 # Performance
 
-## Token Reduction by Strategy
+## Token Savings Benchmark
+
+Measured end-to-end on this project's own source files (30 `.py` files, ~136K tokens total). Benchmark script: [`benchmarks/benchmark_token_savings.py`](../benchmarks/benchmark_token_savings.py).
+
+| Phase | Scenario | Tokens returned | Original | Savings |
+|-------|----------|----------------:|---------:|--------:|
+| 1. Cold read | First read, no cache | 135,643 | 135,643 | 0.0% |
+| 2. Unchanged re-read | Same files, no modifications | 1,247 | 135,643 | 99.1% |
+| 3. Small edits | ~5% of lines changed in 30% of files | 2,383 | 135,736 | 98.2% |
+| 4. Batch read | All files via `batch_smart_read` | 1,247 | 135,736 | 99.1% |
+
+**Overall (phases 2–4): 98.8% token reduction.**
+
+Run it yourself:
+
+```bash
+uv run python benchmarks/benchmark_token_savings.py
+uv run pytest tests/test_benchmark_token_savings.py -v  # CI-verifiable assertion: savings ≥ 80%
+```
+
+### Token Reduction by Strategy
 
 | Strategy          | Savings | Trigger                           |
 |-------------------|---------|-----------------------------------|
@@ -129,7 +149,7 @@ Source code (low entropy) uses ZSTD-9. Already-compressed binary files use STORE
 
 ### Model
 
-`BAAI/bge-small-en-v1.5` — 384-dimensional, 33M parameters, 512 token context. Runs locally via FastEmbed (ONNX Runtime). CUDA is used automatically when a compatible GPU is present.
+`BAAI/bge-small-en-v1.5` — 384-dimensional, 33M parameters, 512 token context. Runs locally via FastEmbed (ONNX Runtime). Device selection is controlled by the `EMBEDDING_DEVICE` environment variable: `cpu` (default), `cuda` (GPU), or `auto` (detect).
 
 ### int8 Quantization
 

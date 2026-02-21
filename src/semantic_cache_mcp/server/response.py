@@ -52,6 +52,11 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -> str:
     """Render tool response as compact JSON with optional token cap."""
+    # In compact mode, strip diagnostic wrapper fields from success responses.
+    # Errors (ok=False) keep all fields so Claude can identify what failed.
+    if TOOL_OUTPUT_MODE == "compact" and payload.get("ok") is True:
+        payload.pop("ok", None)
+        payload.pop("tool", None)
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     if max_response_tokens is not None and max_response_tokens > 0:
         if count_tokens(body) > max_response_tokens:

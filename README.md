@@ -315,6 +315,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
+| `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |
 
 ### Safety Limits
 
@@ -334,14 +335,15 @@ diff path1="/src/v1.py" path2="/src/v2.py"
       "env": {
         "LOG_LEVEL": "INFO",
         "TOOL_OUTPUT_MODE": "compact",
-        "MAX_CONTENT_SIZE": "100000"
+        "MAX_CONTENT_SIZE": "100000",
+        "EMBEDDING_DEVICE": "cpu"
       }
     }
   }
 }
 ```
 
-**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. CUDA acceleration is used automatically when available.
+**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. Set `EMBEDDING_DEVICE` to control hardware: `cpu` (default), `cuda` (GPU), or `auto` (detect available).
 
 **Cache location:** `~/.cache/semantic-cache-mcp/`
 
@@ -376,48 +378,16 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 
 ## Performance
 
-| Component | Improvement | Details |
-|-----------|-------------|---------|
-| Embeddings | 22x smaller | int8 quantization: 388 bytes vs 17 KB/vector (384D) |
-| Similarity search | O(1) lookup | LSH acceleration for caches ≥ 100 files |
-| Persistent LSH index | Survives restarts | Serialized to SQLite; invalidated on write, rebuilt lazily on next search |
-| Batch embedding | N model calls → 1 | `batch_smart_read` pre-scans all new/changed files; single `model.embed()` call |
-| Array conversion | ~100x faster | `frombytes()` memcpy replaces `tolist()` iteration |
-| Chunking | 5–7x faster | SIMD-parallel CDC at ~70–95 MB/s |
-| Hashing | 3.8x faster | BLAKE3 with BLAKE2b fallback |
-| Compression | 3.7x faster | ZSTD adaptive at 6.9 GB/s for text |
-| Summarization | 50–80% savings | Semantic segment selection, structure preserved |
-| Glob queries | N→1 DB calls | Batch `SELECT ... WHERE IN` replaces per-file lookups |
-| Batch read | 2x fewer lookups | Pre-computed cache set eliminates double lookup |
+Measured on this project's 30 source files (~136K tokens). At least 80% token reduction in cached workflows — our benchmark shows 98.8%. Run it yourself: `uv run python benchmarks/benchmark_token_savings.py`
 
-See [docs/performance.md](docs/performance.md) for benchmarks and methodology.
+| Component | Speedup |
+|-----------|--------:|
+| SIMD-parallel chunking | 5–7x |
+| BLAKE3 hashing (8KB+) | 3.8x |
+| Batch matrix similarity | 6–14x |
+| int8 embeddings | 22x smaller |
 
----
-
-## Package Structure
-
-```
-src/semantic_cache_mcp/
-├── cache/              # Orchestration facade
-│   ├── __init__.py     # Public API
-│   ├── store.py        # SemanticCache class: get_or_build_lsh(), get_embeddings_batch()
-│   ├── read.py         # smart_read, batch_smart_read (batch pre-scan + embed)
-│   ├── write.py        # smart_write / smart_edit
-│   ├── search.py       # Embedding search + similar (_LSH_THRESHOLD = 100)
-│   └── _helpers.py     # Internal utilities
-├── server/             # MCP interface (FastMCP 3.0)
-│   ├── __init__.py
-│   ├── _mcp.py         # FastMCP app setup
-│   ├── response.py     # Response formatting + token budget
-│   └── tools.py        # All 11 tool definitions
-├── core/
-│   ├── chunking/       # HyperCDC (Gear hash) + SIMD parallel CDC
-│   ├── similarity/     # Cosine, LSH (serialize/deserialize), int8/binary/ternary quantization
-│   └── text/           # Diff generation, semantic summarization
-├── storage/            # SQLite content-addressable storage (chunks, files, lsh_index)
-├── config.py           # Environment-driven configuration
-└── types.py            # Shared type definitions
-```
+See [docs/performance.md](docs/performance.md) for full benchmarks and methodology.
 
 ---
 
