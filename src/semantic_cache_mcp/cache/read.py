@@ -78,17 +78,16 @@ def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Check for binary file by reading first 8KB and looking for null bytes
+    # Single read: binary check + decode in one I/O operation
+    raw = file_path.read_bytes()
+    if b"\x00" in raw[:8192]:
+        raise ValueError(
+            f"Binary file not supported: {path}. Semantic cache only handles text files."
+        )
     try:
-        sample = file_path.read_bytes()[:8192]
-        if b"\x00" in sample:
-            raise ValueError(
-                f"Binary file not supported: {path}. Semantic cache only handles text files."
-            )
-        content = file_path.read_text(encoding="utf-8")
+        content = raw.decode("utf-8")
     except UnicodeDecodeError:
-        # Try with error replacement for files with mixed encoding
-        content = file_path.read_text(encoding="utf-8", errors="replace")
+        content = raw.decode("utf-8", errors="replace")
         logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
 
     mtime = file_path.stat().st_mtime
@@ -293,10 +292,10 @@ def batch_smart_read(
         if not _resolved.exists() or not _resolved.is_file():
             continue  # will error in smart_read, skip pre-scan
         try:
-            _sample = _resolved.read_bytes()[:8192]
-            if b"\x00" in _sample:
+            _raw = _resolved.read_bytes()
+            if b"\x00" in _raw[:8192]:
                 continue  # binary file — smart_read will raise ValueError
-            _content = _resolved.read_text(encoding="utf-8")
+            _content = _raw.decode("utf-8")
             _to_embed.append((_path, str(_resolved), _content))
         except Exception:  # nosec B112 — pre-scan best-effort; smart_read handles real errors
             continue

@@ -38,14 +38,6 @@ class SimilarityConfig:
     PRUNING_FRACTION: float = 0.8  # Use 80% of most-significant dims, skip 20%
     PRUNING_ADAPTIVE: bool = True  # Adaptively select which dims to prune per query
 
-    # Batching
-    BATCH_SIZE_THRESHOLD: int = 10  # Use batch ops above this many vectors
-    CACHE_QUANTIZED: bool = True  # Cache quantized versions
-
-    # Hardware hints
-    USE_AVX512: bool = True  # Exploit AVX512 if available (auto-detected)
-    THREAD_POOL_SIZE: int = 4  # For parallel batch processing
-
 
 DEFAULT_CONFIG = SimilarityConfig()
 
@@ -383,48 +375,43 @@ def cosine_similarity_batch(
     Returns:
         List of similarity scores
     """
+    if not vectors:
+        return []
+
     # Convert query
     if isinstance(query, array.array):
         q_arr = np.frombuffer(query, dtype=np.float32)
     else:
         q_arr = np.asarray(query, dtype=np.float32)
 
-    # Prune if enabled
+    # Build matrix once (avoid per-vector Python loop)
+    matrix = np.vstack(
+        [
+            np.frombuffer(v, dtype=np.float32)
+            if isinstance(v, array.array)
+            else np.asarray(v, dtype=np.float32)
+            for v in vectors
+        ]
+    )
+
+    # Apply pruning mask to both query and matrix
     if use_pruning:
         dims = _select_pruning_dims(q_arr, DEFAULT_CONFIG.PRUNING_FRACTION, adaptive=True)
         q_arr = q_arr[dims]
-    else:
-        dims = None
+        matrix = matrix[:, dims]
 
-    # Quantize query once if enabled
     if use_quantization:
+        # Batch quantize: query once, matrix rows in one shot
         q_query, s_query = _quantize_vector(q_arr)
+        max_vals = np.max(np.abs(matrix), axis=1, keepdims=True)
+        max_vals[max_vals == 0] = 1.0
+        scales = 127.0 / max_vals.flatten()
+        q_matrix = (matrix * scales.reshape(-1, 1)).round().astype(np.int8)
+        sims = (q_matrix @ q_query.astype(np.int32)).astype(np.float32)
+        sims = sims / (scales * s_query)
+        return sims.tolist()
     else:
-        q_query = None
-        s_query = None
-
-    # Process vectors
-    similarities = []
-    for v in vectors:
-        if isinstance(v, array.array):
-            v_arr = np.frombuffer(v, dtype=np.float32)
-        else:
-            v_arr = np.asarray(v, dtype=np.float32)
-
-        # Apply same pruning mask
-        if dims is not None:
-            v_arr = v_arr[dims]
-
-        if use_quantization:
-            assert q_query is not None and s_query is not None
-            q_v, s_v = _quantize_vector(v_arr)
-            sim = _dequantize_scale(q_query, s_query, q_v, s_v)
-        else:
-            sim = float(np.dot(q_arr, v_arr))
-
-        similarities.append(sim)
-
-    return similarities
+        return (matrix @ q_arr).tolist()
 
 
 def cosine_similarity_batch_matrix(

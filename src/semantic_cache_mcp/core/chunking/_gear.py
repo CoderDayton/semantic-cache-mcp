@@ -72,11 +72,6 @@ _GEAR_TABLE: tuple[int, ...] = tuple(_rnd.getrandbits(64) for _ in range(256))
 del _rnd
 
 
-def _gear_table() -> tuple[int, ...]:
-    """Return pre-computed 64-bit Gear table."""
-    return _GEAR_TABLE
-
-
 # ---------------------------------------------------------------------------
 # Utility: entropy and semantic snapping
 # ---------------------------------------------------------------------------
@@ -106,10 +101,6 @@ def _shannon_entropy_fast(data: bytes) -> float:
         return 0.0
     # Fast log2 approximation using bit_length
     return (unique.bit_length() - 1) + (unique & (unique - 1) > 0) * 0.5
-
-
-# Alias for compatibility
-_shannon_entropy = _shannon_entropy_fast
 
 
 _SEMANTIC_TOKENS = [
@@ -242,7 +233,7 @@ def hypercdc_boundaries(
     if n == 0:
         return
 
-    gear = _gear_table()
+    gear = _GEAR_TABLE
     mask_weak = (1 << cfg.mask_weak_bits) - 1
     mask_strong = (1 << cfg.mask_strong_bits) - 1
 
@@ -268,7 +259,7 @@ def hypercdc_boundaries(
         if (chunk_len - last_entropy_check_at) >= cfg.entropy_interval:
             win_start = max(chunk_start, i - cfg.entropy_window)
             win = content[win_start:i]
-            ent = _shannon_entropy(win)
+            ent = _shannon_entropy_fast(win)
             if ent < cfg.entropy_low:
                 step = cfg.step_fast
             elif ent > cfg.entropy_high:

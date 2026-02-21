@@ -11,6 +11,8 @@ import logging
 import warnings
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
@@ -188,7 +190,9 @@ def embed(text: str) -> array.array[float] | None:
 
         embeddings = list(model.embed([truncated]))
         if embeddings:
-            return array.array("f", embeddings[0].tolist())
+            result = array.array("f")
+            result.frombytes(embeddings[0].astype(np.float32).tobytes())
+            return result
         return None
 
     except Exception as e:
@@ -214,7 +218,12 @@ def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
         model = _get_model()
         truncated = [t[:8000] for t in texts]
         results = list(model.embed(truncated))
-        return [array.array("f", r.tolist()) for r in results]
+        out: list[array.array[float] | None] = []
+        for r in results:
+            a = array.array("f")
+            a.frombytes(r.astype(np.float32).tobytes())
+            out.append(a)
+        return out
     except Exception as e:
         logger.warning(f"Batch embedding failed: {e}")
         return [None] * len(texts)
@@ -239,7 +248,9 @@ def embed_query(text: str) -> array.array[float] | None:
 
         embeddings = list(model.embed([prefixed]))
         if embeddings:
-            return array.array("f", embeddings[0].tolist())
+            result = array.array("f")
+            result.frombytes(embeddings[0].astype(np.float32).tobytes())
+            return result
         return None
 
     except Exception as e:

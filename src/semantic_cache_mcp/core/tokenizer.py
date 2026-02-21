@@ -51,8 +51,6 @@ class BPETokenizer:
         "_pat",
         "_merge_cache",
         "_merge_cache_maxsize",
-        "_pair_heap",
-        "_processed_pairs",
     )
 
     _GPT4_PATTERN = (
@@ -71,8 +69,6 @@ class BPETokenizer:
         # LRU merge cache: caps memory at ~100KB for 4096 entries
         self._merge_cache: OrderedDict[bytes, list[bytes]] = OrderedDict()
         self._merge_cache_maxsize: int = 4096
-        self._pair_heap: list[tuple[int, bytes, bytes]] = []
-        self._processed_pairs: set[tuple[bytes, bytes]] = set()
 
     def load_tiktoken_file(self, path: Path | str) -> None:
         """Load vocab and merges from tiktoken file (base64 encoded tokens)."""
@@ -167,9 +163,6 @@ class BPETokenizer:
         # unique_id breaks ties deterministically and detects stale entries
         heap: list[tuple[int, int, int, int]] = []
         uid = 0
-        # Track latest uid per node to invalidate stale heap entries
-        node_uid: list[int] = [0] * n
-
         for i in range(n - 1):
             pair = (nodes[i][0], nodes[i + 1][0])
             rank = self.bpe_ranks.get(pair)
@@ -199,9 +192,6 @@ class BPETokenizer:
             if right_next != -1:
                 nodes[right_next][1] = li
             nodes[ri][0] = None  # mark removed
-
-            # Bump uid to invalidate any stale heap entries for this node
-            node_uid[li] += 1
 
             # Check new left pair
             left_prev = nodes[li][1]

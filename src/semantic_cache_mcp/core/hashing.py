@@ -82,18 +82,6 @@ DEFAULT_CONFIG = HashConfig()
 # ---------------------------------------------------------------------------
 
 
-def _get_hasher(digest_size: int = 32) -> object:
-    """Get appropriate hash function instance."""
-    if DEFAULT_CONFIG.USE_BLAKE3:
-        try:
-            return blake3.blake3()
-        except (ImportError, AttributeError, OSError):
-            pass  # BLAKE3 not available, use fallback
-
-    # Fallback to BLAKE2b (always available)
-    return hashlib.blake2b(digest_size=digest_size)
-
-
 def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
     """Hash raw bytes and return binary digest."""
     if DEFAULT_CONFIG.USE_BLAKE3:
@@ -274,45 +262,30 @@ class StreamingHasher:
     Allows hashing data in chunks without loading entire file into memory.
     """
 
-    __slots__ = ("_digest_size", "_hasher", "_use_blake3")
+    __slots__ = ("_hasher",)
 
     _hasher: _Hasher
-    _use_blake3: bool
-    _digest_size: int
 
     def __init__(self, digest_size: int = DEFAULT_CONFIG.CHUNK_DIGEST_SIZE):
-        self._digest_size = digest_size
         if HAS_BLAKE3:
             try:
                 self._hasher = blake3.blake3()
-                self._use_blake3 = True
             except (ImportError, AttributeError, OSError):
                 self._hasher = hashlib.blake2b(digest_size=digest_size)
-                self._use_blake3 = False
         else:
             self._hasher = hashlib.blake2b(digest_size=digest_size)
-            self._use_blake3 = False
 
     def update(self, data: bytes) -> None:
         """Add data to the hash."""
-        if self._use_blake3:
-            self._hasher.update(data)
-        else:
-            self._hasher.update(data)
+        self._hasher.update(data)
 
     def finalize(self) -> str:
         """Get final hex digest."""
-        if self._use_blake3:
-            return self._hasher.hexdigest()
-        else:
-            return self._hasher.hexdigest()
+        return self._hasher.hexdigest()
 
     def finalize_binary(self) -> bytes:
         """Get final binary digest."""
-        if self._use_blake3:
-            return self._hasher.digest()
-        else:
-            return self._hasher.digest()
+        return self._hasher.digest()
 
 
 def hash_file_streaming(
