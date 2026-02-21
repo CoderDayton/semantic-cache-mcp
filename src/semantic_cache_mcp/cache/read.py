@@ -10,6 +10,7 @@ import numpy as np
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
+from ._helpers import _is_binary_content
 from .store import SemanticCache, _file_label
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ def smart_read(
 
     # Single read: binary check + decode in one I/O operation
     raw = file_path.read_bytes()
-    if b"\x00" in raw[:8192]:
+    if _is_binary_content(raw):
         raise ValueError(
             f"Binary file not supported: {path}. Semantic cache only handles text files."
         )
@@ -293,7 +294,7 @@ def batch_smart_read(
             continue  # will error in smart_read, skip pre-scan
         try:
             _raw = _resolved.read_bytes()
-            if b"\x00" in _raw[:8192]:
+            if _is_binary_content(_raw):
                 continue  # binary file — smart_read will raise ValueError
             _content = _raw.decode("utf-8")
             _to_embed.append((_path, str(_resolved), _content))

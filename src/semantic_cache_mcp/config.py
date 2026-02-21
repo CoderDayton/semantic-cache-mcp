@@ -1,6 +1,7 @@
 """Configuration constants for semantic-cache-mcp."""
 
 import logging
+import sys
 from os import environ
 from pathlib import Path
 from typing import Final
@@ -11,8 +12,35 @@ LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 
+
 # Paths
-CACHE_DIR: Final = Path.home() / ".cache" / "semantic-cache-mcp"
+def _get_cache_dir() -> Path:
+    """Platform-appropriate cache directory.
+
+    Priority: $SEMANTIC_CACHE_DIR > platform default.
+    - Linux: $XDG_CACHE_HOME/semantic-cache-mcp or ~/.cache/semantic-cache-mcp
+    - macOS: ~/Library/Caches/semantic-cache-mcp
+    - Windows: %LOCALAPPDATA%/semantic-cache-mcp
+    """
+    env_override = environ.get("SEMANTIC_CACHE_DIR")
+    if env_override:
+        return Path(env_override)
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "semantic-cache-mcp"
+    if sys.platform == "win32":
+        local = environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "semantic-cache-mcp"
+        return Path.home() / "AppData" / "Local" / "semantic-cache-mcp"
+    # Linux / other POSIX
+    xdg = environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg) / "semantic-cache-mcp"
+    return Path.home() / ".cache" / "semantic-cache-mcp"
+
+
+CACHE_DIR: Final = _get_cache_dir()
 DB_PATH: Final = CACHE_DIR / "cache.db"
 
 

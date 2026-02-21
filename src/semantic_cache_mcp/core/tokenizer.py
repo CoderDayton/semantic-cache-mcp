@@ -23,12 +23,14 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..config import CACHE_DIR
+
 if TYPE_CHECKING:
     from collections.abc import Set
 
 logger = logging.getLogger(__name__)
 
-TOKENIZER_CACHE_DIR = Path.home() / ".cache" / "semantic-cache-mcp" / "tokenizer"
+TOKENIZER_CACHE_DIR = CACHE_DIR / "tokenizer"
 O200K_BASE_URL = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
 O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 

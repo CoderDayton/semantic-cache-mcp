@@ -36,17 +36,14 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 ## Installation
 
-```bash
-uv tool install semantic-cache-mcp
-```
-
 Add to Claude Code settings (`~/.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
     "semantic-cache": {
-      "command": "semantic-cache-mcp"
+      "command": "uvx",
+      "args": ["semantic-cache-mcp"]
     }
   }
 }
@@ -331,7 +328,8 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 {
   "mcpServers": {
     "semantic-cache": {
-      "command": "semantic-cache-mcp",
+      "command": "uvx",
+      "args": ["semantic-cache-mcp"],
       "env": {
         "LOG_LEVEL": "INFO",
         "TOOL_OUTPUT_MODE": "compact",

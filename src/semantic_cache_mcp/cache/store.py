@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -16,6 +17,52 @@ if TYPE_CHECKING:
     from ..core.similarity import LSHIndex
 
 logger = logging.getLogger(__name__)
+
+
+def _get_rss_mb() -> float | None:
+    """Cross-platform resident set size in MB. Returns None on failure."""
+    try:
+        if sys.platform == "linux":
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return round(int(line.split()[1]) / 1024, 1)
+            return None
+        if sys.platform == "darwin":
+            import resource  # noqa: PLC0415
+
+            # macOS ru_maxrss is in bytes
+            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024), 1)
+        if sys.platform == "win32":
+            import ctypes  # noqa: PLC0415
+            import ctypes.wintypes  # noqa: PLC0415
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.wintypes.DWORD),
+                    ("PageFaultCount", ctypes.wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            pmc = ProcessMemoryCounters()
+            pmc.cb = ctypes.sizeof(pmc)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[union-attr]
+            if ctypes.windll.kernel32.K32GetProcessMemoryInfo(  # type: ignore[union-attr]
+                handle, ctypes.byref(pmc), pmc.cb
+            ):
+                return round(pmc.WorkingSetSize / (1024 * 1024), 1)
+            return None
+    except Exception:
+        return None
+    return None
+
 
 # ---------------------------------------------------------------------------
 # File-type semantic labels — prepended before embedding so the model gets
@@ -412,14 +459,9 @@ class SemanticCache:
         stats: dict[str, object] = {**self._storage.get_stats()}
 
         # Add process memory stats
-        try:
-            with open("/proc/self/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        stats["process_rss_mb"] = round(int(line.split()[1]) / 1024, 1)
-                        break
-        except OSError:
-            pass
+        rss = _get_rss_mb()
+        if rss is not None:
+            stats["process_rss_mb"] = rss
 
         # Add merge cache stats
         from ..core.tokenizer import _tokenizer  # noqa: PLC0415

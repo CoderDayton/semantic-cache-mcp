@@ -7,10 +7,12 @@ requires-python = ">=3.12"
 dependencies = [
     "blake3>=1.0.8",
     "brotli>=1.2.0",
-    "fastembed-gpu>=0.7.4",
+    "fastembed-gpu>=0.7.4; sys_platform == 'linux'",
+    "fastembed>=0.7.4; sys_platform != 'linux'",
     "fastmcp>=3.0.0b1",
     "lz4>=4.4.5",
-    "onnxruntime-gpu>=1.19.0",
+    "onnxruntime-gpu>=1.19.0; sys_platform == 'linux'",
+    "onnxruntime>=1.19.0; sys_platform != 'linux'",
     "zstandard>=0.25.0",
 ]
 

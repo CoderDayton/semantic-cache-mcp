@@ -84,6 +84,7 @@ def _is_binary_content(data: bytes) -> bool:
     """Check if content is binary using multiple heuristics.
 
     Checks:
+    0. Unicode BOMs (UTF-32/16/8) — text, not binary
     1. Null bytes (most reliable indicator)
     2. Common binary file magic numbers
     3. High ratio of non-printable characters
@@ -92,6 +93,18 @@ def _is_binary_content(data: bytes) -> bool:
         return False
 
     sample = data[:8192]
+
+    # 0. Unicode BOMs — check 4-byte before 2-byte (UTF-32 LE shares prefix with UTF-16 LE)
+    text_boms = (
+        b"\xff\xfe\x00\x00",  # UTF-32 LE
+        b"\x00\x00\xfe\xff",  # UTF-32 BE
+        b"\xff\xfe",  # UTF-16 LE
+        b"\xfe\xff",  # UTF-16 BE
+        b"\xef\xbb\xbf",  # UTF-8 BOM
+    )
+    for bom in text_boms:
+        if sample.startswith(bom):
+            return False
 
     # 1. Null bytes - definitive binary indicator
     if b"\x00" in sample:
