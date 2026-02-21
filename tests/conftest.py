@@ -18,9 +18,13 @@ from tests.constants import TEST_EMBEDDING_DIM
 
 @pytest.fixture
 def temp_dir() -> Generator[Path, None, None]:
-    """Create a temporary directory for test files."""
+    """Create a temporary directory for test files.
+
+    Resolves the path so macOS symlinks (/var → /private/var) don't cause
+    mismatches between test paths and smart_read's resolved cache keys.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir)
+        yield Path(tmpdir).resolve()
 
 
 @pytest.fixture

@@ -23,7 +23,7 @@ from semantic_cache_mcp.cache import (
 def temp_dir():
     """Create a temporary directory with test files."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir)
+        yield Path(tmpdir).resolve()
 
 
 @pytest.fixture
