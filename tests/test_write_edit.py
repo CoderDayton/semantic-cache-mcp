@@ -8,7 +8,9 @@ import pytest
 
 from semantic_cache_mcp.cache import (
     SemanticCache,
+    _extract_line_range,
     _suppress_large_diff,
+    smart_batch_edit,
     smart_edit,
     smart_read,
     smart_write,
@@ -497,3 +499,408 @@ class TestSmartWriteAppend:
 
         assert result.diff_content is not None
         assert "+appended" in result.diff_content
+
+
+class TestExtractLineRange:
+    """Tests for _extract_line_range helper."""
+
+    def test_single_line(self) -> None:
+        content = "aaa\nbbb\nccc\n"
+        sub, cs, ce = _extract_line_range(content, 2, 2)
+        assert sub == "bbb\n"
+        assert content[:cs] + "XXX\n" + content[ce:] == "aaa\nXXX\nccc\n"
+
+    def test_multi_line(self) -> None:
+        content = "line1\nline2\nline3\nline4\n"
+        sub, cs, ce = _extract_line_range(content, 2, 3)
+        assert sub == "line2\nline3\n"
+        assert content[:cs] + "replaced\n" + content[ce:] == "line1\nreplaced\nline4\n"
+
+    def test_full_file(self) -> None:
+        content = "a\nb\n"
+        sub, cs, ce = _extract_line_range(content, 1, 2)
+        assert sub == content
+        assert cs == 0
+        assert ce == len(content)
+
+    def test_no_trailing_newline(self) -> None:
+        content = "first\nsecond"
+        sub, cs, ce = _extract_line_range(content, 2, 2)
+        assert sub == "second"
+
+    def test_empty_file_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty file"):
+            _extract_line_range("", 1, 1)
+
+    def test_start_line_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="start_line must be >= 1"):
+            _extract_line_range("a\n", 0, 1)
+
+    def test_end_before_start_raises(self) -> None:
+        with pytest.raises(ValueError, match="end_line.*must be >= start_line"):
+            _extract_line_range("a\nb\n", 2, 1)
+
+    def test_start_exceeds_total_raises(self) -> None:
+        with pytest.raises(ValueError, match="start_line.*exceeds total"):
+            _extract_line_range("a\n", 3, 3)
+
+    def test_end_exceeds_total_raises(self) -> None:
+        with pytest.raises(ValueError, match="end_line.*exceeds total"):
+            _extract_line_range("a\nb\n", 1, 5)
+
+
+class TestSmartEditLineRange:
+    """Tests for line-range editing (Modes B and C)."""
+
+    # --- Mode B: scoped find/replace ---
+
+    def test_mode_b_finds_match_in_range(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B finds old_string within the specified line range."""
+        file_path = temp_dir / "mode_b.txt"
+        file_path.write_text("foo\nbar\nfoo\nbaz\n")
+
+        # "foo" appears on lines 1 and 3; scope to line 3 only
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            "foo",
+            "qux",
+            start_line=3,
+            end_line=3,
+        )
+
+        assert result.replacements_made == 1
+        assert file_path.read_text() == "foo\nbar\nqux\nbaz\n"
+
+    def test_mode_b_not_found_outside_range(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B fails when old_string only exists outside the range."""
+        file_path = temp_dir / "mode_b_miss.txt"
+        file_path.write_text("foo\nbar\nbaz\n")
+
+        with pytest.raises(ValueError, match="not found within lines 2-3"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "foo",
+                "qux",
+                start_line=2,
+                end_line=3,
+            )
+
+    def test_mode_b_reports_absolute_line_numbers(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B reports absolute line numbers, not relative to range."""
+        file_path = temp_dir / "mode_b_abs.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\neee\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            "ccc",
+            "CCC",
+            start_line=2,
+            end_line=4,
+        )
+
+        assert result.line_numbers == [3]
+
+    def test_mode_b_replace_all_within_range(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B replace_all replaces all within the range only."""
+        file_path = temp_dir / "mode_b_all.txt"
+        file_path.write_text("x\nx\nx\nx\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            "x",
+            "y",
+            replace_all=True,
+            start_line=2,
+            end_line=3,
+        )
+
+        assert result.replacements_made == 2
+        assert file_path.read_text() == "x\ny\ny\nx\n"
+
+    def test_mode_b_multiple_matches_without_replace_all_fails(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B with multiple matches in range and no replace_all raises."""
+        file_path = temp_dir / "mode_b_multi.txt"
+        file_path.write_text("x\nx\nx\n")
+
+        with pytest.raises(ValueError, match="found 2 times"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "x",
+                "y",
+                start_line=1,
+                end_line=2,
+            )
+
+    # --- Mode C: line-range replacement ---
+
+    def test_mode_c_replaces_line_range(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C replaces exact line range with new_string."""
+        file_path = temp_dir / "mode_c.txt"
+        file_path.write_text("line1\nline2\nline3\nline4\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "replaced\n",
+            start_line=2,
+            end_line=3,
+        )
+
+        assert file_path.read_text() == "line1\nreplaced\nline4\n"
+        assert result.replacements_made == 2  # 2 lines replaced
+
+    def test_mode_c_single_line(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C works on a single line."""
+        file_path = temp_dir / "mode_c_single.txt"
+        file_path.write_text("aaa\nbbb\nccc\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "BBB\n",
+            start_line=2,
+            end_line=2,
+        )
+
+        assert file_path.read_text() == "aaa\nBBB\nccc\n"
+        assert result.replacements_made == 1
+
+    def test_mode_c_multiline_new_string(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C can insert more lines than it removes."""
+        file_path = temp_dir / "mode_c_multi.txt"
+        file_path.write_text("a\nb\nc\n")
+
+        smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "x\ny\nz\n",
+            start_line=2,
+            end_line=2,
+        )
+
+        assert file_path.read_text() == "a\nx\ny\nz\nc\n"
+
+    def test_mode_c_dry_run(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C dry_run previews without writing."""
+        file_path = temp_dir / "mode_c_dry.txt"
+        file_path.write_text("keep\ndelete\nkeep\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "",
+            start_line=2,
+            end_line=2,
+            dry_run=True,
+        )
+
+        assert file_path.read_text() == "keep\ndelete\nkeep\n"  # Unchanged
+        assert result.diff_content
+
+    def test_mode_c_returns_diff(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C returns a unified diff."""
+        file_path = temp_dir / "mode_c_diff.txt"
+        file_path.write_text("old1\nold2\nold3\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "new2\n",
+            start_line=2,
+            end_line=2,
+        )
+
+        assert "-old2" in result.diff_content
+        assert "+new2" in result.diff_content
+
+    # --- Validation errors ---
+
+    def test_mode_c_reject_replace_all(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C rejects replace_all."""
+        file_path = temp_dir / "mode_c_ra.txt"
+        file_path.write_text("a\nb\n")
+
+        with pytest.raises(ValueError, match="replace_all is not supported"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                None,
+                "x\n",
+                replace_all=True,
+                start_line=1,
+                end_line=1,
+            )
+
+    def test_old_string_none_without_line_range_raises(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """old_string=None without line range raises ValueError."""
+        file_path = temp_dir / "no_range.txt"
+        file_path.write_text("content\n")
+
+        with pytest.raises(ValueError, match="old_string is required"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                None,
+                "new",
+            )
+
+    def test_only_start_line_raises(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Providing only start_line without end_line raises."""
+        file_path = temp_dir / "half_range.txt"
+        file_path.write_text("a\nb\n")
+
+        with pytest.raises(ValueError, match="must both be provided"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "a",
+                "b",
+                start_line=1,
+            )
+
+    def test_out_of_bounds_raises(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Line range exceeding file length raises."""
+        file_path = temp_dir / "oob.txt"
+        file_path.write_text("one\ntwo\n")
+
+        with pytest.raises(ValueError, match="exceeds total"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                None,
+                "x\n",
+                start_line=1,
+                end_line=5,
+            )
+
+    def test_end_before_start_raises(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """end_line < start_line raises."""
+        file_path = temp_dir / "backwards.txt"
+        file_path.write_text("a\nb\nc\n")
+
+        with pytest.raises(ValueError, match="must be >= start_line"):
+            smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                None,
+                "x\n",
+                start_line=3,
+                end_line=1,
+            )
+
+
+class TestSmartBatchEditLineRange:
+    """Tests for line-range editing in batch_edit."""
+
+    def test_mode_c_in_batch(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C works in batch edits."""
+        file_path = temp_dir / "batch_c.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\n")
+
+        result = smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [(None, "BBB\n", 2, 2)],
+        )
+
+        assert result.succeeded == 1
+        assert result.failed == 0
+        assert file_path.read_text() == "aaa\nBBB\nccc\nddd\n"
+
+    def test_mode_b_in_batch(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode B works in batch edits."""
+        file_path = temp_dir / "batch_b.txt"
+        file_path.write_text("foo\nbar\nfoo\n")
+
+        result = smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [("foo", "qux", 3, 3)],
+        )
+
+        assert result.succeeded == 1
+        assert file_path.read_text() == "foo\nbar\nqux\n"
+
+    def test_mixed_modes_in_batch(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mixed Mode A and Mode C edits in same batch."""
+        file_path = temp_dir / "batch_mixed.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\n")
+
+        result = smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [
+                ("aaa", "AAA", None, None),  # Mode A: replace aaa
+                (None, "DDD\n", 4, 4),  # Mode C: replace line 4
+            ],
+        )
+
+        assert result.succeeded == 2
+        assert result.failed == 0
+        text = file_path.read_text()
+        assert "AAA" in text
+        assert "DDD" in text
+
+    def test_invalid_range_becomes_failure(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Invalid line range in batch produces failure outcome, not exception."""
+        file_path = temp_dir / "batch_fail.txt"
+        file_path.write_text("a\nb\n")
+
+        result = smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [(None, "x\n", 1, 99)],
+        )
+
+        assert result.failed == 1
+        assert result.succeeded == 0
+        assert result.outcomes[0].success is False
+        assert "exceeds" in (result.outcomes[0].error or "")

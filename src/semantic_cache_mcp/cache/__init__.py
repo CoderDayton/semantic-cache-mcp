@@ -10,6 +10,7 @@ from ._helpers import (
     MAX_RETURN_DIFF_TOKENS,
     MAX_WRITE_SIZE,
     _choose_min_token_content,
+    _extract_line_range,
     _find_match_line_numbers,
     _format_file,
     _is_binary_content,
@@ -57,6 +58,7 @@ __all__ = [
     # Helpers (some used by tests)
     "_suppress_large_diff",
     "_is_binary_content",
+    "_extract_line_range",
     "_find_match_line_numbers",
     "_format_file",
     "_choose_min_token_content",

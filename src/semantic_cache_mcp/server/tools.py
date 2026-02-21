@@ -293,31 +293,45 @@ def write(
 def edit(
     ctx: Context,
     path: str,
-    old_string: str,
-    new_string: str,
+    old_string: str | None = None,
+    new_string: str = "",
     replace_all: bool = False,
     dry_run: bool = False,
     auto_format: bool = False,
+    start_line: int | None = None,
+    end_line: int | None = None,
 ) -> str:
     """Edit file using find/replace with cached reads.
+
+    Three modes — use line numbers from `read` output to save tokens:
+    - **find/replace**: old_string + new_string. Searches entire file.
+    - **scoped find/replace**: old_string + new_string + start_line/end_line.
+      Searches only within the line range — shorter old_string suffices.
+    - **line replace**: new_string + start_line/end_line (no old_string).
+      Replaces the entire line range. Maximum token savings.
 
     Timing guidance:
     - Use for a single targeted replacement.
     - For 2+ independent replacements in one file, use batch_edit.
     - Use dry_run when validating match uniqueness before committing edits.
+    - When you know exact line numbers, prefer scoped or line replace mode
+      to avoid sending large old_string context.
 
-    Multiple matches: if old_string appears more than once, the call fails with
-    a hint to add more context or use replace_all=true.
+    Multiple matches: if old_string appears more than once (within scope),
+    the call fails with a hint to add more context or use replace_all=true.
 
     Response: returns a unified diff of the change and the line numbers affected.
 
     Args:
         path: Absolute path to file
-        old_string: Exact string to find (whitespace-sensitive)
+        old_string: Exact string to find (whitespace-sensitive).
+            Omit for line-replace mode (requires start_line/end_line).
         new_string: Replacement string
-        replace_all: Replace all occurrences (default: false)
+        replace_all: Replace all occurrences (default: false). Not valid in line-replace mode.
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edit (default: false)
+        start_line: Start of line range, 1-based inclusive. Must pair with end_line.
+        end_line: End of line range, 1-based inclusive. Must pair with start_line.
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -332,6 +346,8 @@ def edit(
             replace_all=replace_all,
             dry_run=dry_run,
             auto_format=auto_format,
+            start_line=start_line,
+            end_line=end_line,
         )
 
         payload: dict[str, Any] = {
@@ -386,10 +402,18 @@ def batch_edit(
 ) -> str:
     """Apply multiple independent edits to a file in one call. Max 50 edits.
 
+    Supports three edit modes per entry (same as `edit` tool):
+    - **find/replace**: [old, new] or {"old": "...", "new": "..."}
+    - **scoped find/replace**: [old, new, start_line, end_line] or
+      {"old": "...", "new": "...", "start_line": 10, "end_line": 15}
+    - **line replace**: [null, new, start_line, end_line] or
+      {"old": null, "new": "...", "start_line": 10, "end_line": 15}
+
     Timing guidance:
     - Use when applying 2+ edits to the same file in one step.
     - More token-efficient than repeated edit calls on the same file.
     - Use dry_run when testing risky edit batches.
+    - Prefer line-range modes when you know exact line numbers from `read`.
 
     Partial success: each edit is applied independently. When edits fail, the
     response includes a failures list with the old_string and error for each —
@@ -397,7 +421,7 @@ def batch_edit(
 
     Args:
         path: Absolute path to file
-        edits: JSON array of [old, new] pairs or {"old": ..., "new": ...} objects
+        edits: JSON array of edit entries (see modes above)
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edits (default: false)
     """
@@ -419,17 +443,27 @@ def batch_edit(
         if not isinstance(edit_list, list):
             return _render_error("batch_edit", "edits must be a JSON array", max_response_tokens)
 
-        # Convert to list of tuples
-        edit_tuples: list[tuple[str, str]] = []
+        # Convert to list of 4-tuples: (old | None, new, start_line | None, end_line | None)
+        edit_tuples: list[tuple[str | None, str, int | None, int | None]] = []
         for item in edit_list:
             if isinstance(item, list) and len(item) == 2:
-                edit_tuples.append((str(item[0]), str(item[1])))
-            elif isinstance(item, dict) and "old" in item and "new" in item:
-                edit_tuples.append((str(item["old"]), str(item["new"])))
+                old = str(item[0]) if item[0] is not None else None
+                edit_tuples.append((old, str(item[1]), None, None))
+            elif isinstance(item, list) and len(item) == 4:
+                old = str(item[0]) if item[0] is not None else None
+                sl = int(item[2]) if item[2] is not None else None
+                el = int(item[3]) if item[3] is not None else None
+                edit_tuples.append((old, str(item[1]), sl, el))
+            elif isinstance(item, dict) and "new" in item:
+                old = str(item["old"]) if item.get("old") is not None else None
+                sl = int(item["start_line"]) if item.get("start_line") is not None else None
+                el = int(item["end_line"]) if item.get("end_line") is not None else None
+                edit_tuples.append((old, str(item["new"]), sl, el))
             else:
                 return _render_error(
                     "batch_edit",
-                    "Each edit must be [old, new] or {old, new}",
+                    "Each edit must be [old, new], [old, new, start, end], "
+                    "or {old, new, start_line?, end_line?}",
                     max_response_tokens,
                 )
 

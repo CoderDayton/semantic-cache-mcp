@@ -155,6 +155,38 @@ def _find_match_line_numbers(content: str, search_string: str) -> list[int]:
     return line_numbers
 
 
+def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[str, int, int]:
+    """Return (substring, char_start, char_end) for a 1-based inclusive line range.
+
+    Uses splitlines(keepends=True) for correct offset calculation.
+    Returned char offsets support direct splicing: content[:char_start] + new + content[char_end:]
+    """
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+
+    if total == 0:
+        raise ValueError("Cannot extract line range from empty file")
+
+    if start_line < 1:
+        raise ValueError(f"start_line must be >= 1, got {start_line}")
+
+    if end_line < start_line:
+        raise ValueError(f"end_line ({end_line}) must be >= start_line ({start_line})")
+
+    if start_line > total:
+        raise ValueError(f"start_line ({start_line}) exceeds total lines ({total})")
+
+    if end_line > total:
+        raise ValueError(f"end_line ({end_line}) exceeds total lines ({total})")
+
+    # Compute char offsets
+    char_start = sum(len(lines[i]) for i in range(start_line - 1))
+    char_end = sum(len(lines[i]) for i in range(end_line))
+
+    substring = content[char_start:char_end]
+    return substring, char_start, char_end
+
+
 def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
     """Pick the response payload with the smallest token count."""
     best_kind = ""

@@ -12,6 +12,7 @@ from ._helpers import (
     MAX_EDIT_SIZE,
     MAX_MATCHES,
     MAX_WRITE_SIZE,
+    _extract_line_range,
     _find_match_line_numbers,
     _format_file,
     _is_binary_content,
@@ -198,28 +199,31 @@ def smart_write(
 def smart_edit(
     cache: SemanticCache,
     path: str,
-    old_string: str,
+    old_string: str | None,
     new_string: str,
     replace_all: bool = False,
     dry_run: bool = False,
     auto_format: bool = False,
+    start_line: int | None = None,
+    end_line: int | None = None,
 ) -> EditResult:
     """Edit file using find/replace with cached read.
 
-    Benefits over built-in Edit:
-    - Uses cache for reading (no token cost!)
-    - Returns diff instead of confirmation
-    - Tracks line numbers of changes
-    - Optional auto-formatting after edit
+    Three modes of operation:
+    - Mode A (find/replace): old_string + new_string — full-file search.
+    - Mode B (scoped): old_string + new_string + start_line/end_line — search within range only.
+    - Mode C (line replace): new_string + start_line/end_line (no old_string) — replace range.
 
     Args:
         cache: SemanticCache instance
         path: Absolute path to file
-        old_string: Exact string to find
+        old_string: Exact string to find (None for Mode C line replacement)
         new_string: Replacement string
-        replace_all: Replace all occurrences
+        replace_all: Replace all occurrences (Mode A/B only)
         dry_run: Preview changes without writing
         auto_format: Run formatter after edit (default: false)
+        start_line: Start of line range, 1-based inclusive (Modes B/C)
+        end_line: End of line range, 1-based inclusive (Modes B/C)
 
     Returns:
         EditResult with diff and match locations
@@ -227,15 +231,30 @@ def smart_edit(
     Raises:
         FileNotFoundError: File doesn't exist
         ValueError: old_string not found, multiple matches without replace_all,
-                   or old_string equals new_string
+                   invalid line range, or old_string equals new_string
         PermissionError: Insufficient permissions
     """
-    # Validate inputs FIRST (fail fast before any I/O)
-    if not old_string:
-        raise ValueError("old_string cannot be empty")
+    # --- Fail-fast validation (before any I/O) ---
+    has_line_range = start_line is not None or end_line is not None
 
-    if old_string == new_string:
-        raise ValueError("old_string and new_string are identical")
+    if has_line_range and (start_line is None or end_line is None):
+        raise ValueError("start_line and end_line must both be provided together")
+
+    if old_string is None:
+        # Mode C: line replace — require line range, reject replace_all
+        if not has_line_range:
+            raise ValueError(
+                "old_string is required for find/replace mode. "
+                "Provide start_line/end_line for line-range replacement."
+            )
+        if replace_all:
+            raise ValueError("replace_all is not supported with line-range replacement (Mode C)")
+    else:
+        # Mode A or B
+        if not old_string:
+            raise ValueError("old_string cannot be empty")
+        if old_string == new_string:
+            raise ValueError("old_string and new_string are identical")
 
     file_path = Path(path).expanduser().resolve()
 
@@ -289,38 +308,93 @@ def smart_edit(
             f"File too large for edit: {len(content):,} bytes exceeds {MAX_EDIT_SIZE:,} byte limit"
         )
 
-    # Quick match count check before expensive operations
-    quick_count = content.count(old_string)
-    if quick_count > MAX_MATCHES:
-        raise ValueError(
-            f"Too many matches ({quick_count:,}). "
-            f"Maximum {MAX_MATCHES:,} occurrences allowed for edit operations."
-        )
-
-    # Find all occurrences with line numbers
-    line_numbers = _find_match_line_numbers(content, old_string)
-    matches_found = len(line_numbers)
-
-    # Validate matches
-    if matches_found == 0:
-        raise ValueError(
-            f"old_string not found in {path}. Hint: Ensure exact whitespace and indentation match."
-        )
-
-    if matches_found > 1 and not replace_all:
-        raise ValueError(
-            f"old_string found {matches_found} times at lines {line_numbers} in {path}. "
-            "Hint: Provide more context to make the match unique, or use replace_all=True"
-        )
-
-    # Perform replacement
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
+    # --- Mode dispatch ---
+    if old_string is None:
+        # Mode C: line-range replacement (start_line/end_line guaranteed non-None by validation)
+        assert start_line is not None and end_line is not None
+        _substring, char_start, char_end = _extract_line_range(content, start_line, end_line)
+        new_content = content[:char_start] + new_string + content[char_end:]
+        line_numbers = list(range(start_line, end_line + 1))
+        matches_found = end_line - start_line + 1
         replacements_made = matches_found
+
+    elif has_line_range:
+        # Mode B: scoped find/replace within line range
+        assert start_line is not None and end_line is not None
+        substring, char_start, char_end = _extract_line_range(content, start_line, end_line)
+
+        # Search within the substring only
+        quick_count = substring.count(old_string)
+        if quick_count > MAX_MATCHES:
+            raise ValueError(
+                f"Too many matches ({quick_count:,}) within lines {start_line}-{end_line}. "
+                f"Maximum {MAX_MATCHES:,} occurrences allowed."
+            )
+
+        if quick_count == 0:
+            raise ValueError(
+                f"old_string not found within lines {start_line}-{end_line} of {path}. "
+                "Hint: Ensure exact whitespace and indentation match."
+            )
+
+        if quick_count > 1 and not replace_all:
+            # Find line numbers within substring, then offset to absolute
+            sub_line_numbers = _find_match_line_numbers(substring, old_string)
+            abs_line_numbers = [ln + start_line - 1 for ln in sub_line_numbers]
+            raise ValueError(
+                f"old_string found {quick_count} times at lines {abs_line_numbers} "
+                f"(within range {start_line}-{end_line}) in {path}. "
+                "Hint: Provide more context to make the match unique, or use replace_all=True"
+            )
+
+        # Perform replacement within substring
+        if replace_all:
+            new_substring = substring.replace(old_string, new_string)
+            replacements_made = quick_count
+        else:
+            new_substring = substring.replace(old_string, new_string, 1)
+            replacements_made = 1
+
+        new_content = content[:char_start] + new_substring + content[char_end:]
+
+        # Report absolute line numbers
+        sub_line_numbers = _find_match_line_numbers(substring, old_string)
+        line_numbers = [ln + start_line - 1 for ln in sub_line_numbers]
+        if not replace_all:
+            line_numbers = line_numbers[:1]
+        matches_found = quick_count
+
     else:
-        new_content = content.replace(old_string, new_string, 1)
-        replacements_made = 1
-        line_numbers = line_numbers[:1]  # Only first match
+        # Mode A: full-file find/replace (existing behavior)
+        quick_count = content.count(old_string)
+        if quick_count > MAX_MATCHES:
+            raise ValueError(
+                f"Too many matches ({quick_count:,}). "
+                f"Maximum {MAX_MATCHES:,} occurrences allowed for edit operations."
+            )
+
+        line_numbers = _find_match_line_numbers(content, old_string)
+        matches_found = len(line_numbers)
+
+        if matches_found == 0:
+            raise ValueError(
+                f"old_string not found in {path}. "
+                "Hint: Ensure exact whitespace and indentation match."
+            )
+
+        if matches_found > 1 and not replace_all:
+            raise ValueError(
+                f"old_string found {matches_found} times at lines {line_numbers} in {path}. "
+                "Hint: Provide more context to make the match unique, or use replace_all=True"
+            )
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replacements_made = matches_found
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            replacements_made = 1
+            line_numbers = line_numbers[:1]
 
     # Generate diff
     diff_content = generate_diff(content, new_content)
@@ -381,7 +455,7 @@ def smart_edit(
 def smart_batch_edit(
     cache: SemanticCache,
     path: str,
-    edits: list[tuple[str, str]],
+    edits: (list[tuple[str | None, str, int | None, int | None]] | list[tuple[str, str]]),
     dry_run: bool = False,
     auto_format: bool = False,
 ) -> BatchEditResult:
@@ -390,10 +464,15 @@ def smart_batch_edit(
     Each edit is processed independently - some can succeed while others fail.
     Successful edits are applied even if some fail (partial apply).
 
+    Each edit tuple is (old_string, new_string, start_line, end_line):
+    - (old, new, None, None) — Mode A: full-file find/replace
+    - (old, new, start, end) — Mode B: scoped search within line range
+    - (None, new, start, end) — Mode C: replace entire line range
+
     Args:
         cache: SemanticCache instance
         path: Absolute path to file
-        edits: List of (old_string, new_string) tuples
+        edits: List of (old_string | None, new_string, start_line | None, end_line | None) tuples
         dry_run: Preview changes without writing
         auto_format: Run formatter after edits (default: false)
 
@@ -445,74 +524,114 @@ def smart_batch_edit(
 
     original_content = content
 
-    # Process each edit independently
-    # First pass: find all matches and validate
-    edit_info: list[tuple[int, str, str, list[int]]] = []  # (idx, old, new, line_nums)
-
-    for idx, (old_string, new_string) in enumerate(edits):
-        if old_string:
-            line_numbers = _find_match_line_numbers(content, old_string)
-            edit_info.append((idx, old_string, new_string, line_numbers))
+    # Normalize edits to 4-tuples: (old | None, new, start_line | None, end_line | None)
+    normalized: list[tuple[str | None, str, int | None, int | None]] = []
+    for edit in edits:
+        if len(edit) == 2:
+            normalized.append((edit[0], edit[1], None, None))
         else:
-            edit_info.append((idx, old_string, new_string, []))
+            normalized.append((edit[0], edit[1], edit[2], edit[3]))
 
-    # Build outcomes and collect successful edits
+    # Process each edit independently — validate and collect results
     outcomes: list[SingleEditOutcome] = []
-    successful_edits: list[tuple[str, str, int]] = []  # (old, new, first_line)
+    # Successful edits: (old | None, new, sort_line, start_line | None, end_line | None)
+    successful_edits: list[tuple[str | None, str, int, int | None, int | None]] = []
 
-    for _idx, old_string, new_string, line_numbers in edit_info:
-        if not old_string:
+    for old_string, new_string, sl, el in normalized:
+        try:
+            has_range = sl is not None or el is not None
+
+            if has_range and (sl is None or el is None):
+                raise ValueError("start_line and end_line must both be provided together")
+
+            if old_string is None:
+                # Mode C: line replace
+                if not has_range:
+                    raise ValueError("old_string is required without line range")
+                if sl is not None and el is not None:
+                    _extract_line_range(content, sl, el)  # validates bounds
+                    sort_line = sl
+                    outcomes.append(
+                        SingleEditOutcome(
+                            old_string="",
+                            new_string=new_string,
+                            success=True,
+                            line_number=sl,
+                            error=None,
+                        )
+                    )
+                    successful_edits.append((None, new_string, sort_line, sl, el))
+
+            elif not old_string:
+                raise ValueError("old_string cannot be empty")
+
+            elif old_string == new_string:
+                raise ValueError("old_string and new_string are identical")
+
+            elif has_range:
+                # Mode B: scoped search
+                assert sl is not None and el is not None
+                substring, _cs, _ce = _extract_line_range(content, sl, el)
+                sub_matches = _find_match_line_numbers(substring, old_string)
+                if not sub_matches:
+                    raise ValueError(f"old_string not found within lines {sl}-{el}")
+                abs_line = sub_matches[0] + sl - 1
+                outcomes.append(
+                    SingleEditOutcome(
+                        old_string=old_string,
+                        new_string=new_string,
+                        success=True,
+                        line_number=abs_line,
+                        error=None,
+                    )
+                )
+                successful_edits.append((old_string, new_string, abs_line, sl, el))
+
+            else:
+                # Mode A: full-file search
+                line_numbers = _find_match_line_numbers(content, old_string)
+                if not line_numbers:
+                    raise ValueError("not found")
+                outcomes.append(
+                    SingleEditOutcome(
+                        old_string=old_string,
+                        new_string=new_string,
+                        success=True,
+                        line_number=line_numbers[0],
+                        error=None,
+                    )
+                )
+                successful_edits.append((old_string, new_string, line_numbers[0], None, None))
+
+        except ValueError as exc:
             outcomes.append(
                 SingleEditOutcome(
-                    old_string=old_string,
+                    old_string=old_string or "",
                     new_string=new_string,
                     success=False,
                     line_number=None,
-                    error="old_string cannot be empty",
+                    error=str(exc),
                 )
             )
-        elif old_string == new_string:
-            outcomes.append(
-                SingleEditOutcome(
-                    old_string=old_string,
-                    new_string=new_string,
-                    success=False,
-                    line_number=None,
-                    error="old_string and new_string are identical",
-                )
-            )
-        elif not line_numbers:
-            outcomes.append(
-                SingleEditOutcome(
-                    old_string=old_string,
-                    new_string=new_string,
-                    success=False,
-                    line_number=None,
-                    error="not found",
-                )
-            )
-        else:
-            # Success - record for application
-            outcomes.append(
-                SingleEditOutcome(
-                    old_string=old_string,
-                    new_string=new_string,
-                    success=True,
-                    line_number=line_numbers[0],
-                    error=None,
-                )
-            )
-            successful_edits.append((old_string, new_string, line_numbers[0]))
 
     # Apply successful edits (sort by line number descending to preserve positions)
     new_content = content
     if successful_edits:
-        # Sort by line number descending (bottom-to-top)
         successful_edits.sort(key=lambda x: x[2], reverse=True)
 
-        for old_string, new_string, _ in successful_edits:
-            # Replace first occurrence only (each edit is independent)
-            new_content = new_content.replace(old_string, new_string, 1)
+        for old_str, new_str, _sort_line, sl, el in successful_edits:
+            if old_str is None and sl is not None and el is not None:
+                # Mode C: splice by line range
+                _sub, cs, ce = _extract_line_range(new_content, sl, el)
+                new_content = new_content[:cs] + new_str + new_content[ce:]
+            elif old_str is not None and sl is not None and el is not None:
+                # Mode B: scoped replace
+                sub, cs, ce = _extract_line_range(new_content, sl, el)
+                new_sub = sub.replace(old_str, new_str, 1)
+                new_content = new_content[:cs] + new_sub + new_content[ce:]
+            elif old_str is not None:
+                # Mode A: full-file replace
+                new_content = new_content.replace(old_str, new_str, 1)
 
     # Generate combined diff
     diff_content = generate_diff(original_content, new_content)
