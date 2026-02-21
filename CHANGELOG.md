@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-02-21
+
+### Fixed
+
+- **macOS/Windows installation** — `fastembed-gpu` and `onnxruntime-gpu` (Linux-only wheels) replaced with platform-conditional dependencies. CPU variants install on macOS/Windows; GPU variants remain on Linux.
+- **Cross-platform cache directory** — respects `$SEMANTIC_CACHE_DIR` env override, then uses platform-appropriate defaults: `$XDG_CACHE_HOME` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows.
+- **Cross-platform RSS memory stats** — `/proc/self/status` replaced with platform-aware helper: `resource.getrusage` on macOS, `K32GetProcessMemoryInfo` on Windows, graceful `None` on unsupported platforms.
+- **UTF-16/32 files falsely detected as binary** — BOM-aware check (UTF-32 LE/BE, UTF-16 LE/BE, UTF-8 BOM) now runs before the null-byte heuristic.
+- **Inline binary checks consolidated** — `read.py` now uses the shared `_is_binary_content()` helper instead of duplicating null-byte checks.
+
+### Changed
+
+- Installation docs updated to use `uvx` instead of `uv tool install`.
+- CI: action versions bumped (checkout v6, setup-uv v7, codecov v5, upload-artifact v6), macOS added to test matrix.
+
 ## [0.1.0] - 2026-02-21
 
 ### Added
@@ -26,5 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/CoderDayton/semantic-cache-mcp/releases/tag/v0.1.0
