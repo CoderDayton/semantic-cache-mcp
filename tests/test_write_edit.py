@@ -828,6 +828,44 @@ class TestSmartEditLineRange:
                 end_line=1,
             )
 
+    def test_mode_c_no_trailing_newline(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C auto-appends newline when new_string lacks one."""
+        file_path = temp_dir / "mode_c_no_nl.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\n")
+
+        result = smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "BBB",  # no trailing \n
+            start_line=2,
+            end_line=2,
+        )
+
+        # Should NOT concatenate "BBB" with "ccc" on one line
+        assert file_path.read_text() == "aaa\nBBB\nccc\nddd\n"
+        assert result.replacements_made == 1
+
+    def test_mode_c_no_trailing_newline_multiline(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C auto-appends newline for multi-line replacement without trailing newline."""
+        file_path = temp_dir / "mode_c_no_nl_multi.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\n")
+
+        smart_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            None,
+            "x\ny",  # no trailing \n
+            start_line=2,
+            end_line=3,
+        )
+
+        assert file_path.read_text() == "aaa\nx\ny\nddd\n"
+
 
 class TestSmartBatchEditLineRange:
     """Tests for line-range editing in batch_edit."""
@@ -904,3 +942,19 @@ class TestSmartBatchEditLineRange:
         assert result.succeeded == 0
         assert result.outcomes[0].success is False
         assert "exceeds" in (result.outcomes[0].error or "")
+
+    def test_batch_mode_c_no_trailing_newline(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Mode C in batch auto-appends newline when new_string lacks one."""
+        file_path = temp_dir / "batch_no_nl.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\n")
+
+        result = smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [(None, "XXX", 2, 2), (None, "YYY", 3, 3)],
+        )
+
+        assert result.succeeded == 2
+        assert file_path.read_text() == "aaa\nXXX\nYYY\nddd\n"

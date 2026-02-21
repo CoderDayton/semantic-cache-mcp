@@ -313,6 +313,9 @@ def smart_edit(
         # Mode C: line-range replacement (start_line/end_line guaranteed non-None by validation)
         assert start_line is not None and end_line is not None
         _substring, char_start, char_end = _extract_line_range(content, start_line, end_line)
+        # Preserve line terminator: if the replaced range ended with \n, ensure new_string does too
+        if _substring.endswith("\n") and not new_string.endswith("\n"):
+            new_string = new_string + "\n"
         new_content = content[:char_start] + new_string + content[char_end:]
         line_numbers = list(range(start_line, end_line + 1))
         matches_found = end_line - start_line + 1
@@ -623,6 +626,8 @@ def smart_batch_edit(
             if old_str is None and sl is not None and el is not None:
                 # Mode C: splice by line range
                 _sub, cs, ce = _extract_line_range(new_content, sl, el)
+                if _sub.endswith("\n") and not new_str.endswith("\n"):
+                    new_str = new_str + "\n"
                 new_content = new_content[:cs] + new_str + new_content[ce:]
             elif old_str is not None and sl is not None and el is not None:
                 # Mode B: scoped replace
