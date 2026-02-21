@@ -520,7 +520,7 @@ def top_k_similarities(
 
 def estimate_speedup(
     num_vectors: int,
-    embedding_dim: int = 384,
+    embedding_dim: int,
     use_quantization: bool = True,
     use_pruning: bool = True,
 ) -> dict:

@@ -327,28 +327,38 @@ def summarize_semantic(
     total_lines = content.count("\n") + 1
 
     # Get embeddings for diversity scoring
-    embeddings: list[NDArray[np.float32]] = []
+    resolved: list[NDArray[np.float32]]
 
     if embed_fn is not None:
-        # Use provided embedding function
+        # Use provided embedding function; infer dim from first success
+        raw: list[NDArray[np.float32] | None] = []
+        inferred_dim: int = 0
         for seg in segments:
             try:
                 emb = embed_fn(seg.content)
                 if emb is not None:
-                    # Normalize
+                    if inferred_dim == 0:
+                        inferred_dim = len(emb)
                     norm = np.linalg.norm(emb)
-                    embeddings.append(emb / norm if norm > 0 else emb)
+                    raw.append(emb / norm if norm > 0 else emb)
                 else:
-                    embeddings.append(np.zeros(384, dtype=np.float32))
+                    raw.append(None)
             except Exception:
-                embeddings.append(np.zeros(384, dtype=np.float32))
+                raw.append(None)
+
+        # Backfill failures with zero vectors of the correct dimension
+        if inferred_dim > 0:
+            zero = np.zeros(inferred_dim, dtype=np.float32)
+            resolved = [e if e is not None else zero for e in raw]
+        else:
+            # All embeds failed — fall back to bag-of-words
+            resolved = [_simple_embedding(seg.content) for seg in segments]
     else:
         # Fallback: simple bag-of-words embedding
-        for seg in segments:
-            embeddings.append(_simple_embedding(seg.content))
+        resolved = [_simple_embedding(seg.content) for seg in segments]
 
     # Score and rank segments
-    scored = score_segments(segments, embeddings, total_lines, config)
+    scored = score_segments(segments, resolved, total_lines, config)
 
     # Greedy selection: pick highest-scoring segments that fit
     # Use 80% of max_size for content, leaving 20% buffer for markers
@@ -374,7 +384,7 @@ def summarize_semantic(
             continue
 
         # Apply diversity penalty
-        diversity_penalty = _compute_diversity_penalty(seg_idx, embeddings, selected_indices)
+        diversity_penalty = _compute_diversity_penalty(seg_idx, resolved, selected_indices)
         adjusted_score = base_score * (1.0 - config.diversity_weight * diversity_penalty)
 
         # Accept if score is still reasonable
@@ -420,7 +430,7 @@ def summarize_semantic(
     return result
 
 
-def _simple_embedding(text: str, dim: int = 384) -> NDArray[np.float32]:
+def _simple_embedding(text: str, dim: int = 256) -> NDArray[np.float32]:
     """
     Simple bag-of-words embedding (fallback when no model available).
 

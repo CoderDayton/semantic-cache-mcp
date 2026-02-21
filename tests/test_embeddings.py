@@ -40,6 +40,7 @@ class TestEmbeddingProviders:
             def embed(self, items):
                 return []
 
+        monkeypatch.setattr(embeddings, "EMBEDDING_DEVICE", "auto")
         monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
         monkeypatch.setitem(
             sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
@@ -94,6 +95,7 @@ class TestEmbeddingProviders:
             def embed(self, items):
                 return []
 
+        monkeypatch.setattr(embeddings, "EMBEDDING_DEVICE", "auto")
         monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
         monkeypatch.setitem(
             sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)

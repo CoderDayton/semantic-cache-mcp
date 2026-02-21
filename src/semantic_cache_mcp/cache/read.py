@@ -141,7 +141,7 @@ def smart_read(
                 f"{stats['compression_ratio']:.1%} size\n"
             )
             result_content = f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
-            embedding = cache.get_embedding(content)
+            embedding = cache.get_embedding(content, path)
             cache.put(str(file_path), content, mtime, embedding)
 
             tokens_returned = count_tokens(result_content)
@@ -158,7 +158,7 @@ def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = cache.get_embedding(content)
+        embedding = cache.get_embedding(content, path)
         if embedding:
             similar_path = cache.find_similar(embedding, str(file_path))
             if similar_path:
@@ -218,7 +218,7 @@ def smart_read(
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = cache.get_embedding(content)
+    embedding = cache.get_embedding(content, path)
     cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)

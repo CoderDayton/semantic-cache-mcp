@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from semantic_cache_mcp.storage.sqlite import SQLiteStorage
 from semantic_cache_mcp.types import EmbeddingVector
+from tests.constants import TEST_EMBEDDING_DIM
 
 
 class TestChunkOperations:
@@ -229,7 +230,7 @@ class TestSemanticSearch:
         """find_similar should return None when no files have embeddings."""
         temp_cache.put("/test/file.txt", "Content", time.time())  # No embedding
 
-        mock_emb = array.array("f", [0.1] * 1536)
+        mock_emb = array.array("f", [0.1] * TEST_EMBEDDING_DIM)
         result = temp_cache.find_similar(mock_emb)
         assert result is None
 

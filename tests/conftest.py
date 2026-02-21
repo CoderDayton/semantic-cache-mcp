@@ -13,6 +13,7 @@ import pytest
 from semantic_cache_mcp.cache import SemanticCache
 from semantic_cache_mcp.storage.sqlite import SQLiteStorage
 from semantic_cache_mcp.types import EmbeddingVector
+from tests.constants import TEST_EMBEDDING_DIM
 
 
 @pytest.fixture
@@ -125,10 +126,10 @@ class Calculator:
 
 @pytest.fixture
 def mock_embeddings() -> EmbeddingVector:
-    """Create a mock embedding vector (normalized, 768 dimensions for nomic)."""
+    """Create a mock embedding vector (normalized, TEST_EMBEDDING_DIM dimensions)."""
     import math
 
-    raw = [0.1] * 768
+    raw = [0.1] * TEST_EMBEDDING_DIM
     magnitude = math.sqrt(sum(x * x for x in raw))
     normalized = [x / magnitude for x in raw]
     return array.array("f", normalized)
@@ -140,7 +141,7 @@ def mock_embeddings_similar() -> EmbeddingVector:
     import math
 
     # Slightly different from mock_embeddings but still similar
-    raw = [0.1] * 768
+    raw = [0.1] * TEST_EMBEDDING_DIM
     raw[0] = 0.11  # Small difference
     raw[1] = 0.09
     magnitude = math.sqrt(sum(x * x for x in raw))
@@ -153,8 +154,9 @@ def mock_embeddings_different() -> EmbeddingVector:
     """Create a mock embedding vector different from mock_embeddings."""
     import math
 
-    # Very different values
-    raw = [-0.1] * 384 + [0.2] * 384
+    # Very different values — two halves with opposite signs
+    half = TEST_EMBEDDING_DIM // 2
+    raw = [-0.1] * half + [0.2] * half
     magnitude = math.sqrt(sum(x * x for x in raw))
     normalized = [x / magnitude for x in raw]
     return array.array("f", normalized)

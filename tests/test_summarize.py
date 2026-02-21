@@ -109,7 +109,8 @@ class TestSegmentScoring:
         ]
 
         # Simple embeddings - same for all to isolate position effect
-        embeddings = [np.ones(384, dtype=np.float32) / np.sqrt(384) for _ in segments]
+        d = 384
+        embeddings = [np.ones(d, dtype=np.float32) / np.sqrt(d) for _ in segments]
 
         scored = score_segments(segments, embeddings, total_lines=100)
         scores = {idx: score for idx, score in scored}
@@ -130,7 +131,8 @@ class TestSegmentScoring:
             Segment(start_line=10, end_line=20, content="header", is_header=True),
         ]
 
-        embeddings = [np.ones(384, dtype=np.float32) / np.sqrt(384) for _ in segments]
+        d = 384
+        embeddings = [np.ones(d, dtype=np.float32) / np.sqrt(d) for _ in segments]
         scored = score_segments(segments, embeddings, total_lines=100)
 
         # Find scores by index

@@ -201,7 +201,7 @@ def compare_files(
     else:
         content1 = file1.read_text(encoding="utf-8")
         mtime1 = file1.stat().st_mtime
-        emb1 = cache.get_embedding(content1)
+        emb1 = cache.get_embedding(content1, str(file1))
         cache.put(str(file1), content1, mtime1, emb1)
 
     # File 2
@@ -212,7 +212,7 @@ def compare_files(
     else:
         content2 = file2.read_text(encoding="utf-8")
         mtime2 = file2.stat().st_mtime
-        emb2 = cache.get_embedding(content2)
+        emb2 = cache.get_embedding(content2, str(file2))
         cache.put(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
@@ -276,7 +276,7 @@ def find_similar_files(
         source_tokens = cached.tokens
     else:
         content = file_path.read_text(encoding="utf-8")
-        source_embedding = cache.get_embedding(content)
+        source_embedding = cache.get_embedding(content, str(file_path))
         source_tokens = count_tokens(content)
         mtime = file_path.stat().st_mtime
         cache.put(str(file_path), content, mtime, source_embedding)

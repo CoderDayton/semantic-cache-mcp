@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.types import EmbeddingVector
+from tests.constants import TEST_EMBEDDING_DIM
 
 
 class TestSmartReadUnchangedFile:
@@ -354,4 +355,4 @@ class TestEmbeddingsIntegration:
             entry = cache.get(str(test_file))
             assert entry is not None
             assert entry.embedding is not None
-            assert len(entry.embedding) == 768
+            assert len(entry.embedding) == TEST_EMBEDDING_DIM

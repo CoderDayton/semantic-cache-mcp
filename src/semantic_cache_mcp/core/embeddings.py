@@ -14,17 +14,19 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
-from ..config import CACHE_DIR
+from ..config import CACHE_DIR, EMBEDDING_DEVICE
 
 logger = logging.getLogger(__name__)
 
-# Model configuration
-FASTEMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+# Model configuration — bge-small is 6x smaller than nomic (33M vs 137M params),
+# 384-dim vs 768-dim, fast on CPU, and quality is sufficient for file similarity.
+FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 FASTEMBED_CACHE_DIR = CACHE_DIR / "models"
 
 # Singleton instance
 _embedding_model: TextEmbedding | None = None
 _model_ready: bool = False
+_embedding_dim: int = 0
 _execution_provider: str = "unknown"
 
 
@@ -69,7 +71,9 @@ def _get_model() -> TextEmbedding:
             "lazy_load": False,  # Load immediately for predictable startup
         }
 
-        use_cuda = _cuda_provider_is_available()
+        use_cuda = EMBEDDING_DEVICE == "cuda" or (
+            EMBEDDING_DEVICE == "auto" and _cuda_provider_is_available()
+        )
         if use_cuda:
             # Configure CUDA provider to limit VRAM arena growth:
             # - kSameAsRequested: allocate exact size needed (default kNextPowerOfTwo
@@ -133,7 +137,7 @@ def warmup() -> None:
     A single-word warmup leaves these cold, causing the first real
     request to pay a ~600ms penalty.
     """
-    global _model_ready
+    global _model_ready, _embedding_dim
 
     if _model_ready:
         return
@@ -141,42 +145,38 @@ def warmup() -> None:
     logger.info("Warming up embedding model...")
     model = _get_model()
 
-    # Representative texts at different lengths to warm up:
-    # - CUDA kernel selection for varying sequence lengths
-    # - ONNX Runtime's memory arena allocation
-    # - fastembed's tokenizer + mean pooling path
+    # Representative texts at different lengths to warm up ONNX kernel cache
+    # and memory allocator.
     warmup_texts = [
-        # Short: typical function signature
-        "search_document: def compute_hash(data: bytes) -> str",
-        # Medium: typical docstring/comment block
+        "def compute_hash(data: bytes) -> str",
         (
-            "search_document: The architecture of modern distributed systems relies "
+            "The architecture of modern distributed systems relies "
             "heavily on eventual consistency models, where nodes communicate through "
             "asynchronous message passing. Each node maintains its own state replica "
             "and conflicts are resolved through vector clocks or CRDTs."
         ),
-        # Long: closer to the 8K char window the model actually processes
         (
-            "search_document: "
-            + "Database indexing strategies significantly impact query performance. "
+            "Database indexing strategies significantly impact query performance. "
             "B-tree indexes provide logarithmic lookup time for range queries while "
             "hash indexes offer constant-time point lookups. Composite indexes can "
             "serve multiple query patterns but increase write amplification. The "
-            "query optimizer must consider index selectivity and cardinality. " * 10
+            "query optimizer must consider index selectivity and cardinality."
         ),
     ]
 
-    _ = list(model.embed(warmup_texts))
+    results = list(model.embed(warmup_texts))
+    if results:
+        _embedding_dim = len(results[0])
 
     _model_ready = True
-    logger.info("Embedding model warmed up and ready")
+    logger.info(f"Embedding model warmed up (dim={_embedding_dim})")
 
 
 def embed(text: str) -> array.array[float] | None:
     """Generate embedding for text.
 
     Args:
-        text: Text to embed (uses first 8192 chars for nomic model)
+        text: Text to embed (truncated to 8000 chars)
 
     Returns:
         Embedding as array.array or None on error
@@ -184,11 +184,9 @@ def embed(text: str) -> array.array[float] | None:
     try:
         model = _get_model()
 
-        # nomic model supports 8192 tokens, but we limit text for efficiency
-        # Add search_document prefix as recommended by nomic
-        prefixed_text = f"search_document: {text[:8000]}"
+        truncated = text[:8000]
 
-        embeddings = list(model.embed([prefixed_text]))
+        embeddings = list(model.embed([truncated]))
         if embeddings:
             return array.array("f", embeddings[0].tolist())
         return None
@@ -201,7 +199,7 @@ def embed(text: str) -> array.array[float] | None:
 def embed_query(text: str) -> array.array[float] | None:
     """Generate embedding for a search query.
 
-    Uses search_query prefix for better retrieval performance.
+    Uses 'Represent this sentence:' prefix for bge retrieval.
 
     Args:
         text: Query text to embed
@@ -212,10 +210,10 @@ def embed_query(text: str) -> array.array[float] | None:
     try:
         model = _get_model()
 
-        # Use search_query prefix for queries
-        prefixed_text = f"search_query: {text[:8000]}"
+        # Official bge query instruction for retrieval tasks
+        prefixed = f"Represent this sentence for searching relevant passages: {text[:8000]}"
 
-        embeddings = list(model.embed([prefixed_text]))
+        embeddings = list(model.embed([prefixed]))
         if embeddings:
             return array.array("f", embeddings[0].tolist())
         return None
@@ -225,14 +223,23 @@ def embed_query(text: str) -> array.array[float] | None:
         return None
 
 
+def get_embedding_dim() -> int:
+    """Return the embedding dimension of the loaded model.
+
+    Falls back to 0 if the model hasn't been warmed up yet.
+    """
+    return _embedding_dim
+
+
 def get_model_info() -> dict[str, str | int]:
     """Get information about the loaded model.
 
     Returns:
-        Dict with model name, dimension, and cache location
+        Dict with model name, dimension, provider, and readiness
     """
     return {
         "model": FASTEMBED_MODEL,
+        "dim": _embedding_dim,
         "cache_dir": str(FASTEMBED_CACHE_DIR),
         "provider": _execution_provider,
         "ready": _model_ready,
