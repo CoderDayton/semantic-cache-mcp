@@ -58,7 +58,7 @@ smart_write(cache, path="/tmp/out.py", content="# chunk 1\n")
 smart_write(cache, path="/tmp/out.py", content="# chunk 2\n", append=True)
 smart_write(cache, path="/tmp/out.py", content="# chunk 3\n", append=True, auto_format=True)
 
-# Smart edit — uses cached content, returns diff
+# smart_edit — Mode A: full-file find/replace (existing behavior)
 edit_result = smart_edit(
     cache=cache,
     path="/path/to/file.py",
@@ -71,14 +71,48 @@ print(f"Matches found:    {edit_result.matches_found}")
 print(f"Lines modified:   {edit_result.line_numbers}")
 print(f"Tokens saved:     {edit_result.tokens_saved}")
 
-# Batch edit — 2+ independent edits in one file, partial success
+# smart_edit — Mode B: scoped find/replace within a line range
+# Useful when read() gave you line numbers — shorter old_string suffices
+edit_result = smart_edit(
+    cache=cache,
+    path="/path/to/file.py",
+    old_string="pass",       # matched only within lines 42–42
+    new_string="return x",
+    start_line=42,
+    end_line=42,
+)
+print(f"Lines modified: {edit_result.line_numbers}")  # absolute line numbers
+
+# smart_edit — Mode C: direct line replacement (maximum token savings)
+# No old_string needed — replaces the entire range unconditionally
+edit_result = smart_edit(
+    cache=cache,
+    path="/path/to/file.py",
+    old_string=None,
+    new_string="    return result\n",
+    start_line=80,
+    end_line=83,
+)
+
+# smart_batch_edit — 2+ independent edits; accepts 2-tuples (Mode A) or 4-tuples (Modes B/C)
+multi_result = smart_batch_edit(
+    cache=cache,
+    path="/path/to/file.py",
+    edits=[
+        ("old1", "new1", None, None),    # Mode A: full-file replace
+        ("pass", "return x", 42, 42),    # Mode B: scoped replace
+        (None, "    return result\n", 80, 83),  # Mode C: line replace
+    ],
+)
+print(f"Succeeded: {multi_result.succeeded}")
+print(f"Failed:    {multi_result.failed}")
+
+# 2-tuples (old, new) are also accepted for backward compatibility
 multi_result = smart_batch_edit(
     cache=cache,
     path="/path/to/file.py",
     edits=[("old1", "new1"), ("old2", "new2")],
 )
-print(f"Succeeded: {multi_result.succeeded}")
-print(f"Failed:    {multi_result.failed}")
 
 # Semantic search — embedding-based, NOT keyword
 # Must seed cache first with smart_read / batch_smart_read

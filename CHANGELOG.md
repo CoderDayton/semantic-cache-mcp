@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LSH acceleration for `search` and `similar` tools — O(1) candidate retrieval for caches ≥ 100 files, falls back to exhaustive O(N) scan for smaller caches
 - `@overload` decorators on `LSHIndex.query` for precise mypy type narrowing (`Literal[True]` → `list[tuple[int, float]]`, `Literal[False]` → `list[int]`)
 - `nosec` annotations for bandit false positives (B310 `urlretrieve`, B608 parameterized `IN`-clause queries)
+- Line-range editing for `edit` and `batch_edit` tools — two new modes: scoped find/replace (searches only within `start_line`/`end_line`) and direct line replacement (`old_string=None`, replaces range wholesale). Fully backward-compatible; existing callers unchanged. 28 new tests covering all modes, validation, and edge cases.
 
 ### Changed
 

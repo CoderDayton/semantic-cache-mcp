@@ -77,8 +77,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
     - `offset`/`limit` → read specific line ranges
   - `batch_read` → 2+ files; supports glob patterns; set diff_mode=false after context compression
   - `write` → new files or full rewrites; append=true for chunked writes of large files
-  - `edit` → targeted find/replace; returns diff
-  - `batch_edit` → 2+ edits in one file
+  - `edit` → find/replace (3 modes: full-file / scoped / line-replace); returns diff
+  - `batch_edit` → 2+ edits in one file; supports all 3 modes per entry
   - `search`/`similar` → semantic search; seed cache first with read/batch_read
   - `glob` → find files by pattern; cached_only=true to see what's already cached
 ```
@@ -93,8 +93,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 |------|-------------|
 | `read` | Smart file reading with diff-mode. Three states: first read (full + cache), unchanged (99% savings), modified (diff, 80–95% savings). Use `offset`/`limit` for line ranges. |
 | `write` | Write files with cache integration. `auto_format=true` runs formatter. `append=true` enables chunked writes for large files. Returns diff on overwrite. |
-| `edit` | Targeted find/replace using cached reads. `dry_run=true` previews changes. `replace_all=true` handles multiple matches. `auto_format=true` runs formatter. Returns unified diff. |
-| `batch_edit` | Up to 50 edits per call with partial success — some can fail while others succeed. `auto_format=true` and `dry_run=true` supported. |
+| `edit` | Find/replace using cached reads — three modes: full-file, scoped to a line range, or direct line replacement. `dry_run=true` previews. `replace_all=true` handles multiple matches. Returns unified diff. |
+| `batch_edit` | Up to 50 edits per call with partial success. Each entry can be find/replace, scoped, or line-range replacement. `auto_format=true` and `dry_run=true` supported. |
 
 ### Discovery
 
@@ -156,16 +156,31 @@ write path="/src/large.py" content="...chunk2..." append=true    # subsequent ch
 </details>
 
 <details>
-<summary><strong>edit</strong> — Targeted find/replace</summary>
+<summary><strong>edit</strong> — Find/replace with three modes</summary>
 
 ```
+# Mode A — find/replace: searches entire file
 edit path="/src/app.py" old_string="def foo():" new_string="def foo(x: int):"
-edit path="/src/app.py" old_string="..." new_string="..." dry_run=true
 edit path="/src/app.py" old_string="..." new_string="..." replace_all=true auto_format=true
+
+# Mode B — scoped find/replace: search only within line range (shorter old_string suffices)
+edit path="/src/app.py" old_string="pass" new_string="return x" start_line=42 end_line=42
+
+# Mode C — line replace: replace entire range, no old_string needed (maximum token savings)
+edit path="/src/app.py" new_string="    return result\n" start_line=80 end_line=83
 ```
 
-- Uses cached content (no token cost for the read)
+**Mode selection:**
+
+| Mode | Parameters | Best for |
+|------|-----------|----------|
+| Find/replace | `old_string` + `new_string` | Unique strings, no line numbers known |
+| Scoped | `old_string` + `new_string` + `start_line`/`end_line` | Shorter context when `read` gave you line numbers |
+| Line replace | `new_string` + `start_line`/`end_line` (no `old_string`) | Maximum token savings when line numbers are known |
+
+- Uses cached content — no token cost for the read
 - Returns unified diff of the change
+- Multiple matches in scope: fails with hint to add context or use `replace_all=true`
 - Use `batch_edit` when applying 2+ independent changes to the same file
 
 </details>
@@ -174,13 +189,27 @@ edit path="/src/app.py" old_string="..." new_string="..." replace_all=true auto_
 <summary><strong>batch_edit</strong> — Multiple edits in one call</summary>
 
 ```
+# Mode A — find/replace: [old, new]
 batch_edit path="/src/app.py" edits='[["old1","new1"],["old2","new2"]]'
-batch_edit path="/src/app.py" edits='[["old1","new1"],["old2","new2"]]' dry_run=true auto_format=true
+
+# Mode B — scoped: [old, new, start_line, end_line]
+batch_edit path="/src/app.py" edits='[["pass","return x",42,42]]'
+
+# Mode C — line replace: [null, new, start_line, end_line]
+batch_edit path="/src/app.py" edits='[[null,"    return result\n",80,83]]'
+
+# Mixed modes in one call (object syntax also supported)
+batch_edit path="/src/app.py" edits='[
+  ["old1", "new1"],
+  {"old": "pass", "new": "return x", "start_line": 42, "end_line": 42},
+  {"old": null, "new": "    return result\n", "start_line": 80, "end_line": 83}
+]' auto_format=true
 ```
 
-- Up to 50 edits per call
+- Up to 50 edits per call — each entry can use any mode independently
 - Partial success: individual edit failures don't block others
 - Single round-trip, single cache update
+- Failures reported per-entry so you can retry only what failed
 
 </details>
 
