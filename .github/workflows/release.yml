@@ -7,12 +7,13 @@ on:
 
 permissions:
   contents: write
-  id-token: write  # Required for PyPI trusted publishing
 
 jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@v6
 
@@ -43,6 +44,12 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Extract changelog for release
         id: changelog
@@ -92,14 +99,46 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-pypi:
+    name: Publish to PyPI
+    needs: release
+    if: needs.release.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/semantic-cache-mcp
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
       - name: Publish to PyPI
-        if: steps.prerelease.outputs.is_prerelease == 'false'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
 
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: release
+    if: needs.release.outputs.is_prerelease == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/semantic-cache-mcp
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
       - name: Publish to TestPyPI
-        if: steps.prerelease.outputs.is_prerelease == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
