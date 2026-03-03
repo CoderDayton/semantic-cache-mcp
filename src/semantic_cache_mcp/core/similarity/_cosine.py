@@ -182,9 +182,11 @@ def similarity_from_quantized_blob(
     scales = np.empty(n, dtype=np.float32)
     matrix = np.empty((n, dim), dtype=np.int8)
 
-    for i, blob in enumerate(quantized_blobs):
-        scales[i] = struct.unpack("<f", blob[:4])[0]
-        matrix[i] = np.frombuffer(blob[4:], dtype=np.int8)
+    # Single-buffer deserialization: concat blobs, reshape, split scale/vector
+    all_data = b"".join(quantized_blobs)
+    raw = np.frombuffer(all_data, dtype=np.uint8).reshape(n, dim + 4)
+    scales = raw[:, :4].copy().view(np.float32).flatten()
+    matrix = raw[:, 4:].view(np.int8)
 
     # Batch int8 dot product (SIMD-friendly)
     # Use int32 accumulator to avoid overflow
@@ -217,7 +219,13 @@ def top_k_from_quantized(
 
     sims = similarity_from_quantized_blob(query, quantized_blobs)
     k = min(k, len(sims))
-    top_indices = np.argsort(-sims)[:k]
+
+    # O(N) partial sort via argpartition instead of O(N log N) full sort
+    if k < len(sims):
+        part_idx = np.argpartition(-sims, k)[:k]
+        top_indices = part_idx[np.argsort(-sims[part_idx])]
+    else:
+        top_indices = np.argsort(-sims)
 
     return [(int(idx), float(sims[idx])) for idx in top_indices]
 
@@ -246,8 +254,12 @@ def _select_pruning_dims(
     # Adaptive pruning: magnitude-based
     if adaptive:
         abs_query = np.abs(query)
-        threshold = np.percentile(abs_query, (1.0 - fraction) * 100)
-        return abs_query >= threshold
+        # O(N) partition instead of O(N log N) percentile
+        prune_count = int(len(abs_query) * (1.0 - fraction))
+        if 0 < prune_count < len(abs_query):
+            threshold = np.partition(abs_query, prune_count)[prune_count]
+            return abs_query >= threshold
+        return np.ones(len(query), dtype=bool)
     else:
         # Simple index-based pruning (first N dims)
         keep_count = int(len(query) * fraction)
@@ -384,15 +396,11 @@ def cosine_similarity_batch(
     else:
         q_arr = np.asarray(query, dtype=np.float32)
 
-    # Build matrix once (avoid per-vector Python loop)
-    matrix = np.vstack(
-        [
-            np.frombuffer(v, dtype=np.float32)
-            if isinstance(v, array.array)
-            else np.asarray(v, dtype=np.float32)
-            for v in vectors
-        ]
-    )
+    # Pre-allocate matrix (avoids intermediate list + vstack copy)
+    dim = len(vectors[0]) if not isinstance(vectors[0], array.array) else len(vectors[0])
+    matrix = np.empty((len(vectors), dim), dtype=np.float32)
+    for i, v in enumerate(vectors):
+        matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v
 
     # Apply pruning mask to both query and matrix
     if use_pruning:
@@ -438,15 +446,11 @@ def cosine_similarity_batch_matrix(
     else:
         q_arr = np.asarray(query, dtype=np.float32)
 
-    # Stack vectors into matrix
-    matrix = np.vstack(
-        [
-            np.frombuffer(v, dtype=np.float32)
-            if isinstance(v, array.array)
-            else np.asarray(v, dtype=np.float32)
-            for v in vectors
-        ]
-    )
+    # Pre-allocate matrix (avoids intermediate list + vstack copy)
+    dim = len(vectors[0]) if not isinstance(vectors[0], array.array) else len(vectors[0])
+    matrix = np.empty((len(vectors), dim), dtype=np.float32)
+    for i, v in enumerate(vectors):
+        matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v
 
     if use_quantization:
         # Quantize all at once
@@ -496,7 +500,14 @@ def top_k_similarities(
     """
     k = min(k, len(vectors))
     sims = cosine_similarity_batch_matrix(query, vectors, use_quantization)
-    top_indices = np.argsort(-sims)[:k]
+
+    # O(N) partial sort via argpartition instead of O(N log N) full sort
+    if k < len(sims):
+        part_idx = np.argpartition(-sims, k)[:k]
+        top_indices = part_idx[np.argsort(-sims[part_idx])]
+    else:
+        top_indices = np.argsort(-sims)
+
     return [(int(idx), float(sims[idx])) for idx in top_indices]
 
 

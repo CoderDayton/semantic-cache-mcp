@@ -102,13 +102,9 @@ def compute_simhash(
     # Convert to binary: positive -> 1, negative -> 0
     bits = (dots > 0).astype(np.uint64)
 
-    # Pack bits into single integer
-    # For 64 bits, this creates a uint64
-    hash_val = 0
-    for i, bit in enumerate(bits):
-        hash_val |= int(bit) << i
-
-    return hash_val
+    # Pack bits into single integer via vectorized power-of-2 multiplication
+    powers = np.uint64(1) << np.arange(len(bits), dtype=np.uint64)
+    return int((bits * powers).sum())
 
 
 def compute_simhash_batch(
@@ -126,15 +122,15 @@ def compute_simhash_batch(
     Returns:
         Array of hash values
     """
-    # Stack embeddings into matrix
-    matrix = np.vstack(
-        [
-            np.frombuffer(e, dtype=np.float32)
-            if isinstance(e, array.array)
-            else np.asarray(e, dtype=np.float32)
-            for e in embeddings
-        ]
-    )
+    # Pre-allocate matrix (avoids intermediate list + vstack copy)
+    first = embeddings[0]
+    dim = len(first) if not isinstance(first, array.array) else len(first)
+    matrix = np.empty((len(embeddings), dim), dtype=np.float32)
+    for i, e in enumerate(embeddings):
+        if isinstance(e, array.array):
+            matrix[i] = np.frombuffer(e, dtype=np.float32)
+        else:
+            matrix[i] = e
 
     # Batch dot products
     dots = matrix @ hyperplanes.T  # (N, num_bits)
@@ -159,7 +155,13 @@ def hamming_distance(h1: int, h2: int) -> int:
     Returns:
         Number of differing bits
     """
-    return bin(h1 ^ h2).count("1")
+    # Kernighan's bit-counting: clear lowest set bit each iteration
+    xor = h1 ^ h2
+    count = 0
+    while xor:
+        xor &= xor - 1
+        count += 1
+    return count
 
 
 def hamming_distance_batch(
@@ -179,12 +181,9 @@ def hamming_distance_batch(
     """
     xor_result = hashes ^ np.uint64(query_hash)
 
-    # Count bits using lookup table approach
-    # Split 64-bit into 8-bit chunks and use numpy's unpackbits
-    distances = np.zeros(len(hashes), dtype=np.int32)
-
-    for i, xor_val in enumerate(xor_result):
-        distances[i] = bin(int(xor_val)).count("1")
+    # Vectorized popcount: view uint64 as 8×uint8, unpack to bits, sum
+    xor_bytes = xor_result.view(np.uint8).reshape(-1, 8)
+    distances = np.unpackbits(xor_bytes, axis=1).sum(axis=1).astype(np.int32)
 
     return distances
 
