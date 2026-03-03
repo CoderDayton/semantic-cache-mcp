@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from filelock import FileLock
+
 from ..config import (
     ACCESS_HISTORY_SIZE,
     DB_PATH,
@@ -52,7 +54,7 @@ class ConnectionPool:
     - No thread affinity (any thread can use any connection)
     """
 
-    __slots__ = ("db_path", "_pool", "_max_size", "_created", "_closed")
+    __slots__ = ("db_path", "_pool", "_max_size", "_created", "_closed", "_file_lock")
 
     def __init__(self, db_path: Path, max_size: int = 5) -> None:
         """Initialize connection pool.
@@ -66,6 +68,9 @@ class ConnectionPool:
         self._pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=max_size)
         self._created = 0
         self._closed = False
+        # Cross-process file lock — serializes DB writes across MCP instances
+        # sharing the same cache (e.g. Cursor + Claude Desktop).
+        self._file_lock = FileLock(str(db_path) + ".lock", timeout=30)
         atexit.register(self.close_all)
 
     def _create_connection(self) -> sqlite3.Connection:
@@ -108,28 +113,31 @@ class ConnectionPool:
                 # Pool full, wait for available connection
                 conn = self._pool.get(timeout=10.0)
 
-        try:
-            yield conn
-            # Commit on success (matches sqlite3.connect context manager)
-            conn.commit()
-        except sqlite3.Error:
-            # Rollback on database error
+        # Acquire cross-process file lock so concurrent MCP instances
+        # (e.g. Cursor + Claude Desktop) serialize instead of crashing.
+        with self._file_lock:
             try:
-                conn.rollback()
+                yield conn
+                # Commit on success (matches sqlite3.connect context manager)
+                conn.commit()
             except sqlite3.Error:
-                logger.debug("Rollback failed during error recovery")
-            raise
-        finally:
-            # Return connection to pool if not closed
-            if conn and not self._closed:
+                # Rollback on database error
                 try:
-                    self._pool.put_nowait(conn)
-                except queue.Full:
-                    # Pool full (shouldn't happen), close connection
+                    conn.rollback()
+                except sqlite3.Error:
+                    logger.debug("Rollback failed during error recovery")
+                raise
+            finally:
+                # Return connection to pool if not closed
+                if conn and not self._closed:
                     try:
-                        conn.close()
-                    except sqlite3.Error:
-                        logger.debug("Failed to close overflow connection")
+                        self._pool.put_nowait(conn)
+                    except queue.Full:
+                        # Pool full (shouldn't happen), close connection
+                        try:
+                            conn.close()
+                        except sqlite3.Error:
+                            logger.debug("Failed to close overflow connection")
 
     def close_all(self) -> None:
         """Close all connections in pool."""

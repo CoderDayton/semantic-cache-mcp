@@ -6,11 +6,16 @@ from os import environ
 from pathlib import Path
 from typing import Final
 
-# Logging configuration
+# Logging configuration — explicit stderr handler to prevent stdout pollution
+# in stdio MCP transport. Default basicConfig would also use stderr, but being
+# explicit guards against accidental reconfiguration by third-party libraries.
 LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logging.root.addHandler(_handler)
+logging.root.setLevel(LOG_LEVEL)
 
 
 # Paths
