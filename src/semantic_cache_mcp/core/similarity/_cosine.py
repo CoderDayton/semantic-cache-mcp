@@ -221,8 +221,9 @@ def top_k_from_quantized(
     k = min(k, len(sims))
 
     # O(N) partial sort via argpartition instead of O(N log N) full sort
+    # kth arg is 0-based: k-1 ensures the k smallest values are in [:k]
     if k < len(sims):
-        part_idx = np.argpartition(-sims, k)[:k]
+        part_idx = np.argpartition(-sims, k - 1)[:k]
         top_indices = part_idx[np.argsort(-sims[part_idx])]
     else:
         top_indices = np.argsort(-sims)
@@ -502,8 +503,9 @@ def top_k_similarities(
     sims = cosine_similarity_batch_matrix(query, vectors, use_quantization)
 
     # O(N) partial sort via argpartition instead of O(N log N) full sort
+    # kth arg is 0-based: k-1 ensures the k smallest values are in [:k]
     if k < len(sims):
-        part_idx = np.argpartition(-sims, k)[:k]
+        part_idx = np.argpartition(-sims, k - 1)[:k]
         top_indices = part_idx[np.argsort(-sims[part_idx])]
     else:
         top_indices = np.argsort(-sims)

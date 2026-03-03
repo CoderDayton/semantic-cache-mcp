@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import queue
@@ -19,6 +20,7 @@ from filelock import Timeout as FileLockTimeout
 from ..config import (
     ACCESS_HISTORY_SIZE,
     DB_PATH,
+    LRU_K,
     MAX_CACHE_ENTRIES,
     SIMILARITY_THRESHOLD,
 )
@@ -129,6 +131,14 @@ class ConnectionPool:
         try:
             self._file_lock.acquire()
         except FileLockTimeout:
+            # Return connection to pool before raising — otherwise the
+            # checked-out conn leaks and repeated timeouts exhaust the pool.
+            if conn and not self._closed:
+                try:
+                    self._pool.put_nowait(conn)
+                except queue.Full:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.close()
             raise RuntimeError(
                 f"Cache database lock timeout ({self._file_lock.timeout}s). "
                 "Another process may be holding the lock."
@@ -445,12 +455,20 @@ class SQLiteStorage:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             if count > MAX_CACHE_ENTRIES:
                 evict_count = max(1, count // 10)
-                # SQL-based eviction: extract LRU-K score directly in SQLite
-                # json_extract gets the K-th-from-last access time (or first if < K entries)
+                # SQL-based LRU-K eviction: use the K-th-from-last access time
+                # as the eviction score (files with oldest K-th access evicted first).
+                # json_array_length / json_extract compute the index inline.
                 evict_rows = conn.execute(
-                    """
+                    f"""
                     SELECT path, chunk_hashes FROM files
-                    ORDER BY json_extract(access_history, '$[0]') ASC
+                    ORDER BY CASE
+                        WHEN json_array_length(access_history) >= {LRU_K}
+                        THEN json_extract(
+                            access_history,
+                            '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
+                        )
+                        ELSE json_extract(access_history, '$[0]')
+                    END ASC
                     LIMIT ?
                     """,
                     (evict_count,),
@@ -615,12 +633,19 @@ class SQLiteStorage:
                 return
 
             evict_count = max(1, count // 10)
-            # SQL-based eviction: extract LRU-K score directly in SQLite
-            # json_extract gets the K-th-from-last access time (or first if < K entries)
+            # SQL-based LRU-K eviction: use the K-th-from-last access time
+            # as the eviction score (files with oldest K-th access evicted first).
             evict_rows = conn.execute(
-                """
+                f"""
                 SELECT path, chunk_hashes FROM files
-                ORDER BY json_extract(access_history, '$[0]') ASC
+                ORDER BY CASE
+                    WHEN json_array_length(access_history) >= {LRU_K}
+                    THEN json_extract(
+                        access_history,
+                        '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
+                    )
+                    ELSE json_extract(access_history, '$[0]')
+                END ASC
                 LIMIT ?
                 """,
                 (evict_count,),

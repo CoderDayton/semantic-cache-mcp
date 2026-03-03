@@ -35,6 +35,16 @@ def _atomic_write(path: Path, content: str) -> None:
     try:
         with open(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        # Preserve original file permissions (mkstemp creates 0600)
+        if path.exists():
+            import os
+            import stat
+
+            try:
+                original_mode = path.stat().st_mode
+                os.chmod(tmp_path, stat.S_IMODE(original_mode))
+            except OSError:
+                pass  # Best effort; new file gets default permissions
         Path(tmp_path).replace(path)  # Atomic on POSIX, best-effort on Windows
     except BaseException:
         # Clean up temp file on any failure

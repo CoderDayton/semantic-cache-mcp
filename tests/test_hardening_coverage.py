@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from filelock import Timeout as FileLockTimeout
 
 from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cache_status
 from semantic_cache_mcp.cache._helpers import _format_file
@@ -807,3 +808,414 @@ class TestMcpLifespan:
             server = MagicMock()
             async with app_lifespan(server) as context:
                 assert "cache" in context
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix verification + remaining coverage gaps
+# ---------------------------------------------------------------------------
+
+
+class TestArgpartitionKMinusOne:
+    """Verify argpartition k-1 fix (off-by-one in top_k_similarities)."""
+
+    def test_top_k_returns_exactly_k(self) -> None:
+        """top_k_similarities must return exactly k results when k < n."""
+        from semantic_cache_mcp.core.similarity._cosine import top_k_similarities
+
+        rng = np.random.default_rng(42)
+        query = rng.standard_normal(64).astype(np.float32)
+        query /= np.linalg.norm(query)
+        embeddings = rng.standard_normal((20, 64)).astype(np.float32)
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings /= np.where(norms > 0, norms, 1.0)
+
+        for k in (1, 3, 5, 10):
+            results = top_k_similarities(query, embeddings, k=k)
+            assert len(results) == k
+            # Must be sorted descending by similarity
+            sims = [s for _, s in results]
+            assert sims == sorted(sims, reverse=True)
+
+    def test_top_k_from_quantized_k_boundary(self) -> None:
+        """top_k_from_quantized with k=n must not crash on argpartition."""
+        from semantic_cache_mcp.core.similarity._cosine import (
+            quantize_embedding,
+            top_k_from_quantized,
+        )
+
+        rng = np.random.default_rng(99)
+        n = 5
+        query = rng.standard_normal(64).astype(np.float32)
+        query /= np.linalg.norm(query)
+        blobs = []
+        for _ in range(n):
+            v = rng.standard_normal(64).astype(np.float32)
+            v /= np.linalg.norm(v)
+            blobs.append(quantize_embedding(v))
+
+        # k == n: argpartition path should not execute (else branch)
+        results = top_k_from_quantized(query, blobs, k=n)
+        assert len(results) == n
+
+
+class TestConnectionLeakOnTimeout:
+    """Verify connection is returned to pool on FileLockTimeout."""
+
+    def test_conn_returned_on_lock_timeout(self, tmp_path: Path) -> None:
+        """Connection must be back in pool after FileLockTimeout."""
+        pool = ConnectionPool(tmp_path / "leak.db", max_size=2)
+
+        # First call succeeds — puts a conn in the pool
+        with pool.get_connection():
+            pass
+
+        def always_timeout(*args: object, **kwargs: object) -> None:
+            raise FileLockTimeout(str(pool._file_lock.lock_file))
+
+        pool._file_lock.acquire = always_timeout
+
+        with pytest.raises(RuntimeError, match="lock timeout"), pool.get_connection():
+            pass
+
+        # Connection should be back in pool, not leaked
+        assert not pool._pool.empty()
+        pool.close_all()
+
+    def test_conn_closed_when_pool_full(self, tmp_path: Path) -> None:
+        """If pool is full on leak-recovery, conn should be closed instead."""
+        pool = ConnectionPool(tmp_path / "full.db", max_size=1)
+
+        # Fill the pool
+        with pool.get_connection():
+            pass
+
+        def timeout_and_fill_pool(*args: object, **kwargs: object) -> None:
+            """Simulate race: another thread returns conn before we handle timeout."""
+            # Stuff a dummy conn into the pool so put_nowait will raise Full
+            dummy = pool._create_connection()
+            pool._pool.put_nowait(dummy)
+            raise FileLockTimeout(str(pool._file_lock.lock_file))
+
+        pool._file_lock.acquire = timeout_and_fill_pool
+
+        with pytest.raises(RuntimeError, match="lock timeout"), pool.get_connection():
+            pass
+
+        # Pool should still have the dummy conn (the checked-out one was closed)
+        assert not pool._pool.empty()
+        pool.close_all()
+
+
+class TestAtomicWritePermissions:
+    """Verify permission preservation in _atomic_write."""
+
+    def test_preserves_existing_permissions(self, tmp_path: Path) -> None:
+        """_atomic_write must copy original file permissions."""
+        import os
+        import stat
+
+        target = tmp_path / "perms.txt"
+        target.write_text("original")
+        os.chmod(target, 0o755)
+
+        _atomic_write(target, "updated content")
+
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode == 0o755
+        assert target.read_text() == "updated content"
+
+    def test_new_file_gets_default_permissions(self, tmp_path: Path) -> None:
+        """_atomic_write on nonexistent file should not crash."""
+        target = tmp_path / "new_file.txt"
+        _atomic_write(target, "fresh content")
+        assert target.read_text() == "fresh content"
+
+    def test_permission_oserror_is_suppressed(self, tmp_path: Path) -> None:
+        """OSError from chmod is suppressed (best-effort)."""
+        target = tmp_path / "oserr.txt"
+        target.write_text("original")
+
+        with patch("os.chmod", side_effect=OSError("permission denied")):
+            _atomic_write(target, "updated")
+
+        assert target.read_text() == "updated"
+
+
+class TestLruKEvictionSQL:
+    """Verify LRU-K eviction uses K-th-from-last access, not first."""
+
+    def test_eviction_order_respects_lru_k(self, tmp_path: Path) -> None:
+        """Files with older K-th access should be evicted first."""
+        import json
+
+        pool = ConnectionPool(tmp_path / "lruk.db", max_size=1)
+        with pool.get_connection() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    path TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    chunk_hashes TEXT,
+                    mtime REAL,
+                    tokens INTEGER,
+                    embedding BLOB,
+                    created_at REAL,
+                    access_history TEXT
+                )
+            """)
+            # File A: old first access, but recent K-th access
+            conn.execute(
+                "INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
+                ("/a.py", "h1", "[]", 1.0, 10, None, 1.0, json.dumps([100.0, 200.0, 300.0, 900.0])),
+            )
+            # File B: recent first access, but old K-th access
+            conn.execute(
+                "INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
+                ("/b.py", "h2", "[]", 1.0, 10, None, 1.0, json.dumps([50.0, 800.0])),
+            )
+
+            from semantic_cache_mcp.config import LRU_K
+
+            rows = conn.execute(
+                f"""
+                SELECT path FROM files
+                ORDER BY CASE
+                    WHEN json_array_length(access_history) >= {LRU_K}
+                    THEN json_extract(
+                        access_history,
+                        '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
+                    )
+                    ELSE json_extract(access_history, '$[0]')
+                END ASC
+                """,
+            ).fetchall()
+
+            paths = [r[0] for r in rows]
+            # B has older K-th access (50.0 vs A's K-th=300.0), so B evicted first
+            assert paths[0] == "/b.py"
+
+        pool.close_all()
+
+
+class TestTokenizerCachePaths:
+    """Cover tokenizer hash-mismatch and download-failure paths."""
+
+    def test_hash_mismatch_triggers_redownload(self, tmp_path: Path) -> None:
+        """If cached file has wrong hash, it should be deleted."""
+        import semantic_cache_mcp.core.tokenizer as tok_mod
+
+        # Reset global state for this test
+        original_loaded = tok_mod._tokenizer_loaded
+        original_tok = tok_mod._tokenizer
+        original_dir = tok_mod.TOKENIZER_CACHE_DIR
+        tok_mod._tokenizer_loaded = False
+        tok_mod._tokenizer = None
+        tok_mod.TOKENIZER_CACHE_DIR = tmp_path
+
+        cache_file = tmp_path / "o200k_base.tiktoken"
+        cache_file.write_text("bad content")
+
+        try:
+            with (
+                patch.object(tok_mod, "_verify_hash", return_value=False),
+                patch.object(tok_mod, "_init_tokenizer", return_value=None),
+                patch("urllib.request.urlretrieve", side_effect=OSError("no network")),
+            ):
+                result = tok_mod._ensure_tokenizer()
+        finally:
+            tok_mod._tokenizer_loaded = original_loaded
+            tok_mod._tokenizer = original_tok
+            tok_mod.TOKENIZER_CACHE_DIR = original_dir
+
+        # Hash mismatch → file deleted, download fails → returns None
+        assert result is None
+        assert not cache_file.exists()
+
+    def test_download_hash_mismatch_returns_none(self, tmp_path: Path) -> None:
+        """If downloaded file has wrong hash, return None without init."""
+        import semantic_cache_mcp.core.tokenizer as tok_mod
+
+        original_loaded = tok_mod._tokenizer_loaded
+        original_tok = tok_mod._tokenizer
+        original_dir = tok_mod.TOKENIZER_CACHE_DIR
+        tok_mod._tokenizer_loaded = False
+        tok_mod._tokenizer = None
+        tok_mod.TOKENIZER_CACHE_DIR = tmp_path
+
+        try:
+
+            def fake_download(url: str, path: object) -> None:
+                Path(path).write_text("fake data")
+
+            with (
+                patch("urllib.request.urlretrieve", side_effect=fake_download),
+                patch.object(tok_mod, "_verify_hash", return_value=False),
+            ):
+                result = tok_mod._ensure_tokenizer()
+        finally:
+            tok_mod._tokenizer_loaded = original_loaded
+            tok_mod._tokenizer = original_tok
+            tok_mod.TOKENIZER_CACHE_DIR = original_dir
+
+        assert result is None
+
+    def test_download_success_inits_tokenizer(self, tmp_path: Path) -> None:
+        """Successful download + hash match should init tokenizer."""
+        import semantic_cache_mcp.core.tokenizer as tok_mod
+
+        original_loaded = tok_mod._tokenizer_loaded
+        original_tok = tok_mod._tokenizer
+        original_dir = tok_mod.TOKENIZER_CACHE_DIR
+        tok_mod._tokenizer_loaded = False
+        tok_mod._tokenizer = None
+        tok_mod.TOKENIZER_CACHE_DIR = tmp_path
+
+        sentinel = MagicMock()
+
+        try:
+
+            def fake_download(url: str, path: object) -> None:
+                Path(path).write_text("fake data")
+
+            with (
+                patch("urllib.request.urlretrieve", side_effect=fake_download),
+                patch.object(tok_mod, "_verify_hash", return_value=True),
+                patch.object(tok_mod, "_init_tokenizer", return_value=sentinel),
+            ):
+                result = tok_mod._ensure_tokenizer()
+        finally:
+            tok_mod._tokenizer_loaded = original_loaded
+            tok_mod._tokenizer = original_tok
+            tok_mod.TOKENIZER_CACHE_DIR = original_dir
+
+        assert result is sentinel
+
+    def test_network_error_returns_none(self, tmp_path: Path) -> None:
+        """URLError during download should return None gracefully."""
+        import urllib.error
+
+        import semantic_cache_mcp.core.tokenizer as tok_mod
+
+        original_loaded = tok_mod._tokenizer_loaded
+        original_tok = tok_mod._tokenizer
+        original_dir = tok_mod.TOKENIZER_CACHE_DIR
+        tok_mod._tokenizer_loaded = False
+        tok_mod._tokenizer = None
+        tok_mod.TOKENIZER_CACHE_DIR = tmp_path
+
+        try:
+            with patch(
+                "urllib.request.urlretrieve",
+                side_effect=urllib.error.URLError("timeout"),
+            ):
+                result = tok_mod._ensure_tokenizer()
+        finally:
+            tok_mod._tokenizer_loaded = original_loaded
+            tok_mod._tokenizer = original_tok
+            tok_mod.TOKENIZER_CACHE_DIR = original_dir
+
+        assert result is None
+
+
+class TestGlobSymlinkEscape:
+    """Cover symlink escape filtering in glob_with_cache_status."""
+
+    def test_symlink_outside_dir_is_skipped(self, tmp_path: Path) -> None:
+        """Symlinks pointing outside the glob directory are filtered out."""
+        import os
+
+        search_dir = tmp_path / "search"
+        search_dir.mkdir()
+        (search_dir / "real.txt").write_text("content")
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("escape")
+
+        link = search_dir / "escape.txt"
+        os.symlink(outside, link)
+
+        with patch("semantic_cache_mcp.cache.search.SemanticCache") as mock_cache:
+            mock_cache.get.return_value = None
+            result = glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
+
+        paths = [m.path for m in result.matches]
+        assert str(search_dir / "real.txt") in paths
+        # symlink pointing outside should be filtered
+        assert str(link) not in paths
+
+    def test_symlink_inside_dir_is_kept(self, tmp_path: Path) -> None:
+        """Symlinks pointing within the glob directory are kept."""
+        import os
+
+        search_dir = tmp_path / "search"
+        search_dir.mkdir()
+        real = search_dir / "real.txt"
+        real.write_text("content")
+
+        link = search_dir / "alias.txt"
+        os.symlink(real, link)
+
+        with patch("semantic_cache_mcp.cache.search.SemanticCache") as mock_cache:
+            mock_cache.get.return_value = None
+            result = glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
+
+        paths = [m.path for m in result.matches]
+        assert str(link) in paths
+
+
+class TestSemanticSearchDirectoryFilter:
+    """Cover directory filter path in semantic_search."""
+
+    def test_directory_filter_excludes_outside_files(self, tmp_path: Path) -> None:
+        """Files outside the directory filter should be excluded."""
+        with patch("semantic_cache_mcp.cache.search.embed_query") as mock_embed:
+            mock_embed.return_value = list(np.zeros(64, dtype=np.float32))
+
+            mock_cache = MagicMock()
+            mock_storage = MagicMock()
+            mock_pool = MagicMock()
+            mock_cache._storage = mock_storage
+            mock_storage._pool = mock_pool
+
+            # Return files in different directories
+            mock_conn = MagicMock()
+            mock_conn.execute.return_value.fetchall.return_value = [
+                ("/home/user/project/a.py", 100, b"\x00" * 64),
+                ("/other/path/b.py", 200, b"\x00" * 64),
+            ]
+            mock_pool.get_connection.return_value.__enter__ = lambda s: mock_conn
+            mock_pool.get_connection.return_value.__exit__ = MagicMock(return_value=False)
+
+            # All filtered out → empty result
+            result = semantic_search(
+                mock_cache,
+                query="test",
+                k=5,
+                directory="/nonexistent/dir",
+            )
+            assert len(result.matches) == 0
+
+
+class TestMcpCacheNoneGuard:
+    """Cover line 54-55 in _mcp.py — cache is None after lifespan block."""
+
+    @pytest.mark.asyncio
+    async def test_cache_none_raises(self) -> None:
+        """If cache is somehow None after init block, RuntimeError raised."""
+        with (
+            patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
+            patch("semantic_cache_mcp.server._mcp.warmup"),
+            patch(
+                "semantic_cache_mcp.server._mcp.get_model_info",
+                return_value={"ready": True, "model": "test"},
+            ),
+            patch(
+                "semantic_cache_mcp.server._mcp.SemanticCache",
+                return_value=None,
+            ),
+        ):
+            from semantic_cache_mcp.server._mcp import app_lifespan
+
+            server = MagicMock()
+            with pytest.raises(RuntimeError, match="Cache failed to initialize"):
+                async with app_lifespan(server) as context:
+                    pass
