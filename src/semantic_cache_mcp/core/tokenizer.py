@@ -19,6 +19,7 @@ import hashlib
 import heapq
 import logging
 import re
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -369,6 +370,9 @@ def _verify_hash(path: Path, expected: str) -> bool:
     return sha256.hexdigest() == expected
 
 
+_tokenizer_lock = threading.Lock()
+
+
 def _ensure_tokenizer() -> BPETokenizer | None:
     """Lazily load tokenizer with automatic download/cache."""
     global _tokenizer, _tokenizer_loaded
@@ -376,35 +380,46 @@ def _ensure_tokenizer() -> BPETokenizer | None:
     if _tokenizer_loaded:
         return _tokenizer
 
-    _tokenizer_loaded = True
-    cache_file = TOKENIZER_CACHE_DIR / "o200k_base.tiktoken"
+    with _tokenizer_lock:
+        # Double-checked locking: re-check after acquiring lock
+        if _tokenizer_loaded:
+            return _tokenizer
 
-    if cache_file.exists():
+        cache_file = TOKENIZER_CACHE_DIR / "o200k_base.tiktoken"
+
+        if cache_file.exists():
+            try:
+                if _verify_hash(cache_file, O200K_BASE_SHA256):
+                    _tokenizer = _init_tokenizer(cache_file)
+                    _tokenizer_loaded = True
+                    return _tokenizer
+                logger.warning("Hash verification failed, re-downloading")
+                cache_file.unlink()
+            except (OSError, ValueError) as e:
+                logger.warning(f"Failed to load cached tokenizer: {e}")
+
         try:
-            if _verify_hash(cache_file, O200K_BASE_SHA256):
-                _tokenizer = _init_tokenizer(cache_file)
-                return _tokenizer
-            logger.warning("Hash verification failed, re-downloading")
-            cache_file.unlink()
-        except (OSError, ValueError) as e:
-            logger.warning(f"Failed to load cached tokenizer: {e}")
+            import urllib.error
+            import urllib.request
 
-    try:
-        import urllib.error
-        import urllib.request
+            TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # Download to temp file then rename atomically
+            tmp_file = cache_file.with_suffix(".tmp")
+            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310 — compile-time constant URL, hash-verified post-download
 
-        TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(O200K_BASE_URL, cache_file)  # nosec B310 — compile-time constant URL, hash-verified post-download
+            if not _verify_hash(tmp_file, O200K_BASE_SHA256):
+                tmp_file.unlink(missing_ok=True)
+                _tokenizer_loaded = True  # Don't retry on hash mismatch
+                return None
 
-        if not _verify_hash(cache_file, O200K_BASE_SHA256):
-            cache_file.unlink()
+            tmp_file.replace(cache_file)  # Atomic on POSIX
+            _tokenizer = _init_tokenizer(cache_file)
+            _tokenizer_loaded = True
+            return _tokenizer
+        except (OSError, urllib.error.URLError, ValueError) as e:
+            logger.warning(f"Failed to download tokenizer: {e}")
+            _tokenizer_loaded = True  # Don't retry on failure
             return None
-
-        _tokenizer = _init_tokenizer(cache_file)
-        return _tokenizer
-    except (OSError, urllib.error.URLError, ValueError) as e:
-        logger.warning(f"Failed to download tokenizer: {e}")
-        return None
 
 
 def count_tokens(content: str) -> int:

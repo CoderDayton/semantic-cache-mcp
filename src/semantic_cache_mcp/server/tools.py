@@ -77,6 +77,13 @@ def read(
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
 
+    # Validate bounds
+    if offset is not None and offset < 1:
+        return _render_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
+    if limit is not None and limit < 1:
+        return _render_error("read", "limit must be >= 1", max_response_tokens)
+    max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
+
     try:
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
@@ -927,5 +934,6 @@ def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
         else:
             expanded.append(p)
         if len(expanded) >= max_files:
+            logger.debug(f"Glob expansion truncated at {max_files} files")
             break
     return expanded[:max_files]

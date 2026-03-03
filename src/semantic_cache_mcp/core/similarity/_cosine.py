@@ -357,7 +357,7 @@ def cosine_similarity_batch(
     vectors: list[array.array | list | np.ndarray],
     use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
     use_pruning: bool = DEFAULT_CONFIG.USE_PRUNING,
-) -> list:
+) -> list[float]:
     """
     Batch cosine similarity with quantization and optional pruning.
 

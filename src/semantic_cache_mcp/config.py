@@ -29,7 +29,7 @@ def _get_cache_dir() -> Path:
     """
     env_override = environ.get("SEMANTIC_CACHE_DIR")
     if env_override:
-        return Path(env_override)
+        return Path(env_override).expanduser().resolve()
 
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches" / "semantic-cache-mcp"

@@ -388,7 +388,7 @@ def summarize_semantic(
         adjusted_score = base_score * (1.0 - config.diversity_weight * diversity_penalty)
 
         # Accept if score is still reasonable
-        if adjusted_score > 0.1 or config.preserve_structure and segment.is_header:
+        if adjusted_score > 0.1 or (config.preserve_structure and segment.is_header):
             selected_indices.add(seg_idx)
             current_size += seg_size
 

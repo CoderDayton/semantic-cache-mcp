@@ -260,7 +260,7 @@ class ChunkDictionary:
             if len(self._chunks) % self._config.dict_window == 0:
                 self._train_dict()
 
-    def get_dict(self) -> Any | None:
+    def get_dict(self) -> object | None:
         """Get compiled dictionary for Zstd."""
         return self._zstd_dict
 
@@ -292,17 +292,19 @@ def _decompress_store(data: bytes) -> bytes:
 
 
 # Cached ZSTD compressors by level (avoid object creation in hot path)
-_ZSTD_COMPRESSORS: dict = {}
-_ZSTD_DECOMPRESSOR: Any | None = None
+_ZSTD_COMPRESSORS: dict[int, object] = {}
+_ZSTD_DECOMPRESSOR: object | None = None
+_ZSTD_CACHE_LOCK = threading.Lock()
 
 
 def _get_zstd_compressor(level: int, dict_obj: Any | None = None) -> Any:
     """Get or create cached ZSTD compressor."""
     if dict_obj is not None:
-        # Can't cache with dictionary
         return zstd.ZstdCompressor(level=level, dict_data=dict_obj)
     if level not in _ZSTD_COMPRESSORS:
-        _ZSTD_COMPRESSORS[level] = zstd.ZstdCompressor(level=level)
+        with _ZSTD_CACHE_LOCK:
+            if level not in _ZSTD_COMPRESSORS:  # Double-checked
+                _ZSTD_COMPRESSORS[level] = zstd.ZstdCompressor(level=level)
     return _ZSTD_COMPRESSORS[level]
 
 
@@ -312,7 +314,9 @@ def _get_zstd_decompressor(dict_obj: Any | None = None) -> Any:
     if dict_obj is not None:
         return zstd.ZstdDecompressor(dict_data=dict_obj)
     if _ZSTD_DECOMPRESSOR is None:
-        _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
+        with _ZSTD_CACHE_LOCK:
+            if _ZSTD_DECOMPRESSOR is None:  # Double-checked
+                _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
     return _ZSTD_DECOMPRESSOR
 
 
