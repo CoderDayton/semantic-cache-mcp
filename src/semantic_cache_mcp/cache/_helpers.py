@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import logging
 import shutil
+import stat as stat_module
 import subprocess  # nosec B404 - used for formatter execution with hardcoded commands
 from pathlib import Path
 
@@ -56,6 +57,15 @@ def _format_file(path: Path) -> bool:
     # Check if formatter is installed
     if not shutil.which(cmd_name):
         logger.debug(f"Formatter not found: {cmd_name}")
+        return False
+
+    # Reject special files (char devices, pipes, /proc entries) before subprocess
+    try:
+        mode = path.stat().st_mode
+        if not stat_module.S_ISREG(mode):
+            logger.debug(f"Skipping non-regular file: {path}")
+            return False
+    except OSError:
         return False
 
     try:

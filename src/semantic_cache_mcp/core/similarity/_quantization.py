@@ -52,19 +52,9 @@ def quantize_binary(v: array.array | list | NDArray[np.float32]) -> bytes:
     else:
         arr = np.asarray(v, dtype=np.float32)
 
-    # Sign-based quantization: True if >= 0
-    bits = arr >= 0
-
-    # Pack bits into bytes
-    dim = len(arr)
-    n_bytes = (dim + 7) // 8
-    packed = np.zeros(n_bytes, dtype=np.uint8)
-
-    for i, bit in enumerate(bits):
-        if bit:
-            packed[i // 8] |= 1 << (7 - (i % 8))
-
-    return packed.tobytes()
+    # Sign-based quantization: True if >= 0, packed via np.packbits (MSB-first)
+    bits = (arr >= 0).astype(np.uint8)
+    return np.packbits(bits).tobytes()
 
 
 def dequantize_binary(blob: bytes, dim: int) -> NDArray[np.float32]:
@@ -81,13 +71,8 @@ def dequantize_binary(blob: bytes, dim: int) -> NDArray[np.float32]:
         Float32 array with values {-1.0, +1.0}
     """
     packed = np.frombuffer(blob, dtype=np.uint8)
-    result = np.zeros(dim, dtype=np.float32)
-
-    for i in range(dim):
-        bit = (packed[i // 8] >> (7 - (i % 8))) & 1
-        result[i] = 1.0 if bit else -1.0
-
-    return result
+    unpacked = np.unpackbits(packed)[:dim]
+    return np.where(unpacked, 1.0, -1.0).astype(np.float32)
 
 
 def hamming_similarity_binary(blob1: bytes, blob2: bytes) -> float:

@@ -28,7 +28,7 @@ What actually happened. Include error messages or logs if available.
 
 - OS: [e.g. macOS 15, Ubuntu 24.04, Windows 11]
 - Python: [e.g. 3.12.3]
-- Package version: [e.g. 0.1.1]
+- Package version: [e.g. 0.2.0]
 - MCP client: [e.g. Claude Code, OpenCode]
 
 ## Additional Context

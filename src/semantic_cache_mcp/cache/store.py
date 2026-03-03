@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from ..config import DB_PATH
-from ..core import count_tokens, get_optimal_chunker
+from ..core import count_tokens
 from ..storage import SQLiteStorage
 from ..types import CacheEntry, EmbeddingVector
 from .metrics import SessionMetrics
@@ -430,15 +430,9 @@ class SemanticCache:
     ) -> None:
         """Store file in cache."""
         tokens = count_tokens(content)
-        content_bytes = content.encode()
-
-        # Use optimal chunker (SIMD if available, otherwise Gear hash)
-        chunker = get_optimal_chunker(prefer_simd=True)
-        chunks = sum(1 for _ in chunker(content_bytes))
-
         self._storage.put(path, content, mtime, embedding)
         self._invalidate_lsh()
-        logger.info(f"Cached file: {path} ({tokens} tokens, {chunks} chunks)")
+        logger.info(f"Cached file: {path} ({tokens} tokens)")
 
     def get_content(self, entry: CacheEntry) -> str:
         """Get full content from cache entry."""

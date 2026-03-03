@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import tempfile
 from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
@@ -24,6 +26,31 @@ logger = logging.getLogger(__name__)
 
 # DoS limit for batch_edit
 MAX_BATCH_EDITS = 50
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write file atomically via temp-file + rename to prevent data loss on crash."""
+    # Write to temp file in same directory (same filesystem for atomic rename)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        # Preserve original file permissions (mkstemp creates 0600)
+        if path.exists():
+            import os
+            import stat
+
+            try:
+                original_mode = path.stat().st_mode
+                os.chmod(tmp_path, stat.S_IMODE(original_mode))
+            except OSError:
+                pass  # Best effort; new file gets default permissions
+        Path(tmp_path).replace(path)  # Atomic on POSIX, best-effort on Windows
+    except BaseException:
+        # Clean up temp file on any failure
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def smart_write(
@@ -150,7 +177,7 @@ def smart_write(
     # Write file (unless dry_run)
     if not dry_run:
         try:
-            file_path.write_text(content, encoding="utf-8")
+            _atomic_write(file_path, content)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
@@ -311,7 +338,8 @@ def smart_edit(
     # --- Mode dispatch ---
     if old_string is None:
         # Mode C: line-range replacement (start_line/end_line guaranteed non-None by validation)
-        assert start_line is not None and end_line is not None
+        if start_line is None or end_line is None:
+            raise TypeError("start_line and end_line required for line-range mode")
         _substring, char_start, char_end = _extract_line_range(content, start_line, end_line)
         # Preserve line terminator: if the replaced range ended with \n, ensure new_string does too
         if _substring.endswith("\n") and not new_string.endswith("\n"):
@@ -323,7 +351,8 @@ def smart_edit(
 
     elif has_line_range:
         # Mode B: scoped find/replace within line range
-        assert start_line is not None and end_line is not None
+        if start_line is None or end_line is None:
+            raise TypeError("start_line and end_line required for line-range mode")
         substring, char_start, char_end = _extract_line_range(content, start_line, end_line)
 
         # Search within the substring only
@@ -415,7 +444,7 @@ def smart_edit(
     # Write file (unless dry_run)
     if not dry_run:
         try:
-            file_path.write_text(new_content, encoding="utf-8")
+            _atomic_write(file_path, new_content)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
@@ -573,7 +602,8 @@ def smart_batch_edit(
 
             elif has_range:
                 # Mode B: scoped search
-                assert sl is not None and el is not None
+                if sl is None or el is None:
+                    raise TypeError("start_line and end_line required for line-range mode")
                 substring, _cs, _ce = _extract_line_range(content, sl, el)
                 sub_matches = _find_match_line_numbers(substring, old_string)
                 if not sub_matches:
@@ -656,7 +686,7 @@ def smart_batch_edit(
     # Write file if any edits succeeded (unless dry_run)
     if succeeded > 0 and not dry_run:
         try:
-            file_path.write_text(new_content, encoding="utf-8")
+            _atomic_write(file_path, new_content)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 

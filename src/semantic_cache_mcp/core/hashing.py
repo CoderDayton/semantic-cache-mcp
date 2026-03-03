@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from functools import lru_cache
-from typing import Any, Protocol
+from typing import Protocol
 
 
 class _Hasher(Protocol):
@@ -117,10 +117,20 @@ def _cached_block_hash(data: bytes) -> str:
     return _hash_hex(data, DEFAULT_CONFIG.BLOCK_DIGEST_SIZE)
 
 
+_CONTENT_CACHE_BYPASS_SIZE = 65536  # Don't cache content hashes for files > 64KB
+
+
 @lru_cache(maxsize=DEFAULT_CONFIG.CONTENT_CACHE_SIZE)
-def _cached_content_hash(data: bytes) -> str:
-    """LRU-cached full-content hashing."""
+def _cached_content_hash_small(data: bytes) -> str:
+    """LRU-cached full-content hashing for small files."""
     return _hash_hex(data, DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
+
+
+def _cached_content_hash(data: bytes) -> str:
+    """Content hashing with size-aware caching to prevent memory bloat."""
+    if len(data) > _CONTENT_CACHE_BYPASS_SIZE:
+        return _hash_hex(data, DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
+    return _cached_content_hash_small(data)
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +479,7 @@ class DeduplicateIndex:
 # ---------------------------------------------------------------------------
 
 
-def get_hash_stats() -> dict[str, Any]:
+def get_hash_stats() -> dict[str, bool | int]:
     """Get hash function statistics."""
     return {
         "use_blake3": DEFAULT_CONFIG.USE_BLAKE3,

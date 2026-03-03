@@ -21,7 +21,7 @@ from ..types import (
     SimilarFile,
     SimilarFilesResult,
 )
-from ._helpers import _suppress_large_diff
+from ._helpers import _is_binary_content, _suppress_large_diff
 from .store import SemanticCache
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ def semantic_search(
         SearchResult with matches sorted by similarity
     """
     # DoS protection
-    k = min(k, MAX_SEARCH_K)
+    k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
 
     # Embed query using search_query prefix
@@ -126,7 +126,7 @@ def semantic_search(
     # Filter by directory if specified
     if directory:
         dir_path = str(Path(directory).expanduser().resolve())
-        rows = [r for r in rows if r[0].startswith(dir_path)]
+        rows = [r for r in rows if Path(r[0]).is_relative_to(dir_path)]
 
     if not rows:
         return SearchResult(query=query, matches=[], files_searched=0, cached_files=0)
@@ -185,6 +185,12 @@ def compare_files(
     file1 = Path(path1).expanduser().resolve()
     file2 = Path(path2).expanduser().resolve()
 
+    # Existence and type checks before any I/O
+    if not file1.is_file():
+        raise FileNotFoundError(f"File not found: {path1}")
+    if not file2.is_file():
+        raise FileNotFoundError(f"File not found: {path2}")
+
     # Get content for both files (from cache or disk)
     content1: str
     content2: str
@@ -197,7 +203,13 @@ def compare_files(
         content1 = cache.get_content(cached1)
         from_cache1 = True
     else:
-        content1 = file1.read_text(encoding="utf-8")
+        try:
+            raw_bytes1 = file1.read_bytes()
+            if _is_binary_content(raw_bytes1):
+                raise ValueError(f"File is binary and cannot be diffed: {path1}")
+            content1 = raw_bytes1.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"File is not valid UTF-8: {path1}") from exc
         mtime1 = file1.stat().st_mtime
         emb1 = cache.get_embedding(content1, str(file1))
         cache.put(str(file1), content1, mtime1, emb1)
@@ -208,7 +220,13 @@ def compare_files(
         content2 = cache.get_content(cached2)
         from_cache2 = True
     else:
-        content2 = file2.read_text(encoding="utf-8")
+        try:
+            raw_bytes2 = file2.read_bytes()
+            if _is_binary_content(raw_bytes2):
+                raise ValueError(f"File is binary and cannot be diffed: {path2}")
+            content2 = raw_bytes2.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"File is not valid UTF-8: {path2}") from exc
         mtime2 = file2.stat().st_mtime
         emb2 = cache.get_embedding(content2, str(file2))
         cache.put(str(file2), content2, mtime2, emb2)
@@ -262,7 +280,7 @@ def find_similar_files(
     Returns:
         SimilarFilesResult with similar files
     """
-    k = min(k, MAX_SIMILAR_K)
+    k = max(1, min(k, MAX_SIMILAR_K))
     file_path = Path(path).expanduser().resolve()
 
     # Get/compute embedding for source file
@@ -361,6 +379,8 @@ def glob_with_cache_status(
             logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
             break
         if not file_path.is_file():
+            continue
+        if file_path.is_symlink() and not file_path.resolve().is_relative_to(dir_path):
             continue
 
         count += 1

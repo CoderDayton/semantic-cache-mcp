@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import array
+import math
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -17,6 +20,14 @@ from semantic_cache_mcp.cache import (
     smart_batch_edit,
     smart_read,
 )
+from tests.constants import TEST_EMBEDDING_DIM
+
+
+def _make_embedding(seed: float = 0.1) -> array.array:
+    """Create a normalized mock embedding vector."""
+    raw = [seed] * TEST_EMBEDDING_DIM
+    magnitude = math.sqrt(sum(x * x for x in raw))
+    return array.array("f", [x / magnitude for x in raw])
 
 
 @pytest.fixture
@@ -73,12 +84,17 @@ class TestSemanticSearch:
 
     def test_search_finds_cached_files(self, cache: SemanticCache, sample_files: dict):
         """Search finds files after they're cached."""
-        # Cache files first
-        smart_read(cache, str(sample_files["py"]))
-        smart_read(cache, str(sample_files["txt"]))
+        mock_emb = _make_embedding()
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=mock_emb),
+            patch("semantic_cache_mcp.cache.search.embed_query", return_value=mock_emb),
+        ):
+            # Cache files first (with mocked embeddings)
+            smart_read(cache, str(sample_files["py"]))
+            smart_read(cache, str(sample_files["txt"]))
 
-        result = semantic_search(cache, "function definition", k=5)
-        assert result.cached_files >= 1
+            result = semantic_search(cache, "function definition", k=5)
+            assert result.cached_files >= 1
 
     def test_search_respects_k_limit(self, cache: SemanticCache, sample_files: dict):
         """Search respects k parameter."""
@@ -186,13 +202,15 @@ class TestFindSimilarFiles:
 
     def test_similar_finds_related_files(self, cache: SemanticCache, sample_files: dict):
         """Similar files finds related cached files."""
-        # Cache all files first
-        for f in sample_files.values():
-            smart_read(cache, str(f))
+        mock_emb = _make_embedding()
+        with patch("semantic_cache_mcp.cache.embed", return_value=mock_emb):
+            # Cache all files first (with mocked embeddings)
+            for f in sample_files.values():
+                smart_read(cache, str(f))
 
-        result = find_similar_files(cache, str(sample_files["py"]), k=3)
-        # Should find at least the other Python file
-        assert result.files_searched >= 1
+            result = find_similar_files(cache, str(sample_files["py"]), k=3)
+            # Should find at least the other Python file
+            assert result.files_searched >= 1
 
     def test_similar_excludes_source(self, cache: SemanticCache, sample_files: dict):
         """Similar files excludes the source file."""

@@ -1945,7 +1945,7 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
@@ -1953,6 +1953,7 @@ dependencies = [
     { name = "fastembed", marker = "sys_platform != 'linux'" },
     { name = "fastembed-gpu", marker = "sys_platform == 'linux'" },
     { name = "fastmcp" },
+    { name = "filelock" },
     { name = "lz4" },
     { name = "onnxruntime", marker = "sys_platform != 'linux'" },
     { name = "onnxruntime-gpu", marker = "sys_platform == 'linux'" },
@@ -1977,6 +1978,7 @@ requires-dist = [
     { name = "fastembed", marker = "sys_platform != 'linux'", specifier = ">=0.7.4" },
     { name = "fastembed-gpu", marker = "sys_platform == 'linux'", specifier = ">=0.7.4" },
     { name = "fastmcp", specifier = ">=3.0.0b1" },
+    { name = "filelock", specifier = ">=3.16.0" },
     { name = "lz4", specifier = ">=4.4.5" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "onnxruntime", marker = "sys_platform != 'linux'", specifier = ">=1.19.0" },

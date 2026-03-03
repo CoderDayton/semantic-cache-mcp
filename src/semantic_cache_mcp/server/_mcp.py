@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import sys
 
 from fastmcp import FastMCP
 from fastmcp.server.lifespan import lifespan
@@ -19,27 +21,38 @@ async def app_lifespan(server: FastMCP):
     """Initialize cache and embedding model on startup."""
     logger.info("Semantic cache MCP server starting...")
 
-    # Warmup tokenizer (loads 200K vocab from disk, ~600ms one-time cost)
-    logger.info("Initializing tokenizer...")
-    get_tokenizer()
+    cache: SemanticCache | None = None
 
-    # Warmup embedding model (downloads if needed, loads into memory)
-    logger.info("Initializing embedding model...")
-    warmup()
+    # Redirect stdout → stderr during initialization to prevent third-party
+    # libraries (fastembed, onnxruntime) from printing to stdout and corrupting
+    # the stdio MCP transport. The lifespan runs BEFORE stdio_server() captures
+    # sys.stdout.buffer, so we must restore before yielding.
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            logger.info("Initializing tokenizer...")
+            get_tokenizer()
 
-    model_info = get_model_info()
-    if not model_info.get("ready", False):
-        logger.error(
-            "Embedding model failed to initialize. "
-            "Semantic similarity features will be disabled. "
-            "Check network connectivity and disk space."
-        )
-    else:
-        logger.info(f"Embedding model ready: {model_info['model']}")
+            logger.info("Initializing embedding model...")
+            warmup()
 
-    # Initialize cache
-    cache = SemanticCache()
-    logger.info("Semantic cache MCP server started")
+            model_info = get_model_info()
+            if not model_info.get("ready", False):
+                logger.error(
+                    "Embedding model failed to initialize. "
+                    "Semantic similarity features will be disabled. "
+                    "Check network connectivity and disk space."
+                )
+            else:
+                logger.info(f"Embedding model ready: {model_info['model']}")
+
+            cache = SemanticCache()
+            logger.info("Semantic cache MCP server started")
+        except Exception:
+            logger.exception("Failed to initialize semantic cache")
+            raise
+
+    if cache is None:
+        raise RuntimeError("Cache failed to initialize")
 
     try:
         yield {"cache": cache}

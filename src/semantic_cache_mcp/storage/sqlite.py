@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import queue
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from ..config import (
     ACCESS_HISTORY_SIZE,
@@ -52,7 +57,15 @@ class ConnectionPool:
     - No thread affinity (any thread can use any connection)
     """
 
-    __slots__ = ("db_path", "_pool", "_max_size", "_created", "_closed")
+    __slots__ = (
+        "db_path",
+        "_pool",
+        "_max_size",
+        "_created",
+        "_closed",
+        "_file_lock",
+        "_create_lock",
+    )
 
     def __init__(self, db_path: Path, max_size: int = 5) -> None:
         """Initialize connection pool.
@@ -65,7 +78,11 @@ class ConnectionPool:
         self._max_size = max_size
         self._pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=max_size)
         self._created = 0
+        self._create_lock = threading.Lock()
         self._closed = False
+        # Cross-process file lock — serializes DB writes across MCP instances
+        # sharing the same cache (e.g. Cursor + Claude Desktop).
+        self._file_lock = FileLock(str(db_path) + ".lock", timeout=30)
         atexit.register(self.close_all)
 
     def _create_connection(self) -> sqlite3.Connection:
@@ -102,34 +119,55 @@ class ConnectionPool:
         try:
             conn = self._pool.get_nowait()
         except queue.Empty:
-            if self._created < self._max_size:
-                conn = self._create_connection()
-            else:
-                # Pool full, wait for available connection
+            with self._create_lock:
+                conn = self._create_connection() if self._created < self._max_size else None
+            if conn is None:
                 conn = self._pool.get(timeout=10.0)
 
+        # Acquire cross-process file lock so concurrent MCP instances
+        # (e.g. Cursor + Claude Desktop) serialize instead of crashing.
+        # Explicit acquire/release so we can convert FileLockTimeout into
+        # a descriptive RuntimeError before the generator yields.
         try:
-            yield conn
-            # Commit on success (matches sqlite3.connect context manager)
-            conn.commit()
-        except sqlite3.Error:
-            # Rollback on database error
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                logger.debug("Rollback failed during error recovery")
-            raise
-        finally:
-            # Return connection to pool if not closed
+            self._file_lock.acquire()
+        except FileLockTimeout:
+            # Return connection to pool before raising — otherwise the
+            # checked-out conn leaks and repeated timeouts exhaust the pool.
             if conn and not self._closed:
                 try:
                     self._pool.put_nowait(conn)
                 except queue.Full:
-                    # Pool full (shouldn't happen), close connection
-                    try:
+                    with contextlib.suppress(sqlite3.Error):
                         conn.close()
-                    except sqlite3.Error:
-                        logger.debug("Failed to close overflow connection")
+            raise RuntimeError(
+                f"Cache database lock timeout ({self._file_lock.timeout}s). "
+                "Another process may be holding the lock."
+            ) from None
+        try:
+            try:
+                yield conn
+                # Commit on success (matches sqlite3.connect context manager)
+                conn.commit()
+            except sqlite3.Error:
+                # Rollback on database error
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    logger.debug("Rollback failed during error recovery")
+                raise
+            finally:
+                # Return connection to pool if not closed
+                if conn and not self._closed:
+                    try:
+                        self._pool.put_nowait(conn)
+                    except queue.Full:
+                        # Pool full (shouldn't happen), close connection
+                        try:
+                            conn.close()
+                        except sqlite3.Error:
+                            logger.debug("Failed to close overflow connection")
+        finally:
+            self._file_lock.release()
 
     def close_all(self) -> None:
         """Close all connections in pool."""
@@ -417,19 +455,27 @@ class SQLiteStorage:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             if count > MAX_CACHE_ENTRIES:
                 evict_count = max(1, count // 10)
-                rows = conn.execute(
-                    "SELECT path, chunk_hashes, access_history FROM files"
+                # SQL-based LRU-K eviction: use the K-th-from-last access time
+                # as the eviction score (files with oldest K-th access evicted first).
+                # json_array_length / json_extract compute the index inline.
+                evict_rows = conn.execute(
+                    f"""
+                    SELECT path, chunk_hashes FROM files
+                    ORDER BY CASE
+                        WHEN json_array_length(access_history) >= {LRU_K}
+                        THEN json_extract(
+                            access_history,
+                            '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
+                        )
+                        ELSE json_extract(access_history, '$[0]')
+                    END ASC
+                    LIMIT ?
+                    """,
+                    (evict_count,),
                 ).fetchall()
 
-                entries_with_score: list[tuple[float, str, list[str]]] = []
-                for p, chunks_json, history_json in rows:
-                    history = json.loads(history_json)
-                    score = history[-LRU_K] if len(history) >= LRU_K else history[0]
-                    entries_with_score.append((score, p, json.loads(chunks_json)))
-
-                entries_with_score.sort()
-                evict_paths = [p for _, p, _ in entries_with_score[:evict_count]]
-                evict_chunks = [c for _, _, cs in entries_with_score[:evict_count] for c in cs]
+                evict_paths = [r[0] for r in evict_rows]
+                evict_chunks = [c for r in evict_rows for c in json.loads(r[1])]
 
                 placeholders = ",".join("?" * len(evict_paths))
                 conn.execute(
@@ -508,12 +554,11 @@ class SQLiteStorage:
                 SELECT path, embedding FROM files
                 WHERE embedding IS NOT NULL
             """
-            params: list = []
+            params: list[str] = []
             if exclude_path:
                 query += " AND path != ?"
                 params.append(exclude_path)
 
-            query += " ORDER BY created_at DESC"
             rows = conn.execute(query, params).fetchall()
 
         if not rows:
@@ -588,23 +633,26 @@ class SQLiteStorage:
                 return
 
             evict_count = max(1, count // 10)
+            # SQL-based LRU-K eviction: use the K-th-from-last access time
+            # as the eviction score (files with oldest K-th access evicted first).
+            evict_rows = conn.execute(
+                f"""
+                SELECT path, chunk_hashes FROM files
+                ORDER BY CASE
+                    WHEN json_array_length(access_history) >= {LRU_K}
+                    THEN json_extract(
+                        access_history,
+                        '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
+                    )
+                    ELSE json_extract(access_history, '$[0]')
+                END ASC
+                LIMIT ?
+                """,
+                (evict_count,),
+            ).fetchall()
 
-            # Get candidates for eviction
-            rows = conn.execute("SELECT path, chunk_hashes, access_history FROM files").fetchall()
-
-            entries_with_score: list[tuple[float, str, list[str]]] = []
-            for path, chunks_json, history_json in rows:
-                history = json.loads(history_json)
-                score = history[-LRU_K] if len(history) >= LRU_K else history[0]
-                entries_with_score.append((score, path, json.loads(chunks_json)))
-
-            entries_with_score.sort()
-
-            # Collect paths and chunks for batch operations
-            evict_paths = [path for _, path, _ in entries_with_score[:evict_count]]
-            evict_chunks = [
-                chunk for _, _, chunks in entries_with_score[:evict_count] for chunk in chunks
-            ]
+            evict_paths = [r[0] for r in evict_rows]
+            evict_chunks = [c for r in evict_rows for c in json.loads(r[1])]
 
             # Batch delete files
             placeholders = ",".join("?" * len(evict_paths))
@@ -665,7 +713,9 @@ class SQLiteStorage:
         """
         with self._pool.get_connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            conn.executescript("DELETE FROM files; DELETE FROM chunks; DELETE FROM lsh_index;")
+            conn.execute("DELETE FROM files")
+            conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM lsh_index")
         return count
 
     # -------------------------------------------------------------------------

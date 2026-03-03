@@ -51,6 +51,8 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 
 Restart Claude Code. Done.
 
+> **`uvx` vs `uv tool install`** — `uvx` runs the server in a temporary environment, always fetching the latest version (ideal for MCP configs where the client spawns the process). `uv tool install semantic-cache-mcp` installs it persistently with a pinned version, available on your `PATH`. Use `uvx` in MCP server configs; use `uv tool install` if you want to pin a version or run the server manually.
+
 ### Block Native File Tools (Recommended)
 
 Disable the client's built-in file tools so all file I/O routes through semantic-cache.
@@ -313,6 +315,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
 | `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |
+| `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 
 ### Safety Limits
 
@@ -343,7 +346,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 
 **Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. Set `EMBEDDING_DEVICE` to control hardware: `cpu` (default), `cuda` (GPU), or `auto` (detect available).
 
-**Cache location:** `~/.cache/semantic-cache-mcp/`
+**Cache location:** Platform-specific (`~/.cache/semantic-cache-mcp/` on Linux, `~/Library/Caches/semantic-cache-mcp/` on macOS, `%LOCALAPPDATA%\semantic-cache-mcp\` on Windows). Override with `SEMANTIC_CACHE_DIR`.
 
 ---
 
