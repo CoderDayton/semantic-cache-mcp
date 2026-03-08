@@ -62,17 +62,56 @@ class VectorStorage:
 
     __slots__ = ("_db", "_collection", "_db_path", "_lock")
 
+    # Quantization currently in use — stored in sidecar to detect future changes.
+    _QUANTIZATION = Quantization.INT8
+    _COLLECTION_NAME = "files"
+
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._clear_if_quantization_changed(db_path)
         self._db = VectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
-            quantization=Quantization.INT8,  # 4x smaller vectors, negligible quality loss
+            quantization=self._QUANTIZATION,
         )
-        self._collection = self._db.collection("files")
+        self._collection = self._db.collection(self._COLLECTION_NAME)
         self._lock = threading.RLock()  # Reentrant: public methods may call each other
         logger.info(f"VectorStorage initialized at {db_path}")
+
+    @classmethod
+    def _clear_if_quantization_changed(cls, db_path: Path) -> None:
+        """Delete stale usearch index when quantization setting changes.
+
+        Opening a usearch index built with one quantization type (e.g. FLOAT16)
+        using a different type (e.g. INT8) causes heap corruption (free():
+        corrupted unsorted chunks). We track the active quantization in a JSON
+        sidecar and wipe the index files on mismatch so usearch rebuilds clean.
+        """
+        meta_path = db_path.with_suffix(".meta.json")
+        current_quant = cls._QUANTIZATION.value
+        stored_quant: str | None = None
+
+        import contextlib
+
+        if meta_path.exists():
+            with contextlib.suppress(Exception):
+                stored_quant = json.loads(meta_path.read_text()).get("quantization")
+
+        if stored_quant != current_quant:
+            if stored_quant is not None:
+                logger.warning(
+                    f"Quantization changed {stored_quant!r} → {current_quant!r}; "
+                    "clearing stale usearch index (cache content preserved in SQLite)"
+                )
+            # Delete usearch index files so VectorDB rebuilds with correct quantization.
+            # Pattern: {db_path}.{collection}.usearch
+            for suffix in (f".{cls._COLLECTION_NAME}.usearch",):
+                stale = db_path.parent / (db_path.name + suffix)
+                if stale.exists():
+                    stale.unlink()
+                    logger.info(f"Deleted stale index: {stale}")
+            meta_path.write_text(json.dumps({"quantization": current_quant}))
 
     def __del__(self) -> None:
         if hasattr(self, "_db"):

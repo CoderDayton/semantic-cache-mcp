@@ -66,6 +66,13 @@ async def app_lifespan(server: FastMCP):
             logger.info("Initializing tokenizer...")
             get_tokenizer()
 
+            # Initialize VectorStorage (usearch) before onnxruntime (fastembed).
+            # Loading onnxruntime first and then usearch causes heap corruption
+            # (free(): corrupted unsorted chunks) on Linux due to allocator conflicts.
+            logger.info("Initializing cache storage...")
+            cache = SemanticCache()
+            _migrate_v2_to_v3()
+
             logger.info("Initializing embedding model...")
             warmup()
 
@@ -78,9 +85,6 @@ async def app_lifespan(server: FastMCP):
                 )
             else:
                 logger.info(f"Embedding model ready: {model_info['model']}")
-
-            cache = SemanticCache()
-            _migrate_v2_to_v3()
             logger.info("Semantic cache MCP server started")
         except Exception:
             logger.exception("Failed to initialize semantic cache")
