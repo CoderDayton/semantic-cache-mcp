@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
+from semantic_cache_mcp.server._mcp import _migrate_v2_to_v3
 from semantic_cache_mcp.storage.vector import VectorStorage
 
 
@@ -307,3 +308,67 @@ class TestDatabaseIntegrity:
         assert entry is not None
         content = storage.get_content(entry)
         assert content == "Test content"
+
+
+# ---------------------------------------------------------------------------
+# Migration: v0.2.0 → v0.3.0
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateV2ToV3:
+    """Test legacy cache.db cleanup on first v0.3.0 startup."""
+
+    def test_removes_legacy_db_with_old_schema(self, tmp_path: Path) -> None:
+        """cache.db with chunks/files/lsh_index tables should be deleted."""
+        import sqlite3
+
+        db = tmp_path / "cache.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE lsh_index (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE session_metrics (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        # Also create WAL/SHM files
+        (tmp_path / "cache.db-wal").write_bytes(b"wal")
+        (tmp_path / "cache.db-shm").write_bytes(b"shm")
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()
+
+        assert not db.exists()
+        assert not (tmp_path / "cache.db-wal").exists()
+        assert not (tmp_path / "cache.db-shm").exists()
+
+    def test_ignores_unrelated_db(self, tmp_path: Path) -> None:
+        """A database without the old schema should be left alone."""
+        import sqlite3
+
+        db = tmp_path / "cache.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE something_else (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()
+
+        assert db.exists()  # Not deleted
+
+    def test_no_op_when_no_db(self, tmp_path: Path) -> None:
+        """No crash when cache.db doesn't exist."""
+        db = tmp_path / "cache.db"
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()  # Should not raise
+
+    def test_handles_corrupted_db(self, tmp_path: Path) -> None:
+        """Corrupted cache.db should not crash migration."""
+        db = tmp_path / "cache.db"
+        db.write_bytes(b"this is not a sqlite database")
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()  # Should not raise
+
+        assert db.exists()  # Left alone since we can't verify schema
