@@ -1,0 +1,62 @@
+# Environment Variables
+
+All environment variables are optional. Defaults are tuned for typical usage.
+
+## Cache & Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEMANTIC_CACHE_DIR` | Platform-specific\* | Override cache/database directory path. All data (database, models, metrics) lives under this directory. |
+| `MAX_CACHE_ENTRIES` | `10000` | Maximum cached file entries before LRU-K eviction kicks in. Higher values use more memory and disk. |
+| `MAX_CONTENT_SIZE` | `100000` | Maximum bytes returned by a single read operation. Files larger than this are truncated with a hint to use `offset`/`limit`. |
+
+\* Linux: `~/.cache/semantic-cache-mcp/`, macOS: `~/Library/Caches/semantic-cache-mcp/`, Windows: `%LOCALAPPDATA%\semantic-cache-mcp\`
+
+## Embeddings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model name for semantic search/similarity. Changing this clears and rebuilds all cached embeddings on next use. See [supported models](https://qdrant.github.io/fastembed/examples/Supported_Models/). |
+| `EMBEDDING_DEVICE` | `cpu` | Hardware for embedding inference. Options: `cpu` (no GPU needed), `cuda` (NVIDIA GPU via ONNX Runtime), `auto` (detect available). |
+
+### Choosing an embedding model
+
+The default `BAAI/bge-small-en-v1.5` (33M params, 384 dimensions) is fast on CPU and sufficient for code similarity. Consider alternatives if you need:
+
+- **Higher quality**: `BAAI/bge-base-en-v1.5` (110M params, 768D) — better retrieval at ~3x slower inference
+- **Multilingual**: `BAAI/bge-small-zh-v1.5` or `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- **Smallest footprint**: `BAAI/bge-micro-v2` (17M params) — faster startup, slightly lower quality
+
+> **Warning**: Changing the model invalidates all cached embeddings. The cache will rebuild as files are re-read.
+
+## Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging verbosity. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Set to `DEBUG` for troubleshooting embedding/storage issues. |
+
+## Tool Response
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOOL_OUTPUT_MODE` | `compact` | Response detail level. Options: `compact` (minimal metadata, best for token savings), `normal` (includes context lines in grep, extra diagnostics), `debug` (full diagnostics including timing and internal state). |
+| `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global cap on response tokens per tool call. `0` disables the cap. Useful for constraining token budget on large operations. |
+
+## Example: MCP Server Config with Custom Env
+
+```json
+{
+  "mcpServers": {
+    "semantic-cache": {
+      "command": "uvx",
+      "args": ["semantic-cache-mcp"],
+      "env": {
+        "EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5",
+        "EMBEDDING_DEVICE": "cuda",
+        "LOG_LEVEL": "DEBUG",
+        "MAX_CACHE_ENTRIES": "20000"
+      }
+    }
+  }
+}
+```

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-08 — Storage Rewrite
+
+Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw text + vector embeddings (VectorStorage via simplevecdb). Simpler data path, better search, same caching semantics.
+
+### Changed
+
+- **Storage backend: SQLiteStorage → VectorStorage** — Files stored as plain text with HNSW embedding vectors. Eliminates compression/decompression overhead.
+- **Small files** (< 8KB) stored as a single document; large files split via HyperCDC into content-defined chunks, each with its own embedding.
+- **Thread safety** — `threading.RLock` on all public VectorStorage methods for safe concurrent access.
+- **Dependencies** — Replaced `fastembed-gpu` (broken Rust rewrite) with `fastembed`. Removed `onnxruntime-gpu` (fastembed handles provider selection).
+- **Stats tool** — Now returns token savings, hit/miss ratio, DB size, and session uptime in a flat JSON structure.
+- **Search scores** — Normalized to 0–1 range (best result = 1.0) instead of raw RRF scores.
+
+### Added
+
+- **Content hash freshness** — BLAKE3 hash comparison when mtime changes but content is identical (touch, git checkout, editor re-save). Returns "unchanged" instead of re-reading. Applied across all 7 freshness check locations.
+- **Truncation hints** — `read`/`batch_read` responses include `hint` with offset to continue reading.
+- **Configurable embedding model** — `EMBEDDING_MODEL` env var (default: `BAAI/bge-small-en-v1.5`).
+- **`grep` tool** — Regex/literal pattern search across cached files with line numbers and context.
+- **`docs/env_variables.md`** — Full reference for all configurable env vars.
+- **Auto-migration** — Detects and removes legacy v0.2.0 `cache.db` on first startup.
+
+### Fixed
+
+- **Stale cache** — `touch`, `git checkout`, editor re-saves no longer invalidate cache when content is identical.
+- **`find_similar_files` returning 0 results** — Always computes embedding via `cache.get_embedding()` instead of relying on VectorStorage.get().
+- **`stats` key mismatch** — Fixed `total_files` → `files_cached` in 3 locations.
+
+### Removed
+
+- Compressed chunk storage (ZSTD/LZ4/Brotli layer)
+- File locking (`filelock`) — replaced by in-process `threading.RLock`
+- Dead code: `_backtrack()` in `_diff.py`
+
 ## [0.2.0] - 2026-03-02
 
 ### Added
@@ -86,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/CoderDayton/semantic-cache-mcp/releases/tag/v0.1.0

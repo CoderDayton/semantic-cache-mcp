@@ -42,7 +42,7 @@ src/semantic_cache_mcp/
 │   ├── chunking/   # _gear.py (HyperCDC), _simd.py (parallel CDC)
 │   ├── similarity/ # _cosine.py, _lsh.py, _quantization.py
 │   └── text/       # _diff.py, _summarize.py
-├── storage/        # sqlite.py (SQLiteStorage)
+├── storage/        # vector.py (VectorStorage via simplevecdb)
 ├── config.py       # Environment-variable configuration
 └── types.py        # All shared data models
 ```
@@ -114,8 +114,8 @@ from semantic_cache_mcp.cache import smart_read, SemanticCache
 
 @pytest.fixture
 def cache(tmp_path):
-    from semantic_cache_mcp.storage.sqlite import SQLiteStorage
-    storage = SQLiteStorage(db_path=tmp_path / "test.db")
+    from semantic_cache_mcp.storage.vector import VectorStorage
+    storage = VectorStorage(db_path=tmp_path / "cache.db")
     return SemanticCache(storage=storage)
 
 def test_read_unchanged_returns_message(cache, tmp_path):
