@@ -40,7 +40,7 @@ src/semantic_cache_mcp/
 ├── server/         # MCP interface: tools.py, response.py, _mcp.py
 ├── core/
 │   ├── chunking/   # _gear.py (HyperCDC), _simd.py (parallel CDC)
-│   ├── similarity/ # _cosine.py, _lsh.py, _quantization.py
+│   ├── similarity/ # _cosine.py
 │   └── text/       # _diff.py, _summarize.py
 ├── storage/        # vector.py (VectorStorage via simplevecdb)
 ├── config.py       # Environment-variable configuration
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
 
 - All functions must have type hints, including return types
 - No `Any` without an inline comment and a TODO explaining why
-- `@overload` for functions with conditional return types (see `LSHIndex.query`)
+- `@overload` for functions with conditional return types
 - `TYPE_CHECKING` blocks for import-only types to avoid circular deps
 
 ### Code Style

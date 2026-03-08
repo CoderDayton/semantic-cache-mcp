@@ -1363,13 +1363,12 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
     { name = "fastembed" },
     { name = "fastmcp" },
-    { name = "filelock" },
     { name = "onnxruntime" },
     { name = "simplevecdb" },
 ]
@@ -1390,7 +1389,6 @@ requires-dist = [
     { name = "blake3", specifier = ">=1.0.8" },
     { name = "fastembed", specifier = ">=0.5.1" },
     { name = "fastmcp", specifier = ">=3.0.0b1" },
-    { name = "filelock", specifier = ">=3.16.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "onnxruntime", specifier = ">=1.19.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },

@@ -50,15 +50,15 @@
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
-- **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/cache.db` and restart
+- **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/vecdb.db` and restart
 
 **`search` or `similar` returns no results**
 - **Cause:** These tools only search cached files. If the cache is empty or the relevant files haven't been read, nothing will match.
 - **Fix:** Seed the cache first with `read` or `batch_read`, then call `search` or `similar`.
 
 **`search` or `similar` results seem stale after adding many files**
-- **Cause:** The LSH index is lazily rebuilt when the cached blob count changes. On the very first query after a large `batch_read`, you may see a one-time rebuild delay.
-- **Fix:** This is normal and self-healing — the rebuilt index is persisted to SQLite so subsequent queries are instant. No action needed.
+- **Cause:** New files need to be cached (via `read` or `batch_read`) before they appear in search results. The HNSW index is updated when files are cached.
+- **Fix:** Run `batch_read` on the new files first, then search again.
 
 ---
 
@@ -69,10 +69,10 @@
 - **Expected:** Normal on first use. Model is cached in `~/.cache/semantic-cache-mcp/models/`.
 
 **High memory usage**
-- **Cause:** Embedding model holds ~200MB resident (ONNX Runtime + bge-small-en-v1.5 weights) + SQLite page cache (up to 64MB)
+- **Cause:** Embedding model holds ~200MB resident (ONNX Runtime + bge-small-en-v1.5 weights) + vector index
 - **Options:**
   - Use `clear` to evict cached entries and reduce DB size
-  - Reduce `MAX_CACHE_ENTRIES` to lower the number of cached embeddings
+  - Reduce `MAX_CACHE_ENTRIES` to lower the number of cached entries
 
 **Glob timeout**
 - **Cause:** Very broad pattern (e.g., `**/*.py` on a large monorepo) exceeds the 5-second timeout
@@ -96,7 +96,8 @@
 
 | Path                                         | Contents                     |
 |----------------------------------------------|------------------------------|
-| `~/.cache/semantic-cache-mcp/cache.db`       | SQLite database (chunks, embeddings, LSH index, file metadata) |
+| `~/.cache/semantic-cache-mcp/vecdb.db`       | VectorStorage database (raw text, HNSW vectors, FTS5 index) |
+| `~/.cache/semantic-cache-mcp/metrics.db`     | Session metrics (token savings, tool calls, lifetime stats) |
 | `~/.cache/semantic-cache-mcp/tokenizer/`     | o200k_base BPE tokenizer file |
 | `~/.cache/semantic-cache-mcp/models/`        | FastEmbed ONNX model (~130MB, BAAI/bge-small-en-v1.5) |
 
@@ -139,7 +140,7 @@ semantic-cache-mcp
 ## Getting Help
 
 1. **Enable debug logging:** `LOG_LEVEL=DEBUG semantic-cache-mcp`
-2. **Check the cache:** `stats` tool shows file count, token totals, and compression ratio
+2. **Check the cache:** `stats` tool shows file count, token totals, and savings percentage
 3. **Reset state:** `clear` tool resets all cache entries; deleting `~/.cache/semantic-cache-mcp/` does a full reset
 4. **Report issues:** [GitHub Issues](https://github.com/CoderDayton/semantic-cache-mcp/issues)
 

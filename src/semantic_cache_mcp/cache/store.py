@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from ..config import CACHE_DIR
 from ..core import count_tokens
@@ -380,9 +380,9 @@ class SemanticCache:
         """Find semantically similar cached file."""
         return self._storage.find_similar(embedding, exclude_path)
 
-    def get_stats(self) -> dict[str, object]:
+    def get_stats(self) -> dict[str, Any]:
         """Get cache statistics including memory, session, and lifetime metrics."""
-        stats: dict[str, object] = {**self._storage.get_stats()}
+        stats: dict[str, Any] = {**self._storage.get_stats()}
 
         # Add process memory stats
         rss = _get_rss_mb()
