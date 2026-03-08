@@ -67,7 +67,7 @@ class VectorStorage:
         self._db = VectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
-            quantization=Quantization.FLOAT16,  # 2x smaller vectors, negligible quality loss
+            quantization=Quantization.INT8,  # 4x smaller vectors, negligible quality loss
         )
         self._collection = self._db.collection("files")
         self._lock = threading.RLock()  # Reentrant: public methods may call each other
