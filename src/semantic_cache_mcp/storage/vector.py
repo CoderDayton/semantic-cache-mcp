@@ -42,6 +42,7 @@ _META_TOKENS = "tokens"
 _META_CREATED_AT = "created_at"
 _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
+_META_HAS_EMBEDDING = "has_embedding"
 
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
 # each stored as a child document with its own vector. Smaller files are stored
@@ -136,6 +137,7 @@ class VectorStorage:
         content_bytes = content.encode("utf-8")
 
         emb_list = self._resolve_embedding(embedding)
+        has_embedding = embedding is not None
 
         base_meta = {
             _META_PATH: path,
@@ -144,6 +146,7 @@ class VectorStorage:
             _META_TOKENS: tokens,
             _META_CREATED_AT: now,
             _META_ACCESS_HISTORY: json.dumps([now]),
+            _META_HAS_EMBEDDING: has_embedding,
         }
 
         with self._lock:
@@ -348,9 +351,11 @@ class VectorStorage:
                 # Convert to similarity: 1 - (distance / 2) maps [0,2] → [1,0]
                 similarity = 1.0 - (distance / 2.0)
                 candidate_path = doc.metadata.get(_META_PATH)
+                has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
 
                 is_match = (
-                    candidate_path
+                    has_emb
+                    and candidate_path
                     and candidate_path != exclude_path
                     and similarity >= SIMILARITY_THRESHOLD
                 )
@@ -394,9 +399,11 @@ class VectorStorage:
             for doc, distance in results:
                 similarity = 1.0 - (distance / 2.0)
                 candidate_path = doc.metadata.get(_META_PATH)
+                has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
 
                 if (
-                    candidate_path
+                    has_emb
+                    and candidate_path
                     and candidate_path != exclude_path
                     and candidate_path not in seen_paths
                     and similarity >= threshold

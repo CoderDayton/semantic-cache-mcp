@@ -35,6 +35,8 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 Add to Claude Code settings (`~/.claude/settings.json`):
 
+**Option 1** — `uvx` (always runs latest version):
+
 ```json
 {
   "mcpServers": {
@@ -46,11 +48,25 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
+**Option 2** — `uv tool install` (recommended for multiple clients):
+
+```bash
+uv tool install semantic-cache-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "semantic-cache": {
+      "command": "semantic-cache-mcp"
+    }
+  }
+}
+```
+
 Restart Claude Code. Done.
 
-> **`uvx` vs `uv tool install`** — `uvx` runs the server in a temporary environment, always fetching the latest version. However, each `uvx` invocation spawns an isolated process with its own embedding model loaded in memory (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy of the model, multiplying RAM usage.
->
-> `uv tool install semantic-cache-mcp` installs it persistently on your `PATH` with a pinned version. All projects share the same installed binary, and the embedding model is loaded once per process. **Use `uv tool install` if you regularly work in multiple projects simultaneously.** Use `uvx` for single-instance setups or when you always want the latest version.
+> **Why Option 2?** — `uvx` spawns an isolated process per invocation, each loading its own embedding model (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy, multiplying RAM usage. `uv tool install` puts the binary on your `PATH` so all projects share one installed copy and the model is loaded once per process.
 
 ### Block Native File Tools (Recommended)
 
