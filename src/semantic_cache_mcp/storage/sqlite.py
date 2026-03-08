@@ -12,9 +12,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from filelock import FileLock
-from filelock import Timeout as FileLockTimeout
-
 from ..config import DB_PATH
 
 if TYPE_CHECKING:
@@ -28,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectionPool:
-    """Thread-safe SQLite connection pool with WAL mode and file locking.
+    """Thread-safe SQLite connection pool with WAL mode.
 
     Attributes:
         db_path: Path to SQLite database
@@ -47,22 +44,12 @@ class ConnectionPool:
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create a new SQLite connection with optimized settings."""
-        lock_path = self.db_path.with_suffix(".lock")
-        try:
-            lock = FileLock(lock_path, timeout=10)
-            with lock:
-                conn = sqlite3.connect(
-                    str(self.db_path),
-                    timeout=30,
-                    check_same_thread=False,
-                )
-        except FileLockTimeout:
-            logger.warning("File lock timeout, connecting without lock")
-            conn = sqlite3.connect(
-                str(self.db_path),
-                timeout=30,
-                check_same_thread=False,
-            )
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30,
+            check_same_thread=False,
+        )
 
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
