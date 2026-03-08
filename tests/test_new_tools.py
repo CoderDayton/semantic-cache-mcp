@@ -209,7 +209,7 @@ class TestFindSimilarFiles:
                 smart_read(cache, str(f))
 
             result = find_similar_files(cache, str(sample_files["py"]), k=3)
-            # Should find at least the other Python file
+            # files_searched reflects total cached files
             assert result.files_searched >= 1
 
     def test_similar_excludes_source(self, cache: SemanticCache, sample_files: dict):

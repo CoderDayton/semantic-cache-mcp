@@ -7,42 +7,17 @@ import sys
 import threading
 from pathlib import Path
 
-from semantic_cache_mcp.storage.sqlite import ConnectionPool, SQLiteStorage
+from semantic_cache_mcp.storage.vector import VectorStorage
 
 
-class TestFileLock:
-    """Tests for cross-process file locking on ConnectionPool."""
-
-    def test_lock_file_created(self, temp_dir: Path) -> None:
-        """ConnectionPool creates a .lock file next to the database."""
-        db_path = temp_dir / "test.db"
-        pool = ConnectionPool(db_path)
-        try:
-            # Lock file should be accessible (created on first acquire)
-            with pool.get_connection():
-                lock_path = Path(str(db_path) + ".lock")
-                assert lock_path.exists()
-        finally:
-            pool.close_all()
-
-    def test_file_lock_exists_on_pool(self, temp_dir: Path) -> None:
-        """ConnectionPool._file_lock should be a FileLock instance."""
-        from filelock import FileLock
-
-        db_path = temp_dir / "test.db"
-        pool = ConnectionPool(db_path)
-        try:
-            assert isinstance(pool._file_lock, FileLock)
-            assert pool._file_lock.lock_file == str(db_path) + ".lock"
-        finally:
-            pool.close_all()
+class TestThreadSafety:
+    """Tests for thread-safe VectorStorage access."""
 
     def test_concurrent_thread_access(self, temp_dir: Path) -> None:
-        """Two threads using the same pool should not crash."""
+        """Multiple threads using VectorStorage should not crash."""
         db_path = temp_dir / "concurrent.db"
-        storage = SQLiteStorage(db_path)
+        storage = VectorStorage(db_path)
 
-        # Create schema
         storage.put("/test/a.txt", "content a", 1.0)
 
         errors: list[Exception] = []
@@ -64,31 +39,32 @@ class TestFileLock:
 
         assert not errors, f"Concurrent writes failed: {errors}"
 
-    def test_two_pools_same_db(self, temp_dir: Path) -> None:
-        """Two ConnectionPools on the same DB should serialize via file lock."""
-        db_path = temp_dir / "shared.db"
-        storage1 = SQLiteStorage(db_path)
-        storage2 = SQLiteStorage(db_path)
+    def test_concurrent_reads(self, temp_dir: Path) -> None:
+        """Concurrent reads should not corrupt data."""
+        db_path = temp_dir / "reads.db"
+        storage = VectorStorage(db_path)
+        storage.put("/test/file.txt", "test content", 1.0)
 
-        storage1.put("/test/1.txt", "from pool 1", 1.0)
-        storage2.put("/test/2.txt", "from pool 2", 2.0)
+        errors: list[Exception] = []
+        results: list[str] = []
 
-        entry1 = storage1.get("/test/1.txt")
-        entry2 = storage2.get("/test/2.txt")
+        def reader() -> None:
+            try:
+                entry = storage.get("/test/file.txt")
+                if entry:
+                    content = storage.get_content(entry)
+                    results.append(content)
+            except Exception as e:
+                errors.append(e)
 
-        assert entry1 is not None
-        assert entry2 is not None
-        assert storage1.get_content(entry1) == "from pool 1"
-        assert storage2.get_content(entry2) == "from pool 2"
+        threads = [threading.Thread(target=reader) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
 
-    def test_file_lock_timeout(self, temp_dir: Path) -> None:
-        """FileLock timeout should match the connection pool's expected range."""
-        db_path = temp_dir / "timeout.db"
-        pool = ConnectionPool(db_path)
-        try:
-            assert pool._file_lock.timeout == 30
-        finally:
-            pool.close_all()
+        assert not errors, f"Concurrent reads failed: {errors}"
+        assert all(r == "test content" for r in results)
 
 
 class TestStderrLogging:

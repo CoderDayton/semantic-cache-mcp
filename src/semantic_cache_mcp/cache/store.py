@@ -5,16 +5,14 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
-from ..config import DB_PATH
+from ..config import CACHE_DIR
 from ..core import count_tokens
-from ..storage import SQLiteStorage
+from ..storage import SQLiteStorage, VectorStorage
+from ..storage.vector import VECDB_PATH
 from ..types import CacheEntry, EmbeddingVector
 from .metrics import SessionMetrics
-
-if TYPE_CHECKING:
-    from ..core.similarity import LSHIndex
 
 logger = logging.getLogger(__name__)
 
@@ -280,99 +278,30 @@ class SemanticCache:
     """High-level cache interface with semantic similarity support.
 
     This facade coordinates:
-    - Storage backend (SQLite with content-addressable chunks)
+    - VectorStorage backend (simplevecdb with HNSW index)
+    - SQLiteStorage for session metrics persistence
     - Local embedding generation (FastEmbed)
     - Caching strategies (diff, truncate, semantic match)
     """
 
-    __slots__ = ("_storage", "_lsh_index", "_metrics")
+    __slots__ = ("_storage", "_metrics_storage", "_metrics")
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
+    def __init__(self, db_path: Path = VECDB_PATH) -> None:
         """Initialize cache.
 
         Args:
-            db_path: Path to SQLite database
+            db_path: Path to simplevecdb database
         """
-        self._storage = SQLiteStorage(db_path)
-        self._lsh_index: LSHIndex | None = None
-        self._metrics = SessionMetrics(self._storage._pool)
+        self._storage = VectorStorage(db_path)
+        # Keep SQLiteStorage only for session metrics persistence
+        metrics_db = CACHE_DIR / "metrics.db"
+        self._metrics_storage = SQLiteStorage(metrics_db)
+        self._metrics = SessionMetrics(self._metrics_storage._pool)
 
     @property
     def metrics(self) -> SessionMetrics:
         """Current session metrics accumulator."""
         return self._metrics
-
-    # -------------------------------------------------------------------------
-    # LSH persistence
-    # -------------------------------------------------------------------------
-
-    def _invalidate_lsh(self) -> None:
-        """Mark LSH stale after any cache mutation.
-
-        Clears both in-memory index and the persisted SQLite blob.
-        The next search call will rebuild from the current file set.
-        """
-        self._lsh_index = None
-        try:
-            self._storage.clear_lsh_index()
-        except Exception as e:
-            logger.warning(f"Failed to clear persisted LSH: {e}")
-
-    def get_or_build_lsh(self, blobs: list[bytes], dim: int) -> LSHIndex:
-        """Return an LSH index consistent with the current blob list.
-
-        Load order: in-memory → SQLite → fresh build.
-        Rebuilds (and re-persists) whenever blob_count has changed.
-
-        Args:
-            blobs: Ordered quantized embedding blobs from the current DB query.
-                   Item IDs 0..N-1 correspond to positions in this list.
-            dim: Embedding dimension (used to skip malformed blobs)
-
-        Returns:
-            LSHIndex populated with the current file set
-        """
-        from ..core.similarity import LSHConfig, LSHIndex, dequantize_embedding
-        from ..core.similarity._lsh import deserialize_lsh_index, serialize_lsh_index
-
-        n = len(blobs)
-
-        # Fast path: in-memory index matches current snapshot
-        if self._lsh_index is not None and len(self._lsh_index._signatures) == n:
-            return self._lsh_index
-
-        # Try loading from SQLite
-        stored = self._storage.get_lsh_index()
-        if stored is not None:
-            data, blob_count = stored
-            if blob_count == n:
-                try:
-                    lsh = deserialize_lsh_index(data)
-                    self._lsh_index = lsh
-                    logger.debug(f"Loaded persisted LSH index ({n} items)")
-                    return lsh
-                except Exception as e:
-                    logger.warning(f"Failed to deserialize LSH index: {e}")
-
-        # Build fresh from current blob snapshot
-        config = LSHConfig(num_bits=64, num_tables=4, band_size=8, similarity_threshold=0.0)
-        lsh = LSHIndex(config=config)
-        for idx, blob in enumerate(blobs):
-            vec = dequantize_embedding(blob)
-            if vec is not None and len(vec) == dim:
-                lsh.add(idx, vec, store_embedding=True)
-
-        self._lsh_index = lsh
-        logger.debug(f"Built LSH index ({n} items)")
-
-        # Persist for reuse across searches (and across restarts)
-        try:
-            data = serialize_lsh_index(lsh)
-            self._storage.set_lsh_index(data, n)
-        except Exception as e:
-            logger.warning(f"Failed to persist LSH index: {e}")
-
-        return lsh
 
     # -------------------------------------------------------------------------
     # Embedding
@@ -431,7 +360,6 @@ class SemanticCache:
         """Store file in cache."""
         tokens = count_tokens(content)
         self._storage.put(path, content, mtime, embedding)
-        self._invalidate_lsh()
         logger.info(f"Cached file: {path} ({tokens} tokens)")
 
     def get_content(self, entry: CacheEntry) -> str:
@@ -475,7 +403,7 @@ class SemanticCache:
 
         # Lifetime metrics (aggregated from all completed sessions)
         try:
-            stats["lifetime"] = self._storage.get_lifetime_stats()
+            stats["lifetime"] = self._metrics_storage.get_lifetime_stats()
         except Exception as e:
             logger.warning(f"Failed to load lifetime stats: {e}")
 
@@ -505,5 +433,4 @@ class SemanticCache:
 
     def clear(self) -> int:
         """Clear all cache entries."""
-        self._invalidate_lsh()
         return self._storage.clear()

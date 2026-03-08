@@ -562,7 +562,7 @@ def search(
     k: int = 10,
     directory: str | None = None,
 ) -> str:
-    """Search cached files by semantic meaning using embeddings (not keyword matching).
+    """Search cached files by hybrid keyword + semantic similarity (BM25 + vector RRF).
 
     IMPORTANT: Only searches files already in the cache. You must read or batch_read
     files first before they become searchable. Returns nothing on an empty cache.
@@ -572,10 +572,10 @@ def search(
     - Start with k=3 to k=5 and increase only if recall is insufficient.
     - Use directory filter early to limit response size.
 
-    Response: ranked list of files with similarity scores and content previews.
+    Response: ranked list of files with relevance scores and content previews.
 
     Args:
-        query: Natural language description of what you're looking for
+        query: Natural language or keyword search (both work — results are fused)
         k: Max results (default: 10, max: 100)
         directory: Optional absolute directory path to limit search scope
     """
@@ -896,6 +896,97 @@ def glob(
     except Exception as e:
         logger.exception("Error in glob")
         return _render_error("glob", str(e), max_response_tokens)
+
+
+@mcp.tool()
+def grep(
+    ctx: Context,
+    pattern: str,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+    context_lines: int = 0,
+    max_matches: int = 100,
+    max_files: int = 50,
+) -> str:
+    """Search cached file content by regex or literal pattern with line numbers.
+
+    Like ripgrep but searches the cache — returns matching lines with context.
+    Unlike `search` (ranked BM25+vector), this does exact pattern matching.
+
+    IMPORTANT: Only searches files already in the cache. Read files first.
+
+    Timing guidance:
+    - Use for exact code patterns: function names, imports, error strings.
+    - Use `search` instead for semantic/fuzzy queries like "error handling logic".
+    - Set fixed_string=true for patterns with special regex chars (e.g. "foo.bar()").
+    - Add context_lines=2-3 to see surrounding code.
+
+    Args:
+        pattern: Regex pattern (or literal string if fixed_string=true)
+        fixed_string: Treat pattern as literal, not regex (default: false)
+        case_sensitive: Case-sensitive matching (default: true)
+        context_lines: Lines of context before/after each match (default: 0)
+        max_matches: Total match limit across all files (default: 100)
+        max_files: Maximum files to return (default: 50)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
+
+    try:
+        results = cache._storage.grep(
+            pattern,
+            fixed_string=fixed_string,
+            case_sensitive=case_sensitive,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_files=max_files,
+        )
+        cache.metrics.record("grep", None)
+
+        total_matches = sum(len(r["matches"]) for r in results)
+
+        # Build response
+        files_payload: list[dict[str, Any]] = []
+        for file_result in results:
+            match_items: list[dict[str, Any]] = []
+            for m in file_result["matches"]:
+                item: dict[str, Any] = {
+                    "line_number": m["line_number"],
+                    "line": m["line"],
+                }
+                if context_lines > 0 and mode in _MODE_NORMAL:
+                    if "before" in m:
+                        item["before"] = m["before"]
+                    if "after" in m:
+                        item["after"] = m["after"]
+                match_items.append(item)
+            files_payload.append(
+                {
+                    "path": file_result["path"],
+                    "count": len(match_items),
+                    "matches": match_items,
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "grep",
+            "pattern": pattern,
+            "total_matches": total_matches,
+            "files_matched": len(files_payload),
+            "files": files_payload,
+        }
+        if mode == _MODE_DEBUG:
+            payload["fixed_string"] = fixed_string
+            payload["case_sensitive"] = case_sensitive
+            payload["context_lines"] = context_lines
+
+        return _render_response(payload, max_response_tokens)
+
+    except Exception as e:
+        logger.exception("Error in grep")
+        return _render_error("grep", str(e), max_response_tokens)
 
 
 def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:

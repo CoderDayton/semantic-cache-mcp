@@ -6,7 +6,6 @@ from .chunking import (
     hypercdc_simd_boundaries,
     hypercdc_simd_chunks,
 )
-from .compression import compress_adaptive, decompress, estimate_entropy
 from .embeddings import embed, embed_batch, embed_query, get_model_info
 from .embeddings import warmup as warmup_embeddings
 from .hashing import (
@@ -19,28 +18,9 @@ from .hashing import (
     hash_content,
 )
 from .similarity import (
-    DEFAULT_LSH_CONFIG,
-    LSHConfig,
-    LSHIndex,
-    batch_dot_product_ternary,
-    batch_hamming_similarity_binary,
-    compute_simhash,
     cosine_similarity,
     cosine_similarity_batch,
     cosine_similarity_batch_matrix,
-    create_lsh_index,
-    dequantize_binary,
-    dequantize_embedding,
-    dequantize_ternary,
-    evaluate_quantization_accuracy,
-    hamming_distance,
-    hamming_similarity_binary,
-    quantize_binary,
-    quantize_embedding,
-    quantize_hybrid,
-    quantize_ternary,
-    similarity_from_quantized_blob,
-    top_k_from_quantized,
     top_k_similarities,
 )
 from .text import (
@@ -66,15 +46,6 @@ __all__ = [
     "hypercdc_simd_chunks",
     "hypercdc_simd_boundaries",
     "get_optimal_chunker",
-    "LSHConfig",
-    "LSHIndex",
-    "compute_simhash",
-    "create_lsh_index",
-    "hamming_distance",
-    "DEFAULT_LSH_CONFIG",
-    "compress_adaptive",
-    "decompress",
-    "estimate_entropy",
     "hash_chunk",
     "hash_content",
     "hash_chunk_binary",
@@ -86,10 +57,6 @@ __all__ = [
     "cosine_similarity_batch",
     "cosine_similarity_batch_matrix",
     "top_k_similarities",
-    "quantize_embedding",
-    "dequantize_embedding",
-    "similarity_from_quantized_blob",
-    "top_k_from_quantized",
     "count_tokens",
     "generate_diff",
     "truncate_smart",
@@ -105,16 +72,6 @@ __all__ = [
     "embed_query",
     "warmup_embeddings",
     "get_model_info",
-    # Extreme quantization (binary/ternary)
-    "quantize_binary",
-    "dequantize_binary",
-    "hamming_similarity_binary",
-    "batch_hamming_similarity_binary",
-    "quantize_ternary",
-    "dequantize_ternary",
-    "batch_dot_product_ternary",
-    "quantize_hybrid",
-    "evaluate_quantization_accuracy",
     # Semantic summarization
     "SummarizationConfig",
     "DEFAULT_SUMMARIZATION_CONFIG",

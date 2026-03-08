@@ -175,7 +175,7 @@ class TestStatsAndClear:
 
         assert stats["files_cached"] == 3
         assert stats["total_tokens_cached"] > 0
-        assert stats["unique_chunks"] > 0
+        assert stats["total_documents"] > 0
 
     def test_clear_removes_all(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Clear should remove all cache entries."""

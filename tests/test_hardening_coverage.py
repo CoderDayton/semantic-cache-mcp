@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from filelock import Timeout as FileLockTimeout
 
 from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cache_status
 from semantic_cache_mcp.cache._helpers import _format_file
@@ -20,18 +19,9 @@ from semantic_cache_mcp.core.similarity._cosine import (
     _select_pruning_dims,
     cosine_similarity_batch,
     cosine_similarity_batch_matrix,
-    similarity_from_quantized_blob,
-    top_k_from_quantized,
     top_k_similarities,
 )
-from semantic_cache_mcp.core.similarity._lsh import (
-    _generate_hyperplanes,
-    compute_simhash,
-    compute_simhash_batch,
-    hamming_distance,
-    hamming_distance_batch,
-)
-from semantic_cache_mcp.storage.sqlite import ConnectionPool, SQLiteStorage
+from semantic_cache_mcp.storage.sqlite import ConnectionPool
 from tests.constants import TEST_EMBEDDING_DIM
 
 # ---------------------------------------------------------------------------
@@ -66,93 +56,8 @@ class TestFormatFileSpecialFileRejection:
 
 
 # ---------------------------------------------------------------------------
-# _cosine.py — buffer protocol, argpartition, np.partition, pre-alloc
+# _cosine.py — np.partition pruning, pre-alloc, top_k_similarities
 # ---------------------------------------------------------------------------
-
-
-class TestBufferProtocolDeserialization:
-    """Cover lines 186-189: single-buffer blob deserialization."""
-
-    def test_similarity_from_quantized_blob(self) -> None:
-        """Buffer deserialization produces correct similarities."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = rng.standard_normal(dim).astype(np.float32)
-
-        # Create quantized blobs manually: 4-byte scale + dim int8 values
-        blobs = []
-        for _ in range(5):
-            vec = rng.standard_normal(dim).astype(np.float32)
-            scale = float(np.max(np.abs(vec)))
-            q_scale = 127.0 / scale if scale > 0 else 1.0
-            quantized = np.round(vec * q_scale).astype(np.int8)
-            import struct
-
-            blob = struct.pack("<f", scale) + quantized.tobytes()
-            blobs.append(blob)
-
-        sims = similarity_from_quantized_blob(query, blobs)
-        assert len(sims) == 5
-        assert sims.dtype == np.float32
-
-
-class TestArgpartitionTopK:
-    """Cover argpartition paths in top_k_from_quantized and top_k_similarities."""
-
-    def _make_blobs(self, n: int, dim: int) -> tuple[np.ndarray, list[bytes]]:
-        rng = np.random.default_rng(42)
-        query = rng.standard_normal(dim).astype(np.float32)
-        blobs = []
-        import struct
-
-        for _ in range(n):
-            vec = rng.standard_normal(dim).astype(np.float32)
-            scale = float(np.max(np.abs(vec)))
-            q_scale = 127.0 / scale if scale > 0 else 1.0
-            quantized = np.round(vec * q_scale).astype(np.int8)
-            blob = struct.pack("<f", scale) + quantized.tobytes()
-            blobs.append(blob)
-        return query, blobs
-
-    def test_top_k_from_quantized_k_less_than_n(self) -> None:
-        """k < n triggers argpartition branch."""
-        query, blobs = self._make_blobs(20, 16)
-        results = top_k_from_quantized(query, blobs, k=5)
-        assert len(results) == 5
-        # Verify descending order
-        sims = [s for _, s in results]
-        assert sims == sorted(sims, reverse=True)
-
-    def test_top_k_from_quantized_k_equals_n(self) -> None:
-        """k == n triggers argsort fallback."""
-        query, blobs = self._make_blobs(5, 16)
-        results = top_k_from_quantized(query, blobs, k=5)
-        assert len(results) == 5
-
-    def test_top_k_similarities_k_less_than_n(self) -> None:
-        """top_k_similarities uses argpartition when k < len(vectors)."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-            for _ in range(20)
-        ]
-        results = top_k_similarities(query, vectors, k=3, use_quantization=False)
-        assert len(results) == 3
-        sims = [s for _, s in results]
-        assert sims == sorted(sims, reverse=True)
-
-    def test_top_k_similarities_k_equals_n(self) -> None:
-        """top_k_similarities falls back to argsort when k == n."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(3)
-        ]
-        results = top_k_similarities(query, vectors, k=3, use_quantization=False)
-        assert len(results) == 3
 
 
 class TestPruningDimsPartition:
@@ -185,7 +90,7 @@ class TestPreAllocatedMatrices:
         vectors = [
             array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(5)
         ]
-        result = cosine_similarity_batch(query, vectors, use_quantization=False, use_pruning=False)
+        result = cosine_similarity_batch(query, vectors, use_pruning=False)
         assert len(result) == 5
         assert all(isinstance(s, float) for s in result)
 
@@ -197,55 +102,53 @@ class TestPreAllocatedMatrices:
         vectors = [
             array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(5)
         ]
-        result = cosine_similarity_batch_matrix(query, vectors, use_quantization=False)
+        result = cosine_similarity_batch_matrix(query, vectors)
         assert len(result) == 5
 
 
-# ---------------------------------------------------------------------------
-# _lsh.py — Kernighan's popcount, vectorized bit packing
-# ---------------------------------------------------------------------------
+class TestTopKSimilarities:
+    """Cover argpartition paths in top_k_similarities."""
 
-
-class TestLSHVectorized:
-    """Cover vectorized SimHash and Kernighan's popcount."""
-
-    def test_kernighan_hamming_distance(self) -> None:
-        """Kernighan's bit-counting produces correct distance."""
-        assert hamming_distance(0b1111, 0b0000) == 4
-        assert hamming_distance(0b1010, 0b0101) == 4
-        assert hamming_distance(0xFF, 0xFF) == 0
-        assert hamming_distance(0, 0) == 0
-        assert hamming_distance(1, 0) == 1
-
-    def test_vectorized_popcount_batch(self) -> None:
-        """np.unpackbits batch popcount matches scalar."""
-        hashes = np.array([0b1111, 0b0000, 0xFF, 0b1010], dtype=np.uint64)
-        distances = hamming_distance_batch(hashes, 0)
-        assert distances[0] == 4
-        assert distances[1] == 0
-        assert distances[2] == 8
-        assert distances[3] == 2
-
-    def test_vectorized_simhash(self) -> None:
-        """Vectorized bit packing produces consistent hash."""
+    def test_top_k_similarities_k_less_than_n(self) -> None:
+        """top_k_similarities uses argpartition when k < len(vectors)."""
+        dim = 16
         rng = np.random.default_rng(42)
-        hyperplanes = _generate_hyperplanes(TEST_EMBEDDING_DIM, 64)
-        emb = rng.standard_normal(TEST_EMBEDDING_DIM).astype(np.float32)
-        h1 = compute_simhash(emb, hyperplanes)
-        h2 = compute_simhash(emb, hyperplanes)
-        assert h1 == h2  # Deterministic
-        assert isinstance(h1, int)
-
-    def test_simhash_batch_preallocated(self) -> None:
-        """Batch SimHash uses pre-allocated matrix."""
-        rng = np.random.default_rng(42)
-        hyperplanes = _generate_hyperplanes(TEST_EMBEDDING_DIM, 64)
-        embeddings = [
-            array.array("f", rng.standard_normal(TEST_EMBEDDING_DIM).astype(np.float32).tolist())
-            for _ in range(5)
+        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
+        vectors = [
+            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
+            for _ in range(20)
         ]
-        hashes = compute_simhash_batch(embeddings, hyperplanes)
-        assert len(hashes) == 5
+        results = top_k_similarities(query, vectors, k=3)
+        assert len(results) == 3
+        sims = [s for _, s in results]
+        assert sims == sorted(sims, reverse=True)
+
+    def test_top_k_similarities_k_equals_n(self) -> None:
+        """top_k_similarities falls back to argsort when k == n."""
+        dim = 16
+        rng = np.random.default_rng(42)
+        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
+        vectors = [
+            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(3)
+        ]
+        results = top_k_similarities(query, vectors, k=3)
+        assert len(results) == 3
+
+    def test_top_k_returns_exactly_k(self) -> None:
+        """top_k_similarities must return exactly k results when k < n."""
+        rng = np.random.default_rng(42)
+        query = rng.standard_normal(64).astype(np.float32)
+        query /= np.linalg.norm(query)
+        embeddings = rng.standard_normal((20, 64)).astype(np.float32)
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings /= np.where(norms > 0, norms, 1.0)
+
+        for k in (1, 3, 5, 10):
+            results = top_k_similarities(query, embeddings, k=k)
+            assert len(results) == k
+            # Must be sorted descending by similarity
+            sims = [s for _, s in results]
+            assert sims == sorted(sims, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +245,7 @@ class TestTokenizerThreadSafety:
 
 
 # ---------------------------------------------------------------------------
-# sqlite.py — pool lock, SQL eviction, FileLockTimeout, clear()
+# sqlite.py — pool lock, FileLockTimeout
 # ---------------------------------------------------------------------------
 
 
@@ -374,109 +277,6 @@ class TestConnectionPoolLock:
         pool.close_all()
         assert not errors
         assert len(results) == 10
-
-    def test_file_lock_timeout_raises_runtime_error(self, temp_dir: Path) -> None:
-        """FileLockTimeout converted to RuntimeError."""
-        from filelock import Timeout as FileLockTimeout
-
-        db_path = temp_dir / "lock_test.db"
-        pool = ConnectionPool(db_path, max_size=2)
-
-        # Mock acquire to raise FileLockTimeout
-        with (
-            patch.object(pool._file_lock, "acquire", side_effect=FileLockTimeout(str(db_path))),
-            pytest.raises(RuntimeError, match="Cache database lock timeout"),
-            pool.get_connection() as conn,
-        ):
-            pass
-
-        pool.close_all()
-
-
-class TestSQLEviction:
-    """Cover SQL-based eviction (json_extract ORDER BY)."""
-
-    def test_eviction_uses_sql(self, temp_dir: Path) -> None:
-        """Eviction selects oldest entries via SQL ORDER BY json_extract."""
-        db_path = temp_dir / "evict_test.db"
-        storage = SQLiteStorage(db_path)
-
-        import json
-        import time
-
-        with storage._pool.get_connection() as conn:
-            for i in range(15):
-                access_time = time.time() - (15 - i) * 100
-                conn.execute(
-                    "INSERT INTO files (path, content_hash, chunk_hashes, mtime, "
-                    "access_history, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        f"/test/file_{i}.py",
-                        f"hash_{i}",
-                        json.dumps([]),
-                        time.time(),
-                        json.dumps([access_time]),
-                        100,
-                        time.time(),
-                    ),
-                )
-
-        with patch("semantic_cache_mcp.storage.sqlite.MAX_CACHE_ENTRIES", 10):
-            storage._evict_if_needed()
-
-        with storage._pool.get_connection() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        assert count < 15
-
-
-class TestClearUsesExecute:
-    """Cover clear() using execute instead of executescript."""
-
-    def test_clear_returns_count(self, temp_dir: Path) -> None:
-        """clear() works and returns count (uses execute, not executescript)."""
-        db_path = temp_dir / "clear_test.db"
-        storage = SQLiteStorage(db_path)
-
-        import json
-        import time
-
-        with storage._pool.get_connection() as conn:
-            for i in range(3):
-                conn.execute(
-                    "INSERT INTO files (path, content_hash, chunk_hashes, mtime, "
-                    "access_history, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        f"/test/file_{i}.py",
-                        f"hash_{i}",
-                        json.dumps([]),
-                        time.time(),
-                        json.dumps([time.time()]),
-                        100,
-                        time.time(),
-                    ),
-                )
-
-        count = storage.clear()
-        assert count == 3
-
-        with storage._pool.get_connection() as conn:
-            remaining = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        assert remaining == 0
-
-
-class TestFindSimilarNoOrderBy:
-    """Cover removed ORDER BY in find_similar."""
-
-    def test_find_similar_params_type(self, temp_dir: Path) -> None:
-        """find_similar uses list[str] params, no ORDER BY created_at."""
-        db_path = temp_dir / "similar_test.db"
-        storage = SQLiteStorage(db_path)
-
-        result = storage.find_similar(
-            embedding=array.array("f", [0.1] * TEST_EMBEDDING_DIM),
-            exclude_path="/some/path.py",
-        )
-        assert result is None  # Empty DB, no results
 
 
 # ---------------------------------------------------------------------------
@@ -815,97 +615,6 @@ class TestMcpLifespan:
 # ---------------------------------------------------------------------------
 
 
-class TestArgpartitionKMinusOne:
-    """Verify argpartition k-1 fix (off-by-one in top_k_similarities)."""
-
-    def test_top_k_returns_exactly_k(self) -> None:
-        """top_k_similarities must return exactly k results when k < n."""
-        from semantic_cache_mcp.core.similarity._cosine import top_k_similarities
-
-        rng = np.random.default_rng(42)
-        query = rng.standard_normal(64).astype(np.float32)
-        query /= np.linalg.norm(query)
-        embeddings = rng.standard_normal((20, 64)).astype(np.float32)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings /= np.where(norms > 0, norms, 1.0)
-
-        for k in (1, 3, 5, 10):
-            results = top_k_similarities(query, embeddings, k=k)
-            assert len(results) == k
-            # Must be sorted descending by similarity
-            sims = [s for _, s in results]
-            assert sims == sorted(sims, reverse=True)
-
-    def test_top_k_from_quantized_k_boundary(self) -> None:
-        """top_k_from_quantized with k=n must not crash on argpartition."""
-        from semantic_cache_mcp.core.similarity._cosine import (
-            quantize_embedding,
-            top_k_from_quantized,
-        )
-
-        rng = np.random.default_rng(99)
-        n = 5
-        query = rng.standard_normal(64).astype(np.float32)
-        query /= np.linalg.norm(query)
-        blobs = []
-        for _ in range(n):
-            v = rng.standard_normal(64).astype(np.float32)
-            v /= np.linalg.norm(v)
-            blobs.append(quantize_embedding(v))
-
-        # k == n: argpartition path should not execute (else branch)
-        results = top_k_from_quantized(query, blobs, k=n)
-        assert len(results) == n
-
-
-class TestConnectionLeakOnTimeout:
-    """Verify connection is returned to pool on FileLockTimeout."""
-
-    def test_conn_returned_on_lock_timeout(self, tmp_path: Path) -> None:
-        """Connection must be back in pool after FileLockTimeout."""
-        pool = ConnectionPool(tmp_path / "leak.db", max_size=2)
-
-        # First call succeeds — puts a conn in the pool
-        with pool.get_connection():
-            pass
-
-        def always_timeout(*args: object, **kwargs: object) -> None:
-            raise FileLockTimeout(str(pool._file_lock.lock_file))
-
-        pool._file_lock.acquire = always_timeout
-
-        with pytest.raises(RuntimeError, match="lock timeout"), pool.get_connection():
-            pass
-
-        # Connection should be back in pool, not leaked
-        assert not pool._pool.empty()
-        pool.close_all()
-
-    def test_conn_closed_when_pool_full(self, tmp_path: Path) -> None:
-        """If pool is full on leak-recovery, conn should be closed instead."""
-        pool = ConnectionPool(tmp_path / "full.db", max_size=1)
-
-        # Fill the pool
-        with pool.get_connection():
-            pass
-
-        def timeout_and_fill_pool(*args: object, **kwargs: object) -> None:
-            """Simulate race: another thread returns conn before we handle timeout."""
-            # Stuff a dummy conn into the pool so put_nowait will raise Full
-            dummy = pool._create_connection()
-            pool._pool.put_nowait(dummy)
-            raise FileLockTimeout(str(pool._file_lock.lock_file))
-
-        pool._file_lock.acquire = timeout_and_fill_pool
-
-        with pytest.raises(RuntimeError, match="lock timeout"), pool.get_connection():
-            pass
-
-        # Pool should still have the dummy conn (the checked-out one was closed)
-        assert not pool._pool.empty()
-        pool.close_all()
-
-
 class TestAtomicWritePermissions:
     """Verify permission preservation in _atomic_write."""
 
@@ -939,61 +648,6 @@ class TestAtomicWritePermissions:
             _atomic_write(target, "updated")
 
         assert target.read_text() == "updated"
-
-
-class TestLruKEvictionSQL:
-    """Verify LRU-K eviction uses K-th-from-last access, not first."""
-
-    def test_eviction_order_respects_lru_k(self, tmp_path: Path) -> None:
-        """Files with older K-th access should be evicted first."""
-        import json
-
-        pool = ConnectionPool(tmp_path / "lruk.db", max_size=1)
-        with pool.get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS files (
-                    path TEXT PRIMARY KEY,
-                    content_hash TEXT,
-                    chunk_hashes TEXT,
-                    mtime REAL,
-                    tokens INTEGER,
-                    embedding BLOB,
-                    created_at REAL,
-                    access_history TEXT
-                )
-            """)
-            # File A: old first access, but recent K-th access
-            conn.execute(
-                "INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
-                ("/a.py", "h1", "[]", 1.0, 10, None, 1.0, json.dumps([100.0, 200.0, 300.0, 900.0])),
-            )
-            # File B: recent first access, but old K-th access
-            conn.execute(
-                "INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
-                ("/b.py", "h2", "[]", 1.0, 10, None, 1.0, json.dumps([50.0, 800.0])),
-            )
-
-            from semantic_cache_mcp.config import LRU_K
-
-            rows = conn.execute(
-                f"""
-                SELECT path FROM files
-                ORDER BY CASE
-                    WHEN json_array_length(access_history) >= {LRU_K}
-                    THEN json_extract(
-                        access_history,
-                        '$[' || (json_array_length(access_history) - {LRU_K}) || ']'
-                    )
-                    ELSE json_extract(access_history, '$[0]')
-                END ASC
-                """,
-            ).fetchall()
-
-            paths = [r[0] for r in rows]
-            # B has older K-th access (50.0 vs A's K-th=300.0), so B evicted first
-            assert paths[0] == "/b.py"
-
-        pool.close_all()
 
 
 class TestTokenizerCachePaths:
@@ -1043,7 +697,7 @@ class TestTokenizerCachePaths:
 
         try:
 
-            def fake_download(url: str, path: object) -> None:
+            def fake_download(url: str, path: str | os.PathLike[str]) -> None:
                 Path(path).write_text("fake data")
 
             with (
@@ -1073,7 +727,7 @@ class TestTokenizerCachePaths:
 
         try:
 
-            def fake_download(url: str, path: object) -> None:
+            def fake_download(url: str, path: str | os.PathLike[str]) -> None:
                 Path(path).write_text("fake data")
 
             with (

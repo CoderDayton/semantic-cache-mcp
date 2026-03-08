@@ -1,23 +1,8 @@
-"""
-Ultra-optimized similarity utilities with quantization, SIMD batching, and pruning.
-
-Performance tiers:
-- Tier 1: NumPy baseline (current) → ~1-5µs per pair
-- Tier 2: int8 quantization → ~0.2-1µs per pair (4-8× faster)
-- Tier 3: Dimension pruning (PDX) → ~40% reduction + quantization
-- Tier 4: GPU acceleration (optional) → 100-1000× for massive batches
-
-For typical RAG/embedding search:
-- Batch 1000 vectors (384D NOMIC embeds) vs single query:
-  - NumPy baseline: ~5ms
-  - int8 quantized: ~0.6ms (8× faster)
-  - Pruned int8: ~0.35ms (14× faster)
-"""
+"""Cosine similarity utilities with SIMD batching and dimension pruning."""
 
 from __future__ import annotations
 
 import array
-import struct
 
 import numpy as np
 
@@ -29,10 +14,6 @@ import numpy as np
 class SimilarityConfig:
     """Tunable similarity search parameters."""
 
-    # Quantization (enabled - 22x storage reduction, 100% recall@10)
-    USE_QUANTIZATION: bool = True
-    QUANTIZATION_BITS: int = 8  # int8 is the sweet spot: 4-8× faster, <0.1% accuracy loss
-
     # Pruning strategy (PDX-inspired dimension reduction)
     USE_PRUNING: bool = True
     PRUNING_FRACTION: float = 0.8  # Use 80% of most-significant dims, skip 20%
@@ -40,195 +21,6 @@ class SimilarityConfig:
 
 
 DEFAULT_CONFIG = SimilarityConfig()
-
-
-# ---------------------------------------------------------------------------
-# Quantization (int8)
-# ---------------------------------------------------------------------------
-
-
-def _quantize_vector(v: array.array | list | np.ndarray) -> tuple[np.ndarray, float]:
-    """
-    Quantize embedding to int8.
-
-    int8 quantization: scale float32 to [-128, 127] range.
-    Saves 4× memory and enables SIMD int8 dot products (4-8× faster).
-
-    Returns: (quantized_int8, scale_factor)
-    """
-    # Convert to numpy if needed
-    if isinstance(v, array.array):
-        arr = np.frombuffer(v, dtype=np.float32)
-    else:
-        arr = np.asarray(v, dtype=np.float32)
-
-    # Find max absolute value
-    max_val = np.max(np.abs(arr))
-    if max_val == 0:
-        return np.zeros(len(arr), dtype=np.int8), 1.0
-
-    # Scale to int8 range [-128, 127]
-    scale = 127.0 / max_val
-    quantized = np.round(arr * scale).astype(np.int8)
-
-    return quantized, scale
-
-
-def _dequantize_scale(q1: np.ndarray, s1: float, q2: np.ndarray, s2: float) -> float:
-    """
-    Compute dot product from two quantized vectors and their scales.
-
-    dot(v1, v2) ≈ dot(q1, q2) / (s1 * s2)
-    """
-    # int8 dot product (SIMD-friendly)
-    dot_int = np.dot(q1.astype(np.int32), q2.astype(np.int32))
-
-    # Rescale to original value
-    return float(dot_int) / (1.0 * s1 * s2)
-
-
-# ---------------------------------------------------------------------------
-# Pre-quantization for storage (22x compression)
-# ---------------------------------------------------------------------------
-
-
-def quantize_embedding(v: array.array | list | np.ndarray) -> bytes:
-    """
-    Quantize embedding to int8 for compact storage.
-
-    Storage format: scale (4 bytes float32) + quantized (N bytes int8)
-    768D embedding: 16,970 bytes (JSON) → 772 bytes (quantized) = 22x reduction
-
-    Args:
-        v: Embedding vector (any format)
-
-    Returns:
-        Binary blob: struct.pack('<f', scale) + int8_array.tobytes()
-    """
-    # Convert to numpy
-    if isinstance(v, array.array):
-        arr = np.frombuffer(v, dtype=np.float32).copy()
-    else:
-        arr = np.asarray(v, dtype=np.float32)
-
-    # Compute scale factor
-    max_val = np.max(np.abs(arr))
-    scale = 1.0 if max_val == 0 else 127.0 / max_val
-
-    # Quantize to int8
-    quantized = np.round(arr * scale).astype(np.int8)
-
-    # Pack: scale (float32) + quantized vector (int8[N])
-    return struct.pack("<f", scale) + quantized.tobytes()
-
-
-def dequantize_embedding(blob: bytes) -> array.array:
-    """
-    Dequantize int8 embedding back to float32.
-
-    Args:
-        blob: Binary blob from quantize_embedding()
-
-    Returns:
-        Reconstructed embedding as array.array
-    """
-    # Unpack scale (first 4 bytes)
-    scale = struct.unpack("<f", blob[:4])[0]
-
-    # Unpack quantized vector
-    quantized = np.frombuffer(blob[4:], dtype=np.int8)
-
-    # Dequantize and convert via memcpy (not .tolist())
-    arr = (quantized.astype(np.float32) / scale).astype(np.float32)
-    result = array.array("f")
-    result.frombytes(arr.tobytes())
-    return result
-
-
-def similarity_from_quantized_blob(
-    query: array.array | list | np.ndarray,
-    quantized_blobs: list[bytes],
-) -> np.ndarray:
-    """
-    Compute similarities directly from pre-quantized storage blobs.
-
-    Optimized path: avoids re-quantizing stored vectors on every query.
-    ~3x faster than quantizing at query time for large batches.
-
-    Args:
-        query: Query embedding (will be quantized once)
-        quantized_blobs: List of binary blobs from quantize_embedding()
-
-    Returns:
-        Array of similarity scores
-    """
-    if not quantized_blobs:
-        return np.array([], dtype=np.float32)
-
-    # Quantize query once
-    if isinstance(query, array.array):
-        q_arr = np.frombuffer(query, dtype=np.float32).copy()
-    else:
-        q_arr = np.asarray(query, dtype=np.float32)
-
-    q_max = np.max(np.abs(q_arr))
-    q_scale = 127.0 / q_max if q_max > 0 else 1.0
-    q_quantized = np.round(q_arr * q_scale).astype(np.int8)
-
-    # Extract scales and vectors from blobs
-    n = len(quantized_blobs)
-    dim = len(quantized_blobs[0]) - 4  # blob size minus scale
-
-    scales = np.empty(n, dtype=np.float32)
-    matrix = np.empty((n, dim), dtype=np.int8)
-
-    # Single-buffer deserialization: concat blobs, reshape, split scale/vector
-    all_data = b"".join(quantized_blobs)
-    raw = np.frombuffer(all_data, dtype=np.uint8).reshape(n, dim + 4)
-    scales = raw[:, :4].copy().view(np.float32).flatten()
-    matrix = raw[:, 4:].view(np.int8)
-
-    # Batch int8 dot product (SIMD-friendly)
-    # Use int32 accumulator to avoid overflow
-    dots = matrix.astype(np.int32) @ q_quantized.astype(np.int32)
-
-    # Rescale to cosine similarity
-    sims = dots.astype(np.float32) / (scales * q_scale)
-
-    return sims
-
-
-def top_k_from_quantized(
-    query: array.array | list | np.ndarray,
-    quantized_blobs: list[bytes],
-    k: int = 10,
-) -> list[tuple[int, float]]:
-    """
-    Find top-K similar vectors from pre-quantized storage.
-
-    Args:
-        query: Query embedding
-        quantized_blobs: Pre-quantized vectors from storage
-        k: Number of results
-
-    Returns:
-        List of (index, similarity) tuples, descending by similarity
-    """
-    if not quantized_blobs:
-        return []
-
-    sims = similarity_from_quantized_blob(query, quantized_blobs)
-    k = min(k, len(sims))
-
-    # O(N) partial sort via argpartition instead of O(N log N) full sort
-    # kth arg is 0-based: k-1 ensures the k smallest values are in [:k]
-    if k < len(sims):
-        part_idx = np.argpartition(-sims, k - 1)[:k]
-        top_indices = part_idx[np.argsort(-sims[part_idx])]
-    else:
-        top_indices = np.argsort(-sims)
-
-    return [(int(idx), float(sims[idx])) for idx in top_indices]
 
 
 # ---------------------------------------------------------------------------
@@ -277,22 +69,15 @@ def _select_pruning_dims(
 def cosine_similarity(
     a: array.array | list | np.ndarray,
     b: array.array | list | np.ndarray,
-    use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
 ) -> float:
-    """
-    Compute cosine similarity with optional int8 quantization.
+    """Cosine similarity between two pre-normalized embedding vectors.
 
-    For normalized vectors, cosine similarity = dot product.
-
-    Args:
-        a: First embedding vector
-        b: Second embedding vector
-        use_quantization: Whether to quantize to int8 (4-8× faster)
+    Vectors MUST be L2-normalized (as from NOMIC/BAAI models). If not,
+    the result is a dot product, not cosine similarity.
 
     Returns:
         Similarity score in [-1, 1]
     """
-    # Convert to numpy if needed
     if isinstance(a, array.array):
         arr_a = np.frombuffer(a, dtype=np.float32)
     else:
@@ -303,37 +88,17 @@ def cosine_similarity(
     else:
         arr_b = np.asarray(b, dtype=np.float32)
 
-    if use_quantization:
-        # Quantize both vectors
-        q_a, s_a = _quantize_vector(arr_a)
-        q_b, s_b = _quantize_vector(arr_b)
-
-        # Compute similarity from quantized versions
-        return _dequantize_scale(q_a, s_a, q_b, s_b)
-    else:
-        # Direct float32 dot product (baseline)
-        return float(np.dot(arr_a, arr_b))
+    return float(np.dot(arr_a, arr_b))
 
 
 def cosine_similarity_with_pruning(
     a: array.array | list | np.ndarray,
     b: array.array | list | np.ndarray,
-    use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
     pruning_fraction: float = DEFAULT_CONFIG.PRUNING_FRACTION,
 ) -> float:
-    """
-    Cosine similarity with dimension pruning (PDX-inspired).
+    """Cosine similarity with dimension pruning (PDX-inspired).
 
     Skips low-magnitude dimensions to trade 0.5% accuracy for 20-40% speed.
-
-    Args:
-        a: First vector
-        b: Second vector
-        use_quantization: Use int8 quantization
-        pruning_fraction: Fraction of dimensions to keep (e.g., 0.8 = keep 80%)
-
-    Returns:
-        Similarity score
     """
     if isinstance(a, array.array):
         arr_a = np.frombuffer(a, dtype=np.float32)
@@ -345,19 +110,10 @@ def cosine_similarity_with_pruning(
     else:
         arr_b = np.asarray(b, dtype=np.float32)
 
-    # Select dimensions to keep (based on query magnitude)
     dims = _select_pruning_dims(arr_a, pruning_fraction, adaptive=True)
-
-    # Prune both vectors
     pruned_a = arr_a[dims]
     pruned_b = arr_b[dims]
-
-    if use_quantization:
-        q_a, s_a = _quantize_vector(pruned_a)
-        q_b, s_b = _quantize_vector(pruned_b)
-        return _dequantize_scale(q_a, s_a, q_b, s_b)
-    else:
-        return float(np.dot(pruned_a, pruned_b))
+    return float(np.dot(pruned_a, pruned_b))
 
 
 # ---------------------------------------------------------------------------
@@ -368,109 +124,46 @@ def cosine_similarity_with_pruning(
 def cosine_similarity_batch(
     query: array.array | list | np.ndarray,
     vectors: list[array.array | list | np.ndarray],
-    use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
     use_pruning: bool = DEFAULT_CONFIG.USE_PRUNING,
 ) -> list[float]:
-    """
-    Batch cosine similarity with quantization and optional pruning.
-
-    For 1000 vectors (384D):
-    - Baseline: ~5ms
-    - Quantized: ~0.6ms
-    - Quantized + pruned: ~0.35ms
-
-    Args:
-        query: Query embedding
-        vectors: List of embedding vectors
-        use_quantization: Use int8 quantization
-        use_pruning: Use dimension pruning
-
-    Returns:
-        List of similarity scores
-    """
+    """Batch cosine similarity with optional dimension pruning."""
     if not vectors:
         return []
 
-    # Convert query
     if isinstance(query, array.array):
         q_arr = np.frombuffer(query, dtype=np.float32)
     else:
         q_arr = np.asarray(query, dtype=np.float32)
 
-    # Pre-allocate matrix (avoids intermediate list + vstack copy)
     dim = len(vectors[0]) if not isinstance(vectors[0], array.array) else len(vectors[0])
     matrix = np.empty((len(vectors), dim), dtype=np.float32)
     for i, v in enumerate(vectors):
         matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v
 
-    # Apply pruning mask to both query and matrix
     if use_pruning:
         dims = _select_pruning_dims(q_arr, DEFAULT_CONFIG.PRUNING_FRACTION, adaptive=True)
         q_arr = q_arr[dims]
         matrix = matrix[:, dims]
 
-    if use_quantization:
-        # Batch quantize: query once, matrix rows in one shot
-        q_query, s_query = _quantize_vector(q_arr)
-        max_vals = np.max(np.abs(matrix), axis=1, keepdims=True)
-        max_vals[max_vals == 0] = 1.0
-        scales = 127.0 / max_vals.flatten()
-        q_matrix = (matrix * scales.reshape(-1, 1)).round().astype(np.int8)
-        sims = (q_matrix @ q_query.astype(np.int32)).astype(np.float32)
-        sims = sims / (scales * s_query)
-        return sims.tolist()
-    else:
-        return (matrix @ q_arr).tolist()
+    return (matrix @ q_arr).tolist()
 
 
 def cosine_similarity_batch_matrix(
     query: array.array | list | np.ndarray,
     vectors: list[array.array | list | np.ndarray],
-    use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
 ) -> np.ndarray:
-    """
-    Batch similarity via single matrix operation (fastest for large batches).
-
-    Avoids Python loop overhead by materializing all-at-once with NumPy.
-
-    Args:
-        query: Query embedding
-        vectors: List of vectors
-        use_quantization: Use int8 quantization
-
-    Returns:
-        NumPy array of similarities
-    """
-    # Convert query
+    """Batch similarity via single matrix operation (fastest for large batches)."""
     if isinstance(query, array.array):
         q_arr = np.frombuffer(query, dtype=np.float32)
     else:
         q_arr = np.asarray(query, dtype=np.float32)
 
-    # Pre-allocate matrix (avoids intermediate list + vstack copy)
     dim = len(vectors[0]) if not isinstance(vectors[0], array.array) else len(vectors[0])
     matrix = np.empty((len(vectors), dim), dtype=np.float32)
     for i, v in enumerate(vectors):
         matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v
 
-    if use_quantization:
-        # Quantize all at once
-        q_query, s_query = _quantize_vector(q_arr)
-
-        # Quantize each row of matrix
-        max_vals = np.max(np.abs(matrix), axis=1, keepdims=True)
-        max_vals[max_vals == 0] = 1.0
-        scales = 127.0 / max_vals.flatten()
-        q_matrix = (matrix * (scales.reshape(-1, 1))).round().astype(np.int8)
-
-        # int8 batch dot product
-        sims = (q_matrix @ q_query.astype(np.int32)).astype(np.float32)
-        sims = sims / (scales * s_query)
-
-        return sims
-    else:
-        # Standard matrix-vector product
-        return matrix @ q_arr
+    return matrix @ q_arr
 
 
 # ---------------------------------------------------------------------------
@@ -482,25 +175,10 @@ def top_k_similarities(
     query: array.array | list | np.ndarray,
     vectors: list[array.array | list | np.ndarray],
     k: int = 10,
-    use_quantization: bool = DEFAULT_CONFIG.USE_QUANTIZATION,
 ) -> list[tuple[int, float]]:
-    """
-    Find top-K most similar vectors efficiently.
-
-    For large vector sets, computing all similarities then selecting top-K
-    is faster than partial selection algorithms due to SIMD efficiency.
-
-    Args:
-        query: Query embedding
-        vectors: List of vectors to search
-        k: Number of top results
-        use_quantization: Use quantization
-
-    Returns:
-        List of (index, similarity) tuples, sorted by similarity descending
-    """
+    """Find top-K most similar vectors efficiently."""
     k = min(k, len(vectors))
-    sims = cosine_similarity_batch_matrix(query, vectors, use_quantization)
+    sims = cosine_similarity_batch_matrix(query, vectors)
 
     # O(N) partial sort via argpartition instead of O(N log N) full sort
     # kth arg is 0-based: k-1 ensures the k smallest values are in [:k]
@@ -511,40 +189,3 @@ def top_k_similarities(
         top_indices = np.argsort(-sims)
 
     return [(int(idx), float(sims[idx])) for idx in top_indices]
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics and benchmarking
-# ---------------------------------------------------------------------------
-
-
-def estimate_speedup(
-    num_vectors: int,
-    embedding_dim: int,
-    use_quantization: bool = True,
-    use_pruning: bool = True,
-) -> dict:
-    """
-    Estimate speedup from optimizations.
-
-    Empirical numbers from benchmarks on typical hardware.
-    """
-    baseline_us = num_vectors * embedding_dim / 100000  # ~1-5µs per pair baseline
-
-    speedup_factors = {
-        "baseline": 1.0,
-        "quantization": 6.0 if use_quantization else 1.0,
-        "pruning": 1.3 if use_pruning else 1.0,
-    }
-
-    total_speedup = speedup_factors["quantization"] * speedup_factors["pruning"]
-    estimated_us = baseline_us / total_speedup
-
-    return {
-        "num_vectors": num_vectors,
-        "embedding_dim": embedding_dim,
-        "baseline_µs": round(baseline_us, 2),
-        "optimized_µs": round(estimated_us, 2),
-        "speedup_factor": round(total_speedup, 1),
-        "speedup_factors": speedup_factors,
-    }
