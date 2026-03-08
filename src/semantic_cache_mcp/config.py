@@ -75,6 +75,9 @@ MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # LRU-K evicti
 # Embedding device: "cpu" (default, no VRAM usage), "cuda" (GPU), "auto" (detect)
 EMBEDDING_DEVICE: Final = environ.get("EMBEDDING_DEVICE", "cpu").strip().lower()
 
+# Embedding model: any FastEmbed-supported model name
+EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip()
+
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)

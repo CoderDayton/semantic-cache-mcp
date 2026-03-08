@@ -370,6 +370,10 @@ class SemanticCache:
         """Record access for LRU-K tracking."""
         self._storage.record_access(path)
 
+    def update_mtime(self, path: str, new_mtime: float) -> None:
+        """Update cached mtime without re-storing content or re-embedding."""
+        self._storage.update_mtime(path, new_mtime)
+
     def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:

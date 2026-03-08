@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.embeddings import embed_query
+from ..core.hashing import hash_content
 from ..core.similarity import cosine_similarity
 from ..types import (
     DiffResult,
@@ -77,19 +78,27 @@ def semantic_search(
         return SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
 
     # Build matches with directory filtering
-    matches: list[SearchMatch] = []
+    filtered: list[tuple[str, str, float]] = []
     for path, preview, score in results:
-        if len(matches) >= k:
+        if len(filtered) >= k:
             break
         # Secure directory filter: is_relative_to prevents prefix attacks
         if resolved_dir and not Path(path).is_relative_to(resolved_dir):
             continue
+        filtered.append((path, preview, score))
+
+    # Normalize scores to 0–1 range (best result = 1.0) so LLMs can
+    # judge relevance without knowing RRF score internals.
+    max_score = filtered[0][2] if filtered else 1.0
+    matches: list[SearchMatch] = []
+    for path, preview, score in filtered:
         entry = cache.get(path)
         tokens = entry.tokens if entry else 0
+        normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
             SearchMatch(
                 path=path,
-                similarity=round(score, 4),
+                similarity=normalized,
                 tokens=tokens,
                 preview=preview.replace("\n", " "),
             )
@@ -229,13 +238,17 @@ def find_similar_files(
     source_tokens = 0
     content = file_path.read_text(encoding="utf-8")
 
-    if cached and cached.mtime >= file_path.stat().st_mtime:
+    file_mtime = file_path.stat().st_mtime
+    if cached and cached.mtime >= file_mtime:
+        source_tokens = cached.tokens
+    elif cached and hash_content(content) == cached.content_hash:
+        # Content identical despite mtime change — update mtime, treat as cached
+        cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
     else:
         source_tokens = count_tokens(content)
-        mtime = file_path.stat().st_mtime
         source_embedding = cache.get_embedding(content, str(file_path))
-        cache.put(str(file_path), content, mtime, source_embedding)
+        cache.put(str(file_path), content, file_mtime, source_embedding)
 
     # VectorStorage doesn't return embeddings from get() — always compute
     source_embedding = cache.get_embedding(content, str(file_path))

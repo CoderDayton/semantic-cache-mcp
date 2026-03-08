@@ -299,6 +299,24 @@ class VectorStorage:
             if updates:
                 self._collection._catalog.update_metadata_batch(updates)
 
+    def update_mtime(self, path: str, new_mtime: float) -> None:
+        """Update cached mtime without re-storing content or re-embedding.
+
+        Used when content hash matches but mtime changed (touch, git checkout).
+        Prevents repeated hash checks on subsequent reads.
+        """
+        with self._lock:
+            results = self._find_docs_by_path(path)
+            if not results:
+                return
+
+            updates: list[tuple[int, dict]] = []
+            for doc_id, _meta, _text in results:
+                updates.append((doc_id, {_META_MTIME: new_mtime}))
+
+            if updates:
+                self._collection._catalog.update_metadata_batch(updates)
+
     # -------------------------------------------------------------------------
     # Similarity search
     # -------------------------------------------------------------------------

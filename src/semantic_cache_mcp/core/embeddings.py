@@ -16,13 +16,14 @@ import numpy as np
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
-from ..config import CACHE_DIR, EMBEDDING_DEVICE
+from ..config import CACHE_DIR, EMBEDDING_DEVICE, EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Model configuration — bge-small is 6x smaller than nomic (33M vs 137M params),
+# Model configuration — default bge-small is 6x smaller than nomic (33M vs 137M params),
 # 384-dim vs 768-dim, fast on CPU, and quality is sufficient for file similarity.
-FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Configurable via EMBEDDING_MODEL env var for users who want different models.
+FASTEMBED_MODEL = EMBEDDING_MODEL
 FASTEMBED_CACHE_DIR = CACHE_DIR / "models"
 
 # Singleton instance

@@ -66,6 +66,11 @@ def read(
     - Keep diff_mode=true during iteration; set false when you need full content again.
     - Use offset/limit to read specific line ranges of large files.
 
+    When a file is truncated:
+    - The response includes a "hint" with the offset to continue reading.
+    - Use read with that offset to get the next section. Do NOT re-read from the beginning.
+    - Example: if hint says offset=500, call read(path, offset=500, limit=500).
+
     Args:
         path: Path to the file to read
         max_size: Maximum content size to return (default: 100000)
@@ -142,6 +147,18 @@ def read(
             payload["is_diff"] = result.is_diff
             payload["truncated"] = result.truncated
             payload["semantic_match"] = result.semantic_match
+            if result.truncated:
+                # Guide the LLM to use offset/limit for remaining content
+                returned_lines = result.content.count("\n") + 1
+                entry = cache.get(str(Path(path).expanduser().resolve()))
+                total_tokens = entry.tokens if entry else result.tokens_original
+                payload["lines"] = {"returned": returned_lines}
+                payload["total_tokens"] = total_tokens
+                payload["hint"] = (
+                    f"File was truncated ({total_tokens} tokens total). "
+                    f"Use read with offset={returned_lines + 1} "
+                    f"to continue reading. Do NOT re-read from the beginning."
+                )
         if mode == _MODE_DEBUG:
             payload["from_cache"] = result.from_cache
             payload["tokens_saved"] = result.tokens_saved
@@ -166,32 +183,51 @@ def read(
 def stats(
     ctx: Context,
 ) -> str:
-    """Get cache statistics: files tracked, tokens, compression ratios, embedding status."""
+    """Get cache statistics, session activity, and lifetime metrics.
+
+    Returns cache occupancy, token savings, tool call counts, embedding model
+    info, and process memory usage. Useful for monitoring cache effectiveness
+    and diagnosing performance issues.
+    """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
     cache_stats = cache.get_stats()
 
-    # Add embedding model info
     model_info = get_model_info()
-    result: dict[str, Any] = {
-        **cache_stats,
-        "embedding_model": model_info["model"],
-        "embedding_ready": model_info["ready"],
-    }
+    session = cache_stats.get("session", {})
+
+    tokens_saved = session.get("tokens_saved", 0)
+    tokens_original = session.get("tokens_original", 0)
+    savings_pct = round(tokens_saved / tokens_original * 100, 1) if tokens_original > 0 else 0
+
     payload: dict[str, Any] = {"ok": True, "tool": "stats"}
+
     if mode == "compact":
-        payload.update(
-            {
-                "files_cached": result["files_cached"],
-                "total_tokens_cached": result["total_tokens_cached"],
-                "embedding_ready": result["embedding_ready"],
-            }
-        )
+        payload["files_cached"] = cache_stats.get("files_cached", 0)
+        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
+        payload["tokens_saved"] = tokens_saved
+        payload["savings_pct"] = savings_pct
+        payload["cache_hits"] = session.get("cache_hits", 0)
+        payload["cache_misses"] = session.get("cache_misses", 0)
+        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
+        payload["embedding_ready"] = model_info["ready"]
+
     elif mode == "normal":
-        payload.update(result)
-    else:
-        payload.update(result)
+        payload["files_cached"] = cache_stats.get("files_cached", 0)
+        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
+        payload["tokens_saved"] = tokens_saved
+        payload["savings_pct"] = savings_pct
+        payload["cache_hits"] = session.get("cache_hits", 0)
+        payload["cache_misses"] = session.get("cache_misses", 0)
+        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
+        payload["embedding_model"] = model_info["model"]
+        payload["embedding_ready"] = model_info["ready"]
+        payload["uptime_s"] = round(session.get("uptime_s", 0), 1)
+
+    else:  # debug
+        payload.update(cache_stats)
+        payload["embedding"] = model_info
         payload["output_mode"] = mode
 
     return _render_response(payload, max_response_tokens)
@@ -758,6 +794,13 @@ def batch_read(
                 item: dict[str, Any] = {"path": f.path, "status": f.status}
                 if f.path in result.contents:
                     item["content"] = result.contents[f.path]
+                if f.status == "truncated":
+                    content = result.contents.get(f.path, "")
+                    returned_lines = content.count("\n") + 1 if content else 0
+                    item["hint"] = (
+                        f"Truncated. Use read with offset={returned_lines + 1} "
+                        f"to continue. Do NOT re-read from the beginning."
+                    )
                 if mode == _MODE_DEBUG:
                     item["tokens"] = f.tokens
                     item["from_cache"] = f.from_cache
@@ -910,7 +953,7 @@ def grep(
 ) -> str:
     """Search cached file content by regex or literal pattern with line numbers.
 
-    Like ripgrep but searches the cache — returns matching lines with context.
+    Like ripgrep but searches the semantic cache — returns matching lines with context.
     Unlike `search` (ranked BM25+vector), this does exact pattern matching.
 
     IMPORTANT: Only searches files already in the cache. Read files first.

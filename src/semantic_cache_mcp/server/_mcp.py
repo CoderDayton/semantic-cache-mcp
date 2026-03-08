@@ -10,10 +10,44 @@ from fastmcp import FastMCP
 from fastmcp.server.lifespan import lifespan
 
 from ..cache import SemanticCache
+from ..config import DB_PATH
 from ..core.embeddings import get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _migrate_v2_to_v3() -> None:
+    """Remove legacy v0.2.0 SQLite cache on first v0.3.0 startup.
+
+    v0.3.0 switched from SQLiteStorage (cache.db with chunks/files/lsh_index tables)
+    to VectorStorage (vecdb.db). The old database is incompatible and just wastes disk.
+    """
+    if not DB_PATH.exists():
+        return
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(DB_PATH))
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        conn.close()
+        # Only delete if it has the old v0.2.0 schema — don't touch unrelated DBs
+        if {"chunks", "files", "lsh_index"} <= tables:
+            DB_PATH.unlink()
+            # Also remove WAL/SHM if present
+            for suffix in ("-wal", "-shm"):
+                wal = DB_PATH.with_name(DB_PATH.name + suffix)
+                if wal.exists():
+                    wal.unlink()
+            logger.info(
+                "Migrated from v0.2.0: removed legacy cache.db "
+                "(cache will rebuild automatically as files are read)"
+            )
+    except Exception:
+        logger.debug("Could not check legacy cache.db for migration", exc_info=True)
 
 
 @lifespan
@@ -46,6 +80,7 @@ async def app_lifespan(server: FastMCP):
                 logger.info(f"Embedding model ready: {model_info['model']}")
 
             cache = SemanticCache()
+            _migrate_v2_to_v3()
             logger.info("Semantic cache MCP server started")
         except Exception:
             logger.exception("Failed to initialize semantic cache")
