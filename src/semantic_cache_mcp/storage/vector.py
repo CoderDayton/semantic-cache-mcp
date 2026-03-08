@@ -9,6 +9,7 @@ Replaces compressed chunk storage with vector + raw text metadata pattern:
 
 from __future__ import annotations
 
+import array
 import json
 import logging
 import threading
@@ -138,20 +139,32 @@ class VectorStorage:
 
             # Prefer parent doc metadata (has file-level tokens, hash, etc.)
             # For single-doc files there is no parent, so use the only doc.
+            selected_id = results[0][0]
             meta = results[0][1]
-            for _doc_id, m, _text in results:
+            for doc_id, m, _text in results:
                 if m.get(_META_IS_PARENT, False):
+                    selected_id = doc_id
                     meta = m
                     break
 
             access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
+
+            # Retrieve embedding from catalog so compare_files() can compute similarity.
+            embedding: EmbeddingVector | None = None
+            try:
+                emb_map = self._collection._catalog.get_embeddings_by_ids([selected_id])
+                raw = emb_map.get(selected_id)
+                if raw is not None:
+                    embedding = array.array("f", raw)
+            except Exception:  # nosec B110 — best-effort embedding retrieval
+                pass
 
             return CacheEntry(
                 path=meta[_META_PATH],
                 content_hash=meta[_META_CONTENT_HASH],
                 mtime=meta[_META_MTIME],
                 tokens=meta[_META_TOKENS],
-                embedding=None,  # Embedding is in the HNSW index, not returned here
+                embedding=embedding,
                 created_at=meta[_META_CREATED_AT],
                 access_history=access_history,
             )
@@ -658,7 +671,11 @@ class VectorStorage:
                 path = meta.get(_META_PATH, "")
                 if path:
                     unique_paths.add(path)
-                total_tokens += meta.get(_META_TOKENS, 0)
+                # Only count tokens from parent docs or single-chunk files.
+                # Child chunks also store token counts, so summing all docs
+                # would double-count chunked files.
+                if meta.get(_META_IS_PARENT, False) or meta.get(_META_TOTAL_CHUNKS, 1) == 1:
+                    total_tokens += meta.get(_META_TOKENS, 0)
 
             return {
                 "files_cached": len(unique_paths),
@@ -713,14 +730,18 @@ class VectorStorage:
 
     def _evict_if_needed(self) -> None:
         """Evict entries using LRU-K policy if over limit."""
-        count = self._collection.count()
-        if count <= MAX_CACHE_ENTRIES:
+        # Get all docs once — used for both the file-count check and LRU scoring.
+        all_docs = self._collection._catalog.get_all_docs_with_text()
+
+        # Count unique files, not documents. Chunked files span multiple
+        # documents, so using doc count fires eviction too early.
+        unique_file_count = len(
+            {meta.get(_META_PATH) for _, _, meta in all_docs if meta.get(_META_PATH)}
+        )
+        if unique_file_count <= MAX_CACHE_ENTRIES:
             return
 
-        evict_count = max(1, count // 10)
-
-        # Get all docs with access history for LRU-K scoring
-        all_docs = self._collection._catalog.get_all_docs_with_text()
+        evict_count = max(1, unique_file_count // 10)
 
         # Score each unique path by its K-th most recent access
         path_scores: dict[str, tuple[float, list[int]]] = {}

@@ -148,16 +148,17 @@ def read(
             payload["truncated"] = result.truncated
             payload["semantic_match"] = result.semantic_match
             if result.truncated:
-                # Guide the LLM to use offset/limit for remaining content
-                returned_lines = result.content.count("\n") + 1
+                # Truncated reads use semantic summarization — the returned
+                # content is non-contiguous, so line numbers don't map to the
+                # original file. Don't hint a specific offset; instead tell
+                # the caller to use offset/limit to read specific line ranges.
                 entry = cache.get(str(Path(path).expanduser().resolve()))
                 total_tokens = entry.tokens if entry else result.tokens_original
-                payload["lines"] = {"returned": returned_lines}
                 payload["total_tokens"] = total_tokens
                 payload["hint"] = (
-                    f"File was truncated ({total_tokens} tokens total). "
-                    f"Use read with offset={returned_lines + 1} "
-                    f"to continue reading. Do NOT re-read from the beginning."
+                    f"File was semantically summarized ({total_tokens} tokens total). "
+                    f"Use read with offset=<line> and limit=<n> to read specific "
+                    f"sections of the original file."
                 )
         if mode == _MODE_DEBUG:
             payload["from_cache"] = result.from_cache
