@@ -68,6 +68,17 @@ Restart Claude Code. Done.
 
 > **Why Option 2?** — `uvx` spawns an isolated process per invocation, each loading its own embedding model (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy, multiplying RAM usage. `uv tool install` puts the binary on your `PATH` so all projects share one installed copy and the model is loaded once per process.
 
+### GPU Acceleration (Optional)
+
+For NVIDIA GPU acceleration, install with the `gpu` extra:
+
+```bash
+uv tool install "semantic-cache-mcp[gpu]"
+# or with uvx: uvx "semantic-cache-mcp[gpu]"
+```
+
+Then set `EMBEDDING_DEVICE=gpu` in your MCP config env block. Falls back to CPU automatically if CUDA is unavailable.
+
 ### Block Native File Tools (Recommended)
 
 Disable the client's built-in file tools so all file I/O routes through semantic-cache.

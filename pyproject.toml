@@ -1,6 +1,6 @@
 [project]
 name = "semantic-cache-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Lightweight MCP server for semantic file caching with 80%+ token reduction"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,11 +8,13 @@ dependencies = [
     "blake3>=1.0.8",
     "fastembed>=0.5.1",
     "fastmcp>=3.0.0b1",
-    "onnxruntime>=1.19.0",
     "simplevecdb>=2.3.0",
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "fastembed-gpu>=0.5.1",
+]
 dev = [
     "bandit>=1.7.0",
     "mypy>=1.8.0",

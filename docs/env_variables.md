@@ -17,7 +17,18 @@ All environment variables are optional. Defaults are tuned for typical usage.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model name for semantic search/similarity. Changing this clears and rebuilds all cached embeddings on next use. See [supported models](https://qdrant.github.io/fastembed/examples/Supported_Models/). |
-| `EMBEDDING_DEVICE` | `cpu` | Hardware for embedding inference. Options: `cpu` (no GPU needed), `cuda` (NVIDIA GPU via ONNX Runtime), `auto` (detect available). |
+| `EMBEDDING_DEVICE` | `cpu` | Hardware for embedding inference. Options: `cpu` (no GPU needed), `gpu` or `cuda` (NVIDIA GPU via ONNX Runtime), `auto` (detect available). Requires `fastembed-gpu` for GPU — see below. |
+
+### GPU acceleration
+
+The default install uses CPU inference via `fastembed`. To enable NVIDIA GPU acceleration:
+
+```bash
+uv tool install "semantic-cache-mcp[gpu]"
+# or: pip install "semantic-cache-mcp[gpu]"
+```
+
+Then set `EMBEDDING_DEVICE=gpu` in your MCP config. If CUDA is unavailable at runtime, the server logs a warning and falls back to CPU automatically.
 
 ### Choosing an embedding model
 
@@ -52,7 +63,7 @@ The default `BAAI/bge-small-en-v1.5` (33M params, 384 dimensions) is fast on CPU
       "args": ["semantic-cache-mcp"],
       "env": {
         "EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5",
-        "EMBEDDING_DEVICE": "cuda",
+        "EMBEDDING_DEVICE": "gpu",
         "LOG_LEVEL": "DEBUG",
         "MAX_CACHE_ENTRIES": "20000"
       }
