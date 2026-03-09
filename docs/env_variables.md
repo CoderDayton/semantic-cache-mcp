@@ -35,8 +35,11 @@ Then set `EMBEDDING_DEVICE=gpu` in your MCP config. If CUDA is unavailable at ru
 The default `BAAI/bge-small-en-v1.5` (33M params, 384 dimensions) is fast on CPU and sufficient for code similarity. Consider alternatives if you need:
 
 - **Higher quality**: `BAAI/bge-base-en-v1.5` (110M params, 768D) — better retrieval at ~3x slower inference
+- **Longer context**: `nomic-ai/nomic-embed-text-v1.5` (137M params, 768D, 8192 token context) — better for large code files
 - **Multilingual**: `BAAI/bge-small-zh-v1.5` or `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
 - **Smallest footprint**: `BAAI/bge-micro-v2` (17M params) — faster startup, slightly lower quality
+
+Any HuggingFace sentence-transformer model with an ONNX export will work — if the model isn't in fastembed's built-in list, it's automatically registered from HuggingFace Hub on first use (requires network access for initial download).
 
 > **Warning**: Changing the model invalidates all cached embeddings. The cache will rebuild as files are re-read.
 

@@ -107,3 +107,202 @@ class TestEmbeddingProviders:
         assert "providers" in calls[0]
         assert "providers" not in calls[1]
         assert embeddings._execution_provider == "CPUExecutionProvider"
+
+
+class TestCustomModelRegistration:
+    """Validate auto-registration of HuggingFace models not in fastembed defaults."""
+
+    def test_register_custom_model_happy_path(self, monkeypatch, tmp_path) -> None:
+        """Should download config, find ONNX, verify SHA256, and call add_custom_model."""
+        from unittest.mock import MagicMock
+
+        from semantic_cache_mcp.core import embeddings
+
+        # --- Fake HF Hub responses ---
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"hidden_size": 768}')
+
+        pooling_file = tmp_path / "1_Pooling" / "config.json"
+        pooling_file.parent.mkdir()
+        pooling_file.write_text('{"pooling_mode_cls_token": true}')
+
+        # Fake ONNX file with known SHA256
+        onnx_file = tmp_path / "onnx" / "model.onnx"
+        onnx_file.parent.mkdir()
+        onnx_content = b"fake-onnx-model-data"
+        onnx_file.write_bytes(onnx_content)
+
+        import hashlib
+
+        expected_sha = hashlib.sha256(onnx_content).hexdigest()
+
+        def fake_hf_download(repo_id: str, filename: str, **kwargs) -> str:
+            if filename == "config.json":
+                return str(config_file)
+            if filename == "1_Pooling/config.json":
+                return str(pooling_file)
+            if filename == "onnx/model.onnx":
+                return str(onnx_file)
+            return str(tmp_path / filename)
+
+        # Fake repo tree entry with LFS sha256
+        onnx_entry = types.SimpleNamespace(
+            path="onnx/model.onnx",
+            lfs=types.SimpleNamespace(sha256=expected_sha, size=len(onnx_content)),
+        )
+        fake_list_repo_tree = MagicMock(return_value=[onnx_entry])
+
+        # Fake fastembed classes
+        mock_add_custom_model = MagicMock()
+        FakePoolingType = types.SimpleNamespace(
+            MEAN=types.SimpleNamespace(name="MEAN"),
+            CLS=types.SimpleNamespace(name="CLS"),
+        )
+        FakeModelSource = MagicMock()
+
+        fake_fastembed = types.SimpleNamespace(
+            TextEmbedding=types.SimpleNamespace(add_custom_model=mock_add_custom_model),
+        )
+        fake_model_desc = types.SimpleNamespace(
+            ModelSource=FakeModelSource,
+            PoolingType=FakePoolingType,
+        )
+        fake_hf_hub = types.SimpleNamespace(
+            hf_hub_download=fake_hf_download,
+            list_repo_tree=fake_list_repo_tree,
+        )
+
+        monkeypatch.setitem(sys.modules, "fastembed", fake_fastembed)
+        monkeypatch.setitem(sys.modules, "fastembed.common.model_description", fake_model_desc)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf_hub)
+
+        result = embeddings._register_custom_model("org/custom-model")
+
+        # Verify add_custom_model was called with correct args
+        mock_add_custom_model.assert_called_once()
+        kw = mock_add_custom_model.call_args
+        assert kw.kwargs["model"] == "org/custom-model"
+        assert kw.kwargs["dim"] == 768
+        assert kw.kwargs["pooling"].name == "CLS"
+        assert kw.kwargs["model_file"] == "onnx/model.onnx"
+
+        # Verify returned model info
+        assert result["dim"] == 768
+        assert result["onnx_size_bytes"] == len(onnx_content)
+
+    def test_register_custom_model_no_onnx_raises(self, monkeypatch, tmp_path) -> None:
+        """Should raise ValueError when model has no ONNX files."""
+        from unittest.mock import MagicMock
+
+        from semantic_cache_mcp.core import embeddings
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"hidden_size": 384}')
+
+        def fake_hf_download(repo_id: str, filename: str, **kwargs) -> str:
+            if filename == "config.json":
+                return str(config_file)
+            if filename == "1_Pooling/config.json":
+                raise FileNotFoundError("no pooling config")
+            return str(tmp_path / filename)
+
+        # Empty repo — no ONNX files
+        fake_list_repo_tree = MagicMock(
+            return_value=[types.SimpleNamespace(path="pytorch_model.bin")]
+        )
+
+        fake_fastembed = types.SimpleNamespace(
+            TextEmbedding=types.SimpleNamespace(add_custom_model=MagicMock()),
+        )
+        fake_model_desc = types.SimpleNamespace(
+            ModelSource=MagicMock(),
+            PoolingType=types.SimpleNamespace(MEAN="MEAN", CLS="CLS"),
+        )
+        fake_hf_hub = types.SimpleNamespace(
+            hf_hub_download=fake_hf_download,
+            list_repo_tree=fake_list_repo_tree,
+        )
+
+        monkeypatch.setitem(sys.modules, "fastembed", fake_fastembed)
+        monkeypatch.setitem(sys.modules, "fastembed.common.model_description", fake_model_desc)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf_hub)
+
+        with pytest.raises(ValueError, match="no ONNX export"):
+            embeddings._register_custom_model("org/no-onnx-model")
+
+    def test_register_custom_model_sha256_mismatch_raises(self, monkeypatch, tmp_path) -> None:
+        """Should raise ValueError when ONNX file hash doesn't match LFS metadata."""
+        from unittest.mock import MagicMock
+
+        from semantic_cache_mcp.core import embeddings
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"hidden_size": 384}')
+
+        onnx_file = tmp_path / "onnx" / "model.onnx"
+        onnx_file.parent.mkdir()
+        onnx_file.write_bytes(b"actual-content")
+
+        def fake_hf_download(repo_id: str, filename: str, **kwargs) -> str:
+            if filename == "config.json":
+                return str(config_file)
+            if filename == "1_Pooling/config.json":
+                raise FileNotFoundError
+            if filename == "onnx/model.onnx":
+                return str(onnx_file)
+            return str(tmp_path / filename)
+
+        onnx_entry = types.SimpleNamespace(
+            path="onnx/model.onnx",
+            lfs=types.SimpleNamespace(
+                sha256="0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+        )
+        fake_list_repo_tree = MagicMock(return_value=[onnx_entry])
+
+        fake_fastembed = types.SimpleNamespace(
+            TextEmbedding=types.SimpleNamespace(add_custom_model=MagicMock()),
+        )
+        fake_model_desc = types.SimpleNamespace(
+            ModelSource=MagicMock(),
+            PoolingType=types.SimpleNamespace(MEAN="MEAN", CLS="CLS"),
+        )
+        fake_hf_hub = types.SimpleNamespace(
+            hf_hub_download=fake_hf_download,
+            list_repo_tree=fake_list_repo_tree,
+        )
+
+        monkeypatch.setitem(sys.modules, "fastembed", fake_fastembed)
+        monkeypatch.setitem(sys.modules, "fastembed.common.model_description", fake_model_desc)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf_hub)
+
+        with pytest.raises(ValueError, match="hash mismatch"):
+            embeddings._register_custom_model("org/tampered-model")
+
+    def test_register_custom_model_network_error_raises(self, monkeypatch, tmp_path) -> None:
+        """Should raise ValueError with helpful message when HF Hub is unreachable."""
+        from unittest.mock import MagicMock
+
+        from semantic_cache_mcp.core import embeddings
+
+        def fake_hf_download(repo_id: str, filename: str, **kwargs) -> str:
+            raise ConnectionError("Network unreachable")
+
+        fake_fastembed = types.SimpleNamespace(
+            TextEmbedding=types.SimpleNamespace(add_custom_model=MagicMock()),
+        )
+        fake_model_desc = types.SimpleNamespace(
+            ModelSource=MagicMock(),
+            PoolingType=types.SimpleNamespace(MEAN="MEAN", CLS="CLS"),
+        )
+        fake_hf_hub = types.SimpleNamespace(
+            hf_hub_download=fake_hf_download,
+            list_repo_tree=MagicMock(),
+        )
+
+        monkeypatch.setitem(sys.modules, "fastembed", fake_fastembed)
+        monkeypatch.setitem(sys.modules, "fastembed.common.model_description", fake_model_desc)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf_hub)
+
+        with pytest.raises(ValueError, match="Could not download config"):
+            embeddings._register_custom_model("org/unreachable-model")

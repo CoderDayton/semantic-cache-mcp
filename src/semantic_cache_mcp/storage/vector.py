@@ -114,6 +114,43 @@ class VectorStorage:
                     logger.info(f"Deleted stale index: {stale}")
             meta_path.write_text(json.dumps({"quantization": current_quant}))
 
+    def clear_if_model_changed(self, model_name: str, dim: int) -> None:
+        """Wipe vector index and stored embeddings when the embedding model changes.
+
+        Different models produce incompatible embeddings (different dimensions,
+        different vector spaces). Detect via sidecar metadata and rebuild clean.
+        """
+        meta_path = self._db_path.with_suffix(".meta.json")
+        meta: dict = {}
+
+        import contextlib
+
+        if meta_path.exists():
+            with contextlib.suppress(Exception):
+                meta = json.loads(meta_path.read_text())
+
+        stored_model = meta.get("embedding_model")
+        if stored_model is not None and stored_model != model_name:
+            logger.warning(
+                f"Embedding model changed {stored_model!r} -> {model_name!r} "
+                f"(dim {meta.get('embedding_dim', '?')} -> {dim}); "
+                "rebuilding vector index and clearing cached embeddings"
+            )
+            with self._lock:
+                # Delete usearch index files
+                for suffix in (f".{self._COLLECTION_NAME}.usearch",):
+                    stale = self._db_path.parent / (self._db_path.name + suffix)
+                    if stale.exists():
+                        stale.unlink()
+                        logger.info(f"Deleted stale index: {stale}")
+                # Clear all documents from SQLite so stale embeddings don't persist
+                self.clear()
+                logger.info("Cleared all cached embeddings")
+
+        meta["embedding_model"] = model_name
+        meta["embedding_dim"] = dim
+        meta_path.write_text(json.dumps(meta))
+
     def __del__(self) -> None:
         if hasattr(self, "_db"):
             try:

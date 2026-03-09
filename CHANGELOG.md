@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-08
+
+### Added
+
+- **Custom embedding model support** — Set `EMBEDDING_MODEL` to any HuggingFace model with an ONNX export. Models not in fastembed's built-in list are automatically downloaded and registered from HuggingFace Hub on first startup.
+- **SHA256 verification** — Downloaded ONNX model files are verified against HuggingFace-reported hashes to prevent tampering.
+- **Clear error messages** — Specific errors for models without ONNX exports and for network failures when downloading custom models.
+
 ## [0.3.1] - 2026-03-08
 
 ### Changed
