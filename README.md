@@ -14,7 +14,7 @@
 
 **Reduce Claude Code token usage by 80%+ with intelligent file caching.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that eliminates redundant token consumption when Claude reads files. Instead of sending full file contents on every request, it returns diffs for changed files, suppresses unchanged files entirely, and intelligently summarizes large files — all transparently through 11 purpose-built MCP tools.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that eliminates redundant token consumption when Claude reads files. Instead of sending full file contents on every request, it returns diffs for changed files, suppresses unchanged files entirely, and intelligently summarizes large files — all transparently through 12 purpose-built MCP tools.
 
 ---
 
@@ -22,13 +22,10 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 - **80%+ Token Reduction** — Unchanged files cost ~0 tokens; changed files return diffs only
 - **Three-State Read Model** — First read (full + cache), unchanged (message only, 99% savings), modified (diff, 80–95% savings)
-- **Semantic Search** — Local embeddings via BAAI/bge-small-en-v1.5 (33M params, 384D, ONNX Runtime), no API keys, works offline
-- **LSH Acceleration** — Persistent SimHash index for O(1) candidate retrieval on caches ≥ 100 files; survives restarts, rebuilt lazily after writes
+- **Semantic Search** — Hybrid BM25 + HNSW vector search via local ONNX embeddings (configurable model, default BAAI/bge-small-en-v1.5), no API keys, works offline
 - **Batch Embedding** — `batch_smart_read` pre-scans all new/changed files and embeds them in a single model call (N calls → 1)
-- **int8 Quantization** — 388 bytes per vector (4B scale + 384×int8), 22x smaller than raw float32
-- **SIMD-Parallel Chunking** — 5–7x faster content-defined deduplication (~70–95 MB/s)
-- **Adaptive Compression** — ZSTD primary (6.9 GB/s for text), LZ4 and Brotli fallbacks
-- **Content-Addressable Storage** — BLAKE3-hashed chunks, 3.8x faster than BLAKE2b
+- **Content Hash Freshness** — BLAKE3 hash detects when mtime changes but content is identical (touch, git checkout) — returns cached instead of re-reading
+- **Grep** — Regex/literal pattern search across cached files with line numbers and context
 - **Semantic Summarization** — 50–80% token savings on large files, structure preserved
 - **DoS Protection** — Write size, edit size, and match count limits enforced at every boundary
 
@@ -37,6 +34,8 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 ## Installation
 
 Add to Claude Code settings (`~/.claude/settings.json`):
+
+**Option 1** — `uvx` (always runs latest version):
 
 ```json
 {
@@ -49,9 +48,25 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
+**Option 2** — `uv tool install` (recommended for multiple clients):
+
+```bash
+uv tool install semantic-cache-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "semantic-cache": {
+      "command": "semantic-cache-mcp"
+    }
+  }
+}
+```
+
 Restart Claude Code. Done.
 
-> **`uvx` vs `uv tool install`** — `uvx` runs the server in a temporary environment, always fetching the latest version (ideal for MCP configs where the client spawns the process). `uv tool install semantic-cache-mcp` installs it persistently with a pinned version, available on your `PATH`. Use `uvx` in MCP server configs; use `uv tool install` if you want to pin a version or run the server manually.
+> **Why Option 2?** — `uvx` spawns an isolated process per invocation, each loading its own embedding model (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy, multiplying RAM usage. `uv tool install` puts the binary on your `PATH` so all projects share one installed copy and the model is loaded once per process.
 
 ### Block Native File Tools (Recommended)
 
@@ -87,15 +102,15 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```markdown
 ## Tools
 
-- semantic-cache: MUST use instead of native file tools (80%+ token savings)
-  - `read` → single-file; diff_mode=true by default (set false after context compression)
-    - `offset`/`limit` → read specific line ranges
-  - `batch_read` → 2+ files; supports glob patterns; set diff_mode=false after context compression
-  - `write` → new files or full rewrites; append=true for chunked writes of large files
-  - `edit` → find/replace (3 modes: full-file / scoped / line-replace); returns diff
-  - `batch_edit` → 2+ edits in one file; supports all 3 modes per entry
-  - `search`/`similar` → semantic search; seed cache first with read/batch_read
-  - `glob` → find files by pattern; cached_only=true to see what's already cached
+- MUST use `semantic-cache` instead of native Read/Write/Edit (80%+ token savings)
+  - `read` / `batch_read` → file reading with diff-mode (set diff_mode=false after context compression)
+  - `write` → new files or full rewrites; `append=true` for large files
+  - `edit` / `batch_edit` → find/replace (full-file / scoped / line-replace)
+  - `search` / `similar` → semantic search (seed cache first with read/batch_read)
+  - `grep` → regex/literal pattern search across cached files
+  - `glob` → find files by pattern; `cached_only=true` to filter to cached files
+  - `diff` → compare two files with semantic similarity score
+  - `stats` / `clear` → cache metrics and reset
 ```
 
 ---
@@ -119,6 +134,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | `similar` | Finds semantically similar cached files to a given path. Start with `k=3–5`. Only searches cached files. |
 | `glob` | Pattern matching with cache status per file. `cached_only=true` filters to already-cached files. Max 1000 matches, 5s timeout. |
 | `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Pre-scans and batch-embeds all new/changed files in a single model call. Set `diff_mode=false` after context compression. |
+| `grep` | Regex or literal pattern search across cached files with line numbers and optional context lines. Like ripgrep for the cache. |
 | `diff` | Compare two files. Returns unified diff plus semantic similarity score. Large diffs are auto-summarized to stay within token budget. |
 
 ### Management
@@ -315,7 +331,10 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
 | `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |
+| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model for search/similarity ([options](https://qdrant.github.io/fastembed/examples/Supported_Models/)) |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
+
+See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, model selection guidance, and examples.
 
 ### Safety Limits
 
@@ -337,14 +356,15 @@ diff path1="/src/v1.py" path2="/src/v2.py"
         "LOG_LEVEL": "INFO",
         "TOOL_OUTPUT_MODE": "compact",
         "MAX_CONTENT_SIZE": "100000",
-        "EMBEDDING_DEVICE": "cpu"
+        "EMBEDDING_DEVICE": "cpu",
+        "EMBEDDING_MODEL": "BAAI/bge-small-en-v1.5"
       }
     }
   }
 }
 ```
 
-**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. Set `EMBEDDING_DEVICE` to control hardware: `cpu` (default), `cuda` (GPU), or `auto` (detect available).
+**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` by default (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. Set `EMBEDDING_MODEL` to use a different model, and `EMBEDDING_DEVICE` to control hardware: `cpu` (default), `cuda` (GPU), or `auto` (detect available).
 
 **Cache location:** Platform-specific (`~/.cache/semantic-cache-mcp/` on Linux, `~/Library/Caches/semantic-cache-mcp/` on macOS, `%LOCALAPPDATA%\semantic-cache-mcp\` on Windows). Override with `SEMANTIC_CACHE_DIR`.
 
@@ -355,7 +375,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
 │  Claude     │────▶│  smart_read  │────▶│  Cache Lookup    │
-│  Code       │     │              │     │  (SQLite + LSH)  │
+│  Code       │     │              │     │  (VectorStorage) │
 └─────────────┘     └──────────────┘     └──────────────────┘
                            │
          ┌─────────────────┼─────────────────┐
@@ -371,22 +391,53 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 
 1. **File unchanged** — mtime matches cache entry → return "no changes" message (~5 tokens)
 2. **File changed** — compute unified diff → return diff only (80–95% savings)
-3. **Semantically similar cached file** — return diff from nearest neighbor (LSH O(1) lookup for caches ≥ 100 files; index persisted in SQLite, rebuilt lazily after writes)
+3. **Semantically similar cached file** — return diff from nearest neighbor (HNSW vector search)
 4. **Large file** — semantic summarization preserving docstrings and key function signatures
-5. **New file** — full content returned, stored via SIMD-accelerated HyperCDC chunking; `batch_read` pre-scans and embeds all new files in a single model call before processing
+5. **New file** — full content returned and embedded; `batch_read` pre-scans and embeds all new files in a single model call
 
 ---
 
 ## Performance
 
-Measured on this project's 30 source files (~136K tokens). At least 80% token reduction in cached workflows — our benchmark shows 98.8%. Run it yourself: `uv run python benchmarks/benchmark_token_savings.py`
+Measured on this project's 30 source files (~136K tokens). Benchmarks run on a standard dev machine (CPU embeddings).
 
-| Component | Speedup |
-|-----------|--------:|
-| SIMD-parallel chunking | 5–7x |
-| BLAKE3 hashing (8KB+) | 3.8x |
-| Batch matrix similarity | 6–14x |
-| int8 embeddings | 22x smaller |
+### Token Savings
+
+| Phase | Scenario | Savings |
+|-------|----------|--------:|
+| Cold read | First read, no cache | 0% (baseline) |
+| Unchanged re-read | Same files, no modifications | **99.1%** |
+| Content hash | Touch files (mtime changed, content identical) | **99.1%** |
+| Small edits | ~5% of lines changed in 30% of files | **98.1%** |
+| Batch read | All files via `batch_read` | **99.1%** |
+| Search | 5 queries × k=5, previews vs full reads | **98.4%** |
+| **Overall (cached)** | **Phases 2–6 combined** | **98.8%** |
+
+### Operation Latency
+
+| Operation | Time |
+|-----------|-----:|
+| Unchanged read (single file) | 2 ms |
+| Unchanged re-read (29 files) | 25 ms |
+| Batch read (29 files, diff mode) | 35 ms |
+| Cold read (29 files, incl. embed) | 2,554 ms |
+| Write (200-line file) | 47 ms |
+| Edit (scoped find/replace) | 48 ms |
+| Semantic search (k=5) | 4 ms |
+| Semantic search (k=10) | 5 ms |
+| Find similar (k=3) | 49 ms |
+| Grep (literal) | 1 ms |
+| Grep (regex) | 2 ms |
+| Embedding model warmup | 206 ms |
+| Single embedding (largest file) | 47 ms |
+| Batch embedding (10 files) | 469 ms |
+
+Run benchmarks yourself:
+
+```bash
+uv run python benchmarks/benchmark_token_savings.py    # token savings
+uv run python benchmarks/benchmark_performance.py      # operation latency
+```
 
 See [docs/performance.md](docs/performance.md) for full benchmarks and methodology.
 
@@ -401,6 +452,7 @@ See [docs/performance.md](docs/performance.md) for full benchmarks and methodolo
 | [Security](docs/security.md) | Threat model, input validation, size limits |
 | [Advanced Usage](docs/advanced-usage.md) | Programmatic API, custom storage backends |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging |
+| [Environment Variables](docs/env_variables.md) | All configurable env vars with defaults and examples |
 
 ---
 
@@ -427,11 +479,8 @@ This project uses Python 3.12+, strict type hints throughout, Ruff for formattin
 
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and:
 
-- [FastEmbed](https://github.com/qdrant/fastembed) — local ONNX embeddings (BAAI/bge-small-en-v1.5, 33M params, 384D)
-- SIMD-accelerated Parallel CDC — 5–7x faster than serial HyperCDC
+- [FastEmbed](https://github.com/qdrant/fastembed) — local ONNX embeddings (configurable, default BAAI/bge-small-en-v1.5)
+- [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB) — HNSW vector storage with FTS5 keyword search
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
-- LSH approximate nearest-neighbor search with SQLite persistence
-- int8/binary/ternary quantization for extreme compression
-- BLAKE3 cryptographic hashing
-- ZSTD/LZ4/Brotli adaptive compression
+- BLAKE3 cryptographic hashing for content freshness
 - LRU-K frequency-aware cache eviction

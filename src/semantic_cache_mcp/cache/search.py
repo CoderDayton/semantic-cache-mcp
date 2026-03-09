@@ -6,14 +6,12 @@ import logging
 import time
 from pathlib import Path
 
-import numpy as np
-
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.embeddings import embed_query
-from ..core.similarity import LSHConfig, LSHIndex, cosine_similarity, top_k_from_quantized
+from ..core.hashing import hash_content
+from ..core.similarity import cosine_similarity
 from ..types import (
     DiffResult,
-    EmbeddingVector,
     GlobMatch,
     GlobResult,
     SearchMatch,
@@ -33,60 +31,6 @@ MAX_SIMILAR_K = 50
 MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
-# LSH acceleration threshold: use exhaustive scan below this, LSH above
-_LSH_THRESHOLD = 100
-
-
-def _top_k_with_lsh(
-    query_embedding: EmbeddingVector,
-    blobs: list[bytes],
-    k: int,
-    cache: SemanticCache | None = None,
-) -> list[tuple[int, float]]:
-    """Top-k similarity using LSH candidate filtering for large collections.
-
-    For small collections (<_LSH_THRESHOLD), falls back to exhaustive scan.
-    For larger ones, uses a persistent LSH index (via cache) to reduce the
-    candidate set, then refines with exact cosine similarity. The index
-    survives server restarts and is rebuilt lazily after any cache mutation.
-
-    Args:
-        query_embedding: Query vector
-        blobs: List of quantized embedding blobs from DB (IDs = positions)
-        k: Number of results
-        cache: SemanticCache for persistent LSH; builds ephemerally if None
-
-    Returns:
-        List of (index, similarity) tuples sorted by descending similarity
-    """
-    n = len(blobs)
-    if n < _LSH_THRESHOLD:
-        return top_k_from_quantized(query_embedding, blobs, k=k)
-
-    query_vec = np.asarray(query_embedding, dtype=np.float32)
-    dim = len(query_vec)
-
-    if cache is not None:
-        lsh = cache.get_or_build_lsh(blobs, dim)
-    else:
-        # Ephemeral fallback (e.g. tests that don't pass cache)
-        from ..core.similarity import dequantize_embedding  # noqa: PLC0415
-
-        config = LSHConfig(num_bits=64, num_tables=4, band_size=8, similarity_threshold=0.0)
-        lsh = LSHIndex(config=config)
-        for idx, blob in enumerate(blobs):
-            vec = dequantize_embedding(blob)
-            if vec is not None and len(vec) == dim:
-                lsh.add(idx, vec, store_embedding=True)
-
-    # Query LSH for candidates (request more than k to improve recall)
-    candidates = lsh.query(query_vec, k=min(k * 4, n), return_distances=True)
-    if not candidates:
-        # LSH found nothing — fall back to exhaustive
-        return top_k_from_quantized(query_embedding, blobs, k=k)
-
-    return [(idx, sim) for idx, sim in candidates[:k]]
-
 
 def semantic_search(
     cache: SemanticCache,
@@ -94,7 +38,7 @@ def semantic_search(
     k: int = 10,
     directory: str | None = None,
 ) -> SearchResult:
-    """Search cached files by semantic meaning.
+    """Search cached files by semantic meaning using hybrid BM25+vector search.
 
     Args:
         cache: SemanticCache instance
@@ -109,59 +53,65 @@ def semantic_search(
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
 
-    # Embed query using search_query prefix
+    # Embed query for vector component of hybrid search
     query_embedding = embed_query(query)
-    if query_embedding is None:
-        return SearchResult(query=query, matches=[], files_searched=0, cached_files=0)
 
-    # Get all cached files with embeddings from storage
-    storage = cache._storage
-    with storage._pool.get_connection() as conn:
-        sql = "SELECT path, tokens, embedding FROM files WHERE embedding IS NOT NULL"
-        rows = conn.execute(sql).fetchall()
-
-    if not rows:
-        return SearchResult(query=query, matches=[], files_searched=0, cached_files=len(rows))
-
-    # Filter by directory if specified
+    # Resolve directory for post-search filtering (is_relative_to is secure
+    # against prefix attacks like /project vs /project_evil)
+    resolved_dir: Path | None = None
     if directory:
-        dir_path = str(Path(directory).expanduser().resolve())
-        rows = [r for r in rows if Path(r[0]).is_relative_to(dir_path)]
+        resolved_dir = Path(directory).expanduser().resolve()
 
-    if not rows:
-        return SearchResult(query=query, matches=[], files_searched=0, cached_files=0)
+    # Use hybrid search (BM25 + vector) via VectorStorage
+    # Request extra results when directory filtering will reduce the set
+    storage = cache._storage
+    search_k = k * 3 if resolved_dir else k
+    results = storage.search_hybrid(
+        query=query,
+        embedding=query_embedding,
+        k=search_k,
+    )
 
-    paths = [r[0] for r in rows]
-    tokens_list = [r[1] for r in rows]
-    blobs = [r[2] for r in rows]
+    if not results:
+        stats = storage.get_stats()
+        total = stats.get("files_cached", 0)
+        return SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
 
-    # Similarity: LSH-accelerated for large caches, exhaustive for small
-    top_results = _top_k_with_lsh(query_embedding, blobs, k=k, cache=cache)
+    # Build matches with directory filtering
+    filtered: list[tuple[str, str, float]] = []
+    for path, preview, score in results:
+        if len(filtered) >= k:
+            break
+        # Secure directory filter: is_relative_to prevents prefix attacks
+        if resolved_dir and not Path(path).is_relative_to(resolved_dir):
+            continue
+        filtered.append((path, preview, score))
 
-    # Build matches with previews
+    # Normalize scores to 0–1 range (best result = 1.0) so LLMs can
+    # judge relevance without knowing RRF score internals.
+    max_score = filtered[0][2] if filtered else 1.0
     matches: list[SearchMatch] = []
-    for idx, sim in top_results:
-        path = paths[idx]
+    for path, preview, score in filtered:
         entry = cache.get(path)
-        preview = ""
-        if entry:
-            content = cache.get_content(entry)
-            preview = content[:200].replace("\n", " ")
-
+        tokens = entry.tokens if entry else 0
+        normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
             SearchMatch(
                 path=path,
-                similarity=round(sim, 4),
-                tokens=tokens_list[idx],
-                preview=preview,
+                similarity=normalized,
+                tokens=tokens,
+                preview=preview.replace("\n", " "),
             )
         )
+
+    stats = storage.get_stats()
+    total = stats.get("files_cached", 0)
 
     return SearchResult(
         query=query,
         matches=matches,
-        files_searched=len(paths),
-        cached_files=len(rows),
+        files_searched=int(total),
+        cached_files=int(total),
     )
 
 
@@ -286,16 +236,22 @@ def find_similar_files(
     # Get/compute embedding for source file
     cached = cache.get(str(file_path))
     source_tokens = 0
+    content = file_path.read_text(encoding="utf-8")
 
-    if cached and cached.mtime >= file_path.stat().st_mtime:
-        source_embedding = cached.embedding
+    file_mtime = file_path.stat().st_mtime
+    if cached and cached.mtime >= file_mtime:
+        source_tokens = cached.tokens
+    elif cached and hash_content(content) == cached.content_hash:
+        # Content identical despite mtime change — update mtime, treat as cached
+        cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
     else:
-        content = file_path.read_text(encoding="utf-8")
-        source_embedding = cache.get_embedding(content, str(file_path))
         source_tokens = count_tokens(content)
-        mtime = file_path.stat().st_mtime
-        cache.put(str(file_path), content, mtime, source_embedding)
+        source_embedding = cache.get_embedding(content, str(file_path))
+        cache.put(str(file_path), content, file_mtime, source_embedding)
+
+    # VectorStorage doesn't return embeddings from get() — always compute
+    source_embedding = cache.get_embedding(content, str(file_path))
 
     if source_embedding is None:
         return SimilarFilesResult(
@@ -305,44 +261,34 @@ def find_similar_files(
             files_searched=0,
         )
 
-    # Get all cached files with embeddings
+    # Use VectorStorage HNSW search
     storage = cache._storage
-    with storage._pool.get_connection() as conn:
-        rows = conn.execute(
-            "SELECT path, tokens, embedding FROM files WHERE embedding IS NOT NULL AND path != ?",
-            (str(file_path),),
-        ).fetchall()
-
-    if not rows:
-        return SimilarFilesResult(
-            source_path=str(file_path),
-            source_tokens=source_tokens,
-            similar_files=[],
-            files_searched=0,
-        )
-
-    paths = [r[0] for r in rows]
-    tokens_list = [r[1] for r in rows]
-    blobs = [r[2] for r in rows]
-
-    # Similarity: LSH-accelerated for large caches, exhaustive for small
-    top_results = _top_k_with_lsh(source_embedding, blobs, k=k, cache=cache)
+    results = storage.find_similar_multi(
+        embedding=source_embedding,
+        exclude_path=str(file_path),
+        k=k,
+    )
 
     similar_files: list[SimilarFile] = []
-    for idx, sim in top_results:
+    for sim_path, sim_score in results:
+        entry = cache.get(sim_path)
+        tokens = entry.tokens if entry else 0
         similar_files.append(
             SimilarFile(
-                path=paths[idx],
-                similarity=round(sim, 4),
-                tokens=tokens_list[idx],
+                path=sim_path,
+                similarity=round(sim_score, 4),
+                tokens=tokens,
             )
         )
+
+    stats = storage.get_stats()
+    total = stats.get("files_cached", 0)
 
     return SimilarFilesResult(
         source_path=str(file_path),
         source_tokens=source_tokens,
         similar_files=similar_files,
-        files_searched=len(paths),
+        files_searched=int(total),
     )
 
 

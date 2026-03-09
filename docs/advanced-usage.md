@@ -115,7 +115,7 @@ multi_result = smart_batch_edit(
     edits=[("old1", "new1"), ("old2", "new2")],
 )
 
-# Semantic search — embedding-based, NOT keyword
+# Semantic search — hybrid BM25 + HNSW vector search
 # Must seed cache first with smart_read / batch_smart_read
 search_result = semantic_search(
     cache=cache,
@@ -175,12 +175,11 @@ print(f"Cached: {glob_result.cached_count}")
 
 ```python
 from pathlib import Path
-from semantic_cache_mcp.storage.sqlite import SQLiteStorage
+from semantic_cache_mcp.storage.vector import VectorStorage
 from semantic_cache_mcp.cache import SemanticCache
 
 # Use a custom database path
-storage = SQLiteStorage(db_path=Path("/tmp/my-cache.db"))
-cache = SemanticCache(storage=storage)
+cache = SemanticCache(db_path=Path("/tmp/my-cache.db"))
 ```
 
 ---
@@ -215,8 +214,7 @@ query_vec = embed_query("search query here")
 stats = cache.get_stats()
 print(f"Files cached:       {stats['files_cached']}")
 print(f"Total tokens:       {stats['total_tokens_cached']}")
-print(f"Compression ratio:  {stats['compression_ratio']:.1%}")
-print(f"Deduplication:      {stats['dedup_ratio']:.2f}×")
+print(f"DB size (MB):       {stats['db_size_mb']}")
 
 # Session metrics (current session)
 session = stats["session"]
@@ -233,22 +231,6 @@ print(f"Lifetime saved:     {lifetime['tokens_saved']}")
 ---
 
 ## Advanced Algorithms
-
-### SIMD Chunking
-
-```python
-from semantic_cache_mcp.core import get_optimal_chunker, hypercdc_chunks, hypercdc_simd_chunks
-
-# Auto-select: SIMD if available, serial HyperCDC otherwise
-chunker = get_optimal_chunker(prefer_simd=True)
-chunks  = list(chunker(content.encode()))
-
-# Force serial HyperCDC
-chunks = list(hypercdc_chunks(content.encode()))
-
-# Force SIMD (falls back to serial if unavailable)
-chunks = list(hypercdc_simd_chunks(content.encode()))
-```
 
 ### Semantic Summarization
 
@@ -288,57 +270,6 @@ for text, vec in zip(texts, vectors):
 ```
 
 `batch_smart_read` calls this automatically for all new/changed files before the main read loop — you typically don't need to call it directly.
-
-### LSH Approximate Search
-
-The LSH index is built on-demand and **persisted to SQLite** automatically — no manual management required. After the first build, subsequent queries load instantly from the database.
-
-```python
-from semantic_cache_mcp.core import LSHIndex, LSHConfig
-
-config = LSHConfig(num_bits=64, num_tables=4, band_size=8)
-index  = LSHIndex(config=config)
-
-# Add vectors
-for item_id, vec in enumerate(embeddings):
-    index.add(item_id, vec, store_embedding=True)
-
-# Query — return_distances=True gives list[tuple[int, float]]
-results = index.query(query_vec, k=5, return_distances=True)
-for item_id, similarity in results:
-    print(f"  id={item_id}  sim={similarity:.3f}")
-
-# return_distances=False gives list[int]
-item_ids = index.query(query_vec, k=10)
-```
-
-### Extreme Quantization
-
-```python
-from semantic_cache_mcp.core import (
-    quantize_binary,
-    quantize_ternary,
-    quantize_hybrid,
-    hamming_similarity_binary,
-    evaluate_quantization_accuracy,
-)
-
-# Binary (32× compression, ~82% accuracy)
-binary = quantize_binary(embedding)
-
-# Ternary (16× compression, ~88% accuracy)
-ternary = quantize_ternary(embedding)
-
-# Hybrid: int8 base + binary index for two-stage search
-hybrid = quantize_hybrid(embedding)
-
-# Fast binary similarity (Hamming-based)
-sim = hamming_similarity_binary(binary1, binary2)
-
-# Evaluate accuracy vs exact cosine on a sample
-report = evaluate_quantization_accuracy(embeddings, method="int8")
-print(f"Mean error: {report['mean_error']:.4f}")
-```
 
 ### Delta Compression
 
@@ -504,7 +435,9 @@ print(f"Cleared {cleared} entries")
 | Strategy             | Token Savings | Trigger Condition                              |
 |----------------------|--------------|------------------------------------------------|
 | Unchanged (mtime)    | ~99%         | File mtime matches cached entry                |
+| Content hash         | ~99%         | mtime changed but BLAKE3 hash matches          |
 | Diff (changed)       | 80–95%       | File modified since last cache                 |
+| Search previews      | ~98%         | Semantic search returns previews, not full files |
 | Semantic match       | 70–90%       | Similar file found in cache                    |
 | Summarized (large)   | 50–80%       | File exceeds `MAX_CONTENT_SIZE` limit          |
 | Full (new/cold)      | 0%           | Not in cache; stored for future savings        |

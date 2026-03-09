@@ -9,6 +9,7 @@ import numpy as np
 
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
+from ..core.hashing import hash_content
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
 from ._helpers import _is_binary_content
 from .store import SemanticCache, _file_label
@@ -99,7 +100,17 @@ def smart_read(
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:
         if cached.mtime >= mtime:
-            # File unchanged
+            # File unchanged (mtime match)
+            pass
+        elif hash_content(content) == cached.content_hash:
+            # Content identical despite mtime change — update mtime, treat as unchanged
+            cache.update_mtime(str(file_path), mtime)
+        else:
+            # Content actually changed — fall through to diff logic below
+            cached = None  # sentinel: forces diff path
+
+        if cached is not None:
+            # Unchanged path (either mtime match or content hash match)
             cache.record_access(str(file_path))
             unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
             msg_tokens = count_tokens(unchanged_msg)
@@ -129,33 +140,41 @@ def smart_read(
                 compression_ratio=1.0,
             )
 
+        # Re-fetch cached for diff — we nulled it as sentinel above
+        cached = cache.get(str(file_path))
+
         # File changed - generate diff with stats
-        old_content = cache.get_content(cached)
-        diff_content = generate_diff(old_content, content)
-        stats = diff_stats(old_content, content)
-        diff_tokens = count_tokens(diff_content)
+        if cached is not None:
+            old_content = cache.get_content(cached)
+            diff_content = generate_diff(old_content, content)
+            stats = diff_stats(old_content, content)
+            diff_tokens = count_tokens(diff_content)
 
-        if diff_tokens < tokens_original * 0.6:
-            stats_msg = (
-                f"// Stats: +{stats['insertions']} -{stats['deletions']} "
-                f"~{stats['modifications']} lines, "
-                f"{stats['compression_ratio']:.1%} size\n"
-            )
-            result_content = f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
-            embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
-            cache.put(str(file_path), content, mtime, embedding)
+            if diff_tokens < tokens_original * 0.6:
+                stats_msg = (
+                    f"// Stats: +{stats['insertions']} -{stats['deletions']} "
+                    f"~{stats['modifications']} lines, "
+                    f"{stats['compression_ratio']:.1%} size\n"
+                )
+                result_content = (
+                    f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
+                )
+                embedding = (
+                    _embedding if _embedding is not None else cache.get_embedding(content, path)
+                )
+                cache.put(str(file_path), content, mtime, embedding)
 
-            tokens_returned = count_tokens(result_content)
-            return ReadResult(
-                content=result_content,
-                from_cache=True,
-                is_diff=True,
-                tokens_original=tokens_original,
-                tokens_returned=tokens_returned,
-                tokens_saved=tokens_original - tokens_returned,
-                truncated=False,
-                compression_ratio=len(result_content) / len(content),
-            )
+                tokens_returned = count_tokens(result_content)
+                return ReadResult(
+                    content=result_content,
+                    from_cache=True,
+                    is_diff=True,
+                    tokens_original=tokens_original,
+                    tokens_returned=tokens_returned,
+                    tokens_saved=tokens_original - tokens_returned,
+                    truncated=False,
+                    compression_ratio=len(result_content) / len(content),
+                )
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
@@ -262,9 +281,20 @@ def batch_smart_read(
     def estimate_min_tokens(p: str) -> int:
         resolved = Path(p).expanduser().resolve()
         cached = cache.get(str(resolved))
-        if cached and resolved.exists() and cached.mtime >= resolved.stat().st_mtime:
-            unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
-            return min(cached.tokens, count_tokens(unchanged_msg))
+        if cached and resolved.exists():
+            file_mtime = resolved.stat().st_mtime
+            if cached.mtime >= file_mtime:
+                unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
+                return min(cached.tokens, count_tokens(unchanged_msg))
+            # Content hash check — treat as unchanged if content identical
+            try:
+                disk_content = resolved.read_text(encoding="utf-8")
+                if hash_content(disk_content) == cached.content_hash:
+                    cache.update_mtime(str(resolved), file_mtime)
+                    unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
+                    return min(cached.tokens, count_tokens(unchanged_msg))
+            except Exception:  # nosec B110 — estimate is best-effort
+                pass
         if not resolved.exists() or not resolved.is_file():
             return 1
         # Rough estimate for uncached content: ~4 characters per token.
@@ -288,8 +318,18 @@ def batch_smart_read(
     for _path in paths_sorted:
         _resolved = Path(_path).expanduser().resolve()
         _cached = cache.get(str(_resolved))
-        if _cached and _resolved.exists() and _cached.mtime >= _resolved.stat().st_mtime:
-            continue  # unchanged — no embedding needed
+        if _cached and _resolved.exists():
+            _file_mtime = _resolved.stat().st_mtime
+            if _cached.mtime >= _file_mtime:
+                continue  # unchanged — no embedding needed
+            # Check content hash before assuming changed
+            try:
+                _raw_text = _resolved.read_text(encoding="utf-8")
+                if hash_content(_raw_text) == _cached.content_hash:
+                    cache.update_mtime(str(_resolved), _file_mtime)
+                    continue  # content unchanged — no embedding needed
+            except Exception:  # nosec B110
+                pass
         if not _resolved.exists() or not _resolved.is_file():
             continue  # will error in smart_read, skip pre-scan
         try:

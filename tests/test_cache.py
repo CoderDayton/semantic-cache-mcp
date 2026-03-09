@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.types import EmbeddingVector
-from tests.constants import TEST_EMBEDDING_DIM
 
 
 class TestSmartReadUnchangedFile:
@@ -341,7 +340,7 @@ class TestEmbeddingsIntegration:
     def test_embedding_stored_in_cache(
         self, temp_dir: Path, mock_embeddings: EmbeddingVector
     ) -> None:
-        """Verify embedding is stored with cache entry."""
+        """Verify embedding is stored and file is retrievable."""
         db_path = temp_dir / "store_test.db"
 
         with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
@@ -354,5 +353,7 @@ class TestEmbeddingsIntegration:
 
             entry = cache.get(str(test_file))
             assert entry is not None
-            assert entry.embedding is not None
-            assert len(entry.embedding) == TEST_EMBEDDING_DIM
+            # Embedding is stored in HNSW index, not returned on CacheEntry
+            # Verify the file is findable via similarity search
+            similar = cache.find_similar(mock_embeddings)
+            assert similar is not None

@@ -66,6 +66,11 @@ def read(
     - Keep diff_mode=true during iteration; set false when you need full content again.
     - Use offset/limit to read specific line ranges of large files.
 
+    When a file is truncated:
+    - The response includes a "hint" with the offset to continue reading.
+    - Use read with that offset to get the next section. Do NOT re-read from the beginning.
+    - Example: if hint says offset=500, call read(path, offset=500, limit=500).
+
     Args:
         path: Path to the file to read
         max_size: Maximum content size to return (default: 100000)
@@ -142,6 +147,19 @@ def read(
             payload["is_diff"] = result.is_diff
             payload["truncated"] = result.truncated
             payload["semantic_match"] = result.semantic_match
+            if result.truncated:
+                # Truncated reads use semantic summarization — the returned
+                # content is non-contiguous, so line numbers don't map to the
+                # original file. Don't hint a specific offset; instead tell
+                # the caller to use offset/limit to read specific line ranges.
+                entry = cache.get(str(Path(path).expanduser().resolve()))
+                total_tokens = entry.tokens if entry else result.tokens_original
+                payload["total_tokens"] = total_tokens
+                payload["hint"] = (
+                    f"File was semantically summarized ({total_tokens} tokens total). "
+                    f"Use read with offset=<line> and limit=<n> to read specific "
+                    f"sections of the original file."
+                )
         if mode == _MODE_DEBUG:
             payload["from_cache"] = result.from_cache
             payload["tokens_saved"] = result.tokens_saved
@@ -166,32 +184,51 @@ def read(
 def stats(
     ctx: Context,
 ) -> str:
-    """Get cache statistics: files tracked, tokens, compression ratios, embedding status."""
+    """Get cache statistics, session activity, and lifetime metrics.
+
+    Returns cache occupancy, token savings, tool call counts, embedding model
+    info, and process memory usage. Useful for monitoring cache effectiveness
+    and diagnosing performance issues.
+    """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
     cache_stats = cache.get_stats()
 
-    # Add embedding model info
     model_info = get_model_info()
-    result: dict[str, Any] = {
-        **cache_stats,
-        "embedding_model": model_info["model"],
-        "embedding_ready": model_info["ready"],
-    }
+    session = cache_stats.get("session", {})
+
+    tokens_saved = session.get("tokens_saved", 0)
+    tokens_original = session.get("tokens_original", 0)
+    savings_pct = round(tokens_saved / tokens_original * 100, 1) if tokens_original > 0 else 0
+
     payload: dict[str, Any] = {"ok": True, "tool": "stats"}
+
     if mode == "compact":
-        payload.update(
-            {
-                "files_cached": result["files_cached"],
-                "total_tokens_cached": result["total_tokens_cached"],
-                "embedding_ready": result["embedding_ready"],
-            }
-        )
+        payload["files_cached"] = cache_stats.get("files_cached", 0)
+        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
+        payload["tokens_saved"] = tokens_saved
+        payload["savings_pct"] = savings_pct
+        payload["cache_hits"] = session.get("cache_hits", 0)
+        payload["cache_misses"] = session.get("cache_misses", 0)
+        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
+        payload["embedding_ready"] = model_info["ready"]
+
     elif mode == "normal":
-        payload.update(result)
-    else:
-        payload.update(result)
+        payload["files_cached"] = cache_stats.get("files_cached", 0)
+        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
+        payload["tokens_saved"] = tokens_saved
+        payload["savings_pct"] = savings_pct
+        payload["cache_hits"] = session.get("cache_hits", 0)
+        payload["cache_misses"] = session.get("cache_misses", 0)
+        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
+        payload["embedding_model"] = model_info["model"]
+        payload["embedding_ready"] = model_info["ready"]
+        payload["uptime_s"] = round(session.get("uptime_s", 0), 1)
+
+    else:  # debug
+        payload.update(cache_stats)
+        payload["embedding"] = model_info
         payload["output_mode"] = mode
 
     return _render_response(payload, max_response_tokens)
@@ -562,7 +599,7 @@ def search(
     k: int = 10,
     directory: str | None = None,
 ) -> str:
-    """Search cached files by semantic meaning using embeddings (not keyword matching).
+    """Search cached files by hybrid keyword + semantic similarity (BM25 + vector RRF).
 
     IMPORTANT: Only searches files already in the cache. You must read or batch_read
     files first before they become searchable. Returns nothing on an empty cache.
@@ -572,10 +609,10 @@ def search(
     - Start with k=3 to k=5 and increase only if recall is insufficient.
     - Use directory filter early to limit response size.
 
-    Response: ranked list of files with similarity scores and content previews.
+    Response: ranked list of files with relevance scores and content previews.
 
     Args:
-        query: Natural language description of what you're looking for
+        query: Natural language or keyword search (both work — results are fused)
         k: Max results (default: 10, max: 100)
         directory: Optional absolute directory path to limit search scope
     """
@@ -758,6 +795,13 @@ def batch_read(
                 item: dict[str, Any] = {"path": f.path, "status": f.status}
                 if f.path in result.contents:
                     item["content"] = result.contents[f.path]
+                if f.status == "truncated":
+                    content = result.contents.get(f.path, "")
+                    returned_lines = content.count("\n") + 1 if content else 0
+                    item["hint"] = (
+                        f"Truncated. Use read with offset={returned_lines + 1} "
+                        f"to continue. Do NOT re-read from the beginning."
+                    )
                 if mode == _MODE_DEBUG:
                     item["tokens"] = f.tokens
                     item["from_cache"] = f.from_cache
@@ -896,6 +940,97 @@ def glob(
     except Exception as e:
         logger.exception("Error in glob")
         return _render_error("glob", str(e), max_response_tokens)
+
+
+@mcp.tool()
+def grep(
+    ctx: Context,
+    pattern: str,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+    context_lines: int = 0,
+    max_matches: int = 100,
+    max_files: int = 50,
+) -> str:
+    """Search cached file content by regex or literal pattern with line numbers.
+
+    Like ripgrep but searches the semantic cache — returns matching lines with context.
+    Unlike `search` (ranked BM25+vector), this does exact pattern matching.
+
+    IMPORTANT: Only searches files already in the cache. Read files first.
+
+    Timing guidance:
+    - Use for exact code patterns: function names, imports, error strings.
+    - Use `search` instead for semantic/fuzzy queries like "error handling logic".
+    - Set fixed_string=true for patterns with special regex chars (e.g. "foo.bar()").
+    - Add context_lines=2-3 to see surrounding code.
+
+    Args:
+        pattern: Regex pattern (or literal string if fixed_string=true)
+        fixed_string: Treat pattern as literal, not regex (default: false)
+        case_sensitive: Case-sensitive matching (default: true)
+        context_lines: Lines of context before/after each match (default: 0)
+        max_matches: Total match limit across all files (default: 100)
+        max_files: Maximum files to return (default: 50)
+    """
+    cache: SemanticCache = ctx.lifespan_context["cache"]
+    mode = _response_mode()
+    max_response_tokens = _response_token_cap()
+
+    try:
+        results = cache._storage.grep(
+            pattern,
+            fixed_string=fixed_string,
+            case_sensitive=case_sensitive,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_files=max_files,
+        )
+        cache.metrics.record("grep", None)
+
+        total_matches = sum(len(r["matches"]) for r in results)
+
+        # Build response
+        files_payload: list[dict[str, Any]] = []
+        for file_result in results:
+            match_items: list[dict[str, Any]] = []
+            for m in file_result["matches"]:
+                item: dict[str, Any] = {
+                    "line_number": m["line_number"],
+                    "line": m["line"],
+                }
+                if context_lines > 0 and mode in _MODE_NORMAL:
+                    if "before" in m:
+                        item["before"] = m["before"]
+                    if "after" in m:
+                        item["after"] = m["after"]
+                match_items.append(item)
+            files_payload.append(
+                {
+                    "path": file_result["path"],
+                    "count": len(match_items),
+                    "matches": match_items,
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tool": "grep",
+            "pattern": pattern,
+            "total_matches": total_matches,
+            "files_matched": len(files_payload),
+            "files": files_payload,
+        }
+        if mode == _MODE_DEBUG:
+            payload["fixed_string"] = fixed_string
+            payload["case_sensitive"] = case_sensitive
+            payload["context_lines"] = context_lines
+
+        return _render_response(payload, max_response_tokens)
+
+    except Exception as e:
+        logger.exception("Error in grep")
+        return _render_error("grep", str(e), max_response_tokens)
 
 
 def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:

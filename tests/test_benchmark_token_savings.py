@@ -31,22 +31,36 @@ def test_unchanged_reread_savings(benchmark_results: dict[str, float]) -> None:
     )
 
 
+def test_content_hash_savings(benchmark_results: dict[str, float]) -> None:
+    """Phase 3: Content hash (touch, mtime changed) should save ≥95% tokens."""
+    assert benchmark_results["content_hash"] >= 0.95, (
+        f"Content hash savings {benchmark_results['content_hash']:.1%} < 95%"
+    )
+
+
 def test_small_edits_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 3: Mixed changed/unchanged should save ≥80% tokens."""
+    """Phase 4: Mixed changed/unchanged should save ≥80% tokens."""
     assert benchmark_results["small_edits"] >= 0.80, (
         f"Small edits savings {benchmark_results['small_edits']:.1%} < 80%"
     )
 
 
 def test_batch_read_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 4: Batch read should save ≥80% tokens."""
+    """Phase 5: Batch read should save ≥80% tokens."""
     assert benchmark_results["batch_read"] >= 0.80, (
         f"Batch read savings {benchmark_results['batch_read']:.1%} < 80%"
     )
 
 
+def test_search_savings(benchmark_results: dict[str, float]) -> None:
+    """Phase 6: Search previews should save ≥50% vs full file reads."""
+    assert benchmark_results["search"] >= 0.50, (
+        f"Search savings {benchmark_results['search']:.1%} < 50%"
+    )
+
+
 def test_overall_savings(benchmark_results: dict[str, float]) -> None:
-    """Overall savings across phases 2-4 should meet the 80% claim."""
+    """Overall savings across phases 2-6 should meet the 80% claim."""
     assert benchmark_results["overall"] >= 0.80, (
         f"Overall savings {benchmark_results['overall']:.1%} < 80%"
     )

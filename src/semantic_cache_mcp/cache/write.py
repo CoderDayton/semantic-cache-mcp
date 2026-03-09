@@ -144,6 +144,17 @@ def smart_write(
                 old_content = cache.get_content(cached)
                 from_cache = True
                 logger.debug(f"Using cached content for diff: {path}")
+            else:
+                # mtime changed — check content hash before falling back to disk
+                try:
+                    disk_bytes = file_path.read_bytes()
+                    if hash_content(disk_bytes) == cached.content_hash:
+                        cache.update_mtime(str(file_path), mtime)
+                        old_content = cache.get_content(cached)
+                        from_cache = True
+                        logger.debug(f"Content hash match for diff: {path}")
+                except Exception:  # nosec B110 — fall through to disk read
+                    pass
 
         # Fall back to disk read
         if old_content is None:
@@ -317,11 +328,18 @@ def smart_edit(
             from_cache = True
             logger.debug(f"Using cached content for edit: {path}")
         else:
-            # Cache stale, read from disk
+            # mtime changed — check content hash before falling back to disk
             try:
-                content = file_path.read_text(encoding="utf-8")
+                disk_content = file_path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                content = file_path.read_text(encoding="utf-8", errors="replace")
+                disk_content = file_path.read_text(encoding="utf-8", errors="replace")
+            if hash_content(disk_content) == cached.content_hash:
+                cache.update_mtime(str(file_path), mtime)
+                content = cache.get_content(cached)
+                from_cache = True
+                logger.debug(f"Content hash match for edit: {path}")
+            else:
+                content = disk_content
     else:
         # No cache entry, read from disk
         try:
@@ -550,7 +568,14 @@ def smart_batch_edit(
             content = cache.get_content(cached)
             from_cache = True
         else:
-            content = file_path.read_text(encoding="utf-8")
+            # mtime changed — check content hash before falling back to disk
+            disk_content = file_path.read_text(encoding="utf-8")
+            if hash_content(disk_content) == cached.content_hash:
+                cache.update_mtime(str(file_path), mtime)
+                content = cache.get_content(cached)
+                from_cache = True
+            else:
+                content = disk_content
     else:
         content = file_path.read_text(encoding="utf-8")
 

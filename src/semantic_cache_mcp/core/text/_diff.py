@@ -32,23 +32,6 @@ def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
     Reference: "An O(ND) Difference Algorithm" by Myers (1986)
     """
 
-    def _backtrack(x: int, y: int, trace: dict) -> list[tuple[str, str]]:
-        """Backtrack from endpoint to reconstruct edit script."""
-        edits = []
-        while x > 0 or y > 0:
-            if (x - 1, y - 1) in trace.get((x, y), []):
-                edits.append((" ", old[x - 1]))
-                x, y = x - 1, y - 1
-            elif (x - 1, y) in trace.get((x, y), []):
-                edits.append(("-", old[x - 1]))
-                x = x - 1
-            elif (x, y - 1) in trace.get((x, y), []):
-                edits.append(("+", new[y - 1]))
-                y = y - 1
-            else:
-                break
-        return list(reversed(edits))
-
     m, n = len(old), len(new)
     if m == 0 and n == 0:
         return []

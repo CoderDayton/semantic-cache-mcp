@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 
 # Type aliases (Python 3.12+)
 type EmbeddingVector = array.array[float] | list[float]
-type ChunkHash = str
 type ContentHash = str
 
 
@@ -17,7 +16,6 @@ class CacheEntry:
 
     path: str
     content_hash: ContentHash
-    chunks: list[ChunkHash]
     mtime: float
     tokens: int
     embedding: EmbeddingVector | None
@@ -38,15 +36,6 @@ class ReadResult:
     truncated: bool
     compression_ratio: float
     semantic_match: str | None = None
-
-
-@dataclass(slots=True, frozen=True)
-class ChunkData:
-    """Immutable chunk data for storage."""
-
-    hash: ChunkHash
-    data: bytes
-    size: int
 
 
 @dataclass(slots=True)

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""End-to-end token savings benchmark for semantic-cache-mcp.
+"""Token savings benchmark for semantic-cache-mcp.
 
-Proves the "80%+ token reduction" claim using real source files from this project.
-Runs 4 phases against a temporary cache, measuring exact token counts:
+Measures actual token reduction across 6 real-world phases:
 
-  1. Cold read     — first read, no cache (baseline)
-  2. Unchanged     — re-read identical files (mtime cache hit)
-  3. Small edits   — ~5% of lines changed in 30% of files
-  4. Batch read    — all files via batch_smart_read
+  1. Cold read        — first read, no cache (baseline)
+  2. Unchanged        — re-read identical files (cache hit)
+  3. Content hash     — touch files (mtime changes, content identical)
+  4. Small edits      — ~5% of lines changed in 30% of files
+  5. Batch read       — all files via batch_smart_read
+  6. Search after cache — semantic search on cached corpus
 
 Usage:
     uv run python benchmarks/benchmark_token_savings.py
@@ -15,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import random
 import shutil
 import sys
@@ -26,7 +28,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from semantic_cache_mcp.cache import SemanticCache, batch_smart_read, smart_read  # noqa: E402, I001
+from semantic_cache_mcp.cache import (  # noqa: E402, I001
+    SemanticCache,
+    batch_smart_read,
+    semantic_search,
+    smart_read,
+)
 from semantic_cache_mcp.core.tokenizer import count_tokens  # noqa: E402
 
 
@@ -145,8 +152,30 @@ def phase_small_modifications(
     }
 
 
+def phase_content_hash(
+    cache: SemanticCache,
+    files: list[Path],
+) -> tuple[int, int]:
+    """Phase 3: Touch files (mtime changes, content identical).
+
+    Simulates `git checkout` or editor save-without-change scenarios.
+    The cache should detect content is unchanged via BLAKE3 hash.
+    """
+    # Touch all files to update mtime without changing content
+    for f in files:
+        os.utime(f)
+
+    tokens_returned = 0
+    tokens_original = 0
+    for f in files:
+        result = smart_read(cache, str(f), diff_mode=True)
+        tokens_returned += result.tokens_returned
+        tokens_original += result.tokens_original
+    return tokens_returned, tokens_original
+
+
 def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
-    """Phase 4: Batch read with token budget."""
+    """Phase 5: Batch read with token budget."""
     result = batch_smart_read(
         cache,
         [str(f) for f in files],
@@ -158,6 +187,35 @@ def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]
     # Original = total_tokens + tokens_saved
     tokens_original = result.total_tokens + result.tokens_saved
     return result.total_tokens, tokens_original
+
+
+def phase_search_after_cache(
+    cache: SemanticCache,
+    original_tokens: int,
+    num_files: int,
+) -> tuple[int, int]:
+    """Phase 6: Semantic search on cached corpus.
+
+    Measures token cost of search results vs reading matched files fully.
+    """
+    queries = [
+        "embedding model configuration",
+        "file caching and diff logic",
+        "semantic search implementation",
+        "token counting and BPE",
+        "MCP server tool registration",
+    ]
+    tokens_returned = 0
+    for query in queries:
+        result = semantic_search(cache, query, k=5)
+        for m in result.matches:
+            # Each match returns a preview, not the full file
+            tokens_returned += count_tokens(m.preview) if m.preview else 0
+
+    # Original = what it would cost to read k files fully per query
+    avg_tokens = original_tokens // max(num_files, 1)
+    tokens_original = len(queries) * 5 * avg_tokens
+    return tokens_returned, tokens_original
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +244,7 @@ def run_benchmark(
     seed: int = 42,
     quiet: bool = False,
 ) -> dict[str, float]:
-    """Run the full 4-phase benchmark.
+    """Run the full 6-phase benchmark.
 
     Args:
         file_limit: Max files to use (None = all source files).
@@ -238,45 +296,63 @@ def run_benchmark(
             print("\nPhase 2: Unchanged Re-read")
             print(_fmt_row("Cached re-read", p2_ret, p2_orig))
 
-        # Phase 3: Small modifications
-        modified = _apply_small_edits(files, fraction=0.3, seed=seed)
-        p3 = phase_small_modifications(cache, files, modified)
-        p3c_ret, p3c_orig = p3["combined"]
-        p3_saved = _pct(p3c_orig - p3c_ret, p3c_orig)
+        # Phase 3: Content hash freshness (touch without change)
+        p3_ret, p3_orig = phase_content_hash(cache, files)
+        p3_saved = _pct(p3_orig - p3_ret, p3_orig)
 
         if not quiet:
-            ch_ret, ch_orig = p3["changed"]
-            unch_ret, unch_orig = p3["unchanged"]
-            print(f"\nPhase 3: Small Modifications ({len(modified)}/{len(files)} files changed)")
+            print("\nPhase 3: Content Hash (touch, mtime changed, content identical)")
+            print(_fmt_row("Content hash hit", p3_ret, p3_orig))
+
+        # Phase 4: Small modifications
+        modified = _apply_small_edits(files, fraction=0.3, seed=seed)
+        p4 = phase_small_modifications(cache, files, modified)
+        p4c_ret, p4c_orig = p4["combined"]
+        p4_saved = _pct(p4c_orig - p4c_ret, p4c_orig)
+
+        if not quiet:
+            ch_ret, ch_orig = p4["changed"]
+            unch_ret, unch_orig = p4["unchanged"]
+            print(f"\nPhase 4: Small Modifications ({len(modified)}/{len(files)} files changed)")
             print(_fmt_row(f"Changed ({len(modified)} files)", ch_ret, ch_orig))
             print(_fmt_row(f"Unchanged ({len(files) - len(modified)} files)", unch_ret, unch_orig))
-            print(_fmt_row("Combined", p3c_ret, p3c_orig))
+            print(_fmt_row("Combined", p4c_ret, p4c_orig))
 
-        # Phase 4: Batch read (files already partially cached from phase 3)
-        p4_ret, p4_orig = phase_batch_read(cache, files)
-        p4_saved = _pct(p4_orig - p4_ret, p4_orig)
+        # Phase 5: Batch read (files already partially cached from phase 4)
+        p5_ret, p5_orig = phase_batch_read(cache, files)
+        p5_saved = _pct(p5_orig - p5_ret, p5_orig)
 
         if not quiet:
-            print("\nPhase 4: Batch Read (all files, 200K budget)")
-            print(_fmt_row("Batch read", p4_ret, p4_orig))
+            print("\nPhase 5: Batch Read (all files, 200K budget)")
+            print(_fmt_row("Batch read", p5_ret, p5_orig))
+
+        # Phase 6: Search after cache
+        p6_ret, p6_orig = phase_search_after_cache(cache, p1_orig, len(files))
+        p6_saved = _pct(p6_orig - p6_ret, p6_orig)
+
+        if not quiet:
+            print("\nPhase 6: Search (5 queries × k=5, previews vs full reads)")
+            print(_fmt_row("Search previews", p6_ret, p6_orig))
 
         elapsed = time.perf_counter() - t0
 
-        # Aggregate: average savings across phases 2-4 (phase 1 is baseline)
-        all_returned = p2_ret + p3c_ret + p4_ret
-        all_original = p2_orig + p3c_orig + p4_orig
+        # Aggregate: average savings across phases 2-6 (phase 1 is baseline)
+        all_returned = p2_ret + p3_ret + p4c_ret + p5_ret + p6_ret
+        all_original = p2_orig + p3_orig + p4c_orig + p5_orig + p6_orig
         overall = _pct(all_original - all_returned, all_original)
 
         if not quiet:
             print(f"\n{'=' * 55}")
-            print(f"Overall (phases 2-4): {overall:.1%} token reduction")
+            print(f"Overall (phases 2-6): {overall:.1%} token reduction")
             print(f"Elapsed: {elapsed:.2f}s")
 
         return {
             "cold_read": p1_saved,
             "unchanged": p2_saved,
-            "small_edits": p3_saved,
-            "batch_read": p4_saved,
+            "content_hash": p3_saved,
+            "small_edits": p4_saved,
+            "batch_read": p5_saved,
+            "search": p6_saved,
             "overall": overall,
         }
 

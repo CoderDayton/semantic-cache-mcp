@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -11,7 +10,8 @@ from unittest.mock import patch
 import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
-from semantic_cache_mcp.storage.sqlite import SQLiteStorage
+from semantic_cache_mcp.server._mcp import _migrate_v2_to_v3
+from semantic_cache_mcp.storage.vector import VectorStorage
 
 
 class TestFileNotFoundHandling:
@@ -171,7 +171,7 @@ class TestConcurrentAccess:
     def test_concurrent_writes(self, temp_dir: Path) -> None:
         """Concurrent writes should not corrupt database."""
         db_path = temp_dir / "concurrent.db"
-        storage = SQLiteStorage(db_path)
+        storage = VectorStorage(db_path)
         errors: list[Exception] = []
 
         def write_file(i: int):
@@ -194,32 +194,13 @@ class TestConcurrentAccess:
 class TestCorruptedCacheRecovery:
     """Tests for corrupted cache scenarios."""
 
-    def test_corrupted_db_recreation(self, corrupted_cache_db: Path) -> None:
-        """Corrupted database should be detected on connection."""
-        # This should raise an error when trying to use corrupted DB
-        with pytest.raises(sqlite3.DatabaseError):
-            storage = SQLiteStorage(corrupted_cache_db)
-            storage.get_stats()
-
-    def test_missing_chunks_graceful(self, temp_dir: Path) -> None:
-        """Missing chunks should be handled gracefully."""
-        db_path = temp_dir / "missing_chunks.db"
-        storage = SQLiteStorage(db_path)
-
-        # Store a file
-        storage.put("/test/file.txt", "Test content", time.time())
-
-        # Manually delete chunks
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("DELETE FROM chunks")
-
-        # Try to retrieve - should handle gracefully
-        entry = storage.get("/test/file.txt")
-        assert entry is not None
-
-        # Content retrieval will fail or return partial
-        result = storage.load_chunks(entry.chunks)
-        assert result == b""  # Empty because chunks are missing
+    def test_empty_storage_stats(self, temp_dir: Path) -> None:
+        """Empty VectorStorage should return zero stats."""
+        db_path = temp_dir / "empty.db"
+        storage = VectorStorage(db_path)
+        stats = storage.get_stats()
+        assert stats["files_cached"] == 0
+        assert stats["total_documents"] == 0
 
 
 class TestMissingEmbeddingsService:
@@ -310,25 +291,84 @@ class TestPathTraversalPrevention:
 class TestDatabaseIntegrity:
     """Tests for database integrity."""
 
-    def test_schema_creation(self, temp_dir: Path) -> None:
-        """Database schema should be created on init."""
+    def test_storage_creation(self, temp_dir: Path) -> None:
+        """VectorStorage should initialize and create database file."""
         db_path = temp_dir / "new_db.db"
-        storage = SQLiteStorage(db_path)
+        storage = VectorStorage(db_path)
+        assert db_path.exists()
+        stats = storage.get_stats()
+        assert stats["files_cached"] == 0
 
-        with sqlite3.connect(db_path) as conn:
-            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            table_names = {t[0] for t in tables}
+    def test_put_and_retrieve(self, temp_dir: Path) -> None:
+        """VectorStorage should store and retrieve content."""
+        db_path = temp_dir / "integrity.db"
+        storage = VectorStorage(db_path)
+        storage.put("/test/file.txt", "Test content", time.time())
+        entry = storage.get("/test/file.txt")
+        assert entry is not None
+        content = storage.get_content(entry)
+        assert content == "Test content"
 
-            assert "chunks" in table_names
-            assert "files" in table_names
 
-    def test_index_creation(self, temp_dir: Path) -> None:
-        """Indexes should be created for performance."""
-        db_path = temp_dir / "indexed_db.db"
-        SQLiteStorage(db_path)
+# ---------------------------------------------------------------------------
+# Migration: v0.2.0 → v0.3.0
+# ---------------------------------------------------------------------------
 
-        with sqlite3.connect(db_path) as conn:
-            indexes = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
-            index_names = {i[0] for i in indexes}
 
-            assert "idx_created" in index_names
+class TestMigrateV2ToV3:
+    """Test legacy cache.db cleanup on first v0.3.0 startup."""
+
+    def test_removes_legacy_db_with_old_schema(self, tmp_path: Path) -> None:
+        """cache.db with chunks/files/lsh_index tables should be deleted."""
+        import sqlite3
+
+        db = tmp_path / "cache.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE chunks (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE lsh_index (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE session_metrics (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        # Also create WAL/SHM files
+        (tmp_path / "cache.db-wal").write_bytes(b"wal")
+        (tmp_path / "cache.db-shm").write_bytes(b"shm")
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()
+
+        assert not db.exists()
+        assert not (tmp_path / "cache.db-wal").exists()
+        assert not (tmp_path / "cache.db-shm").exists()
+
+    def test_ignores_unrelated_db(self, tmp_path: Path) -> None:
+        """A database without the old schema should be left alone."""
+        import sqlite3
+
+        db = tmp_path / "cache.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE something_else (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()
+
+        assert db.exists()  # Not deleted
+
+    def test_no_op_when_no_db(self, tmp_path: Path) -> None:
+        """No crash when cache.db doesn't exist."""
+        db = tmp_path / "cache.db"
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()  # Should not raise
+
+    def test_handles_corrupted_db(self, tmp_path: Path) -> None:
+        """Corrupted cache.db should not crash migration."""
+        db = tmp_path / "cache.db"
+        db.write_bytes(b"this is not a sqlite database")
+
+        with patch("semantic_cache_mcp.server._mcp.DB_PATH", db):
+            _migrate_v2_to_v3()  # Should not raise
+
+        assert db.exists()  # Left alone since we can't verify schema

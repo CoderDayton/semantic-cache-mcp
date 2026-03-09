@@ -1,4 +1,4 @@
-"""Tests for core algorithms: chunking, hashing, compression, similarity."""
+"""Tests for core algorithms: chunking, hashing, similarity."""
 
 from __future__ import annotations
 
@@ -6,11 +6,6 @@ import array
 import math
 
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
-from semantic_cache_mcp.core.compression import (
-    compress_adaptive,
-    decompress,
-    estimate_entropy,
-)
 from semantic_cache_mcp.core.hashing import hash_chunk, hash_content
 from semantic_cache_mcp.core.similarity import cosine_similarity
 from semantic_cache_mcp.core.text import generate_diff, truncate_smart
@@ -115,67 +110,6 @@ class TestHashing:
         """Empty string should have a valid hash."""
         result = hash_content("")
         assert len(result) == 64
-
-
-class TestCompression:
-    """Tests for adaptive Brotli compression."""
-
-    def test_compress_decompress_roundtrip(self) -> None:
-        """Compressing then decompressing should return original."""
-        original = b"Test data for compression roundtrip. " * 100
-        compressed = compress_adaptive(original)
-        decompressed = decompress(compressed)
-        assert decompressed == original
-
-    def test_compression_reduces_size(self) -> None:
-        """Highly compressible data should compress well."""
-        original = b"aaaaaaaaaa" * 1000
-        compressed = compress_adaptive(original)
-        assert len(compressed) < len(original)
-
-    def test_empty_data_roundtrip(self) -> None:
-        """Empty data should roundtrip correctly."""
-        original = b""
-        compressed = compress_adaptive(original)
-        decompressed = decompress(compressed)
-        assert decompressed == original
-
-    def test_binary_data_roundtrip(self) -> None:
-        """Binary data should roundtrip correctly."""
-        original = bytes(range(256)) * 10
-        compressed = compress_adaptive(original)
-        decompressed = decompress(compressed)
-        assert decompressed == original
-
-    def test_entropy_estimation_low(self) -> None:
-        """Repetitive data should have low entropy."""
-        data = b"aaaa" * 1000
-        entropy = estimate_entropy(data)
-        assert entropy < 1.0  # Very low entropy
-
-    def test_entropy_estimation_high(self) -> None:
-        """Random-like data should have high entropy."""
-        data = bytes(range(256)) * 10
-        entropy = estimate_entropy(data)
-        assert entropy > 7.0  # High entropy (close to 8 bits)
-
-    def test_entropy_empty_data(self) -> None:
-        """Empty data should have zero entropy."""
-        assert estimate_entropy(b"") == 0.0
-
-    def test_adaptive_quality_selection(self) -> None:
-        """Different entropy levels should work with adaptive compression."""
-        # Low entropy (highly compressible)
-        low_entropy = b"x" * 10000
-        comp_low = compress_adaptive(low_entropy)
-
-        # High entropy (less compressible)
-        high_entropy = bytes(range(256)) * 40
-        comp_high = compress_adaptive(high_entropy)
-
-        # Both should decompress correctly
-        assert decompress(comp_low) == low_entropy
-        assert decompress(comp_high) == high_entropy
 
 
 class TestSimilarity:
