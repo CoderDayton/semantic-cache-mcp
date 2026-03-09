@@ -52,6 +52,12 @@ def _cuda_provider_is_available() -> bool:
         logger.info("CUDAExecutionProvider detected; enabling GPU embeddings")
     else:
         logger.info(f"CUDAExecutionProvider not detected (available: {providers})")
+        if EMBEDDING_DEVICE == "cuda":
+            logger.warning(
+                "EMBEDDING_DEVICE=gpu/cuda but CUDAExecutionProvider unavailable. "
+                "Install GPU support: uv add fastembed-gpu (or pip install fastembed-gpu). "
+                "Falling back to CPU."
+            )
     return has_cuda
 
 

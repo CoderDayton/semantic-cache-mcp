@@ -72,8 +72,9 @@ def _env_mode(name: str, default: str) -> str:
 MAX_CONTENT_SIZE: Final = _env_int("MAX_CONTENT_SIZE", 100_000)  # 100KB default max return size
 MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # LRU-K eviction limit
 
-# Embedding device: "cpu" (default, no VRAM usage), "cuda" (GPU), "auto" (detect)
-EMBEDDING_DEVICE: Final = environ.get("EMBEDDING_DEVICE", "cpu").strip().lower()
+# Embedding device: "cpu" (default), "gpu"/"cuda" (NVIDIA GPU), "auto" (detect)
+_raw_device = environ.get("EMBEDDING_DEVICE", "cpu").strip().lower()
+EMBEDDING_DEVICE: Final = "cuda" if _raw_device == "gpu" else _raw_device
 
 # Embedding model: any FastEmbed-supported model name
 EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip()
@@ -136,7 +137,7 @@ def _validate_config() -> None:
         errors.append(f"TOOL_MAX_RESPONSE_TOKENS ({TOOL_MAX_RESPONSE_TOKENS}) must be >= 0")
 
     if EMBEDDING_DEVICE not in {"cpu", "cuda", "auto"}:
-        errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, cuda, auto")
+        errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, gpu, cuda, auto")
 
     if not 0 < SIMILARITY_THRESHOLD < 1:
         errors.append(f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD}) must be between 0 and 1")
