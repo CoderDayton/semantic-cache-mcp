@@ -77,6 +77,11 @@ async def app_lifespan(server: FastMCP):
             warmup()
 
             model_info = get_model_info()
+            # Detect embedding model change and rebuild index if needed
+            if model_info.get("ready") and cache is not None:
+                cache._storage.clear_if_model_changed(
+                    str(model_info["model"]), int(model_info["dim"])
+                )
             if not model_info.get("ready", False):
                 logger.error(
                     "Embedding model failed to initialize. "

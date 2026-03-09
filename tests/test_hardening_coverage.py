@@ -556,7 +556,7 @@ class TestMcpLifespan:
             patch("semantic_cache_mcp.server._mcp.warmup", side_effect=mock_warmup),
             patch(
                 "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test"},
+                return_value={"ready": True, "model": "test", "dim": 384},
             ),
             patch("semantic_cache_mcp.server._mcp.SemanticCache") as mock_cache_cls,
         ):
@@ -860,7 +860,7 @@ class TestMcpCacheNoneGuard:
             patch("semantic_cache_mcp.server._mcp.warmup"),
             patch(
                 "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test"},
+                return_value={"ready": True, "model": "test", "dim": 384},
             ),
             patch(
                 "semantic_cache_mcp.server._mcp.SemanticCache",

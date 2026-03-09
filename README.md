@@ -79,6 +79,18 @@ uv tool install "semantic-cache-mcp[gpu]"
 
 Then set `EMBEDDING_DEVICE=gpu` in your MCP config env block. Falls back to CPU automatically if CUDA is unavailable.
 
+### Custom Embedding Models
+
+Any HuggingFace model with an ONNX export works — set `EMBEDDING_MODEL` in your env config:
+
+```json
+"env": {
+  "EMBEDDING_MODEL": "nomic-ai/nomic-embed-text-v1.5"
+}
+```
+
+If the model isn't in fastembed's built-in list, it's automatically downloaded and registered from HuggingFace Hub on first startup (ONNX file integrity is verified via SHA256). See [env_variables.md](docs/env_variables.md) for model recommendations.
+
 ### Block Native File Tools (Recommended)
 
 Disable the client's built-in file tools so all file I/O routes through semantic-cache.

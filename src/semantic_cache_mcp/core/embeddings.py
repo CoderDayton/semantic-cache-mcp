@@ -7,6 +7,9 @@ Uses CUDA provider when available and falls back to CPU automatically.
 from __future__ import annotations
 
 import array
+import contextlib
+import hashlib
+import json
 import logging
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -55,6 +58,118 @@ def _cuda_provider_is_available() -> bool:
     return has_cuda
 
 
+def _register_custom_model(model_name: str) -> dict[str, int | str | None]:
+    """Auto-register an unsupported HuggingFace model with fastembed.
+
+    Downloads config.json and pooling config from HF Hub to infer
+    embedding dim, pooling type, and ONNX model path, then registers
+    via TextEmbedding.add_custom_model().
+
+    Returns model info dict with dim, model_file, and onnx_size_bytes.
+    """
+    from fastembed import TextEmbedding
+    from fastembed.common.model_description import ModelSource, PoolingType
+    from huggingface_hub import hf_hub_download, list_repo_tree
+
+    logger.info(f"Model {model_name} not in fastembed defaults, registering from HuggingFace Hub")
+
+    # 1. Get embedding dimension from config.json
+    try:
+        config_path = hf_hub_download(model_name, "config.json", cache_dir=str(FASTEMBED_CACHE_DIR))
+    except Exception as exc:
+        raise ValueError(
+            f"Could not download config for {model_name} from HuggingFace Hub. "
+            f"Check your network or use a built-in model. ({exc})"
+        ) from exc
+    with open(config_path) as f:
+        config = json.load(f)
+    dim = config.get("hidden_size", 768)
+
+    # 2. Infer pooling type from sentence-transformers config
+    pooling = PoolingType.MEAN
+    try:
+        pooling_path = hf_hub_download(
+            model_name, "1_Pooling/config.json", cache_dir=str(FASTEMBED_CACHE_DIR)
+        )
+        with open(pooling_path) as f:
+            pooling_config = json.load(f)
+        if pooling_config.get("pooling_mode_cls_token"):
+            pooling = PoolingType.CLS
+    except Exception:  # noqa: BLE001 — pooling config is optional
+        pass
+
+    # 3. Find the ONNX model file and its expected SHA256 from repo metadata
+    model_file = "onnx/model.onnx"
+    expected_sha256: str | None = None
+    onnx_size_bytes: int | None = None
+    try:
+        entries = list(list_repo_tree(model_name, recursive=True))
+        onnx_entries = sorted(
+            [e for e in entries if hasattr(e, "path") and e.path.endswith(".onnx")],
+            key=lambda e: e.path,
+        )
+        if not onnx_entries:
+            raise ValueError(
+                f"Model {model_name} has no ONNX export on HuggingFace. "
+                f"Use a model with ONNX support (look for the 'onnx' tag)."
+            )
+        # Prefer the base model.onnx over quantized/optimized variants
+        preferred = [e for e in onnx_entries if e.path.endswith("/model.onnx")]
+        chosen = preferred[0] if preferred else onnx_entries[0]
+        model_file = chosen.path
+        # LFS entries carry a sha256; non-LFS carry blob_id (git SHA-1)
+        if hasattr(chosen, "lfs") and chosen.lfs is not None:
+            expected_sha256 = chosen.lfs.sha256
+            if hasattr(chosen.lfs, "size"):
+                onnx_size_bytes = chosen.lfs.size
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.warning(f"Could not list repo files for {model_name}: {exc}")
+
+    # 4. Pre-download the ONNX model file + tokenizer so fastembed finds them
+    #    in its HF cache snapshot directory at init time.
+    required_files = [
+        model_file,
+        model_file + "_data",  # external weights for large models (e.g. model.onnx_data)
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ]
+    for fname in required_files:
+        with contextlib.suppress(Exception):
+            hf_hub_download(model_name, fname, cache_dir=str(FASTEMBED_CACHE_DIR))
+
+    # 5. Verify ONNX model integrity against HF-reported SHA256
+    if expected_sha256:
+        onnx_path = hf_hub_download(
+            model_name, model_file, cache_dir=str(FASTEMBED_CACHE_DIR), local_files_only=True
+        )
+        sha256 = hashlib.sha256()
+        with open(onnx_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                sha256.update(chunk)
+        actual = sha256.hexdigest()
+        if actual != expected_sha256:
+            raise ValueError(
+                f"ONNX model hash mismatch for {model_name}: "
+                f"expected {expected_sha256}, got {actual}"
+            )
+
+    logger.info(f"Custom model: dim={dim}, pooling={pooling.name}, onnx={model_file}")
+
+    TextEmbedding.add_custom_model(
+        model=model_name,
+        pooling=pooling,
+        normalization=True,
+        sources=ModelSource(hf=model_name),
+        dim=dim,
+        model_file=model_file,
+    )
+
+    return {"dim": dim, "model_file": model_file, "onnx_size_bytes": onnx_size_bytes}
+
+
 def _get_model() -> TextEmbedding:
     """Get or initialize the embedding model singleton."""
     global _embedding_model, _execution_provider
@@ -81,29 +196,29 @@ def _get_model() -> TextEmbedding:
                 "Install GPU support: pip install 'semantic-cache-mcp[gpu]'. "
                 "Falling back to CPU."
             )
-        use_cuda = EMBEDDING_DEVICE == "cuda" or (EMBEDDING_DEVICE == "auto" and cuda_available)
+        use_cuda = cuda_available and EMBEDDING_DEVICE in ("cuda", "auto")
         if use_cuda:
             # Configure CUDA provider to limit VRAM arena growth:
             # - kSameAsRequested: allocate exact size needed (default kNextPowerOfTwo
-            #   doubles on each expansion, wasting ~3GB for a 137M param model)
-            # - gpu_mem_limit: 4GB cap — model needs ~1.5GB weights + ~500MB activations
-            #   for max sequence length; headroom for attention matmul spikes
+            #   doubles on each expansion, wasting VRAM)
+            # - gpu_mem_limit: 3x ONNX file size (weights + activations + overhead),
+            #   defaults to 4GB for built-in models
             # - cudnn_conv_algo_search: HEURISTIC avoids cuDNN workspace bloat
             init_kwargs["providers"] = [
                 (
                     "CUDAExecutionProvider",
                     {
                         "arena_extend_strategy": "kSameAsRequested",
-                        "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4GB
+                        "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4GB default
                         "cudnn_conv_algo_search": "HEURISTIC",
                     },
                 ),
             ]
 
-        try:
+        def _try_init(kwargs: dict[str, Any]) -> TextEmbedding:
             with warnings.catch_warnings(record=True) as captured_warnings:
                 warnings.simplefilter("always")
-                _embedding_model = TextEmbedding(**init_kwargs)
+                model = TextEmbedding(**kwargs)
 
             # fastembed may emit warning and silently fall back to CPU if CUDA init fails.
             cuda_warning = any(
@@ -112,15 +227,43 @@ def _get_model() -> TextEmbedding:
             )
             if use_cuda and cuda_warning:
                 raise RuntimeError("CUDA provider initialization failed at runtime")
+            return model
 
+        try:
+            _embedding_model = _try_init(init_kwargs)
             _execution_provider = "CUDAExecutionProvider" if use_cuda else "CPUExecutionProvider"
+        except ValueError as e:
+            if "not supported" not in str(e):
+                raise
+            # Model not in fastembed's built-in list — auto-register from HuggingFace Hub
+            model_info = _register_custom_model(FASTEMBED_MODEL)
+            # Recalculate gpu_mem_limit from actual ONNX size: 3x for activations + overhead
+            if use_cuda and model_info.get("onnx_size_bytes"):
+                # 3x model size + 512MB headroom for attention spikes and kernel workspace
+                mem_limit = int(model_info["onnx_size_bytes"]) * 3 + 512 * 1024 * 1024  # type: ignore[arg-type]
+                init_kwargs["providers"][0][1]["gpu_mem_limit"] = mem_limit
+                logger.info(f"GPU memory limit set to {mem_limit / (1024**3):.1f}GB from ONNX size")
+            try:
+                _embedding_model = _try_init(init_kwargs)
+                _execution_provider = (
+                    "CUDAExecutionProvider" if use_cuda else "CPUExecutionProvider"
+                )
+            except Exception as cuda_err:
+                if "providers" not in init_kwargs:
+                    raise
+                logger.warning(
+                    f"CUDA init failed for custom model ({cuda_err}), falling back to CPU"
+                )
+                init_kwargs.pop("providers", None)
+                _embedding_model = _try_init(init_kwargs)
+                _execution_provider = "CPUExecutionProvider"
         except TypeError:
             # Backward compatibility: some fastembed versions may not accept providers.
             if "providers" not in init_kwargs:
                 raise
             logger.warning("TextEmbedding does not accept providers arg, falling back")
             init_kwargs.pop("providers", None)
-            _embedding_model = TextEmbedding(**init_kwargs)
+            _embedding_model = _try_init(init_kwargs)
             _execution_provider = "CPUExecutionProvider"
         except Exception as e:
             # If CUDA init fails (driver/runtime mismatch), retry on CPU providers.
@@ -128,7 +271,7 @@ def _get_model() -> TextEmbedding:
                 raise
             logger.warning(f"CUDA initialization failed ({e}), falling back to CPU provider")
             init_kwargs.pop("providers", None)
-            _embedding_model = TextEmbedding(**init_kwargs)
+            _embedding_model = _try_init(init_kwargs)
             _execution_provider = "CPUExecutionProvider"
 
         logger.info(f"Embedding execution provider: {_execution_provider}")
