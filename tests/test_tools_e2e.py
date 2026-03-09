@@ -458,7 +458,7 @@ class TestReadLargeFile:
         start = time.monotonic()
         result = smart_read(cache, str(large_py))
         elapsed = time.monotonic() - start
-        assert elapsed < 30.0  # CI machines are slow; just check it doesn't hang
+        assert elapsed < 120.0  # macOS CI cold-starts embedding + summarizes 134K tokens
         assert result.tokens_original > 0
         # Large file exceeds MAX_CONTENT_SIZE, so truncation is expected
         if result.truncated:
