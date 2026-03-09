@@ -52,12 +52,6 @@ def _cuda_provider_is_available() -> bool:
         logger.info("CUDAExecutionProvider detected; enabling GPU embeddings")
     else:
         logger.info(f"CUDAExecutionProvider not detected (available: {providers})")
-        if EMBEDDING_DEVICE == "cuda":
-            logger.warning(
-                "EMBEDDING_DEVICE=gpu/cuda but CUDAExecutionProvider unavailable. "
-                "Install GPU support: uv add fastembed-gpu (or pip install fastembed-gpu). "
-                "Falling back to CPU."
-            )
     return has_cuda
 
 
@@ -80,9 +74,14 @@ def _get_model() -> TextEmbedding:
             "lazy_load": False,  # Load immediately for predictable startup
         }
 
-        use_cuda = EMBEDDING_DEVICE == "cuda" or (
-            EMBEDDING_DEVICE == "auto" and _cuda_provider_is_available()
-        )
+        cuda_available = _cuda_provider_is_available()
+        if EMBEDDING_DEVICE == "cuda" and not cuda_available:
+            logger.warning(
+                "EMBEDDING_DEVICE=gpu/cuda but CUDAExecutionProvider unavailable. "
+                "Install GPU support: pip install 'semantic-cache-mcp[gpu]'. "
+                "Falling back to CPU."
+            )
+        use_cuda = EMBEDDING_DEVICE == "cuda" or (EMBEDDING_DEVICE == "auto" and cuda_available)
         if use_cuda:
             # Configure CUDA provider to limit VRAM arena growth:
             # - kSameAsRequested: allocate exact size needed (default kNextPowerOfTwo
