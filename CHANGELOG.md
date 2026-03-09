@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-08
+
+### Changed
+
+- **Removed explicit `onnxruntime` dependency** — `fastembed` now owns the ONNX Runtime dependency. Users with `fastembed-gpu` get `onnxruntime-gpu` automatically instead of being forced to CPU.
+
+### Added
+
+- **`[gpu]` optional extra** — Install with `semantic-cache-mcp[gpu]` to get NVIDIA GPU acceleration via `fastembed-gpu`.
+- **`gpu` alias for `EMBEDDING_DEVICE`** — `EMBEDDING_DEVICE=gpu` now accepted as an alias for `cuda`.
+- **Startup warning on missing CUDA** — When `EMBEDDING_DEVICE=gpu/cuda` but `CUDAExecutionProvider` is unavailable, logs a warning with install instructions before falling back to CPU.
+
 ## [0.3.0] - 2026-03-08 — Storage Rewrite
 
 Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw text + vector embeddings (VectorStorage via simplevecdb). Simpler data path, better search, same caching semantics.
