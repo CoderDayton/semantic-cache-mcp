@@ -30,8 +30,6 @@ from numpy.typing import NDArray
 
 @dataclass
 class SummarizationConfig:
-    """Configuration for semantic summarization."""
-
     # Segment size bounds
     min_segment_lines: int = 3
     max_segment_lines: int = 50
@@ -74,31 +72,17 @@ _BOUNDARY_REGEX = re.compile("|".join(f"({p})" for p in _BOUNDARY_PATTERNS), re.
 
 @dataclass
 class Segment:
-    """A semantic segment of the file."""
-
     start_line: int
     end_line: int
     content: str
-    is_header: bool = False  # Is this a class/function definition header?
+    is_header: bool = False  # True if line matches a class/function definition pattern
 
 
 def extract_segments(
     content: str,
     config: SummarizationConfig = DEFAULT_SUMMARIZATION_CONFIG,
 ) -> list[Segment]:
-    """
-    Extract semantic segments from content.
-
-    Tries to split at natural boundaries (function/class definitions, headers).
-    Falls back to paragraph/line-based splitting if no boundaries found.
-
-    Args:
-        content: File content
-        config: Segmentation configuration
-
-    Returns:
-        List of Segment objects
-    """
+    """Split at natural boundaries (function/class defs, headers); falls back to paragraphs."""
     lines = content.splitlines(keepends=True)
     n_lines = len(lines)
 
@@ -106,13 +90,13 @@ def extract_segments(
         return []
 
     # Find boundary lines
-    boundary_lines = [0]  # Always start at line 0
+    boundary_lines = [0]
 
     for i, line in enumerate(lines):
         if _BOUNDARY_REGEX.match(line) and i not in boundary_lines:
             boundary_lines.append(i)
 
-    boundary_lines.append(n_lines)  # End marker
+    boundary_lines.append(n_lines)
     boundary_lines = sorted(set(boundary_lines))
 
     # Create segments from boundaries
@@ -179,23 +163,15 @@ def extract_segments(
 
 
 def _position_score(segment: Segment, total_lines: int) -> float:
-    """
-    Score based on position: favor start and end of file.
-
-    Files often have important info at the top (imports, config) and
-    bottom (main blocks, exports).
-    """
+    """U-shaped score: high at start/end (imports, main block, exports), low in the middle."""
     if total_lines == 0:
         return 0.5
 
-    # Relative position [0, 1]
     rel_pos = segment.start_line / total_lines
 
-    # U-shaped curve: high at start (x=0) and end (x=1), low in middle (x=0.5)
-    # 4*(x-0.5)^2 gives 1 at x=0, 0 at x=0.5, 1 at x=1
+    # 4*(x-0.5)^2: 1 at x=0, 0 at x=0.5, 1 at x=1
     score = 4.0 * (rel_pos - 0.5) ** 2
 
-    # Boost headers (class/function definitions)
     if segment.is_header:
         score = min(1.0, score + 0.2)
 
@@ -203,11 +179,7 @@ def _position_score(segment: Segment, total_lines: int) -> float:
 
 
 def _information_density(segment: Segment) -> float:
-    """
-    Estimate information density of a segment.
-
-    Higher density = more unique tokens, less repetition, more code-like.
-    """
+    """Estimate info density: unique token ratio + syntax char density + non-whitespace ratio."""
     content = segment.content
 
     if not content.strip():
@@ -237,12 +209,8 @@ def _compute_diversity_penalty(
     selected_indices: set[int],
     threshold: float = 0.85,
 ) -> float:
-    """
-    Penalize segments too similar to already-selected ones.
-
-    Encourages diversity in selected content.
-    """
-    if not selected_indices or segment_idx >= len(embeddings):
+    """Penalty that ramps linearly when similarity to any selected segment exceeds threshold."""
+    if not selected_indices:
         return 0.0
 
     seg_emb = embeddings[segment_idx]
@@ -253,7 +221,6 @@ def _compute_diversity_penalty(
             sim = np.dot(seg_emb, embeddings[idx])
             max_similarity = max(max_similarity, sim)
 
-    # Penalty ramps up as similarity exceeds threshold
     if max_similarity > threshold:
         return (max_similarity - threshold) / (1.0 - threshold)
 
@@ -266,11 +233,7 @@ def score_segments(
     total_lines: int,
     config: SummarizationConfig = DEFAULT_SUMMARIZATION_CONFIG,
 ) -> list[tuple[int, float]]:
-    """
-    Score segments by importance.
-
-    Returns list of (segment_index, score) tuples, sorted by score descending.
-    """
+    """Return (segment_index, score) tuples sorted by score descending."""
     scores = []
 
     for i, segment in enumerate(segments):
@@ -298,35 +261,24 @@ def summarize_semantic(
     config: SummarizationConfig = DEFAULT_SUMMARIZATION_CONFIG,
     embed_fn: Callable[[str], NDArray[np.float32]] | None = None,
 ) -> str:
-    """
-    Semantic summarization: select most important segments.
+    """Select and reassemble the most important segments,
+    preserving content from throughout the file.
 
-    Unlike simple truncation, this preserves semantically important content
-    from throughout the file, not just the beginning/end.
-
-    Args:
-        content: Full file content
-        max_size: Maximum output size in characters
-        config: Summarization configuration
-        embed_fn: Optional embedding function (uses default if None)
-
-    Returns:
-        Summarized content with omission markers
+    Based on TCRA-LLM (arXiv:2310.15556). Uses embed_fn for diversity scoring;
+    falls back to bag-of-words when None.
     """
     if len(content) <= max_size:
         return content
 
-    # Extract segments
     segments = extract_segments(content, config)
 
     if len(segments) <= 1:
-        # Can't summarize single segment - fall back to truncation
+        # Single segment — can't do diversity-aware selection
         marker = "\n\n// [TRUNCATED - file too large]\n"
         return content[: max_size - len(marker)] + marker
 
     total_lines = content.count("\n") + 1
 
-    # Get embeddings for diversity scoring
     resolved: list[NDArray[np.float32]]
 
     if embed_fn is not None:
@@ -351,35 +303,30 @@ def summarize_semantic(
             zero = np.zeros(inferred_dim, dtype=np.float32)
             resolved = [e if e is not None else zero for e in raw]
         else:
-            # All embeds failed — fall back to bag-of-words
             resolved = [_simple_embedding(seg.content) for seg in segments]
     else:
-        # Fallback: simple bag-of-words embedding
         resolved = [_simple_embedding(seg.content) for seg in segments]
 
-    # Score and rank segments
     scored = score_segments(segments, resolved, total_lines, config)
 
-    # Greedy selection: pick highest-scoring segments that fit
-    # Use 80% of max_size for content, leaving 20% buffer for markers
+    # Greedy selection: highest-scoring segments that fit within 80% of budget
+    # (20% reserved for omission markers)
     content_budget = int(max_size * 0.80)
     selected_indices: set[int] = set()
     current_size = 0
 
-    # Always include first segment if it fits (contains docstrings, imports, headers)
+    # Always include first segment — typically contains imports, module docstring, headers
     if segments and len(segments[0].content) < content_budget:
         selected_indices.add(0)
         current_size += len(segments[0].content)
 
     for seg_idx, base_score in scored:
-        # Skip if already selected
         if seg_idx in selected_indices:
             continue
 
         segment = segments[seg_idx]
         seg_size = len(segment.content)
 
-        # Check if adding this segment would exceed budget
         if current_size + seg_size > content_budget:
             continue
 
@@ -392,18 +339,15 @@ def summarize_semantic(
             selected_indices.add(seg_idx)
             current_size += seg_size
 
-    # If we selected nothing, at least include first and last
     if not selected_indices:
         selected_indices = {0, len(segments) - 1}
 
-    # Reassemble in original order
     result_parts: list[str] = []
     last_end = 0
 
     for seg_idx in sorted(selected_indices):
         segment = segments[seg_idx]
 
-        # Add omission marker if there's a gap
         if config.include_markers and segment.start_line > last_end:
             omitted_lines = segment.start_line - last_end
             if omitted_lines > 0:
@@ -412,7 +356,6 @@ def summarize_semantic(
         result_parts.append(segment.content)
         last_end = segment.end_line
 
-    # Final omission marker
     if config.include_markers and last_end < total_lines:
         omitted_lines = total_lines - last_end
         if omitted_lines > 0:
@@ -420,7 +363,6 @@ def summarize_semantic(
 
     result = "".join(result_parts)
 
-    # Final size check - strictly enforce max_size
     if len(result) > max_size:
         # Ensure we have room for the truncation marker
         marker = "\n// [TRUNCATED]\n"
@@ -431,23 +373,17 @@ def summarize_semantic(
 
 
 def _simple_embedding(text: str, dim: int = 256) -> NDArray[np.float32]:
-    """
-    Simple bag-of-words embedding (fallback when no model available).
-
-    Uses hashed word frequencies as a crude semantic representation.
-    """
+    """Bag-of-words fallback: hashed word frequencies projected into `dim` dimensions."""
     words = re.findall(r"\b\w+\b", text.lower())
 
     if not words:
         return np.zeros(dim, dtype=np.float32)
 
-    # Hash words to dimensions
     vec = np.zeros(dim, dtype=np.float32)
     for word in words:
         idx = hash(word) % dim
         vec[idx] += 1.0
 
-    # Normalize
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
 
@@ -463,26 +399,11 @@ def truncate_with_summarization(
     use_semantic: bool = True,
     embed_fn: Callable[[str], NDArray[np.float32]] | None = None,
 ) -> str:
-    """
-    Smart truncation with optional semantic summarization.
-
-    Uses semantic summarization for better content preservation when possible,
-    falls back to simple truncation for very small limits.
-
-    Args:
-        content: Full file content
-        max_size: Maximum output size
-        use_semantic: Use semantic summarization
-        embed_fn: Optional embedding function
-
-    Returns:
-        Truncated/summarized content
-    """
     if len(content) <= max_size:
         return content
 
     if not use_semantic or max_size < 500:
-        # Too small for meaningful summarization
+        # Budget too small for meaningful segment selection
         return content[: max_size - 20] + "\n// [TRUNCATED]\n"
 
     return summarize_semantic(content, max_size, embed_fn=embed_fn)

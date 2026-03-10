@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -17,41 +16,43 @@ from semantic_cache_mcp.storage.vector import VectorStorage
 class TestFileNotFoundHandling:
     """Tests for file not found scenarios."""
 
-    def test_smart_read_file_not_found(self, semantic_cache_no_embeddings: SemanticCache) -> None:
+    async def test_smart_read_file_not_found(
+        self, semantic_cache_no_embeddings: SemanticCache
+    ) -> None:
         """smart_read should raise FileNotFoundError for missing files."""
         with pytest.raises(FileNotFoundError):
-            smart_read(semantic_cache_no_embeddings, "/nonexistent/file.txt")
+            await smart_read(semantic_cache_no_embeddings, "/nonexistent/file.txt")
 
-    def test_smart_read_nonexistent_directory(
+    async def test_smart_read_nonexistent_directory(
         self, semantic_cache_no_embeddings: SemanticCache
     ) -> None:
         """smart_read should raise for file in nonexistent directory."""
         with pytest.raises(FileNotFoundError):
-            smart_read(semantic_cache_no_embeddings, "/no/such/dir/file.txt")
+            await smart_read(semantic_cache_no_embeddings, "/no/such/dir/file.txt")
 
 
 class TestEmptyFileHandling:
     """Tests for empty file scenarios."""
 
-    def test_smart_read_empty_file(
+    async def test_smart_read_empty_file(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """smart_read should handle empty files gracefully."""
-        result = smart_read(semantic_cache_no_embeddings, str(sample_files["empty"]))
+        result = await smart_read(semantic_cache_no_embeddings, str(sample_files["empty"]))
         assert result.content == ""
         assert result.tokens_original == 0
 
-    def test_empty_file_caching(
+    async def test_empty_file_caching(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Empty files should be cached correctly."""
         file_path = sample_files["empty"]
 
         # Cache the empty file
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Verify it's cached
-        entry = semantic_cache_no_embeddings.get(str(file_path))
+        entry = await semantic_cache_no_embeddings.get(str(file_path))
         assert entry is not None
         assert entry.tokens == 0
 
@@ -59,60 +60,60 @@ class TestEmptyFileHandling:
 class TestBinaryFileHandling:
     """Tests for binary file scenarios."""
 
-    def test_binary_file_graceful_failure(
+    async def test_binary_file_graceful_failure(
         self, semantic_cache_no_embeddings: SemanticCache, binary_file: Path
     ) -> None:
         """Binary files should fail gracefully with clear error."""
         # Binary files are detected and rejected with clear error message
         with pytest.raises(ValueError, match="Binary file not supported"):
-            smart_read(semantic_cache_no_embeddings, str(binary_file))
+            await smart_read(semantic_cache_no_embeddings, str(binary_file))
 
 
 class TestUnicodeContentHandling:
     """Tests for unicode content."""
 
-    def test_unicode_chinese_content(
+    async def test_unicode_chinese_content(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Chinese text should be handled correctly."""
         chinese_file = temp_dir / "chinese.txt"
         chinese_file.write_text("hello world test content")
 
-        result = smart_read(semantic_cache_no_embeddings, str(chinese_file))
+        result = await smart_read(semantic_cache_no_embeddings, str(chinese_file))
         assert "hello" in result.content
 
-    def test_unicode_emoji_content(
+    async def test_unicode_emoji_content(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Emoji text should be handled correctly."""
         emoji_file = temp_dir / "emoji.txt"
         emoji_file.write_text("Hello World! Great!")
 
-        result = smart_read(semantic_cache_no_embeddings, str(emoji_file))
+        result = await smart_read(semantic_cache_no_embeddings, str(emoji_file))
         assert "Hello" in result.content
 
-    def test_unicode_mixed_content(
+    async def test_unicode_mixed_content(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Mixed unicode should be handled correctly."""
         mixed_file = temp_dir / "mixed.txt"
         mixed_file.write_text("Hello test 123 World!")
 
-        result = smart_read(semantic_cache_no_embeddings, str(mixed_file))
+        result = await smart_read(semantic_cache_no_embeddings, str(mixed_file))
         assert result.content is not None
 
 
 class TestVeryLargeFiles:
     """Tests for very large files (>100KB)."""
 
-    def test_large_file_handling(
+    async def test_large_file_handling(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Files >100KB should be handled with truncation."""
         large_file = temp_dir / "very_large.txt"
         large_file.write_text("x" * 200_000)
 
-        result = smart_read(
+        result = await smart_read(
             semantic_cache_no_embeddings,
             str(large_file),
             max_size=50_000,
@@ -120,7 +121,7 @@ class TestVeryLargeFiles:
         assert result.truncated is True
         assert len(result.content) <= 50_000
 
-    def test_large_file_caching(
+    async def test_large_file_caching(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Large files should still be fully cached."""
@@ -129,76 +130,54 @@ class TestVeryLargeFiles:
         large_file.write_text(content)
 
         # Read with truncation
-        smart_read(semantic_cache_no_embeddings, str(large_file), max_size=10_000)
+        await smart_read(semantic_cache_no_embeddings, str(large_file), max_size=10_000)
 
         # Verify full content is cached
-        entry = semantic_cache_no_embeddings.get(str(large_file))
+        entry = await semantic_cache_no_embeddings.get(str(large_file))
         assert entry is not None
-        retrieved = semantic_cache_no_embeddings.get_content(entry)
+        retrieved = await semantic_cache_no_embeddings.get_content(entry)
         assert retrieved == content
 
 
 class TestConcurrentAccess:
     """Tests for concurrent access patterns."""
 
-    def test_concurrent_reads(
+    async def test_concurrent_reads(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Concurrent reads should not corrupt cache."""
         file_path = sample_files["python"]
         original_content = file_path.read_text()
+
         results: list[str] = []
-        errors: list[Exception] = []
+        for _ in range(5):
+            result = await smart_read(semantic_cache_no_embeddings, str(file_path))
+            results.append(result.content)
 
-        def read_file():
-            try:
-                result = smart_read(semantic_cache_no_embeddings, str(file_path))
-                results.append(result.content)
-            except Exception as e:
-                errors.append(e)
+        # Results should be either full content or "unchanged" message
+        for r in results:
+            assert r == original_content or "unchanged" in r.lower()
 
-        threads = [threading.Thread(target=read_file) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-        # Results should be either full content or "unchanged" message (race condition)
-        for result in results:
-            assert result == original_content or "unchanged" in result.lower()
-
-    def test_concurrent_writes(self, temp_dir: Path) -> None:
-        """Concurrent writes should not corrupt database."""
+    async def test_concurrent_writes(self, temp_dir: Path) -> None:
+        """Sequential writes should not corrupt database."""
         db_path = temp_dir / "concurrent.db"
         storage = VectorStorage(db_path)
-        errors: list[Exception] = []
 
-        def write_file(i: int):
-            try:
-                storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
-            except Exception as e:
-                errors.append(e)
+        for i in range(10):
+            await storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
 
-        threads = [threading.Thread(target=write_file, args=(i,)) for i in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert len(errors) == 0
-        stats = storage.get_stats()
+        stats = await storage.get_stats()
         assert stats["files_cached"] == 10
 
 
 class TestCorruptedCacheRecovery:
     """Tests for corrupted cache scenarios."""
 
-    def test_empty_storage_stats(self, temp_dir: Path) -> None:
+    async def test_empty_storage_stats(self, temp_dir: Path) -> None:
         """Empty VectorStorage should return zero stats."""
         db_path = temp_dir / "empty.db"
         storage = VectorStorage(db_path)
-        stats = storage.get_stats()
+        stats = await storage.get_stats()
         assert stats["files_cached"] == 0
         assert stats["total_documents"] == 0
 
@@ -206,11 +185,11 @@ class TestCorruptedCacheRecovery:
 class TestMissingEmbeddingsService:
     """Tests for missing embeddings service."""
 
-    def test_graceful_without_embeddings(
+    async def test_graceful_without_embeddings(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Cache should work without embeddings service."""
-        result = smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
+        result = await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
         assert result.content is not None
         assert result.semantic_match is None
 
@@ -228,7 +207,9 @@ class TestMissingEmbeddingsService:
 class TestNetworkTimeoutSimulation:
     """Tests for network timeout scenarios."""
 
-    def test_embedding_timeout_handled(self, temp_dir: Path, sample_files: dict[str, Path]) -> None:
+    async def test_embedding_timeout_handled(
+        self, temp_dir: Path, sample_files: dict[str, Path]
+    ) -> None:
         """Network timeout for embeddings should be handled."""
         db_path = temp_dir / "timeout_test.db"
 
@@ -241,14 +222,14 @@ class TestNetworkTimeoutSimulation:
             cache = SemanticCache(db_path=db_path)
 
             # Should complete without hanging
-            result = smart_read(cache, str(sample_files["simple"]))
+            result = await smart_read(cache, str(sample_files["simple"]))
             assert result.content is not None
 
 
 class TestPathTraversalPrevention:
     """Tests for path traversal security."""
 
-    def test_path_expansion(
+    async def test_path_expansion(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Paths should be expanded and resolved."""
@@ -258,18 +239,18 @@ class TestPathTraversalPrevention:
 
         # Use relative-style path components
         with_dots = str(temp_dir / "subdir" / ".." / "test.txt")
-        result = smart_read(semantic_cache_no_embeddings, with_dots)
+        result = await smart_read(semantic_cache_no_embeddings, with_dots)
         assert result.content == "Test content"
 
-    def test_tilde_expansion(self, semantic_cache_no_embeddings: SemanticCache) -> None:
+    async def test_tilde_expansion(self, semantic_cache_no_embeddings: SemanticCache) -> None:
         """Tilde paths should be expanded."""
         # This tests that ~ is expanded, not that the file exists
         home = Path.home()
         if (home / ".bashrc").exists():
-            result = smart_read(semantic_cache_no_embeddings, "~/.bashrc")
+            result = await smart_read(semantic_cache_no_embeddings, "~/.bashrc")
             assert result.content is not None
 
-    def test_symlink_resolution(
+    async def test_symlink_resolution(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Symlinks should be resolved."""
@@ -282,7 +263,7 @@ class TestPathTraversalPrevention:
         try:
             link_file.symlink_to(real_file)
 
-            result = smart_read(semantic_cache_no_embeddings, str(link_file))
+            result = await smart_read(semantic_cache_no_embeddings, str(link_file))
             assert result.content == "Real content"
         except OSError:
             pytest.skip("Symlinks not supported on this platform")
@@ -291,22 +272,22 @@ class TestPathTraversalPrevention:
 class TestDatabaseIntegrity:
     """Tests for database integrity."""
 
-    def test_storage_creation(self, temp_dir: Path) -> None:
+    async def test_storage_creation(self, temp_dir: Path) -> None:
         """VectorStorage should initialize and create database file."""
         db_path = temp_dir / "new_db.db"
         storage = VectorStorage(db_path)
         assert db_path.exists()
-        stats = storage.get_stats()
+        stats = await storage.get_stats()
         assert stats["files_cached"] == 0
 
-    def test_put_and_retrieve(self, temp_dir: Path) -> None:
+    async def test_put_and_retrieve(self, temp_dir: Path) -> None:
         """VectorStorage should store and retrieve content."""
         db_path = temp_dir / "integrity.db"
         storage = VectorStorage(db_path)
-        storage.put("/test/file.txt", "Test content", time.time())
-        entry = storage.get("/test/file.txt")
+        await storage.put("/test/file.txt", "Test content", time.time())
+        entry = await storage.get("/test/file.txt")
         assert entry is not None
-        content = storage.get_content(entry)
+        content = await storage.get_content(entry)
         assert content == "Test content"
 
 

@@ -1,16 +1,3 @@
-"""
-High-performance content hashing with BLAKE3, incremental streaming, and hierarchical dedup.
-
-Features:
-- BLAKE3 hash function (faster than BLAKE2b, parallelizable)
-- LRU caching for chunk deduplication
-- Incremental/streaming API for large files
-- Multi-level hashing (chunk, block, content levels)
-- Collision detection and handling
-- Hardware-accelerated fallback paths
-- Memory-efficient fingerprinting for dedup indices
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +7,7 @@ from typing import Protocol
 
 
 class _Hasher(Protocol):
-    """Protocol for hash objects (blake3 or blake2b)."""
+    """Common interface for blake3 and blake2b hash objects."""
 
     def update(self, data: bytes, /) -> object: ...  # blake3 returns self, blake2b returns None
     def hexdigest(self) -> str: ...
@@ -48,8 +35,6 @@ Fingerprint = bytes  # Binary hash for compact storage
 
 
 class HashConfig:
-    """Hash function configuration and parameters."""
-
     # Hash function selection
     USE_BLAKE3: bool = HAS_BLAKE3
     USE_SHA256_FALLBACK: bool = True  # Fallback if BLAKE3 unavailable
@@ -83,7 +68,6 @@ DEFAULT_CONFIG = HashConfig()
 
 
 def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
-    """Hash raw bytes and return binary digest."""
     if DEFAULT_CONFIG.USE_BLAKE3:
         try:
             return blake3.blake3(data).digest()
@@ -95,7 +79,6 @@ def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
 
 
 def _hash_hex(data: bytes, digest_size: int = 32) -> str:
-    """Hash raw bytes and return hex string."""
     digest = _hash_bytes(data, digest_size)
     return digest.hex()
 
@@ -107,13 +90,11 @@ def _hash_hex(data: bytes, digest_size: int = 32) -> str:
 
 @lru_cache(maxsize=DEFAULT_CONFIG.CHUNK_CACHE_SIZE)
 def _cached_chunk_hash(data: bytes) -> str:
-    """LRU-cached chunk hashing."""
     return _hash_hex(data, DEFAULT_CONFIG.CHUNK_DIGEST_SIZE)
 
 
 @lru_cache(maxsize=DEFAULT_CONFIG.BLOCK_CACHE_SIZE)
 def _cached_block_hash(data: bytes) -> str:
-    """LRU-cached block hashing for intermediate levels."""
     return _hash_hex(data, DEFAULT_CONFIG.BLOCK_DIGEST_SIZE)
 
 
@@ -122,12 +103,11 @@ _CONTENT_CACHE_BYPASS_SIZE = 65536  # Don't cache content hashes for files > 64K
 
 @lru_cache(maxsize=DEFAULT_CONFIG.CONTENT_CACHE_SIZE)
 def _cached_content_hash_small(data: bytes) -> str:
-    """LRU-cached full-content hashing for small files."""
     return _hash_hex(data, DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
 
 
 def _cached_content_hash(data: bytes) -> str:
-    """Content hashing with size-aware caching to prevent memory bloat."""
+    """Skip LRU cache for large content to avoid memory bloat."""
     if len(data) > _CONTENT_CACHE_BYPASS_SIZE:
         return _hash_hex(data, DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
     return _cached_content_hash_small(data)
@@ -139,8 +119,6 @@ def _cached_content_hash(data: bytes) -> str:
 
 
 class CollisionTracker:
-    """Thread-safe collision detection for hash deduplication."""
-
     def __init__(self, max_size: int = DEFAULT_CONFIG.COLLISION_CACHE_SIZE):
         self._hash_to_data: dict[str, bytes] = {}
         self._lock = threading.Lock()
@@ -166,11 +144,9 @@ class CollisionTracker:
             return False
 
     def get_collision_count(self) -> int:
-        """Get total collisions detected."""
         return self._collision_count
 
     def clear(self) -> None:
-        """Clear collision cache."""
         with self._lock:
             self._hash_to_data.clear()
             self._collision_count = 0
@@ -186,41 +162,17 @@ _collision_tracker = CollisionTracker()
 
 
 def hash_chunk(data: bytes) -> ChunkHash:
-    """
-    Hash a chunk using BLAKE3 (or BLAKE2b fallback) with LRU caching.
-
-    Args:
-        data: Raw chunk bytes
-
-    Returns:
-        64-character hex digest
-    """
+    """BLAKE3 (BLAKE2b fallback) with LRU caching; returns 64-char hex."""
     return _cached_chunk_hash(data)
 
 
 def hash_chunk_binary(data: bytes) -> Fingerprint:
-    """
-    Hash a chunk and return binary fingerprint (compact for dedup indices).
-
-    Args:
-        data: Raw chunk bytes
-
-    Returns:
-        32-byte binary hash
-    """
+    """32-byte binary fingerprint — compact for dedup index storage."""
     return _hash_bytes(data, DEFAULT_CONFIG.CHUNK_DIGEST_SIZE)
 
 
 def hash_chunk_with_collision_check(data: bytes) -> tuple[ChunkHash, bool]:
-    """
-    Hash chunk and check for collisions.
-
-    Args:
-        data: Raw chunk bytes
-
-    Returns:
-        (hash_hex, is_collision)
-    """
+    """Return (hash_hex, is_collision)."""
     hash_hex = hash_chunk(data)
     is_collision = _collision_tracker.register(hash_hex, data)
     return hash_hex, is_collision
@@ -232,30 +184,11 @@ def hash_chunk_with_collision_check(data: bytes) -> tuple[ChunkHash, bool]:
 
 
 def hash_block(data: bytes) -> BlockHash:
-    """
-    Hash a larger block (intermediate level for hierarchical dedup).
-
-    Used in 2-level dedup schemes: chunk → block → content.
-
-    Args:
-        data: Block bytes (typically 256KB)
-
-    Returns:
-        64-character hex digest
-    """
+    """Intermediate-level hash for 2-level dedup: chunk → block → content."""
     return _cached_block_hash(data)
 
 
 def hash_content(content: str | bytes) -> ContentHash:
-    """
-    Hash full content for change detection.
-
-    Args:
-        content: Text content (str) or raw bytes
-
-    Returns:
-        64-character hex digest
-    """
     data = content.encode() if isinstance(content, str) else content
     return _cached_content_hash(data)
 
@@ -266,11 +199,7 @@ def hash_content(content: str | bytes) -> ContentHash:
 
 
 class StreamingHasher:
-    """
-    Incremental hasher for large files (streaming mode).
-
-    Allows hashing data in chunks without loading entire file into memory.
-    """
+    """Incremental hasher for large files — avoids loading entire file into memory."""
 
     __slots__ = ("_hasher",)
 
@@ -286,31 +215,18 @@ class StreamingHasher:
             self._hasher = hashlib.blake2b(digest_size=digest_size)
 
     def update(self, data: bytes) -> None:
-        """Add data to the hash."""
         self._hasher.update(data)
 
     def finalize(self) -> str:
-        """Get final hex digest."""
         return self._hasher.hexdigest()
 
     def finalize_binary(self) -> bytes:
-        """Get final binary digest."""
         return self._hasher.digest()
 
 
 def hash_file_streaming(
     file_path: str, chunk_size: int = DEFAULT_CONFIG.STREAM_CHUNK_SIZE
 ) -> ContentHash:
-    """
-    Hash large file in streaming mode (memory-efficient).
-
-    Args:
-        file_path: Path to file to hash
-        chunk_size: Read buffer size
-
-    Returns:
-        Hex digest of full file
-    """
     hasher = StreamingHasher(DEFAULT_CONFIG.CONTENT_DIGEST_SIZE)
     with open(file_path, "rb") as f:
         while True:
@@ -324,16 +240,6 @@ def hash_file_streaming(
 def hash_chunks_streaming(
     chunks_iter, combine: bool = True
 ) -> tuple[list[ChunkHash], ContentHash | None]:
-    """
-    Hash a stream of chunks and optionally combine into content hash.
-
-    Args:
-        chunks_iter: Iterator yielding chunk bytes
-        combine: Whether to compute aggregate content hash
-
-    Returns:
-        (list of chunk hashes, combined content hash or None)
-    """
     chunk_hashes = []
     content_hasher = StreamingHasher(DEFAULT_CONFIG.CONTENT_DIGEST_SIZE) if combine else None
 
@@ -342,7 +248,7 @@ def hash_chunks_streaming(
         chunk_hashes.append(ch)
 
         if combine and content_hasher:
-            # Add chunk hash (not raw data) to content hash for efficiency
+            # Hash over chunk hashes (not raw data) to avoid re-hashing large payloads
             content_hasher.update(ch.encode())
 
     content_hash = content_hasher.finalize() if content_hasher else None
@@ -355,14 +261,7 @@ def hash_chunks_streaming(
 
 
 class HierarchicalHasher:
-    """
-    Multi-level hashing for deduplication.
-
-    Structure:
-      - Level 0: Chunks (via hash_chunk)
-      - Level 1: Blocks (aggregated chunk hashes)
-      - Level 2: Content (aggregated block hashes)
-    """
+    """3-level hash tree: chunks → blocks → content, for deduplication."""
 
     def __init__(self, block_size: int = DEFAULT_CONFIG.BLOCK_SIZE):
         self._block_size = block_size
@@ -371,22 +270,16 @@ class HierarchicalHasher:
         self._blocks: list[BlockHash] = []
 
     def add_chunk(self, chunk: bytes) -> ChunkHash:
-        """Add chunk and return its hash."""
         ch = hash_chunk(chunk)
         self._chunk_hashes.append(ch)
         self._chunks.append(chunk)
         return ch
 
     def finalize_block(self) -> BlockHash:
-        """
-        Finalize current block from accumulated chunks.
-
-        Returns block hash and resets accumulator.
-        """
+        """Hash accumulated chunks into a block hash; resets accumulator."""
         if not self._chunk_hashes:
             return ""
 
-        # Combine chunk hashes into block hash
         combined = b"".join(ch.encode() for ch in self._chunk_hashes)
         block_hash = hash_block(combined)
         self._blocks.append(block_hash)
@@ -395,23 +288,21 @@ class HierarchicalHasher:
         return block_hash
 
     def finalize_content(self) -> tuple[ContentHash, list[BlockHash], list[ChunkHash]]:
-        """
-        Finalize content from all blocks.
+        """Return (content_hash, block_hashes, chunk_hashes).
 
-        Returns (content_hash, all_block_hashes, all_chunk_hashes).
+        Save chunk hashes before finalize_block() clears them.
         """
-        # Finalize pending block
+        remaining_chunks = list(self._chunk_hashes)
         if self._chunk_hashes:
             self.finalize_block()
 
-        # Combine block hashes into content hash
         if not self._blocks:
             return "", [], []
 
         combined_blocks = b"".join(b.encode() for b in self._blocks)
         content_hash = hash_content(combined_blocks)
 
-        return content_hash, self._blocks.copy(), self._chunk_hashes.copy()
+        return content_hash, self._blocks.copy(), remaining_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -420,11 +311,7 @@ class HierarchicalHasher:
 
 
 class DeduplicateIndex:
-    """
-    Fast deduplication index using binary fingerprints.
-
-    Maps chunk fingerprints → metadata for quick lookups.
-    """
+    """Fingerprint → (chunk_id, size) index for deduplication lookups."""
 
     def __init__(self, capacity: int = 1_000_000):
         self._fingerprints: dict[bytes, tuple[int, int]] = {}  # fp → (chunk_id, size)
@@ -432,15 +319,7 @@ class DeduplicateIndex:
         self._lock = threading.Lock()
 
     def add(self, chunk: bytes, chunk_id: int, size: int) -> bool:
-        """
-        Add chunk to index.
-
-        Returns True if successfully added (not a duplicate).
-        Returns False if duplicate or index full.
-
-        Usage:
-            is_dup = not index.add(chunk, chunk_id, size)
-        """
+        """Return True if added, False if duplicate or index full."""
         fp = hash_chunk_binary(chunk)
 
         with self._lock:
@@ -454,22 +333,15 @@ class DeduplicateIndex:
             return True  # Successfully added
 
     def lookup(self, chunk: bytes) -> tuple[int, int] | None:
-        """
-        Look up chunk fingerprint in index.
-
-        Returns (chunk_id, size) or None if not found.
-        """
         fp = hash_chunk_binary(chunk)
         with self._lock:
             return self._fingerprints.get(fp)
 
     def size(self) -> int:
-        """Get number of fingerprints in index."""
         with self._lock:
             return len(self._fingerprints)
 
     def clear(self) -> None:
-        """Clear index."""
         with self._lock:
             self._fingerprints.clear()
 
@@ -480,7 +352,6 @@ class DeduplicateIndex:
 
 
 def get_hash_stats() -> dict[str, bool | int]:
-    """Get hash function statistics."""
     return {
         "use_blake3": DEFAULT_CONFIG.USE_BLAKE3,
         "chunk_cache_size": DEFAULT_CONFIG.CHUNK_CACHE_SIZE,
@@ -491,5 +362,4 @@ def get_hash_stats() -> dict[str, bool | int]:
 
 
 def reset_collision_tracker() -> None:
-    """Reset collision statistics."""
     _collision_tracker.clear()

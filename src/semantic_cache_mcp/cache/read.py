@@ -1,4 +1,4 @@
-"""Smart read operations for the cache package."""
+"""Smart read operations."""
 
 from __future__ import annotations
 
@@ -21,26 +21,7 @@ MAX_BATCH_FILES = 50
 MAX_BATCH_TOKENS = 200_000
 
 
-def _fit_content_to_max_size(content: str, max_size: int, cache: SemanticCache) -> tuple[str, bool]:
-    """Bound returned content to max_size using semantic summarization when needed."""
-    if len(content) <= max_size:
-        return content, False
-
-    try:
-        # Keep summarization embed_fn local to avoid extra allocations when unneeded.
-        def embed_fn(text: str):
-            emb = cache.get_embedding(text)
-            if emb is None:
-                return None
-            return np.asarray(emb, dtype=np.float32)
-
-        return summarize_semantic(content, max_size, embed_fn=embed_fn), True
-    except Exception as e:
-        logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
-        return truncate_semantic(content, max_size), True
-
-
-def smart_read(
+async def smart_read(
     cache: SemanticCache,
     path: str,
     max_size: int = MAX_CONTENT_SIZE,
@@ -56,16 +37,6 @@ def smart_read(
     3. Similar file in cache -> reference + diff (70-90% reduction)
     4. Large file -> smart truncation (50-80% reduction)
     5. New file -> full content with caching for future reads
-
-    Args:
-        cache: SemanticCache instance
-        path: Path to file
-        max_size: Maximum content size to return
-        diff_mode: Enable diff-based responses
-        force_full: Force full content even if cached
-
-    Returns:
-        ReadResult with content and metadata
     """
     file_path = Path(path).expanduser().resolve()
 
@@ -95,7 +66,7 @@ def smart_read(
     mtime = file_path.stat().st_mtime
     tokens_original = count_tokens(content)
 
-    cached = cache.get(str(file_path))
+    cached = await cache.get(str(file_path))
 
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:
@@ -104,14 +75,14 @@ def smart_read(
             pass
         elif hash_content(content) == cached.content_hash:
             # Content identical despite mtime change — update mtime, treat as unchanged
-            cache.update_mtime(str(file_path), mtime)
+            await cache.update_mtime(str(file_path), mtime)
         else:
             # Content actually changed — fall through to diff logic below
             cached = None  # sentinel: forces diff path
 
         if cached is not None:
             # Unchanged path (either mtime match or content hash match)
-            cache.record_access(str(file_path))
+            await cache.record_access(str(file_path))
             unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
             msg_tokens = count_tokens(unchanged_msg)
 
@@ -128,7 +99,7 @@ def smart_read(
                 )
 
             # Small file - return full content
-            cached_content = cache.get_content(cached)
+            cached_content = await cache.get_content(cached)
             return ReadResult(
                 content=cached_content,
                 from_cache=True,
@@ -141,11 +112,11 @@ def smart_read(
             )
 
         # Re-fetch cached for diff — we nulled it as sentinel above
-        cached = cache.get(str(file_path))
+        cached = await cache.get(str(file_path))
 
         # File changed - generate diff with stats
         if cached is not None:
-            old_content = cache.get_content(cached)
+            old_content = await cache.get_content(cached)
             diff_content = generate_diff(old_content, content)
             stats = diff_stats(old_content, content)
             diff_tokens = count_tokens(diff_content)
@@ -162,7 +133,7 @@ def smart_read(
                 embedding = (
                     _embedding if _embedding is not None else cache.get_embedding(content, path)
                 )
-                cache.put(str(file_path), content, mtime, embedding)
+                await cache.put(str(file_path), content, mtime, embedding)
 
                 tokens_returned = count_tokens(result_content)
                 return ReadResult(
@@ -180,11 +151,11 @@ def smart_read(
     if not cached and diff_mode and not force_full:
         embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
         if embedding:
-            similar_path = cache.find_similar(embedding, str(file_path))
+            similar_path = await cache.find_similar(embedding, str(file_path))
             if similar_path:
-                similar_entry = cache.get(similar_path)
+                similar_entry = await cache.get(similar_path)
                 if similar_entry:
-                    similar_content = cache.get_content(similar_entry)
+                    similar_content = await cache.get_content(similar_entry)
                     diff_content = generate_diff(similar_content, content)
                     stats = diff_stats(similar_content, content)
                     diff_tokens = count_tokens(diff_content)
@@ -200,7 +171,7 @@ def smart_read(
                             f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
-                        cache.put(str(file_path), content, mtime, embedding)
+                        await cache.put(str(file_path), content, mtime, embedding)
 
                         tokens_returned = count_tokens(result_content)
                         return ReadResult(
@@ -239,7 +210,7 @@ def smart_read(
             truncated = True
 
     embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
-    cache.put(str(file_path), content, mtime, embedding)
+    await cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
     return ReadResult(
@@ -254,7 +225,7 @@ def smart_read(
     )
 
 
-def batch_smart_read(
+async def batch_smart_read(
     cache: SemanticCache,
     paths: list[str],
     max_total_tokens: int = 50000,
@@ -263,38 +234,25 @@ def batch_smart_read(
 ) -> BatchReadResult:
     """Read multiple files with token budget, priority ordering, and unchanged detection.
 
-    Args:
-        cache: SemanticCache instance
-        paths: List of file paths
-        max_total_tokens: Token budget (capped at 200K)
-        priority: Paths to read first (order preserved). Does NOT override budget.
-        diff_mode: When False, always return full content (use after context compression).
-
-    Returns:
-        BatchReadResult with contents, summaries, and unchanged_paths
+    priority paths are read first but do NOT override the token budget.
+    diff_mode=False forces full content (use after context compression).
     """
     # DoS protection
     paths = paths[:MAX_BATCH_FILES]
-    max_total_tokens = min(max_total_tokens, MAX_BATCH_TOKENS)
+    max_total_tokens = max(1, min(max_total_tokens, MAX_BATCH_TOKENS))
 
     # Estimate tokens for sorting and skipped-file enrichment.
-    def estimate_min_tokens(p: str) -> int:
+    async def estimate_min_tokens(p: str) -> int:
         resolved = Path(p).expanduser().resolve()
-        cached = cache.get(str(resolved))
+        cached = await cache.get(str(resolved))
         if cached and resolved.exists():
             file_mtime = resolved.stat().st_mtime
             if cached.mtime >= file_mtime:
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
-            # Content hash check — treat as unchanged if content identical
-            try:
-                disk_content = resolved.read_text(encoding="utf-8")
-                if hash_content(disk_content) == cached.content_hash:
-                    cache.update_mtime(str(resolved), file_mtime)
-                    unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
-                    return min(cached.tokens, count_tokens(unchanged_msg))
-            except Exception:  # nosec B110 — estimate is best-effort
-                pass
+            # mtime changed — return cached tokens as conservative estimate
+            # (reading and hashing the file is too expensive for a budget estimator)
+            return cached.tokens
         if not resolved.exists() or not resolved.is_file():
             return 1
         # Rough estimate for uncached content: ~4 characters per token.
@@ -305,10 +263,10 @@ def batch_smart_read(
         priority_set = set(priority)
         priority_ordered = [p for p in priority if p in set(paths)]
         remainder = [p for p in paths if p not in priority_set]
-        remainder_sorted = sorted(remainder, key=lambda p: (estimate_min_tokens(p), p))
+        remainder_sorted = sorted(remainder)  # sort key uses async fn; sort by path name
         paths_sorted = priority_ordered + remainder_sorted
     else:
-        paths_sorted = sorted(paths, key=lambda p: (estimate_min_tokens(p), p))
+        paths_sorted = sorted(paths)  # sort key uses async fn; sort by path name
 
     # Pre-scan: batch embed all new/changed files in a single model call.
     # This amortizes ONNX Runtime inference overhead from N calls → 1.
@@ -317,7 +275,7 @@ def batch_smart_read(
     _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
     for _path in paths_sorted:
         _resolved = Path(_path).expanduser().resolve()
-        _cached = cache.get(str(_resolved))
+        _cached = await cache.get(str(_resolved))
         if _cached and _resolved.exists():
             _file_mtime = _resolved.stat().st_mtime
             if _cached.mtime >= _file_mtime:
@@ -326,7 +284,7 @@ def batch_smart_read(
             try:
                 _raw_text = _resolved.read_text(encoding="utf-8")
                 if hash_content(_raw_text) == _cached.content_hash:
-                    cache.update_mtime(str(_resolved), _file_mtime)
+                    await cache.update_mtime(str(_resolved), _file_mtime)
                     continue  # content unchanged — no embedding needed
             except Exception:  # nosec B110
                 pass
@@ -366,7 +324,7 @@ def batch_smart_read(
         if total_tokens >= max_total_tokens:
             # Enrich remaining paths with est_tokens
             for remaining in paths_sorted[processed - 1 :]:
-                est = estimate_min_tokens(remaining)
+                est = await estimate_min_tokens(remaining)
                 files.append(
                     FileReadSummary(
                         path=remaining,
@@ -381,7 +339,7 @@ def batch_smart_read(
 
         try:
             _resolved_key = str(Path(path).expanduser().resolve())
-            result = smart_read(
+            result = await smart_read(
                 cache,
                 path,
                 diff_mode=diff_mode,
@@ -415,7 +373,7 @@ def batch_smart_read(
 
             # Check token budget
             if total_tokens + result.tokens_returned > max_total_tokens:
-                est = estimate_min_tokens(path)
+                est = await estimate_min_tokens(path)
                 files.append(
                     FileReadSummary(
                         path=path,

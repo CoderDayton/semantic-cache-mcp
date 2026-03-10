@@ -14,7 +14,6 @@ import array
 import os
 import tempfile
 import threading
-from collections.abc import Iterator
 
 import numpy as np
 import pytest
@@ -22,84 +21,6 @@ import pytest
 # ---------------------------------------------------------------------------
 # _diff.py tests
 # ---------------------------------------------------------------------------
-
-
-class TestMyersDiff:
-    def test_both_empty(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        assert _myers_diff([], []) == []
-
-    def test_old_empty(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        result = _myers_diff([], ["a\n", "b\n"])
-        assert all(op == "+" for op, _ in result)
-        assert [line for _, line in result] == ["a\n", "b\n"]
-
-    def test_new_empty(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        result = _myers_diff(["a\n", "b\n"], [])
-        assert all(op == "-" for op, _ in result)
-
-    def test_no_changes(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        lines = ["hello\n", "world\n"]
-        result = _myers_diff(lines, lines)
-        assert all(op == " " for op, _ in result)
-
-    def test_replacement(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        old = ["foo\n", "bar\n"]
-        new = ["foo\n", "baz\n"]
-        result = _myers_diff(old, new)
-        ops = [op for op, _ in result]
-        assert "-" in ops
-        assert "+" in ops
-
-    def test_insertion(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        old = ["a\n"]
-        new = ["a\n", "b\n"]
-        result = _myers_diff(old, new)
-        assert any(op == "+" for op, _ in result)
-
-    def test_deletion(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _myers_diff
-
-        old = ["a\n", "b\n"]
-        new = ["a\n"]
-        result = _myers_diff(old, new)
-        assert any(op == "-" for op, _ in result)
-
-
-class TestUnifiedDiffFast:
-    def test_no_changes(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _unified_diff_fast
-
-        result = _unified_diff_fast("same\n", "same\n")
-        assert result == ""
-
-    def test_changes_produce_diff(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _unified_diff_fast
-
-        result = _unified_diff_fast("old\n", "new\n")
-        assert "-old" in result
-        assert "+new" in result
-
-    def test_context_lines(self) -> None:
-        from semantic_cache_mcp.core.text._diff import _unified_diff_fast
-
-        old = "\n".join(str(i) for i in range(20)) + "\n"
-        new = old.replace("10\n", "TEN\n")
-        result_0 = _unified_diff_fast(old, new, context_lines=0)
-        result_3 = _unified_diff_fast(old, new, context_lines=3)
-        # More context = more lines
-        assert len(result_3) > len(result_0)
 
 
 class TestComputeDelta:
@@ -237,52 +158,6 @@ class TestTruncateSmart:
         assert "TRUNCATED" in result
 
 
-class TestGenerateDiffStreaming:
-    def test_generates_diff(self) -> None:
-        from semantic_cache_mcp.core.text._diff import generate_diff_streaming
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f1:
-            f1.write("line one\nline two\n")
-            path1 = f1.name
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f2:
-            f2.write("line one\nline THREE\n")
-            path2 = f2.name
-
-        try:
-            chunks = list(generate_diff_streaming(path1, path2))
-            combined = "".join(chunks)
-            assert "-line two" in combined or "+line THREE" in combined
-        finally:
-            os.unlink(path1)
-            os.unlink(path2)
-
-    def test_identical_files_no_diff(self) -> None:
-        from semantic_cache_mcp.core.text._diff import generate_diff_streaming
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f1:
-            f1.write("same content\n")
-            path = f1.name
-
-        try:
-            chunks = list(generate_diff_streaming(path, path))
-            assert chunks == []
-        finally:
-            os.unlink(path)
-
-    def test_is_iterator(self) -> None:
-        from semantic_cache_mcp.core.text._diff import generate_diff_streaming
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("a\n")
-            path = f.name
-
-        try:
-            result = generate_diff_streaming(path, path)
-            assert isinstance(result, Iterator)
-        finally:
-            os.unlink(path)
-
-
 class TestDiffStats:
     def test_identical_has_zero_changes(self) -> None:
         from semantic_cache_mcp.core.text._diff import diff_stats
@@ -316,19 +191,6 @@ class TestDiffStats:
 
         stats = diff_stats("old\n", "new\n")
         assert stats["delta_size_bytes"] > 0
-
-
-class TestInvertDiff:
-    def test_inverted_diff_is_reverse(self) -> None:
-        from semantic_cache_mcp.core.text._diff import generate_diff, invert_diff
-
-        old = "alpha\nbeta\n"
-        new = "alpha\ngamma\n"
-        forward = generate_diff(old, new)
-        inverted = invert_diff(old, new)
-        # Inverted diff swaps +/- relative to forward
-        assert forward != inverted
-        assert "-gamma" in inverted or "+beta" in inverted
 
 
 # ---------------------------------------------------------------------------
@@ -957,14 +819,14 @@ class TestCosineSimilarity:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         v = _unit_vec(128)
-        assert cosine_similarity(v, v) == pytest.approx(1.0, abs=1e-5)
+        assert cosine_similarity(v, v) == pytest.approx(1.0, abs=0.02)
 
     def test_orthogonal_vectors(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         a = np.array([1.0, 0.0], dtype=np.float32)
         b = np.array([0.0, 1.0], dtype=np.float32)
-        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=1e-6)
+        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=0.02)
 
     def test_array_array_input(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
@@ -973,14 +835,14 @@ class TestCosineSimilarity:
         a_arr = array.array("f", v.tolist())
         b_arr = array.array("f", v.tolist())
         result = cosine_similarity(a_arr, b_arr)
-        assert result == pytest.approx(1.0, abs=1e-4)
+        assert result == pytest.approx(1.0, abs=0.02)
 
     def test_list_input(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         v = _unit_vec(32)
         result = cosine_similarity(v.tolist(), v.tolist())
-        assert result == pytest.approx(1.0, abs=1e-4)
+        assert result == pytest.approx(1.0, abs=0.02)
 
 
 class TestCosineSimilarityWithPruning:

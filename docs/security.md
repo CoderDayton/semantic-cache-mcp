@@ -2,17 +2,10 @@
 
 ## Threat Model
 
-Semantic Cache MCP is a **single-user, local-only tool**. It runs on your machine, reads files from your filesystem, and stores cached content in `~/.cache/semantic-cache-mcp/`. It is not designed for multi-user or network-accessible deployment.
+Single-user, local-only. Cached content lives in `~/.cache/semantic-cache-mcp/`. No multi-user or network-accessible deployment support.
 
-**In scope:**
-- File content caching and retrieval (local filesystem only)
-- SQLite database operations on local disk
-- Local embedding generation — no external API calls for embeddings
-
-**Out of scope:**
-- Multi-user or multi-tenant scenarios
-- Network-accessible deployment
-- Authentication or authorization (relies on OS filesystem permissions)
+**In scope:** local filesystem caching, SQLite on disk, local embedding inference.
+**Out of scope:** multi-tenant, network exposure, auth (defers to OS permissions).
 
 ---
 
@@ -66,19 +59,19 @@ All inputs are validated before I/O:
 
 ### Data Storage
 
-**Local only** — All cached content, embeddings, and metadata are stored in `~/.cache/semantic-cache-mcp/` with standard user-mode permissions (`700` for the directory).
+**Local only** — All data stored in `~/.cache/semantic-cache-mcp/` with `700` permissions.
 
-**No network transmission** — Cached file content and embeddings are never sent over the network. The only outbound network requests are:
-1. Embedding model download from HuggingFace Hub on first use (~130MB for BAAI/bge-small-en-v1.5)
-2. Tokenizer file download from `openaipublic.blob.core.windows.net` on first use (~3.5MB)
+**No network transmission** — The only outbound requests are one-time downloads on first use:
+1. Embedding model from HuggingFace Hub (~130MB)
+2. Tokenizer from `openaipublic.blob.core.windows.net` (~3.5MB)
 
-Both downloads are SHA256-verified before use. A corrupted or tampered download is detected and discarded.
+Both are SHA256-verified; corrupted downloads are discarded.
 
-**SQLite WAL mode** — Write-Ahead Logging provides crash recovery and prevents data corruption from abrupt termination.
+**SQLite WAL mode** — crash recovery, no data corruption on abrupt termination.
 
 ### Embedding Model
 
-Embeddings are generated entirely locally using [FastEmbed](https://github.com/qdrant/fastembed) with the [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) model (33M parameters, 384 dimensions). No file content is ever sent to an external API for embedding — inference runs entirely on-device via ONNX Runtime.
+Inference runs locally via ONNX Runtime ([FastEmbed](https://github.com/qdrant/fastembed), [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)). No file content is sent to any external API.
 
 ---
 
@@ -86,7 +79,7 @@ Embeddings are generated entirely locally using [FastEmbed](https://github.com/q
 
 ### For Users
 
-**Sensitive files** — Avoid caching files containing secrets, credentials, API keys, or PII. The cache stores plaintext file content in a local SQLite database. Clear the cache when switching to or from sensitive projects:
+**Sensitive files** — Avoid caching files containing secrets, credentials, or PII. Clear the cache when switching to or from sensitive projects:
 
 ```bash
 # Via MCP tool
@@ -112,11 +105,11 @@ chmod 700 ~/.cache/semantic-cache-mcp/
 
 ### For Deployment
 
-**Single-user only** — Do not expose Semantic Cache MCP in multi-user environments without additional access controls. There is no authentication layer.
+**Single-user only** — No authentication layer. Do not expose in multi-user environments.
 
-**Container isolation** — If running in containers, mount only the directories the cache needs to access. Avoid mounting `/` or sensitive directories into the container.
+**Container isolation** — Mount only the directories the cache needs; avoid mounting `/` or sensitive paths.
 
-**Audit logging** — File accesses are logged at INFO level (path and token counts). Set `LOG_LEVEL=DEBUG` for verbose access logs, though these are not designed as a security audit trail.
+**Audit logging** — File accesses logged at INFO level (path + token counts). Not designed as a security audit trail.
 
 ---
 

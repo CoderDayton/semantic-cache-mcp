@@ -12,9 +12,10 @@ from typing import Final
 LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-_handler = logging.StreamHandler(sys.stderr)
-_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logging.root.addHandler(_handler)
+if not logging.root.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.root.addHandler(_handler)
 logging.root.setLevel(LOG_LEVEL)
 
 
@@ -50,7 +51,6 @@ DB_PATH: Final = CACHE_DIR / "cache.db"
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read positive integer env var with fallback."""
     raw = environ.get(name)
     if raw is None:
         return default
@@ -61,7 +61,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_mode(name: str, default: str) -> str:
-    """Read normalized response mode env var."""
     raw = environ.get(name)
     if raw is None:
         return default
@@ -114,7 +113,7 @@ ACCESS_HISTORY_SIZE: Final = 5  # Number of accesses to track
 
 
 def _validate_config() -> None:
-    """Validate configuration constants at module load time."""
+    """Fail fast on invalid config at import time."""
     errors: list[str] = []
 
     if CHUNK_MAX_SIZE <= CHUNK_MIN_SIZE:

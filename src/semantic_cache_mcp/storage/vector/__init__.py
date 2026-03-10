@@ -1,33 +1,26 @@
-"""Vector storage backend using simplevecdb for raw text + embedding persistence.
-
-Replaces compressed chunk storage with vector + raw text metadata pattern:
-- Each file stored as one or more Documents (chunks for large files)
-- page_content = raw text (no compression, 100% fidelity)
-- Embedding vectors enable HNSW-based semantic similarity search
-- Metadata tracks path, chunk ordering, mtime, content hash, tokens
-"""
+"""simplevecdb-backed storage: raw text + HNSW embeddings, HyperCDC chunking for large files."""
 
 from __future__ import annotations
 
 import array
+import asyncio
 import json
 import logging
-import threading
 import time
 from pathlib import Path
 
-from simplevecdb import DistanceStrategy, Quantization, VectorDB
+from simplevecdb import AsyncVectorDB, DistanceStrategy, Quantization
 
-from ..config import (
+from ...config import (
     CACHE_DIR,
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
     SIMILARITY_THRESHOLD,
 )
-from ..core.chunking import get_optimal_chunker
-from ..core.hashing import hash_content
-from ..core.tokenizer import count_tokens
-from ..types import CacheEntry, EmbeddingVector
+from ...core.chunking import get_optimal_chunker
+from ...core.hashing import hash_content
+from ...core.tokenizer import count_tokens
+from ...types import CacheEntry, EmbeddingVector
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +54,7 @@ class VectorStorage:
     - LRU-K eviction via access_history metadata
     """
 
-    __slots__ = ("_db", "_collection", "_db_path", "_lock")
+    __slots__ = ("_db", "_collection", "_db_path", "_closed")
 
     # Quantization currently in use — stored in sidecar to detect future changes.
     _QUANTIZATION = Quantization.INT8
@@ -71,13 +64,13 @@ class VectorStorage:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._clear_if_quantization_changed(db_path)
-        self._db = VectorDB(
+        self._db = AsyncVectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
             quantization=self._QUANTIZATION,
         )
         self._collection = self._db.collection(self._COLLECTION_NAME)
-        self._lock = threading.RLock()  # Reentrant: public methods may call each other
+        self._closed = False
         logger.info(f"VectorStorage initialized at {db_path}")
 
     @classmethod
@@ -136,90 +129,117 @@ class VectorStorage:
                 f"(dim {meta.get('embedding_dim', '?')} -> {dim}); "
                 "rebuilding vector index and clearing cached embeddings"
             )
-            with self._lock:
-                # Delete usearch index files
-                for suffix in (f".{self._COLLECTION_NAME}.usearch",):
-                    stale = self._db_path.parent / (self._db_path.name + suffix)
-                    if stale.exists():
-                        stale.unlink()
-                        logger.info(f"Deleted stale index: {stale}")
-                # Clear all documents from SQLite so stale embeddings don't persist
-                self.clear()
-                logger.info("Cleared all cached embeddings")
+            # Delete usearch index files
+            for suffix in (f".{self._COLLECTION_NAME}.usearch",):
+                stale = self._db_path.parent / (self._db_path.name + suffix)
+                if stale.exists():
+                    stale.unlink()
+                    logger.info(f"Deleted stale index: {stale}")
+            # Clear all documents from SQLite so stale embeddings don't persist.
+            self._clear_sync()
+            logger.info("Cleared all cached embeddings")
 
         meta["embedding_model"] = model_name
         meta["embedding_dim"] = dim
         meta_path.write_text(json.dumps(meta))
 
-    def __del__(self) -> None:
-        if hasattr(self, "_db"):
+    def close(self, *, timeout: float = 5.0) -> None:
+        """Save and close the database with a deadline.
+
+        Uses a background thread so a hung usearch/SQLite save cannot block
+        the asyncio event loop or delay process exit past *timeout* seconds.
+        Idempotent — safe to call multiple times.
+        """
+        if self._closed:
+            return
+
+        import threading  # noqa: PLC0415
+
+        self._closed = True
+        close_error: BaseException | None = None
+
+        def _do_close() -> None:
+            nonlocal close_error
             try:
-                self._db.save()
-                self._db.close()
-            except Exception:  # nosec B110 — best-effort cleanup in __del__
-                pass
+                # Access the sync VectorDB via AsyncVectorDB._db.
+                # Guard with getattr so a simplevecdb API change logs a
+                # warning instead of crashing during shutdown.
+                sync_db = getattr(self._db, "_db", None)
+                if sync_db is None:
+                    logger.warning("simplevecdb internal API changed — cannot access sync VectorDB")
+                    return
+                sync_db.save()
+                sync_db.close()
+            except Exception as exc:
+                close_error = exc
+
+        # Use a daemon thread so a hung save doesn't prevent process exit.
+        # ThreadPoolExecutor.__exit__ calls shutdown(wait=True) which would
+        # block indefinitely if _do_close hangs — daemon thread avoids this.
+        t = threading.Thread(target=_do_close, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+
+        if t.is_alive():
+            logger.warning(
+                f"VectorStorage close timed out after {timeout}s — "
+                "index may need recovery on next startup"
+            )
+        elif close_error is not None:
+            logger.warning(f"VectorStorage close error: {close_error}")
+        else:
+            logger.info("VectorStorage closed cleanly")
 
     # -------------------------------------------------------------------------
     # File operations
     # -------------------------------------------------------------------------
 
-    def get(self, path: str) -> CacheEntry | None:
-        """Get cached file entry by path.
+    async def get(self, path: str) -> CacheEntry | None:
+        """Return metadata for path. For chunked files, uses the parent document."""
+        results = await self._find_docs_by_path(path)
+        if not results:
+            return None
 
-        Returns metadata only — call get_content() for full text.
-        For chunked files, returns metadata from the parent document.
-        """
-        with self._lock:
-            results = self._find_docs_by_path(path)
-            if not results:
-                return None
+        # Prefer parent doc metadata (has file-level tokens, hash, etc.)
+        # For single-doc files there is no parent, so use the only doc.
+        selected_id = results[0][0]
+        meta = results[0][1]
+        for doc_id, m, _text in results:
+            if m.get(_META_IS_PARENT, False):
+                selected_id = doc_id
+                meta = m
+                break
 
-            # Prefer parent doc metadata (has file-level tokens, hash, etc.)
-            # For single-doc files there is no parent, so use the only doc.
-            selected_id = results[0][0]
-            meta = results[0][1]
-            for doc_id, m, _text in results:
-                if m.get(_META_IS_PARENT, False):
-                    selected_id = doc_id
-                    meta = m
-                    break
+        access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
 
-            access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
+        # Retrieve embedding from catalog so compare_files() can compute similarity.
+        embedding: EmbeddingVector | None = None
+        try:
+            emb_map = self._collection._collection._catalog.get_embeddings_by_ids([selected_id])
+            raw = emb_map.get(selected_id)
+            if raw is not None:
+                embedding = array.array("f", raw)
+        except Exception:  # nosec B110 — best-effort embedding retrieval
+            pass
 
-            # Retrieve embedding from catalog so compare_files() can compute similarity.
-            embedding: EmbeddingVector | None = None
-            try:
-                emb_map = self._collection._catalog.get_embeddings_by_ids([selected_id])
-                raw = emb_map.get(selected_id)
-                if raw is not None:
-                    embedding = array.array("f", raw)
-            except Exception:  # nosec B110 — best-effort embedding retrieval
-                pass
+        return CacheEntry(
+            path=meta[_META_PATH],
+            content_hash=meta[_META_CONTENT_HASH],
+            mtime=meta[_META_MTIME],
+            tokens=meta[_META_TOKENS],
+            embedding=embedding,
+            created_at=meta[_META_CREATED_AT],
+            access_history=access_history,
+        )
 
-            return CacheEntry(
-                path=meta[_META_PATH],
-                content_hash=meta[_META_CONTENT_HASH],
-                mtime=meta[_META_MTIME],
-                tokens=meta[_META_TOKENS],
-                embedding=embedding,
-                created_at=meta[_META_CREATED_AT],
-                access_history=access_history,
-            )
-
-    def put(
+    async def put(
         self,
         path: str,
         content: str,
         mtime: float,
         embedding: EmbeddingVector | None = None,
     ) -> None:
-        """Store file in cache as raw text with embedding.
-
-        Small files (< CHUNK_THRESHOLD) stored as a single document.
-        Large files are split via HyperCDC SIMD chunker into content-defined
-        chunks, stored as parent (file metadata) + children (raw text chunks).
-        Each chunk gets its own embedding for fine-grained similarity search.
-        """
+        """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
         content_hash = hash_content(content)
         tokens = count_tokens(content)
         now = time.time()
@@ -238,27 +258,25 @@ class VectorStorage:
             _META_HAS_EMBEDDING: has_embedding,
         }
 
-        with self._lock:
-            # Remove old entry for this path
-            self._delete_by_path(path)
+        # Remove old entry for this path
+        await self._delete_by_path(path)
 
-            if len(content_bytes) < CHUNK_THRESHOLD:
-                # Small file: single document
-                meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
-                self._collection.add_texts(
-                    texts=[content],
-                    metadatas=[meta],
-                    embeddings=[emb_list],
-                )
-                logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
-            else:
-                # Large file: parent + chunked children
-                self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+        if len(content_bytes) < CHUNK_THRESHOLD:
+            # Small file: single document
+            meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
+            await self._collection.add_texts(
+                texts=[content],
+                metadatas=[meta],
+                embeddings=[emb_list],
+            )
+            logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
+        else:
+            # Large file: parent + chunked children
+            await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
 
-            self._collection.save()
-            self._evict_if_needed()
+        await self._evict_if_needed()
 
-    def _put_chunked(
+    async def _put_chunked(
         self,
         path: str,
         content: str,
@@ -266,7 +284,7 @@ class VectorStorage:
         base_meta: dict,
         file_embedding: list[float],
     ) -> None:
-        """Store a large file as parent doc + CDC-chunked children."""
+        """Store large file as parent doc (file metadata) + CDC-chunked children (raw text)."""
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
         total_chunks = len(chunks_bytes)
@@ -289,17 +307,19 @@ class VectorStorage:
             _META_CHUNK_INDEX: -1,
             _META_TOTAL_CHUNKS: total_chunks,
         }
-        parent_ids = self._collection.add_texts(
+        parent_ids = await self._collection.add_texts(
             texts=[""],  # Parent has no content — children hold raw text
             metadatas=[parent_meta],
             embeddings=[file_embedding],
         )
         parent_id = parent_ids[0]
 
-        # Store children — each chunk is a child of the parent
+        # Store children — each chunk is a child of the parent.
+        # AsyncVectorCollection.add_texts does not expose parent_ids, so we call
+        # the underlying sync collection directly via run_in_executor.
         child_metas: list[dict] = []
         child_embeddings: list[list[float]] = []
-        zero_emb = self._zero_embedding()
+        zero_emb = self._resolve_embedding(None)
 
         for i, text in enumerate(chunk_texts):
             child_meta = {
@@ -319,11 +339,16 @@ class VectorStorage:
             # calls which is too expensive for the cache hot path.
             child_embeddings.append(zero_emb)
 
-        self._collection.add_texts(
-            texts=chunk_texts,
-            metadatas=child_metas,
-            embeddings=child_embeddings,
-            parent_ids=[parent_id] * total_chunks,
+        sync_coll = self._collection._collection
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._db._executor,
+            lambda: sync_coll.add_texts(
+                texts=chunk_texts,
+                metadatas=child_metas,
+                embeddings=child_embeddings,
+                parent_ids=[parent_id] * total_chunks,
+            ),
         )
 
         logger.debug(
@@ -332,253 +357,203 @@ class VectorStorage:
         )
 
     def _resolve_embedding(self, embedding: EmbeddingVector | None) -> list[float]:
-        """Convert embedding to list[float], falling back to zero vector."""
         if embedding is not None:
             return list(embedding)
-        dim = self._collection._dim
+        dim = self._collection._collection._dim
         if dim is None:
             dim = 384  # Default: matches BAAI/bge-small-en-v1.5
         return [0.0] * dim
 
-    def _zero_embedding(self) -> list[float]:
-        """Return a zero vector matching the index dimension."""
-        dim = self._collection._dim
-        if dim is None:
-            dim = 384
-        return [0.0] * dim
+    async def get_content(self, entry: CacheEntry) -> str:
+        """Reassemble full text from simplevecdb chunks (sorted by chunk_index)."""
+        results = await self._find_docs_by_path(entry.path)
+        if not results:
+            raise ValueError(f"No cached content found for {entry.path}")
 
-    def get_content(self, entry: CacheEntry) -> str:
-        """Get full content for a cache entry.
+        # Filter out parent docs (they have is_parent=True and empty content)
+        children = [r for r in results if not r[1].get(_META_IS_PARENT, False)]
 
-        Retrieves raw text from simplevecdb — no decompression needed.
-        For chunked files, skips the parent doc and reassembles children
-        in chunk_index order.
-        """
-        with self._lock:
-            results = self._find_docs_by_path(entry.path)
-            if not results:
-                raise ValueError(f"No cached content found for {entry.path}")
+        if not children:
+            # Shouldn't happen — but fall back to all results
+            children = results
 
-            # Filter out parent docs (they have is_parent=True and empty content)
-            children = [r for r in results if not r[1].get(_META_IS_PARENT, False)]
+        # Sort by chunk_index for correct reassembly
+        children.sort(key=lambda r: r[1].get(_META_CHUNK_INDEX, 0))
 
-            if not children:
-                # Shouldn't happen — but fall back to all results
-                children = results
+        # Concatenate raw text from all chunks
+        return "".join(r[2] for r in children)
 
-            # Sort by chunk_index for correct reassembly
-            children.sort(key=lambda r: r[1].get(_META_CHUNK_INDEX, 0))
+    async def record_access(self, path: str) -> None:
+        results = await self._find_docs_by_path(path)
+        if not results:
+            return
 
-            # Concatenate raw text from all chunks
-            return "".join(r[2] for r in children)
+        now = time.time()
+        updates: list[tuple[int, dict]] = []
 
-    def record_access(self, path: str) -> None:
-        """Record access for LRU-K tracking."""
-        with self._lock:
-            results = self._find_docs_by_path(path)
-            if not results:
-                return
+        for doc_id, meta, _text in results:
+            history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
+            history.append(now)
+            history = history[-5:]  # Keep last 5 accesses
+            updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
 
-            now = time.time()
-            updates: list[tuple[int, dict]] = []
+        if updates:
+            self._collection._collection._catalog.update_metadata_batch(updates)
 
-            for doc_id, meta, _text in results:
-                history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
-                history.append(now)
-                history = history[-5:]  # Keep last 5 accesses
-                updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
-
-            if updates:
-                self._collection._catalog.update_metadata_batch(updates)
-
-    def update_mtime(self, path: str, new_mtime: float) -> None:
+    async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding.
 
         Used when content hash matches but mtime changed (touch, git checkout).
         Prevents repeated hash checks on subsequent reads.
         """
-        with self._lock:
-            results = self._find_docs_by_path(path)
-            if not results:
-                return
+        results = await self._find_docs_by_path(path)
+        if not results:
+            return
 
-            updates: list[tuple[int, dict]] = []
-            for doc_id, _meta, _text in results:
-                updates.append((doc_id, {_META_MTIME: new_mtime}))
+        updates: list[tuple[int, dict]] = []
+        for doc_id, _meta, _text in results:
+            updates.append((doc_id, {_META_MTIME: new_mtime}))
 
-            if updates:
-                self._collection._catalog.update_metadata_batch(updates)
+        if updates:
+            self._collection._collection._catalog.update_metadata_batch(updates)
 
     # -------------------------------------------------------------------------
     # Similarity search
     # -------------------------------------------------------------------------
 
-    def find_similar(
+    async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
-        """Find semantically similar cached file using HNSW search.
-
-        Returns the path of the most similar file above SIMILARITY_THRESHOLD.
-        """
+        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None."""
         emb_list = list(embedding)
 
-        with self._lock:
-            try:
-                results = self._collection.similarity_search(
-                    query=emb_list,
-                    k=10,  # Get candidates, then filter
-                )
-            except Exception as e:
-                logger.warning(f"Similarity search failed: {e}")
-                return None
-
-            if not results:
-                return None
-
-            for doc, distance in results:
-                # COSINE distance in simplevecdb: 0 = identical, 2 = opposite
-                # Convert to similarity: 1 - (distance / 2) maps [0,2] → [1,0]
-                similarity = 1.0 - (distance / 2.0)
-                candidate_path = doc.metadata.get(_META_PATH)
-                has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
-
-                is_match = (
-                    has_emb
-                    and candidate_path
-                    and candidate_path != exclude_path
-                    and similarity >= SIMILARITY_THRESHOLD
-                )
-                if is_match:
-                    logger.debug(
-                        f"Similar file found: {candidate_path} (similarity={similarity:.3f})"
-                    )
-                    return candidate_path
-
+        try:
+            results = await self._collection.similarity_search(
+                query=emb_list,
+                k=10,  # Get candidates, then filter
+            )
+        except Exception as e:
+            logger.warning(f"Similarity search failed: {e}")
             return None
 
-    def find_similar_multi(
+        if not results:
+            return None
+
+        for doc, distance in results:
+            # COSINE distance in simplevecdb: 0 = identical, 2 = opposite
+            # Convert to similarity: 1 - (distance / 2) maps [0,2] → [1,0]
+            similarity = 1.0 - (distance / 2.0)
+            candidate_path = doc.metadata.get(_META_PATH)
+            has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
+
+            is_match = (
+                has_emb
+                and candidate_path
+                and candidate_path != exclude_path
+                and similarity >= SIMILARITY_THRESHOLD
+            )
+            if is_match:
+                logger.debug(f"Similar file found: {candidate_path} (similarity={similarity:.3f})")
+                return candidate_path
+
+        return None
+
+    async def find_similar_multi(
         self,
         embedding: EmbeddingVector,
         exclude_path: str | None = None,
         k: int = 5,
         threshold: float | None = None,
     ) -> list[tuple[str, float]]:
-        """Find multiple similar files with scores.
-
-        Returns list of (path, similarity) tuples above threshold.
-        """
+        """Return up to k (path, similarity) tuples above threshold."""
         if threshold is None:
             threshold = SIMILARITY_THRESHOLD
 
         emb_list = list(embedding)
 
-        with self._lock:
-            try:
-                results = self._collection.similarity_search(
-                    query=emb_list,
-                    k=k * 3,  # Over-fetch to account for filtering
-                )
-            except Exception as e:
-                logger.warning(f"Similarity search failed: {e}")
-                return []
+        try:
+            results = await self._collection.similarity_search(
+                query=emb_list,
+                k=k * 3,  # Over-fetch to account for filtering
+            )
+        except Exception as e:
+            logger.warning(f"Similarity search failed: {e}")
+            return []
 
-            matches: list[tuple[str, float]] = []
-            seen_paths: set[str] = set()
+        matches: list[tuple[str, float]] = []
+        seen_paths: set[str] = set()
 
-            for doc, distance in results:
-                similarity = 1.0 - (distance / 2.0)
-                candidate_path = doc.metadata.get(_META_PATH)
-                has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
+        for doc, distance in results:
+            similarity = 1.0 - (distance / 2.0)
+            candidate_path = doc.metadata.get(_META_PATH)
+            has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
 
-                if (
-                    has_emb
-                    and candidate_path
-                    and candidate_path != exclude_path
-                    and candidate_path not in seen_paths
-                    and similarity >= threshold
-                ):
-                    seen_paths.add(candidate_path)
-                    matches.append((candidate_path, similarity))
+            if (
+                has_emb
+                and candidate_path
+                and candidate_path != exclude_path
+                and candidate_path not in seen_paths
+                and similarity >= threshold
+            ):
+                seen_paths.add(candidate_path)
+                matches.append((candidate_path, similarity))
 
-                    if len(matches) >= k:
-                        break
+                if len(matches) >= k:
+                    break
 
-            return matches
+        return matches
 
     # -------------------------------------------------------------------------
     # Query-based search
     # -------------------------------------------------------------------------
 
-    def search_by_query(
+    async def search_by_query(
         self,
         query: str,
         k: int = 5,
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Search cached content by text query using BM25 keyword ranking.
+        """BM25 keyword search over cached content. FTS5 syntax supported."""
+        try:
+            results = await self._collection.keyword_search(query, k=k * 2, filter=filter)
+        except Exception as e:
+            logger.warning(f"Keyword search failed: {e}")
+            return []
 
-        Uses FTS5 full-text search for exact/partial keyword matching.
+        return self._dedupe_search_results(results, k)
 
-        Args:
-            query: Text query (FTS5 syntax supported)
-            k: Maximum results to return
-            filter: Optional metadata filter (e.g. {path: "/src/foo.py"})
-
-        Returns:
-            List of (path, preview, score) tuples sorted by relevance
-        """
-        with self._lock:
-            try:
-                results = self._collection.keyword_search(query, k=k * 2, filter=filter)
-            except Exception as e:
-                logger.warning(f"Keyword search failed: {e}")
-                return []
-
-            return self._dedupe_search_results(results, k)
-
-    def search_hybrid(
+    async def search_hybrid(
         self,
         query: str,
         embedding: EmbeddingVector | None = None,
         k: int = 5,
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Search cached content using hybrid BM25 + vector similarity (RRF).
+        """Hybrid BM25 + vector search with RRF fusion.
 
-        Combines keyword matching with semantic similarity for best results.
         Falls back to keyword-only if no embedding provided.
-
-        Args:
-            query: Text query for keyword component
-            embedding: Optional query embedding for vector component
-            k: Maximum results to return
-            filter: Optional metadata filter
-
-        Returns:
-            List of (path, preview, score) tuples sorted by fused relevance
         """
         query_vector = list(embedding) if embedding is not None else None
 
-        with self._lock:
-            try:
-                results = self._collection.hybrid_search(
-                    query,
-                    k=k * 2,
-                    filter=filter,
-                    query_vector=query_vector,
-                )
-            except Exception as e:
-                logger.warning(f"Hybrid search failed: {e}")
-                return []
+        try:
+            results = await self._collection.hybrid_search(
+                query,
+                k=k * 2,
+                filter=filter,
+                query_vector=query_vector,
+            )
+        except Exception as e:
+            logger.warning(f"Hybrid search failed: {e}")
+            return []
 
-            return self._dedupe_search_results(results, k)
+        return self._dedupe_search_results(results, k)
 
     def _dedupe_search_results(
         self,
         results: list[tuple],
         k: int,
     ) -> list[tuple[str, str, float]]:
-        """Deduplicate search results by path, keeping best score per file."""
+        """Deduplicate by path, keeping best score. Skips parent (empty) docs."""
         seen_paths: set[str] = set()
         matches: list[tuple[str, str, float]] = []
 
@@ -600,7 +575,12 @@ class VectorStorage:
     # Grep — regex/literal content search across cached files
     # -------------------------------------------------------------------------
 
-    def grep(
+    # Upper bounds for grep parameters — prevent excessive memory/CPU usage
+    _GREP_MAX_CONTEXT_LINES = 20
+    _GREP_MAX_MATCHES = 10_000
+    _GREP_MAX_FILES = 500
+
+    async def grep(
         self,
         pattern: str,
         *,
@@ -610,24 +590,16 @@ class VectorStorage:
         max_matches: int = 100,
         max_files: int = 50,
     ) -> list[dict]:
-        """Search cached file content by regex or literal pattern.
+        """Exact pattern matching across cached files — like ripgrep on the cache.
 
-        Unlike search/search_hybrid (ranked BM25+vector), this does exact
-        pattern matching with line numbers and context — like ripgrep on the
-        cache.
-
-        Args:
-            pattern: Regex pattern (or literal string if fixed_string=True)
-            fixed_string: Treat pattern as literal, not regex
-            case_sensitive: Case-sensitive matching (default: True)
-            context_lines: Lines of context before/after each match
-            max_matches: Total match limit across all files
-            max_files: Maximum files to return
-
-        Returns:
-            List of dicts: {path, matches: [{line_number, line, before, after}]}
+        Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
         """
         import re  # noqa: PLC0415
+
+        # Clamp inputs to prevent excessive memory/CPU usage
+        context_lines = max(0, min(context_lines, self._GREP_MAX_CONTEXT_LINES))
+        max_matches = max(1, min(max_matches, self._GREP_MAX_MATCHES))
+        max_files = max(1, min(max_files, self._GREP_MAX_FILES))
 
         flags = 0 if case_sensitive else re.IGNORECASE
         if fixed_string:
@@ -639,9 +611,8 @@ class VectorStorage:
                 logger.warning(f"Invalid regex pattern: {e}")
                 return []
 
-        # Collect all cached file content grouped by path (lock for DB access)
-        with self._lock:
-            all_docs = self._collection._catalog.get_all_docs_with_text()
+        # Collect all cached file content grouped by path
+        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
         files: dict[str, list[tuple[int, str]]] = {}  # path -> [(chunk_index, text)]
         for _doc_id, text, meta in all_docs:
             if meta.get(_META_IS_PARENT, False):
@@ -693,56 +664,74 @@ class VectorStorage:
     # Statistics and management
     # -------------------------------------------------------------------------
 
-    def get_stats(self) -> dict[str, int | float]:
-        """Get cache statistics."""
-        with self._lock:
-            count = self._collection.count()
-            db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
+    def is_healthy(self) -> bool:
+        """Lightweight probe: True when the catalog and index are accessible.
 
-            # Count unique files (not chunks)
-            unique_paths: set[str] = set()
-            total_tokens = 0
+        Intended for post-startup validation and observability. Does not
+        perform I/O beyond a single count query on the in-memory catalog.
+        """
+        if self._closed:
+            return False
+        try:
+            self._collection._collection.count()
+            return True
+        except Exception:
+            return False
 
-            all_docs = self._collection._catalog.get_all_docs_with_text()
-            for _doc_id, _text, meta in all_docs:
-                path = meta.get(_META_PATH, "")
-                if path:
-                    unique_paths.add(path)
-                # Only count tokens from parent docs or single-chunk files.
-                # Child chunks also store token counts, so summing all docs
-                # would double-count chunked files.
-                if meta.get(_META_IS_PARENT, False) or meta.get(_META_TOTAL_CHUNKS, 1) == 1:
-                    total_tokens += meta.get(_META_TOKENS, 0)
+    async def get_stats(self) -> dict[str, int | float]:
+        count = self._collection._collection.count()
+        db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
-            return {
-                "files_cached": len(unique_paths),
-                "total_tokens_cached": total_tokens,
-                "total_documents": count,
-                "db_size_mb": round(db_size / 1024 / 1024, 2),
-            }
+        # Count unique files (not chunks)
+        unique_paths: set[str] = set()
+        total_tokens = 0
 
-    def clear(self) -> int:
+        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
+        for _doc_id, _text, meta in all_docs:
+            path = meta.get(_META_PATH, "")
+            if path:
+                unique_paths.add(path)
+            # Only count tokens from parent docs or single-chunk files.
+            # Child chunks also store token counts, so summing all docs
+            # would double-count chunked files.
+            if meta.get(_META_IS_PARENT, False) or meta.get(_META_TOTAL_CHUNKS, 1) == 1:
+                total_tokens += meta.get(_META_TOKENS, 0)
+
+        return {
+            "files_cached": len(unique_paths),
+            "total_tokens_cached": total_tokens,
+            "total_documents": count,
+            "db_size_mb": round(db_size / 1024 / 1024, 2),
+        }
+
+    def _clear_sync(self) -> int:
+        """Synchronous clear — safe to call without an event loop.
+
+        Used by clear_if_model_changed() which runs before the async
+        server starts. Avoids the fragile get_event_loop().run_until_complete()
+        pattern that breaks when called from within a running loop.
+        """
+        sync_coll = self._collection._collection
+        count = sync_coll.count()
+        if count > 0:
+            all_docs = sync_coll._catalog.get_all_docs_with_text()
+            doc_ids = [doc_id for doc_id, _, _ in all_docs]
+            if doc_ids:
+                sync_coll.delete_by_ids(doc_ids)
+                sync_coll.save()
+        return count
+
+    async def clear(self) -> int:
         """Clear all cache entries. Returns count of files removed."""
-        with self._lock:
-            count = self._collection.count()
-            if count > 0:
-                all_docs = self._collection._catalog.get_all_docs_with_text()
-                doc_ids = [doc_id for doc_id, _, _ in all_docs]
-                if doc_ids:
-                    self._collection.delete_by_ids(doc_ids)
-                    self._collection.save()
-            return count
+        return self._clear_sync()
 
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
 
-    def _find_docs_by_path(self, path: str) -> list[tuple[int, dict, str]]:
-        """Find all documents for a given file path.
-
-        Returns list of (doc_id, metadata_dict, text) tuples.
-        """
-        catalog = self._collection._catalog
+    async def _find_docs_by_path(self, path: str) -> list[tuple[int, dict, str]]:
+        """Return [(doc_id, metadata, text)] for all documents at path."""
+        catalog = self._collection._collection._catalog
         try:
             docs = catalog.get_all_docs_with_text(
                 filter_dict={_META_PATH: path},
@@ -755,20 +744,20 @@ class VectorStorage:
         # docs is list of (doc_id, text, metadata_dict)
         return [(doc_id, meta, text) for doc_id, text, meta in docs]
 
-    def _delete_by_path(self, path: str) -> int:
-        """Delete all documents for a given file path. Returns count deleted."""
-        results = self._find_docs_by_path(path)
+    async def _delete_by_path(self, path: str) -> int:
+        results = await self._find_docs_by_path(path)
         if not results:
             return 0
 
         doc_ids = [r[0] for r in results]
-        self._collection.delete_by_ids(doc_ids)
+        await self._collection.delete_by_ids(doc_ids)
         return len(doc_ids)
 
-    def _evict_if_needed(self) -> None:
-        """Evict entries using LRU-K policy if over limit."""
+    async def _evict_if_needed(self) -> None:
+        """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
         # Get all docs once — used for both the file-count check and LRU scoring.
-        all_docs = self._collection._catalog.get_all_docs_with_text()
+        sync_coll = self._collection._collection
+        all_docs = sync_coll._catalog.get_all_docs_with_text()
 
         # Count unique files, not documents. Chunked files span multiple
         # documents, so using doc count fires eviction too early.
@@ -809,22 +798,16 @@ class VectorStorage:
             if evicted >= evict_count:
                 break
             ids_to_delete.extend(doc_ids)
-            evicted += len(doc_ids)
+            evicted += 1
 
         if ids_to_delete:
-            self._collection.delete_by_ids(ids_to_delete)
-            self._collection.save()
+            await self._collection.delete_by_ids(ids_to_delete)
+            sync_coll.save()
             logger.info(f"Cache eviction: removed {evicted} documents")
 
     def save(self) -> None:
         """Persist index to disk."""
-        self._collection.save()
-        self._db.save()
-
-    def close(self) -> None:
-        """Close the database."""
-        try:
-            self._db.save()
-            self._db.close()
-        except Exception as e:
-            logger.warning(f"Error closing VectorStorage: {e}")
+        self._collection._collection.save()
+        sync_db = getattr(self._db, "_db", None)
+        if sync_db is not None:
+            sync_db.save()

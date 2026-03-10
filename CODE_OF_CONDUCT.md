@@ -1,38 +1,25 @@
 # Code of Conduct
 
-## Our Pledge
+Be direct, honest, and respectful. Criticism of ideas is fine; personal attacks, harassment, and unwanted contact are not.
 
-We as members, contributors, and leaders pledge to make participation in our community a positive experience for everyone.
+## Standards
 
-## Our Standards
+Acceptable:
 
-Examples of behavior that contributes to a positive environment:
+- Constructive criticism and differing viewpoints
+- Asking questions; admitting uncertainty
+- Holding each other to high technical standards
 
-- Using welcoming and inclusive language
-- Being respectful of differing viewpoints and experiences
-- Gracefully accepting constructive feedback
-- Focusing on what is best for the community
-- Showing empathy towards other community members
+Not acceptable:
 
-Examples of unacceptable behavior:
-
-- Trolling, insulting or derogatory comments, and personal attacks
-- Public or private unwanted contact
-- Publishing others' private information without explicit permission
-- Other conduct which could reasonably be considered inappropriate in a professional setting
-
-## Enforcement Responsibilities
-
-Community leaders are responsible for clarifying and enforcing our standards of acceptable behavior and will take appropriate and fair corrective action in response to any behavior that they deem inappropriate or harmful.
-
-## Scope
-
-This Code of Conduct applies within all community spaces, and also applies when an individual is officially representing the community in public spaces.
+- Insults, personal attacks, trolling
+- Unwanted contact (public or private)
+- Publishing someone's private information without consent
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported to the project maintainers. All complaints will be reviewed and investigated promptly and fairly.
+Report violations to the project maintainers. Complaints are reviewed promptly. Maintainers may remove, edit, or reject contributions that violate these standards.
 
-## Attribution
+---
 
-This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/), version 2.1.
+Adapted from the [Contributor Covenant](https://www.contributor-covenant.org/) v2.1.

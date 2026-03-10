@@ -1,10 +1,7 @@
-"""Text sub-package: diff, delta, truncation, and semantic summarization."""
-
 from __future__ import annotations
 
 from ._diff import (
     DiffDelta,
-    apply_delta,
     compute_delta,
     diff_stats,
     generate_diff,
@@ -27,7 +24,6 @@ __all__ = [
     "generate_diff",
     "diff_stats",
     "compute_delta",
-    "apply_delta",
     "truncate_smart",
     "truncate_semantic",
     # summarization

@@ -1,4 +1,4 @@
-"""Cache package - re-exports all public symbols for backward compatibility."""
+"""Cache package."""
 
 from __future__ import annotations
 

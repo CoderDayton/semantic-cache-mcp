@@ -1,4 +1,4 @@
-"""MCP tool implementations."""
+"""MCP tool handlers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 
 from fastmcp import Context
 
-from ..cache import (
+from ...cache import (
     SemanticCache,
     batch_smart_read,
     compare_files,
@@ -22,10 +22,10 @@ from ..cache import (
     smart_read,
     smart_write,
 )
-from ..config import MAX_CONTENT_SIZE
-from ..core.embeddings import get_model_info
-from ._mcp import mcp
-from .response import (
+from ...config import MAX_CONTENT_SIZE
+from ...core.embeddings import get_model_info
+from .._mcp import mcp
+from ..response import (
     _MODE_DEBUG,
     _MODE_NORMAL,
     _render_error,
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
         "github": "https://github.com/CoderDayton/semantic-cache-mcp",
     }
 )
-def read(
+async def read(
     ctx: Context,
     path: str,
     max_size: int = MAX_CONTENT_SIZE,
@@ -92,7 +92,7 @@ def read(
     try:
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
-            result = smart_read(
+            result = await smart_read(
                 cache=cache,
                 path=path,
                 max_size=max_size,
@@ -130,7 +130,7 @@ def read(
 
             return _render_response(payload, max_response_tokens)
 
-        result = smart_read(
+        result = await smart_read(
             cache=cache,
             path=path,
             max_size=max_size,
@@ -152,7 +152,7 @@ def read(
                 # content is non-contiguous, so line numbers don't map to the
                 # original file. Don't hint a specific offset; instead tell
                 # the caller to use offset/limit to read specific line ranges.
-                entry = cache.get(str(Path(path).expanduser().resolve()))
+                entry = await cache.get(str(Path(path).expanduser().resolve()))
                 total_tokens = entry.tokens if entry else result.tokens_original
                 payload["total_tokens"] = total_tokens
                 payload["hint"] = (
@@ -181,7 +181,7 @@ def read(
 
 
 @mcp.tool()
-def stats(
+async def stats(
     ctx: Context,
 ) -> str:
     """Get cache statistics, session activity, and lifetime metrics.
@@ -192,57 +192,171 @@ def stats(
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-    cache_stats = cache.get_stats()
-
+    cache_stats = await cache.get_stats()
     model_info = get_model_info()
+
     session = cache_stats.get("session", {})
+    lifetime = cache_stats.get("lifetime", {})
 
-    tokens_saved = session.get("tokens_saved", 0)
-    tokens_original = session.get("tokens_original", 0)
-    savings_pct = round(tokens_saved / tokens_original * 100, 1) if tokens_original > 0 else 0
+    # Session savings
+    s_saved = session.get("tokens_saved", 0)
+    s_original = session.get("tokens_original", 0)
+    s_pct = round(s_saved / s_original * 100, 1) if s_original > 0 else 0.0
+    s_hits = session.get("cache_hits", 0)
+    s_misses = session.get("cache_misses", 0)
+    s_total = s_hits + s_misses
+    s_hit_pct = round(s_hits / s_total * 100) if s_total > 0 else 0
 
-    payload: dict[str, Any] = {"ok": True, "tool": "stats"}
+    # Lifetime savings
+    lt_saved = lifetime.get("tokens_saved", 0)
+    lt_original = lifetime.get("tokens_original", 0)
+    lt_pct = round(lt_saved / lt_original * 100, 1) if lt_original > 0 else 0.0
+    lt_hits = lifetime.get("cache_hits", 0)
+    lt_misses = lifetime.get("cache_misses", 0)
+    lt_total = lt_hits + lt_misses
+    lt_hit_pct = round(lt_hits / lt_total * 100) if lt_total > 0 else 0
+    lt_sessions = lifetime.get("total_sessions", 0)
+
+    # Helpers
+    def _n(v: int) -> str:
+        return f"{v:,}"
+
+    def _mb(v: float) -> str:
+        return f"{v:.2f} MB"
+
+    def _uptime(s: float) -> str:
+        s = int(s)
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m {s % 60}s"
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+
+    model_name = str(model_info.get("model", "unknown"))
+    provider = str(cache_stats.get("embedding_provider", "CPU"))
+    ready = model_info.get("ready", False)
+    provider_str = f"{provider} ✓" if ready else f"{provider} ✗"
 
     if mode == "compact":
-        payload["files_cached"] = cache_stats.get("files_cached", 0)
-        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
-        payload["tokens_saved"] = tokens_saved
-        payload["savings_pct"] = savings_pct
-        payload["cache_hits"] = session.get("cache_hits", 0)
-        payload["cache_misses"] = session.get("cache_misses", 0)
-        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
-        payload["embedding_ready"] = model_info["ready"]
+        lines = [
+            "## Semantic Cache",
+            "",
+            f"**{_n(cache_stats.get('files_cached', 0))}** files · "
+            f"**{_n(cache_stats.get('total_tokens_cached', 0))}** tokens stored · "
+            f"**{_mb(cache_stats.get('db_size_mb', 0.0))}**",
+            "",
+            "| | Saved | Rate | Hit Rate |",
+            "|---|---:|---:|---:|",
+            f"| **Session** | {_n(s_saved)} | **{s_pct}%** | {s_hit_pct}% ({s_hits}/{s_total}) |",
+            (
+                f"| **Lifetime** | {_n(lt_saved)} | **{lt_pct}%** "
+                f"| {lt_hit_pct}% ({lt_hits}/{lt_total}) |"
+            ),
+            "",
+            (
+                f"*{lt_sessions} completed session"
+                f"{'s' if lt_sessions != 1 else ''} · {model_name} · {provider_str}*"
+            ),
+        ]
+        return "\n".join(lines)
 
-    elif mode == "normal":
-        payload["files_cached"] = cache_stats.get("files_cached", 0)
-        payload["tokens_cached"] = cache_stats.get("total_tokens_cached", 0)
-        payload["tokens_saved"] = tokens_saved
-        payload["savings_pct"] = savings_pct
-        payload["cache_hits"] = session.get("cache_hits", 0)
-        payload["cache_misses"] = session.get("cache_misses", 0)
-        payload["db_size_mb"] = cache_stats.get("db_size_mb", 0)
-        payload["embedding_model"] = model_info["model"]
-        payload["embedding_ready"] = model_info["ready"]
-        payload["uptime_s"] = round(session.get("uptime_s", 0), 1)
+    if mode == "normal":
+        uptime = _uptime(session.get("uptime_s", 0))
+        files_read = session.get("files_read", 0)
+        files_written = session.get("files_written", 0)
+        files_edited = session.get("files_edited", 0)
+        diffs = session.get("diffs_served", 0)
+        tool_calls: dict[str, int] = session.get("tool_calls", {})
+        top_tools = sorted(tool_calls.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    else:  # debug
-        payload.update(cache_stats)
-        payload["embedding"] = model_info
-        payload["output_mode"] = mode
+        lt_files_read = lifetime.get("files_read", 0)
+        lt_files_written = lifetime.get("files_written", 0)
+        lt_files_edited = lifetime.get("files_edited", 0)
 
-    return _render_response(payload, max_response_tokens)
+        rss = cache_stats.get("process_rss_mb")
+        mem_str = f"{rss:.0f} MB RSS" if rss is not None else "—"
+
+        lines = [
+            "# Semantic Cache Stats",
+            "",
+            "---",
+            "",
+            "## Storage",
+            "",
+            "| Files Cached | Tokens Stored | Documents | DB Size |",
+            "|---:|---:|---:|---:|",
+            f"| **{_n(cache_stats.get('files_cached', 0))}** "
+            f"| **{_n(cache_stats.get('total_tokens_cached', 0))}** "
+            f"| {_n(cache_stats.get('total_documents', 0))} "
+            f"| {_mb(cache_stats.get('db_size_mb', 0.0))} |",
+            "",
+            "---",
+            "",
+            f"## This Session  ·  uptime {uptime}",
+            "",
+            "| Metric | Tokens | Rate |",
+            "|---|---:|---:|",
+            f"| Tokens saved | **{_n(s_saved)}** | **{s_pct}%** |",
+            f"| Tokens returned | {_n(session.get('tokens_returned', 0))} | — |",
+            "",
+            "| Cache hits | Cache misses | Hit rate |",
+            "|---:|---:|---:|",
+            f"| **{_n(s_hits)}** | {_n(s_misses)} | **{s_hit_pct}%** |",
+            "",
+            f"Files read: **{files_read}** · "
+            f"written: **{files_written}** · "
+            f"edited: **{files_edited}** · "
+            f"diffs served: **{diffs}**",
+        ]
+
+        if top_tools:
+            lines += [
+                "",
+                "**Tool calls:** " + " · ".join(f"`{t}` ×{c}" for t, c in top_tools),
+            ]
+
+        lines += [
+            "",
+            "---",
+            "",
+            f"## Lifetime  ·  {lt_sessions} session{'s' if lt_sessions != 1 else ''}",
+            "",
+            "| Metric | Tokens | Rate |",
+            "|---|---:|---:|",
+            f"| Tokens saved | **{_n(lt_saved)}** | **{lt_pct}%** |",
+            f"| Tokens returned | {_n(lifetime.get('tokens_returned', 0))} | — |",
+            "",
+            "| Cache hits | Cache misses | Hit rate |",
+            "|---:|---:|---:|",
+            f"| **{_n(lt_hits)}** | {_n(lt_misses)} | **{lt_hit_pct}%** |",
+            "",
+            f"Files read: **{_n(lt_files_read)}** · "
+            f"written: **{_n(lt_files_written)}** · "
+            f"edited: **{_n(lt_files_edited)}**",
+            "",
+            "---",
+            "",
+            "## System",
+            "",
+            "| Model | Provider | Memory |",
+            "|---|---|---:|",
+            f"| `{model_name}` | {provider_str} | {mem_str} |",
+        ]
+        return "\n".join(lines)
+
+    # debug — full raw dump
+    return f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```"
 
 
 @mcp.tool()
-def clear(
+async def clear(
     ctx: Context,
 ) -> str:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
-    count = cache.clear()
+    count = await cache.clear()
     cache.metrics.record("clear", None)
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
@@ -251,7 +365,7 @@ def clear(
 
 
 @mcp.tool()
-def write(
+async def write(
     ctx: Context,
     path: str,
     content: str,
@@ -287,7 +401,7 @@ def write(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = smart_write(
+        result = await smart_write(
             cache=cache,
             path=path,
             content=content,
@@ -339,7 +453,7 @@ def write(
 
 
 @mcp.tool()
-def edit(
+async def edit(
     ctx: Context,
     path: str,
     old_string: str | None = None,
@@ -387,7 +501,7 @@ def edit(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = smart_edit(
+        result = await smart_edit(
             cache=cache,
             path=path,
             old_string=old_string,
@@ -444,7 +558,7 @@ def edit(
 
 
 @mcp.tool()
-def batch_edit(
+async def batch_edit(
     ctx: Context,
     path: str,
     edits: str,
@@ -491,8 +605,6 @@ def batch_edit(
             )
 
         edit_list = json.loads(edits_str)
-        if not isinstance(edit_list, list):
-            return _render_error("batch_edit", "edits must be a JSON array", max_response_tokens)
 
         # Convert to list of 4-tuples: (old | None, new, start_line | None, end_line | None)
         edit_tuples: list[tuple[str | None, str, int | None, int | None]] = []
@@ -518,7 +630,7 @@ def batch_edit(
                     max_response_tokens,
                 )
 
-        result = smart_batch_edit(
+        result = await smart_batch_edit(
             cache=cache,
             path=path,
             edits=edit_tuples,
@@ -593,7 +705,7 @@ def batch_edit(
 
 
 @mcp.tool()
-def search(
+async def search(
     ctx: Context,
     query: str,
     k: int = 10,
@@ -621,7 +733,7 @@ def search(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = semantic_search(cache, query, k=k, directory=directory)
+        result = await semantic_search(cache, query, k=k, directory=directory)
         cache.metrics.record("search", result)
 
         match_payload: list[dict[str, Any]] = []
@@ -654,7 +766,7 @@ def search(
 
 
 @mcp.tool()
-def diff(
+async def diff(
     ctx: Context,
     path1: str,
     path2: str,
@@ -679,7 +791,7 @@ def diff(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = compare_files(cache, path1, path2, context_lines=context_lines)
+        result = await compare_files(cache, path1, path2, context_lines=context_lines)
         cache.metrics.record("diff", result)
 
         payload: dict[str, Any] = {
@@ -707,7 +819,7 @@ def diff(
 
 
 @mcp.tool()
-def batch_read(
+async def batch_read(
     ctx: Context,
     paths: str,
     max_total_tokens: int = 50000,
@@ -757,7 +869,7 @@ def batch_read(
             else:
                 priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
 
-        result = batch_smart_read(
+        result = await batch_smart_read(
             cache,
             path_list,
             max_total_tokens=max_total_tokens,
@@ -830,7 +942,7 @@ def batch_read(
 
 
 @mcp.tool()
-def similar(
+async def similar(
     ctx: Context,
     path: str,
     k: int = 5,
@@ -853,7 +965,7 @@ def similar(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = find_similar_files(cache, path, k=k)
+        result = await find_similar_files(cache, path, k=k)
         cache.metrics.record("similar", result)
 
         similar_payload = [
@@ -884,7 +996,7 @@ def similar(
 
 
 @mcp.tool()
-def glob(
+async def glob(
     ctx: Context,
     pattern: str,
     directory: str = ".",
@@ -908,7 +1020,7 @@ def glob(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = glob_with_cache_status(
+        result = await glob_with_cache_status(
             cache,
             pattern,
             directory=directory,
@@ -943,7 +1055,7 @@ def glob(
 
 
 @mcp.tool()
-def grep(
+async def grep(
     ctx: Context,
     pattern: str,
     fixed_string: bool = False,
@@ -978,11 +1090,14 @@ def grep(
     max_response_tokens = _response_token_cap()
 
     try:
-        results = cache._storage.grep(
+        # In compact mode, context lines are dropped in the response anyway —
+        # skip fetching them to avoid wasted storage work.
+        effective_context = context_lines if mode in _MODE_NORMAL else 0
+        results = await cache._storage.grep(
             pattern,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
-            context_lines=context_lines,
+            context_lines=effective_context,
             max_matches=max_matches,
             max_files=max_files,
         )
@@ -999,7 +1114,7 @@ def grep(
                     "line_number": m["line_number"],
                     "line": m["line"],
                 }
-                if context_lines > 0 and mode in _MODE_NORMAL:
+                if effective_context > 0:
                     if "before" in m:
                         item["before"] = m["before"]
                     if "after" in m:

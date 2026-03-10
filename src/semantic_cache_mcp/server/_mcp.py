@@ -29,11 +29,15 @@ def _migrate_v2_to_v3() -> None:
         import sqlite3
 
         conn = sqlite3.connect(str(DB_PATH))
-        tables = {
-            r[0]
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
-        conn.close()
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
         # Only delete if it has the old v0.2.0 schema — don't touch unrelated DBs
         if {"chunks", "files", "lsh_index"} <= tables:
             DB_PATH.unlink()
@@ -101,7 +105,13 @@ async def app_lifespan(server: FastMCP):
     try:
         yield {"cache": cache}
     finally:
-        cache.metrics.persist()
+        cache.close()
+        # Flush streams before exit — prevents lost log output when running
+        # as a subprocess (stdio transport) or in containers.
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                if not stream.closed:
+                    stream.flush()
         logger.info("Semantic cache MCP server stopped")
 
 

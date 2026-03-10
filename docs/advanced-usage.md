@@ -2,15 +2,6 @@
 
 ## Programmatic API
 
-### Timing Policy (Token-Efficient)
-
-- Use `smart_read` for single-file iteration; `batch_smart_read` for 2+ files
-- Keep `diff_mode=True` while iterating; set `diff_mode=False` only after context compression to recover full content
-- Use `smart_edit` for one targeted replacement; `smart_batch_edit` for 2+ edits in one file
-- Seed cache before `semantic_search` or `find_similar_files` — they only search cached files
-- Start `k` at 3–5 for search/similar; increase only if recall is insufficient
-- Use `glob_with_cache_status` to shortlist candidates, then `batch_smart_read` to retrieve content
-
 ```python
 from semantic_cache_mcp.cache import (
     SemanticCache,
@@ -189,12 +180,9 @@ cache = SemanticCache(db_path=Path("/tmp/my-cache.db"))
 ```python
 from semantic_cache_mcp.core.embeddings import configure, warmup, embed, embed_query, get_model_info
 
-# Optional: set custom model directory before warmup
-# Defaults to ~/.cache/semantic-cache-mcp/models when omitted
-configure(cache_dir="/path/to/custom/models")
+configure(cache_dir="/path/to/custom/models")  # defaults to ~/.cache/semantic-cache-mcp/models
 
-# Warmup model — called automatically at server start
-warmup()
+warmup()  # called automatically at server start
 
 # Get model status
 info = get_model_info()
@@ -251,8 +239,6 @@ summary = summarize_semantic(
 
 ### Batch Embedding
 
-When embedding many files at once, amortize ONNX Runtime inference overhead with a single model call:
-
 ```python
 from semantic_cache_mcp.core.embeddings import embed_batch
 
@@ -269,7 +255,7 @@ for text, vec in zip(texts, vectors):
         print(f"Embedded {len(text)} chars → {len(vec)}-dim vector")
 ```
 
-`batch_smart_read` calls this automatically for all new/changed files before the main read loop — you typically don't need to call it directly.
+`batch_smart_read` calls this automatically — you rarely need it directly.
 
 ### Delta Compression
 
@@ -427,20 +413,6 @@ print(f"Cleared {cleared} entries")
 | `total_matches`       | `int`           | Total files matched                   |
 | `cached_count`        | `int`           | Files already in cache                |
 | `total_cached_tokens` | `int`           | Total tokens of cached files          |
-
----
-
-## Caching Strategy Reference
-
-| Strategy             | Token Savings | Trigger Condition                              |
-|----------------------|--------------|------------------------------------------------|
-| Unchanged (mtime)    | ~99%         | File mtime matches cached entry                |
-| Content hash         | ~99%         | mtime changed but BLAKE3 hash matches          |
-| Diff (changed)       | 80–95%       | File modified since last cache                 |
-| Search previews      | ~98%         | Semantic search returns previews, not full files |
-| Semantic match       | 70–90%       | Similar file found in cache                    |
-| Summarized (large)   | 50–80%       | File exceeds `MAX_CONTENT_SIZE` limit          |
-| Full (new/cold)      | 0%           | Not in cache; stored for future savings        |
 
 ---
 

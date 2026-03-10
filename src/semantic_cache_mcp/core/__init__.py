@@ -1,5 +1,3 @@
-"""Core algorithms for semantic caching."""
-
 from .chunking import (
     get_optimal_chunker,
     hypercdc_chunks,
@@ -28,7 +26,6 @@ from .text import (
     DiffDelta,
     Segment,
     SummarizationConfig,
-    apply_delta,
     compute_delta,
     diff_stats,
     extract_segments,
@@ -62,7 +59,6 @@ __all__ = [
     "truncate_smart",
     "truncate_semantic",
     "compute_delta",
-    "apply_delta",
     "diff_stats",
     "DiffDelta",
     "BPETokenizer",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import logging
 import queue
@@ -25,25 +24,20 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectionPool:
-    """Thread-safe SQLite connection pool with WAL mode.
+    """Thread-safe SQLite connection pool with WAL mode."""
 
-    Attributes:
-        db_path: Path to SQLite database
-        max_size: Maximum connections in pool
-    """
-
-    __slots__ = ("_available", "_lock", "_total", "db_path", "max_size")
+    __slots__ = ("_all_conns", "_available", "_closed", "_lock", "_total", "db_path", "max_size")
 
     def __init__(self, db_path: Path, max_size: int = 5) -> None:
         self.db_path = db_path
         self.max_size = max_size
         self._available: queue.Queue[sqlite3.Connection] = queue.Queue()
+        self._all_conns: set[sqlite3.Connection] = set()
         self._total = 0
         self._lock = threading.Lock()
-        atexit.register(self.close_all)
+        self._closed = False
 
     def _create_connection(self) -> sqlite3.Connection:
-        """Create a new SQLite connection with optimized settings."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(self.db_path),
@@ -56,11 +50,11 @@ class ConnectionPool:
         conn.execute("PRAGMA cache_size=-8000")  # 8MB
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self._all_conns.add(conn)
         return conn
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Get a connection from the pool."""
         conn: sqlite3.Connection | None = None
         try:
             conn = self._available.get_nowait()
@@ -92,14 +86,23 @@ class ConnectionPool:
                     conn.close()
 
     def close_all(self) -> None:
-        """Close all pooled connections."""
+        """Close all connections — both pooled and in-use. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+
+        # Drain the available queue first
         while True:
             try:
-                conn = self._available.get_nowait()
-                with contextlib.suppress(Exception):
-                    conn.close()
+                self._available.get_nowait()
             except queue.Empty:
                 break
+
+        # Close every connection we ever created (includes in-use ones)
+        for conn in self._all_conns:
+            with contextlib.suppress(Exception):
+                conn.close()
+        self._all_conns.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -108,33 +111,17 @@ class ConnectionPool:
 
 
 class SQLiteStorage:
-    """SQLite storage for session metrics persistence.
-
-    Only handles session_metrics table — file content storage is handled
-    by VectorStorage via simplevecdb.
-    """
+    """Session metrics persistence. File content lives in VectorStorage."""
 
     __slots__ = ("_pool", "db_path")
 
     def __init__(self, db_path: Path = DB_PATH, pool_size: int = 5) -> None:
-        """Initialize storage with connection pool.
-
-        Args:
-            db_path: Path to SQLite database file
-            pool_size: Maximum connections in pool (default: 5)
-        """
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._pool = ConnectionPool(db_path, max_size=pool_size)
         self._init_schema()
 
-    def __del__(self) -> None:
-        """Clean up connection pool on deletion."""
-        if hasattr(self, "_pool"):
-            self._pool.close_all()
-
     def _init_schema(self) -> None:
-        """Initialize session metrics table."""
         with self._pool.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS session_metrics (
@@ -154,46 +141,8 @@ class SQLiteStorage:
                 ) WITHOUT ROWID;
             """)
 
-    def save_session(self, data: dict[str, object]) -> None:
-        """Persist a session metrics snapshot.
-
-        Args:
-            data: Dict with session_id, started_at, ended_at, counters, tool_calls_json
-        """
-        with self._pool.get_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO session_metrics
-                (session_id, started_at, ended_at,
-                 tokens_saved, tokens_original, tokens_returned,
-                 cache_hits, cache_misses,
-                 files_read, files_written, files_edited,
-                 diffs_served, tool_calls_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    data["session_id"],
-                    data["started_at"],
-                    data["ended_at"],
-                    data["tokens_saved"],
-                    data["tokens_original"],
-                    data["tokens_returned"],
-                    data["cache_hits"],
-                    data["cache_misses"],
-                    data["files_read"],
-                    data["files_written"],
-                    data["files_edited"],
-                    data["diffs_served"],
-                    data["tool_calls_json"],
-                ),
-            )
-
     def get_lifetime_stats(self) -> dict[str, int]:
-        """Aggregate metrics across all completed sessions.
-
-        Returns:
-            Dict with total_sessions, sum of each counter
-        """
+        """Aggregate counters across all completed sessions."""
         with self._pool.get_connection() as conn:
             row = conn.execute(
                 """

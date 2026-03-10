@@ -1,4 +1,4 @@
-"""Semantic search and similarity operations for the cache package."""
+"""Semantic search and similarity operations."""
 
 from __future__ import annotations
 
@@ -32,23 +32,13 @@ MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
 
-def semantic_search(
+async def semantic_search(
     cache: SemanticCache,
     query: str,
     k: int = 10,
     directory: str | None = None,
 ) -> SearchResult:
-    """Search cached files by semantic meaning using hybrid BM25+vector search.
-
-    Args:
-        cache: SemanticCache instance
-        query: Search query text
-        k: Max results (capped at 100)
-        directory: Optional directory filter
-
-    Returns:
-        SearchResult with matches sorted by similarity
-    """
+    """Search cached files by semantic meaning using hybrid BM25+vector search."""
     # DoS protection
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
@@ -66,14 +56,14 @@ def semantic_search(
     # Request extra results when directory filtering will reduce the set
     storage = cache._storage
     search_k = k * 3 if resolved_dir else k
-    results = storage.search_hybrid(
+    results = await storage.search_hybrid(
         query=query,
         embedding=query_embedding,
         k=search_k,
     )
 
     if not results:
-        stats = storage.get_stats()
+        stats = await storage.get_stats()
         total = stats.get("files_cached", 0)
         return SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
 
@@ -92,7 +82,7 @@ def semantic_search(
     max_score = filtered[0][2] if filtered else 1.0
     matches: list[SearchMatch] = []
     for path, preview, score in filtered:
-        entry = cache.get(path)
+        entry = await cache.get(path)
         tokens = entry.tokens if entry else 0
         normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
@@ -104,7 +94,7 @@ def semantic_search(
             )
         )
 
-    stats = storage.get_stats()
+    stats = await storage.get_stats()
     total = stats.get("files_cached", 0)
 
     return SearchResult(
@@ -115,23 +105,16 @@ def semantic_search(
     )
 
 
-def compare_files(
+async def compare_files(
     cache: SemanticCache,
     path1: str,
     path2: str,
     context_lines: int = 3,
 ) -> DiffResult:
-    """Compare two files using cache.
+    """Compare two files using cache. Returns diff and semantic similarity score."""
+    # Cap context_lines to prevent excessive diff output
+    context_lines = max(0, min(context_lines, 50))
 
-    Args:
-        cache: SemanticCache instance
-        path1: First file path
-        path2: Second file path
-        context_lines: Lines of context in diff
-
-    Returns:
-        DiffResult with diff and similarity
-    """
     file1 = Path(path1).expanduser().resolve()
     file2 = Path(path2).expanduser().resolve()
 
@@ -148,9 +131,9 @@ def compare_files(
     from_cache2 = False
 
     # File 1
-    cached1 = cache.get(str(file1))
+    cached1 = await cache.get(str(file1))
     if cached1 and cached1.mtime >= file1.stat().st_mtime:
-        content1 = cache.get_content(cached1)
+        content1 = await cache.get_content(cached1)
         from_cache1 = True
     else:
         try:
@@ -162,12 +145,12 @@ def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
         mtime1 = file1.stat().st_mtime
         emb1 = cache.get_embedding(content1, str(file1))
-        cache.put(str(file1), content1, mtime1, emb1)
+        await cache.put(str(file1), content1, mtime1, emb1)
 
     # File 2
-    cached2 = cache.get(str(file2))
+    cached2 = await cache.get(str(file2))
     if cached2 and cached2.mtime >= file2.stat().st_mtime:
-        content2 = cache.get_content(cached2)
+        content2 = await cache.get_content(cached2)
         from_cache2 = True
     else:
         try:
@@ -179,7 +162,7 @@ def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
         mtime2 = file2.stat().st_mtime
         emb2 = cache.get_embedding(content2, str(file2))
-        cache.put(str(file2), content2, mtime2, emb2)
+        await cache.put(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
@@ -189,8 +172,8 @@ def compare_files(
 
     # Compute semantic similarity between embeddings (normalized)
     similarity = 0.0
-    entry1 = cache.get(str(file1))
-    entry2 = cache.get(str(file2))
+    entry1 = await cache.get(str(file1))
+    entry2 = await cache.get(str(file2))
     if entry1 and entry1.embedding and entry2 and entry2.embedding:
         # Normalize to proper cosine similarity in [0, 1] range
         raw_sim = cosine_similarity(entry1.embedding, entry2.embedding)
@@ -215,43 +198,44 @@ def compare_files(
     )
 
 
-def find_similar_files(
+async def find_similar_files(
     cache: SemanticCache,
     path: str,
     k: int = 5,
 ) -> SimilarFilesResult:
-    """Find files semantically similar to given file.
-
-    Args:
-        cache: SemanticCache instance
-        path: Source file path
-        k: Max results (capped at 50)
-
-    Returns:
-        SimilarFilesResult with similar files
-    """
+    """Find files semantically similar to the given file using HNSW search."""
     k = max(1, min(k, MAX_SIMILAR_K))
     file_path = Path(path).expanduser().resolve()
 
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    # Guard against binary files before read_text
+    raw = file_path.read_bytes()
+    if _is_binary_content(raw):
+        raise ValueError(f"Binary file not supported: {path}")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        content = raw.decode("utf-8", errors="replace")
+
     # Get/compute embedding for source file
-    cached = cache.get(str(file_path))
+    cached = await cache.get(str(file_path))
     source_tokens = 0
-    content = file_path.read_text(encoding="utf-8")
 
     file_mtime = file_path.stat().st_mtime
     if cached and cached.mtime >= file_mtime:
         source_tokens = cached.tokens
+        source_embedding = cache.get_embedding(content, str(file_path))
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
-        cache.update_mtime(str(file_path), file_mtime)
+        await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
+        source_embedding = cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
         source_embedding = cache.get_embedding(content, str(file_path))
-        cache.put(str(file_path), content, file_mtime, source_embedding)
-
-    # VectorStorage doesn't return embeddings from get() — always compute
-    source_embedding = cache.get_embedding(content, str(file_path))
+        await cache.put(str(file_path), content, file_mtime, source_embedding)
 
     if source_embedding is None:
         return SimilarFilesResult(
@@ -263,7 +247,7 @@ def find_similar_files(
 
     # Use VectorStorage HNSW search
     storage = cache._storage
-    results = storage.find_similar_multi(
+    results = await storage.find_similar_multi(
         embedding=source_embedding,
         exclude_path=str(file_path),
         k=k,
@@ -271,7 +255,7 @@ def find_similar_files(
 
     similar_files: list[SimilarFile] = []
     for sim_path, sim_score in results:
-        entry = cache.get(sim_path)
+        entry = await cache.get(sim_path)
         tokens = entry.tokens if entry else 0
         similar_files.append(
             SimilarFile(
@@ -281,7 +265,7 @@ def find_similar_files(
             )
         )
 
-    stats = storage.get_stats()
+    stats = await storage.get_stats()
     total = stats.get("files_cached", 0)
 
     return SimilarFilesResult(
@@ -292,22 +276,15 @@ def find_similar_files(
     )
 
 
-def glob_with_cache_status(
+async def glob_with_cache_status(
     cache: SemanticCache,
     pattern: str,
     directory: str = ".",
     cached_only: bool = False,
 ) -> GlobResult:
-    """Find files by pattern with cache status.
+    """Find files by glob pattern with cache status.
 
-    Args:
-        cache: SemanticCache instance
-        pattern: Glob pattern (e.g., "**/*.py")
-        directory: Base directory
-        cached_only: Only return files already in cache (reduces noise for large codebases)
-
-    Returns:
-        GlobResult with matches and cache info
+    cached_only=True reduces noise on large repos.
     """
     dir_path = Path(directory).expanduser().resolve()
 
@@ -334,7 +311,7 @@ def glob_with_cache_status(
         mtime = file_path.stat().st_mtime
 
         # Check cache status
-        cached = cache.get(path_str)
+        cached = await cache.get(path_str)
         is_cached = cached is not None
         tokens = cached.tokens if cached else None
 

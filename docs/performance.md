@@ -2,7 +2,7 @@
 
 ## Token Savings Benchmark
 
-Measured end-to-end on this project's own source files (30 `.py` files, ~136K tokens total). Benchmark script: [`benchmarks/benchmark_token_savings.py`](../benchmarks/benchmark_token_savings.py).
+30 `.py` files, ~136K tokens total. Script: [`benchmarks/benchmark_token_savings.py`](../benchmarks/benchmark_token_savings.py).
 
 | Phase | Scenario | Tokens returned | Original | Savings |
 |-------|----------|----------------:|---------:|--------:|
@@ -37,7 +37,7 @@ uv run pytest tests/test_benchmark_token_savings.py -v  # CI-verifiable assertio
 
 ## Operation Latency
 
-Measured on this project's 30 source files with CPU embeddings (BAAI/bge-small-en-v1.5 via ONNX Runtime). Benchmark script: [`benchmarks/benchmark_performance.py`](../benchmarks/benchmark_performance.py).
+CPU embeddings (BAAI/bge-small-en-v1.5 via ONNX Runtime), 30 source files. Script: [`benchmarks/benchmark_performance.py`](../benchmarks/benchmark_performance.py).
 
 ### Cache Read
 
@@ -86,90 +86,6 @@ Run it yourself:
 ```bash
 uv run python benchmarks/benchmark_performance.py
 ```
-
----
-
-## Optimization Summary
-
-| Technique | Benefit | Details |
-|-----------|---------|---------|
-| **Three-state read model** | 80–99% token savings | Unchanged → message only; changed → diff only; new → full content |
-| **Content hash freshness** | Avoids false re-reads | BLAKE3 hash detects when mtime changes but content is identical (touch, git checkout) |
-| **Batch embedding** | N ONNX calls → 1 | `batch_read` pre-scans all new/changed files; single `model.embed()` call |
-| **Hybrid search (BM25 + HNSW)** | Sub-5ms search | simplevecdb combines keyword and vector search via Reciprocal Rank Fusion |
-| **O(N log M) BPE tokenizer** | vs O(N²) naive | Priority-queue merge with memoization |
-| **LRU-K cache eviction** | Frequency-aware | Keeps frequently accessed files; evicts cold entries first |
-| **`__slots__` on dataclasses** | Eliminate `__dict__` | Memory-efficient data models |
-| **Generator expressions** | Avoid intermediate lists | Used in hot paths (similarity ranking, batch operations) |
-| **In-memory grep** | Sub-2ms pattern search | Cached file contents searched without disk I/O |
-| **BLAKE3 hashing** | Fast content fingerprinting | Hardware-accelerated; used for change detection |
-
----
-
-## Embeddings
-
-### Model
-
-`BAAI/bge-small-en-v1.5` (default) — 384-dimensional, 33M parameters, 512 token context. Runs locally via [FastEmbed](https://github.com/qdrant/fastembed) (ONNX Runtime). Configurable via `EMBEDDING_MODEL` env var.
-
-Device selection via `EMBEDDING_DEVICE`: `cpu` (default), `cuda` (GPU), or `auto` (detect).
-
-### Batch Embedding (`embed_batch`)
-
-`batch_read` pre-scans all requested paths before the main read loop:
-
-1. Identify new/changed files via mtime check (unchanged files need no embedding)
-2. Read content from disk and prepare for embedding
-3. Call `embed_batch()` once — a single `model.embed(texts)` ONNX inference call
-4. Distribute results into `smart_read` via `_embedding=` parameter
-
-For a batch of 20 files where 12 are new: 12 model calls → 1. Unchanged files pay zero embedding cost.
-
----
-
-## Storage
-
-### VectorStorage (simplevecdb)
-
-The storage backend uses [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB), which provides:
-
-- **HNSW index** — Approximate nearest neighbor search for semantic similarity
-- **FTS5 full-text search** — BM25 keyword search for grep and hybrid queries
-- **Hybrid search** — Reciprocal Rank Fusion combines HNSW + BM25 results
-- **Raw text storage** — File contents stored as plain text (no compression layer)
-
-### Why Raw Text?
-
-v0.3.0 replaced the previous compressed-chunk architecture (SQLiteStorage with CDC chunking, ZSTD compression, int8 quantized embeddings, LSH index) with raw text + vector embeddings. The tradeoffs:
-
-| | v0.2.x (SQLiteStorage) | v0.3.0 (VectorStorage) |
-|---|---|---|
-| Storage format | Compressed CDC chunks | Raw text + embeddings |
-| Search | LSH approximate + exact re-rank | HNSW + BM25 hybrid |
-| Complexity | ~2,500 LOC across 6 modules | ~400 LOC, single module |
-| Disk usage | Lower (compression) | Higher (raw text) |
-| Search quality | Good (int8 cosine) | Better (hybrid RRF) |
-| Maintenance | Complex (chunk/compress/quantize pipeline) | Simple (store/embed/search) |
-
-The simplicity and search quality improvements outweigh the modest increase in disk usage. Source code files compress well but are small enough that the compression overhead isn't justified.
-
----
-
-## Semantic Summarization
-
-Research-based content selection (TCRA-LLM, arXiv:2310.15556) for large files:
-
-**Algorithm:**
-1. Split at semantic boundaries (function/class definitions, paragraphs)
-2. Score each segment:
-   - **Position**: U-shaped curve — high at start and end, low in middle
-   - **Density**: unique token ratio + syntax density + non-whitespace ratio
-   - **Diversity**: cosine penalty for similarity to already-selected segments
-3. Greedily select highest-scoring segments that fit the budget
-4. Always preserve the first segment (module docstring, imports)
-5. Reassemble with omission markers
-
-**Result:** 50–80% token savings vs simple truncation, while preserving code structure and intent.
 
 ---
 

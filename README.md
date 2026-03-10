@@ -48,7 +48,7 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
-**Option 2** — `uv tool install` (recommended for multiple clients):
+**Option 2** — `uv tool install`:
 
 ```bash
 uv tool install semantic-cache-mcp
@@ -64,9 +64,7 @@ uv tool install semantic-cache-mcp
 }
 ```
 
-Restart Claude Code. Done.
-
-> **Why Option 2?** — `uvx` spawns an isolated process per invocation, each loading its own embedding model (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy, multiplying RAM usage. `uv tool install` puts the binary on your `PATH` so all projects share one installed copy and the model is loaded once per process.
+Restart Claude Code.
 
 ### GPU Acceleration (Optional)
 
@@ -125,17 +123,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```markdown
 ## Tools
 
-- MUST use `semantic-cache` instead of native Read/Write/Edit (80%+ token savings)
-  - `read` / `batch_read` → file reading with diff-mode (set diff_mode=false after context compression)
-  - `write` → new files or full rewrites; `append=true` for large files
-  - `edit` / `batch_edit` → find/replace (full-file / scoped / line-replace)
-  - `search` / `similar` → semantic search (seed cache first with read/batch_read)
-  - `grep` → regex/literal pattern search across cached files
-  - `glob` → find files by pattern; `cached_only=true` to filter to cached files
-  - `diff` → compare two files with semantic similarity score
-  - `stats` / `clear` → cache metrics and reset
+- MUST use `semantic-cache-mcp` instead of native I/O tools (80%+ token savings)
 ```
-
 ---
 
 ## Tools
@@ -189,8 +178,6 @@ read path="/src/app.py" offset=120 limit=80    # lines 120–199 only
 | Unchanged | `"File unchanged (1,234 tokens cached)"` | ~5 tokens |
 | Modified | Unified diff only | 5–20% of original |
 
-Set `diff_mode=false` after context compression — Claude has lost its cached copy and needs full content.
-
 </details>
 
 <details>
@@ -202,10 +189,6 @@ write path="/src/new.py" content="..." auto_format=true
 write path="/src/large.py" content="...chunk1..." append=false   # first chunk
 write path="/src/large.py" content="...chunk2..." append=true    # subsequent chunks
 ```
-
-- Returns diff on overwrite, confirms creation on new files
-- `append=true` appends content rather than replacing — use for writing large files in chunks
-- Cache is updated immediately after write
 
 </details>
 
@@ -232,11 +215,6 @@ edit path="/src/app.py" new_string="    return result\n" start_line=80 end_line=
 | Scoped | `old_string` + `new_string` + `start_line`/`end_line` | Shorter context when `read` gave you line numbers |
 | Line replace | `new_string` + `start_line`/`end_line` (no `old_string`) | Maximum token savings when line numbers are known |
 
-- Uses cached content — no token cost for the read
-- Returns unified diff of the change
-- Multiple matches in scope: fails with hint to add context or use `replace_all=true`
-- Use `batch_edit` when applying 2+ independent changes to the same file
-
 </details>
 
 <details>
@@ -260,11 +238,6 @@ batch_edit path="/src/app.py" edits='[
 ]' auto_format=true
 ```
 
-- Up to 50 edits per call — each entry can use any mode independently
-- Partial success: individual edit failures don't block others
-- Single round-trip, single cache update
-- Failures reported per-entry so you can retry only what failed
-
 </details>
 
 <details>
@@ -274,10 +247,6 @@ batch_edit path="/src/app.py" edits='[
 search query="authentication middleware logic" k=5
 search query="database connection pooling" k=3
 ```
-
-- Embedding-based semantic search — finds meaning, not keywords
-- Only searches files that have been previously cached via `read` or `batch_read`
-- Seed the cache first, then search
 
 </details>
 
@@ -289,10 +258,6 @@ similar path="/src/auth.py" k=3
 similar path="/tests/test_auth.py" k=5
 ```
 
-- Finds cached files most similar to the given file
-- Useful for discovering related tests, implementations, or documentation
-- Only considers cached files; start with `k=3–5`
-
 </details>
 
 <details>
@@ -302,10 +267,6 @@ similar path="/tests/test_auth.py" k=5
 glob pattern="**/*.py" directory="./src"
 glob pattern="**/*.py" directory="./src" cached_only=true
 ```
-
-- Shows cache status (cached/uncached) for each matched file
-- `cached_only=true` returns only files already in cache — useful for scoping searches
-- Max 1000 matches, 5-second timeout
 
 </details>
 
@@ -333,10 +294,6 @@ batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
 ```
 diff path1="/src/v1.py" path2="/src/v2.py"
 ```
-
-- Returns unified diff between two files
-- Includes semantic similarity score (cosine distance of embeddings)
-- Large diffs auto-summarized to stay within token budget
 
 </details>
 
@@ -387,9 +344,7 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
 }
 ```
 
-**Embeddings:** Uses [FastEmbed](https://github.com/qdrant/fastembed) with `BAAI/bge-small-en-v1.5` by default (33M params, 384-dimensional, 512 token context). Runs entirely locally via ONNX Runtime — no API keys, no network calls during search. Set `EMBEDDING_MODEL` to use a different model, and `EMBEDDING_DEVICE` to control hardware: `cpu` (default), `cuda` (GPU), or `auto` (detect available).
-
-**Cache location:** Platform-specific (`~/.cache/semantic-cache-mcp/` on Linux, `~/Library/Caches/semantic-cache-mcp/` on macOS, `%LOCALAPPDATA%\semantic-cache-mcp\` on Windows). Override with `SEMANTIC_CACHE_DIR`.
+**Cache location:** `~/.cache/semantic-cache-mcp/` (Linux), `~/Library/Caches/semantic-cache-mcp/` (macOS), `%LOCALAPPDATA%\semantic-cache-mcp\` (Windows). Override with `SEMANTIC_CACHE_DIR`.
 
 ---
 
@@ -409,14 +364,6 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
    │  (99%)   │     │ (80-95%) │     │ full content │
    └──────────┘     └──────────┘     └──────────────┘
 ```
-
-**Read pipeline (in priority order):**
-
-1. **File unchanged** — mtime matches cache entry → return "no changes" message (~5 tokens)
-2. **File changed** — compute unified diff → return diff only (80–95% savings)
-3. **Semantically similar cached file** — return diff from nearest neighbor (HNSW vector search)
-4. **Large file** — semantic summarization preserving docstrings and key function signatures
-5. **New file** — full content returned and embedded; `batch_read` pre-scans and embeds all new files in a single model call
 
 ---
 
@@ -488,7 +435,7 @@ uv sync
 uv run pytest
 ```
 
-This project uses Python 3.12+, strict type hints throughout, Ruff for formatting and linting, and pytest for testing. See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks, and code standards.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks, and code standards.
 
 ---
 

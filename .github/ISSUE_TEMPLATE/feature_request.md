@@ -8,16 +8,8 @@ assignees: ''
 
 ## Problem
 
-What problem does this solve? What's the current limitation?
-
 ## Proposed Solution
-
-Describe the feature or change you'd like.
 
 ## Alternatives Considered
 
-Any alternative approaches you've thought about.
-
 ## Additional Context
-
-Relevant examples, links, or mockups.

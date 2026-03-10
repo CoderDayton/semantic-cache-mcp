@@ -21,6 +21,7 @@ import random
 import shutil
 import sys
 import tempfile
+import asyncio
 import time
 from pathlib import Path
 
@@ -100,29 +101,29 @@ def _total_original_tokens(files: list[Path]) -> int:
     return total
 
 
-def phase_cold_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
+async def phase_cold_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
     """Phase 1: Cold read — populates cache, returns (tokens_returned, tokens_original)."""
     tokens_returned = 0
     tokens_original = 0
     for f in files:
-        result = smart_read(cache, str(f), diff_mode=True)
+        result = await smart_read(cache, str(f), diff_mode=True)
         tokens_returned += result.tokens_returned
         tokens_original += result.tokens_original
     return tokens_returned, tokens_original
 
 
-def phase_unchanged_reread(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
+async def phase_unchanged_reread(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
     """Phase 2: Unchanged re-read — all files cached + unmodified."""
     tokens_returned = 0
     tokens_original = 0
     for f in files:
-        result = smart_read(cache, str(f), diff_mode=True)
+        result = await smart_read(cache, str(f), diff_mode=True)
         tokens_returned += result.tokens_returned
         tokens_original += result.tokens_original
     return tokens_returned, tokens_original
 
 
-def phase_small_modifications(
+async def phase_small_modifications(
     cache: SemanticCache,
     files: list[Path],
     modified: list[Path],
@@ -137,7 +138,7 @@ def phase_small_modifications(
     unchanged_ret = unchanged_orig = 0
 
     for f in files:
-        result = smart_read(cache, str(f), diff_mode=True)
+        result = await smart_read(cache, str(f), diff_mode=True)
         if f in modified_set:
             changed_ret += result.tokens_returned
             changed_orig += result.tokens_original
@@ -152,7 +153,7 @@ def phase_small_modifications(
     }
 
 
-def phase_content_hash(
+async def phase_content_hash(
     cache: SemanticCache,
     files: list[Path],
 ) -> tuple[int, int]:
@@ -168,15 +169,15 @@ def phase_content_hash(
     tokens_returned = 0
     tokens_original = 0
     for f in files:
-        result = smart_read(cache, str(f), diff_mode=True)
+        result = await smart_read(cache, str(f), diff_mode=True)
         tokens_returned += result.tokens_returned
         tokens_original += result.tokens_original
     return tokens_returned, tokens_original
 
 
-def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
+async def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
     """Phase 5: Batch read with token budget."""
-    result = batch_smart_read(
+    result = await batch_smart_read(
         cache,
         [str(f) for f in files],
         max_total_tokens=200_000,
@@ -189,7 +190,7 @@ def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]
     return result.total_tokens, tokens_original
 
 
-def phase_search_after_cache(
+async def phase_search_after_cache(
     cache: SemanticCache,
     original_tokens: int,
     num_files: int,
@@ -207,7 +208,7 @@ def phase_search_after_cache(
     ]
     tokens_returned = 0
     for query in queries:
-        result = semantic_search(cache, query, k=5)
+        result = await semantic_search(cache, query, k=5)
         for m in result.matches:
             # Each match returns a preview, not the full file
             tokens_returned += count_tokens(m.preview) if m.preview else 0
@@ -239,7 +240,7 @@ def _fmt_row(label: str, returned: int, original: int) -> str:
     )
 
 
-def run_benchmark(
+async def run_benchmark(
     file_limit: int | None = None,
     seed: int = 42,
     quiet: bool = False,
@@ -280,7 +281,7 @@ def run_benchmark(
         t0 = time.perf_counter()
 
         # Phase 1: Cold read
-        p1_ret, p1_orig = phase_cold_read(cache, files)
+        p1_ret, p1_orig = await phase_cold_read(cache, files)
         p1_saved = _pct(p1_orig - p1_ret, p1_orig)
 
         if not quiet:
@@ -289,7 +290,7 @@ def run_benchmark(
             print(_fmt_row("First read", p1_ret, p1_orig))
 
         # Phase 2: Unchanged re-read
-        p2_ret, p2_orig = phase_unchanged_reread(cache, files)
+        p2_ret, p2_orig = await phase_unchanged_reread(cache, files)
         p2_saved = _pct(p2_orig - p2_ret, p2_orig)
 
         if not quiet:
@@ -297,7 +298,7 @@ def run_benchmark(
             print(_fmt_row("Cached re-read", p2_ret, p2_orig))
 
         # Phase 3: Content hash freshness (touch without change)
-        p3_ret, p3_orig = phase_content_hash(cache, files)
+        p3_ret, p3_orig = await phase_content_hash(cache, files)
         p3_saved = _pct(p3_orig - p3_ret, p3_orig)
 
         if not quiet:
@@ -306,7 +307,7 @@ def run_benchmark(
 
         # Phase 4: Small modifications
         modified = _apply_small_edits(files, fraction=0.3, seed=seed)
-        p4 = phase_small_modifications(cache, files, modified)
+        p4 = await phase_small_modifications(cache, files, modified)
         p4c_ret, p4c_orig = p4["combined"]
         p4_saved = _pct(p4c_orig - p4c_ret, p4c_orig)
 
@@ -319,7 +320,7 @@ def run_benchmark(
             print(_fmt_row("Combined", p4c_ret, p4c_orig))
 
         # Phase 5: Batch read (files already partially cached from phase 4)
-        p5_ret, p5_orig = phase_batch_read(cache, files)
+        p5_ret, p5_orig = await phase_batch_read(cache, files)
         p5_saved = _pct(p5_orig - p5_ret, p5_orig)
 
         if not quiet:
@@ -327,7 +328,7 @@ def run_benchmark(
             print(_fmt_row("Batch read", p5_ret, p5_orig))
 
         # Phase 6: Search after cache
-        p6_ret, p6_orig = phase_search_after_cache(cache, p1_orig, len(files))
+        p6_ret, p6_orig = await phase_search_after_cache(cache, p1_orig, len(files))
         p6_saved = _pct(p6_orig - p6_ret, p6_orig)
 
         if not quiet:
@@ -358,7 +359,7 @@ def run_benchmark(
 
 
 if __name__ == "__main__":
-    results = run_benchmark()
+    results = asyncio.run(run_benchmark())
     # Exit non-zero if overall savings < 80%
     if results["overall"] < 0.80:
         print(f"\nFAIL: Overall savings {results['overall']:.1%} < 80% target")

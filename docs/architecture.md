@@ -29,7 +29,7 @@ src/semantic_cache_mcp/
 │   ├── hashing.py          # BLAKE3/BLAKE2b content hashing, DeduplicateIndex
 │   ├── similarity/         # Cosine similarity utilities
 │   │   ├── __init__.py
-│   │   └── _cosine.py      # cosine_similarity, batch operations
+│   │   └���─ _cosine.py      # cosine_similarity, batch operations
 │   ├── text/               # Diff generation and semantic summarization
 │   │   ├── __init__.py
 │   │   ├── _diff.py        # generate_diff, compute_delta, diff_stats
@@ -44,10 +44,9 @@ src/semantic_cache_mcp/
 ## Design Principles
 
 - **Separation of concerns** — `core/` is stateless pure algorithms; `storage/` is persistence only; `cache/` orchestrates; `server/` translates MCP ↔ Python
-- **Dependency injection** — storage and config are passed explicitly; no hidden globals
+- **Dependency injection** — storage and config passed explicitly; no hidden globals
 - **Facade pattern** — `cache/` exposes a clean API; callers never touch `storage/` directly
 - **Performance first in hot paths** — embedding, hashing, similarity, and tokenization are optimized; everything else prioritizes clarity
-- **Type safety** — strict mypy, no `Any` in public APIs
 
 ---
 
@@ -73,7 +72,7 @@ Small file (< 8KB):
 
 Large file (≥ 8KB):
   ├── Parent document: page_content="", embedding=file_vector, is_parent=True
-  └── Child documents (per CDC chunk):
+  └���─ Child documents (per CDC chunk):
       ├── page_content=chunk_text, embedding=zero_vector, chunk_index=0
       ├── page_content=chunk_text, embedding=zero_vector, chunk_index=1
       └── ...
@@ -106,15 +105,13 @@ When `MAX_CACHE_ENTRIES` is exceeded, eviction uses the **K-th most recent** acc
 
 ### Session Metrics (`storage/sqlite.py`)
 
-A separate lightweight SQLite database stores session metrics only. This is not used for file content — just for tracking token savings, cache hits/misses, and tool call counts across sessions.
+Separate SQLite database for token savings, cache hits/misses, and tool call counts. Not used for file content.
 
 ---
 
 ## Core Algorithms
 
 ### Chunking (`core/chunking/`)
-
-Used by `VectorStorage._put_chunked()` to split large files (≥ 8KB) into content-defined chunks.
 
 #### Serial HyperCDC — `_gear.py`
 
@@ -142,13 +139,11 @@ Faster chunking via CPU-core-level parallelism:
 
 ### Hashing (`core/hashing.py`)
 
-BLAKE3 primary, BLAKE2b fallback. Used for:
+BLAKE3 primary, BLAKE2b fallback. LRU-cached to avoid re-hashing identical data.
 
-- **Content hash freshness** — detecting when mtime changes but content is identical (touch, git checkout)
+- **Content hash freshness** — detects mtime changes with identical content (touch, git checkout)
 - **Deduplication** — `DeduplicateIndex` for fingerprint-based dedup
-- **Change detection** — comparing cached vs current content hash
-
-LRU cache avoids re-hashing identical data.
+- **Change detection** — cached vs current content hash
 
 ---
 
@@ -156,12 +151,10 @@ LRU cache avoids re-hashing identical data.
 
 GPT-4o compatible (o200k_base) BPE tokenizer.
 
-- **O(N log M)** priority-queue merge algorithm vs O(N²) naive
+- **O(N log M)** priority-queue merge vs O(N²) naive
 - Merge results memoized to skip repeated BPE sequences
 - Single-byte tokens skip BPE entirely (fast path)
 - Files > 50KB use sampling for O(1) estimate
-- Auto-downloads tiktoken file (~3.5MB), SHA256-verified
-- Heuristic fallback (chars / 4) when model unavailable
 
 ---
 
@@ -175,12 +168,10 @@ Local text embeddings via FastEmbed (configurable model, default `BAAI/bge-small
 - Warmup pass at server startup for predictable first-request latency
 - `"Represent this sentence for searching relevant passages:"` prefix for query embedding
 - File-type semantic labels prepended to document content before embedding (e.g., `"python source file: ..."`)
-- Model stored in `~/.cache/semantic-cache-mcp/models/`
-- No API keys; fully offline after initial download
 
 #### Batch Embedding
 
-`embed_batch(texts)` amortizes ONNX Runtime overhead across N texts in a single model call — critical for `batch_smart_read` where multiple files need embedding on first cache miss.
+`embed_batch(texts)` amortizes ONNX Runtime overhead across N texts in a single model call.
 
 **Pre-scan flow in `batch_smart_read`:**
 1. Before reading any file, scan all requested paths for new or changed files (mtime check)
@@ -242,7 +233,7 @@ Client ──→ smart_read(path, diff_mode=True)
                           (80-95% savings)
 ```
 
-After context compression, call with `diff_mode=False` to bypass the "unchanged" path and always receive full content.
+After context compression, use `diff_mode=False` to force full content.
 
 ### Batch Read
 
