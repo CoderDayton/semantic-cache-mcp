@@ -1,5 +1,3 @@
-"""BPE tokenizer package — o200k_base encoding with O(N log M) merge tracking."""
-
 from __future__ import annotations
 
 from ._bpe import (

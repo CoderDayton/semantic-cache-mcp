@@ -1,15 +1,6 @@
-"""
-HyperCDC: High-performance content-defined chunking.
+"""HyperCDC: Gear-hash CDC with entropy-adaptive stepping and semantic boundary snapping.
 
-Features:
-- Gear-hash based rolling fingerprint (fast, simple).
-- FastCDC-style normalized chunking with weak/strong masks.
-- Entropy-adaptive step size (skip faster in low-entropy regions).
-- Semantic boundary snapping near newlines / sentence ends.
-- Optional 2-level hierarchical chunking API.
-
-Design is inspired by FastCDC, QuickCDC, UltraCDC, and modern CDC surveys,
-but implemented in clean, dependency-free Python for clarity.
+Inspired by FastCDC, QuickCDC, and UltraCDC but dependency-free.
 """
 
 from __future__ import annotations
@@ -223,12 +214,7 @@ def hypercdc_boundaries(
     content: bytes,
     cfg: HyperCDCConfig = DEFAULT_CONFIG,
 ) -> Iterator[tuple[int, int]]:
-    """
-    Yield (start, end) byte indices for HyperCDC chunks.
-
-    This is the core scanner; it can be wrapped to produce chunk byte strings
-    or chunk metadata as needed.
-    """
+    """Yield (start, end) byte indices for HyperCDC chunks."""
     n = len(content)
     if n == 0:
         return
@@ -314,18 +300,7 @@ def hypercdc_chunks(
     min_size: int = 2048,
     max_size: int = 65536,
 ) -> Iterator[bytes]:
-    """Yield HyperCDC chunks as byte strings.
-
-    Fast Gear-hash based content-defined chunking (~13 MB/s).
-
-    Args:
-        content: Raw bytes to chunk
-        min_size: Minimum chunk size (default: 2KB)
-        max_size: Maximum chunk size (default: 64KB)
-
-    Yields:
-        Content chunks with natural boundaries
-    """
+    """Yield HyperCDC chunks as byte strings (~13 MB/s via turbo path)."""
     for start, end in hypercdc_boundaries_turbo(content, min_size, max_size):
         yield content[start:end]
 
@@ -340,20 +315,13 @@ def hierarchical_hypercdc_chunks(
     cfg_level1: HyperCDCConfig = DEFAULT_CONFIG,
     cfg_level2: HyperCDCConfig | None = None,
 ) -> Iterator[bytes]:
-    """
-    Two-level CDC:
-      - Level 1: chunk raw content with cfg_level1.
-      - Level 2 (optional): re-chunk concatenated level-1 chunks with cfg_level2.
-
-    If cfg_level2 is None, a coarser default will be derived automatically.
-    """
-    # Level 1 chunks
+    """Two-level CDC: fine chunks at level 1, coarse chunks at level 2 (auto-derived if None)."""
     level1_spans = list(hypercdc_boundaries(content, cfg_level1))
     if not level1_spans:
-        return  # Generator returns empty
+        return
 
     if cfg_level2 is None:
-        # Coarser configuration: ~4x larger norm/max
+        # 4x larger norm/max gives ~4x coarser granularity at level 2
         cfg_level2 = HyperCDCConfig(
             min_size=cfg_level1.min_size * 2,
             norm_size=cfg_level1.norm_size * 4,
@@ -369,18 +337,16 @@ def hierarchical_hypercdc_chunks(
             entropy_interval=cfg_level1.entropy_interval,
         )
 
-    # Build a synthetic "index stream" of first-level chunk IDs.
     l1_lengths = [end - start for start, end in level1_spans]
     prefix_sum = [0]
     for length in l1_lengths:
         prefix_sum.append(prefix_sum[-1] + length)
     total = prefix_sum[-1]
 
-    # Run level-2 CDC on a virtual linear space [0, total).
-    virtual = bytes(total)  # placeholder; we only use its length
+    # Run level-2 CDC on a virtual linear space [0, total); only the length matters
+    virtual = bytes(total)
     l2_spans = list(hypercdc_boundaries(virtual, cfg_level2))
 
-    # Map virtual spans to concrete byte ranges in original content.
     def v2real(vpos: int) -> int:
         # Binary search prefix_sum to map virtual offset to real byte offset
         lo, hi = 0, len(prefix_sum) - 1

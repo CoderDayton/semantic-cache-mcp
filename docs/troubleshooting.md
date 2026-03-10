@@ -52,21 +52,13 @@
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
 - **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/vecdb.db` and restart
 
-**`search` or `similar` returns no results**
-- **Cause:** These tools only search cached files. If the cache is empty or the relevant files haven't been read, nothing will match.
-- **Fix:** Seed the cache first with `read` or `batch_read`, then call `search` or `similar`.
-
-**`search` or `similar` results seem stale after adding many files**
-- **Cause:** New files need to be cached (via `read` or `batch_read`) before they appear in search results. The HNSW index is updated when files are cached.
-- **Fix:** Run `batch_read` on the new files first, then search again.
+**`search` or `similar` returns no results / stale results**
+- **Cause:** Only cached files are searched. New or unread files aren't in the HNSW index.
+- **Fix:** Seed the cache with `read` or `batch_read` first.
 
 ---
 
 ## Performance Issues
-
-**Slow first startup**
-- **Cause:** Embedding model download (~130MB) on first use, followed by ONNX initialization
-- **Expected:** Normal on first use. Model is cached in `~/.cache/semantic-cache-mcp/models/`.
 
 **High memory usage**
 - **Cause:** Embedding model holds ~200MB resident (ONNX Runtime + bge-small-en-v1.5 weights) + vector index
@@ -77,18 +69,6 @@
 **Glob timeout**
 - **Cause:** Very broad pattern (e.g., `**/*.py` on a large monorepo) exceeds the 5-second timeout
 - **Fix:** Narrow the pattern or add a `directory` argument to limit scope. The timeout is a safety guard — results up to the timeout are still returned.
-
----
-
-## Configuration Reference
-
-| Variable                    | Default    | Description                                          |
-|-----------------------------|------------|------------------------------------------------------|
-| `LOG_LEVEL`                 | `INFO`     | Verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`       |
-| `TOOL_OUTPUT_MODE`          | `compact`  | Response detail: `compact`, `normal`, `debug`        |
-| `TOOL_MAX_RESPONSE_TOKENS`  | `0`        | Global response cap (0 = disabled)                   |
-| `MAX_CONTENT_SIZE`          | `100000`   | Max bytes returned by `read`                         |
-| `MAX_CACHE_ENTRIES`         | `10000`    | Max entries before LRU-K eviction                    |
 
 ---
 

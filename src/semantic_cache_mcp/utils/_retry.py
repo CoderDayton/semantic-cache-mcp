@@ -19,21 +19,12 @@ def retry[T](
     exceptions: tuple[type[Exception], ...] = (Exception,),
     label: str = "operation",
 ) -> T:
-    """Call *fn* up to ``len(delays) + 1`` times, sleeping between attempts.
+    """Call fn up to len(delays)+1 times with exponential backoff.
 
-    Args:
-        fn: Zero-argument callable to retry.
-        delays: Sleep durations (seconds) between consecutive attempts.
-                Total attempts = len(delays) + 1.
-        exceptions: Exception types that trigger a retry. Others propagate
-                    immediately without retrying.
-        label: Human-readable name shown in log warnings.
-
-    Returns:
-        The return value of the first successful *fn* call.
+    Exceptions not in *exceptions* propagate immediately without retrying.
 
     Raises:
-        The last exception raised by *fn* after all retries are exhausted.
+        The last exception from fn after all retries are exhausted.
     """
     last_err: Exception = RuntimeError(f"{label}: no attempts made")
     attempts = len(delays) + 1

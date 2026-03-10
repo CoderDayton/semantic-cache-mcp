@@ -1,4 +1,4 @@
-"""Response rendering helpers for the MCP server."""
+"""Response rendering helpers."""
 
 from __future__ import annotations
 
@@ -13,17 +13,15 @@ _MODE_DEBUG = "debug"
 
 
 def _response_mode() -> str:
-    """Global response mode from environment-backed config."""
     return TOOL_OUTPUT_MODE
 
 
 def _response_token_cap() -> int | None:
-    """Global response token cap from environment-backed config."""
     return TOOL_MAX_RESPONSE_TOKENS if TOOL_MAX_RESPONSE_TOKENS > 0 else None
 
 
 def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Build minimal JSON payload when response exceeds token budget."""
+    """Strip payload to essential fields when response exceeds token budget."""
     keep_order = (
         "ok",
         "tool",
@@ -51,7 +49,7 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -> str:
-    """Render tool response as compact JSON with optional token cap."""
+    """Serialize payload to compact JSON, truncating if it exceeds max_response_tokens."""
     # In compact mode, strip diagnostic wrapper fields from success responses.
     # Errors (ok=False) keep all fields so Claude can identify what failed.
     if TOOL_OUTPUT_MODE == "compact" and payload.get("ok") is True:
@@ -67,6 +65,5 @@ def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -
 
 
 def _render_error(tool: str, message: str, max_response_tokens: int | None) -> str:
-    """Render consistent error responses."""
     payload = {"ok": False, "tool": tool, "error": message}
     return _render_response(payload, max_response_tokens)

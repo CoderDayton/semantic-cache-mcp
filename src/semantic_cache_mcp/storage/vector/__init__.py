@@ -1,11 +1,4 @@
-"""Vector storage backend using simplevecdb for raw text + embedding persistence.
-
-Replaces compressed chunk storage with vector + raw text metadata pattern:
-- Each file stored as one or more Documents (chunks for large files)
-- page_content = raw text (no compression, 100% fidelity)
-- Embedding vectors enable HNSW-based semantic similarity search
-- Metadata tracks path, chunk ordering, mtime, content hash, tokens
-"""
+"""simplevecdb-backed storage: raw text + HNSW embeddings, HyperCDC chunking for large files."""
 
 from __future__ import annotations
 
@@ -202,11 +195,7 @@ class VectorStorage:
     # -------------------------------------------------------------------------
 
     async def get(self, path: str) -> CacheEntry | None:
-        """Get cached file entry by path.
-
-        Returns metadata only — call get_content() for full text.
-        For chunked files, returns metadata from the parent document.
-        """
+        """Return metadata for path. For chunked files, uses the parent document."""
         results = await self._find_docs_by_path(path)
         if not results:
             return None
@@ -250,13 +239,7 @@ class VectorStorage:
         mtime: float,
         embedding: EmbeddingVector | None = None,
     ) -> None:
-        """Store file in cache as raw text with embedding.
-
-        Small files (< CHUNK_THRESHOLD) stored as a single document.
-        Large files are split via HyperCDC SIMD chunker into content-defined
-        chunks, stored as parent (file metadata) + children (raw text chunks).
-        Each chunk gets its own embedding for fine-grained similarity search.
-        """
+        """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
         content_hash = hash_content(content)
         tokens = count_tokens(content)
         now = time.time()
@@ -301,7 +284,7 @@ class VectorStorage:
         base_meta: dict,
         file_embedding: list[float],
     ) -> None:
-        """Store a large file as parent doc + CDC-chunked children."""
+        """Store large file as parent doc (file metadata) + CDC-chunked children (raw text)."""
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
         total_chunks = len(chunks_bytes)
@@ -374,7 +357,6 @@ class VectorStorage:
         )
 
     def _resolve_embedding(self, embedding: EmbeddingVector | None) -> list[float]:
-        """Convert embedding to list[float], falling back to zero vector."""
         if embedding is not None:
             return list(embedding)
         dim = self._collection._collection._dim
@@ -383,19 +365,13 @@ class VectorStorage:
         return [0.0] * dim
 
     def _zero_embedding(self) -> list[float]:
-        """Return a zero vector matching the index dimension."""
         dim = self._collection._collection._dim
         if dim is None:
             dim = 384
         return [0.0] * dim
 
     async def get_content(self, entry: CacheEntry) -> str:
-        """Get full content for a cache entry.
-
-        Retrieves raw text from simplevecdb — no decompression needed.
-        For chunked files, skips the parent doc and reassembles children
-        in chunk_index order.
-        """
+        """Reassemble full text from simplevecdb chunks (sorted by chunk_index)."""
         results = await self._find_docs_by_path(entry.path)
         if not results:
             raise ValueError(f"No cached content found for {entry.path}")
@@ -414,7 +390,6 @@ class VectorStorage:
         return "".join(r[2] for r in children)
 
     async def record_access(self, path: str) -> None:
-        """Record access for LRU-K tracking."""
         results = await self._find_docs_by_path(path)
         if not results:
             return
@@ -455,10 +430,7 @@ class VectorStorage:
     async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
-        """Find semantically similar cached file using HNSW search.
-
-        Returns the path of the most similar file above SIMILARITY_THRESHOLD.
-        """
+        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None."""
         emb_list = list(embedding)
 
         try:
@@ -499,10 +471,7 @@ class VectorStorage:
         k: int = 5,
         threshold: float | None = None,
     ) -> list[tuple[str, float]]:
-        """Find multiple similar files with scores.
-
-        Returns list of (path, similarity) tuples above threshold.
-        """
+        """Return up to k (path, similarity) tuples above threshold."""
         if threshold is None:
             threshold = SIMILARITY_THRESHOLD
 
@@ -550,18 +519,7 @@ class VectorStorage:
         k: int = 5,
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Search cached content by text query using BM25 keyword ranking.
-
-        Uses FTS5 full-text search for exact/partial keyword matching.
-
-        Args:
-            query: Text query (FTS5 syntax supported)
-            k: Maximum results to return
-            filter: Optional metadata filter (e.g. {path: "/src/foo.py"})
-
-        Returns:
-            List of (path, preview, score) tuples sorted by relevance
-        """
+        """BM25 keyword search over cached content. FTS5 syntax supported."""
         try:
             results = await self._collection.keyword_search(query, k=k * 2, filter=filter)
         except Exception as e:
@@ -577,19 +535,9 @@ class VectorStorage:
         k: int = 5,
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Search cached content using hybrid BM25 + vector similarity (RRF).
+        """Hybrid BM25 + vector search with RRF fusion.
 
-        Combines keyword matching with semantic similarity for best results.
         Falls back to keyword-only if no embedding provided.
-
-        Args:
-            query: Text query for keyword component
-            embedding: Optional query embedding for vector component
-            k: Maximum results to return
-            filter: Optional metadata filter
-
-        Returns:
-            List of (path, preview, score) tuples sorted by fused relevance
         """
         query_vector = list(embedding) if embedding is not None else None
 
@@ -611,7 +559,7 @@ class VectorStorage:
         results: list[tuple],
         k: int,
     ) -> list[tuple[str, str, float]]:
-        """Deduplicate search results by path, keeping best score per file."""
+        """Deduplicate by path, keeping best score. Skips parent (empty) docs."""
         seen_paths: set[str] = set()
         matches: list[tuple[str, str, float]] = []
 
@@ -648,22 +596,9 @@ class VectorStorage:
         max_matches: int = 100,
         max_files: int = 50,
     ) -> list[dict]:
-        """Search cached file content by regex or literal pattern.
+        """Exact pattern matching across cached files — like ripgrep on the cache.
 
-        Unlike search/search_hybrid (ranked BM25+vector), this does exact
-        pattern matching with line numbers and context — like ripgrep on the
-        cache.
-
-        Args:
-            pattern: Regex pattern (or literal string if fixed_string=True)
-            fixed_string: Treat pattern as literal, not regex
-            case_sensitive: Case-sensitive matching (default: True)
-            context_lines: Lines of context before/after each match
-            max_matches: Total match limit across all files
-            max_files: Maximum files to return
-
-        Returns:
-            List of dicts: {path, matches: [{line_number, line, before, after}]}
+        Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
         """
         import re  # noqa: PLC0415
 
@@ -750,7 +685,6 @@ class VectorStorage:
             return False
 
     async def get_stats(self) -> dict[str, int | float]:
-        """Get cache statistics."""
         count = self._collection._collection.count()
         db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
@@ -802,10 +736,7 @@ class VectorStorage:
     # -------------------------------------------------------------------------
 
     async def _find_docs_by_path(self, path: str) -> list[tuple[int, dict, str]]:
-        """Find all documents for a given file path.
-
-        Returns list of (doc_id, metadata_dict, text) tuples.
-        """
+        """Return [(doc_id, metadata, text)] for all documents at path."""
         catalog = self._collection._collection._catalog
         try:
             docs = catalog.get_all_docs_with_text(
@@ -820,7 +751,6 @@ class VectorStorage:
         return [(doc_id, meta, text) for doc_id, text, meta in docs]
 
     async def _delete_by_path(self, path: str) -> int:
-        """Delete all documents for a given file path. Returns count deleted."""
         results = await self._find_docs_by_path(path)
         if not results:
             return 0
@@ -830,7 +760,7 @@ class VectorStorage:
         return len(doc_ids)
 
     async def _evict_if_needed(self) -> None:
-        """Evict entries using LRU-K policy if over limit."""
+        """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
         # Get all docs once — used for both the file-count check and LRU scoring.
         sync_coll = self._collection._collection
         all_docs = sync_coll._catalog.get_all_docs_with_text()

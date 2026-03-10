@@ -41,13 +41,9 @@ FORMATTERS: dict[str, tuple[str, ...]] = {
 
 
 def _format_file(path: Path) -> bool:
-    """Format file in-place using appropriate formatter.
+    """Format file in-place using the appropriate formatter.
 
-    Args:
-        path: Path to file to format
-
-    Returns:
-        True if formatted successfully, False if formatter not found or failed
+    Returns False if the formatter is absent or fails.
     """
     formatter = FORMATTERS.get(path.suffix.lower())
     if not formatter:
@@ -144,11 +140,7 @@ def _is_binary_content(data: bytes) -> bool:
 
 
 def _find_match_line_numbers(content: str, search_string: str) -> list[int]:
-    """Find line numbers where search_string appears.
-
-    Returns 1-based line numbers for each occurrence.
-    Uses binary search for O(M log N) complexity where M=matches, N=lines.
-    """
+    """Return 1-based line numbers for each occurrence of search_string. O(M log N)."""
     lines = content.splitlines(keepends=True)
     line_numbers: list[int] = []
 
@@ -181,8 +173,7 @@ def _find_match_line_numbers(content: str, search_string: str) -> list[int]:
 def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[str, int, int]:
     """Return (substring, char_start, char_end) for a 1-based inclusive line range.
 
-    Uses splitlines(keepends=True) for correct offset calculation.
-    Returned char offsets support direct splicing: content[:char_start] + new + content[char_end:]
+    Char offsets support direct splicing: content[:char_start] + new + content[char_end:]
     """
     lines = content.splitlines(keepends=True)
     total = len(lines)
@@ -211,7 +202,7 @@ def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[s
 
 
 def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
-    """Pick the response payload with the smallest token count."""
+    """Return (kind, content, tokens) for the option with the fewest tokens."""
     best_kind = ""
     best_content = ""
     best_tokens: int | None = None
@@ -227,11 +218,7 @@ def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
 
 
 def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | None:
-    """Suppress large diff payloads to optimize returned token count.
-
-    Returns the diff unchanged for small files, a summary string for large
-    diffs that exceed the token cap, or None for empty input.
-    """
+    """Return diff unchanged, a summary for diffs exceeding the token cap, or None if empty."""
     if not diff_content:
         return None
 

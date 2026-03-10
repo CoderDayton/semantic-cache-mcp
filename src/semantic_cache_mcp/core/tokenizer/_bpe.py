@@ -74,7 +74,6 @@ class BPETokenizer:
         self._merge_cache_maxsize: int = 4096
 
     def load_tiktoken_file(self, path: Path | str) -> None:
-        """Load vocab and merges from tiktoken file (base64 encoded tokens)."""
         path = Path(path)
         self.vocab.clear()
         self.inverse_vocab.clear()
@@ -128,7 +127,6 @@ class BPETokenizer:
                 self.bpe_ranks[best_split] = rank
 
     def add_special_tokens(self, tokens: dict[str, int]) -> None:
-        """Add special tokens to vocabulary."""
         self.special_tokens.update(tokens)
         for token_str, token_id in tokens.items():
             token_bytes = token_str.encode("utf-8")
@@ -231,10 +229,7 @@ class BPETokenizer:
         return parts
 
     def _compile_pattern(self) -> re.Pattern[str]:
-        """Lazy compile regex pattern (only once).
-
-        Returns re.Pattern or regex.Pattern (API compatible).
-        """
+        """Prefer `regex` module for Unicode category support; fall back to stdlib `re`."""
         if self._pat is not None:
             return self._pat
         try:
@@ -246,7 +241,6 @@ class BPETokenizer:
         return self._pat
 
     def encode(self, text: str, *, allowed_special: Set[str] | None = None) -> list[int]:
-        """Encode text into token IDs with special token handling."""
         if allowed_special is None:
             allowed_special = set()
 
@@ -280,7 +274,6 @@ class BPETokenizer:
         return token_ids
 
     def _encode_chunk(self, text: str) -> list[int]:
-        """Encode chunk without special tokens (streaming-friendly)."""
         token_ids: list[int] = []
         pat = self._compile_pattern()
         matches = pat.findall(text)
@@ -304,7 +297,6 @@ class BPETokenizer:
         return token_ids
 
     def decode(self, token_ids: list[int]) -> str:
-        """Decode token IDs to text (streaming-safe)."""
         result = []
         for tid in token_ids:
             if tid in self.vocab:
@@ -352,7 +344,6 @@ _SPECIAL_TOKENS = {"<|endoftext|>": 199999, "<|endofprompt|>": 200018}
 
 
 def _init_tokenizer(cache_file: Path) -> BPETokenizer:
-    """Initialize tokenizer from cache."""
     logger.info(f"Loading o200k_base tokenizer from {cache_file}")
     tok = BPETokenizer()
     tok.load_tiktoken_file(cache_file)
@@ -362,7 +353,6 @@ def _init_tokenizer(cache_file: Path) -> BPETokenizer:
 
 
 def _verify_hash(path: Path, expected: str) -> bool:
-    """Verify file SHA256 hash."""
     sha256 = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -374,7 +364,7 @@ _tokenizer_lock = threading.Lock()
 
 
 def _ensure_tokenizer() -> BPETokenizer | None:
-    """Lazily load tokenizer with automatic download/cache."""
+    """Lazy-load with automatic download on first call; marks loaded on failure to prevent retry."""
     global _tokenizer, _tokenizer_loaded
 
     if _tokenizer_loaded:
@@ -423,7 +413,7 @@ def _ensure_tokenizer() -> BPETokenizer | None:
 
 
 def count_tokens(content: str) -> int:
-    """Count tokens with automatic fallback to heuristics."""
+    """Count tokens; falls back to word-count heuristic if tokenizer unavailable."""
     if not content:
         return 0
 

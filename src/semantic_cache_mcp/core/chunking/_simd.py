@@ -129,22 +129,7 @@ def hypercdc_simd_boundaries(
     max_size: int = 65536,
     mask_bits: int = 13,
 ) -> Iterator[tuple[int, int]]:
-    """Parallel CDC boundary detection using SIMD-optimized fingerprinting.
-
-    Novel algorithm achieving ~5x speedup over sequential Gear hash:
-    - 70+ MB/s throughput (vs ~14 MB/s for Gear hash)
-    - Fully vectorized boundary detection
-    - Similar chunk size distribution and deduplication properties
-
-    Args:
-        content: Raw bytes to chunk
-        min_size: Minimum chunk size (default: 2KB)
-        max_size: Maximum chunk size (default: 64KB)
-        mask_bits: Selectivity bits (default: 13 for ~8KB expected chunks)
-
-    Yields:
-        (start, end) byte indices for each chunk
-    """
+    """Yield (start, end) chunk indices using SIMD-vectorized fingerprinting (~70+ MB/s)."""
     n = len(content)
     if n == 0:
         return
@@ -165,33 +150,13 @@ def hypercdc_simd_chunks(
     max_size: int = 65536,
     mask_bits: int = 13,
 ) -> Iterator[bytes]:
-    """Yield SIMD-accelerated CDC chunks using parallel fingerprinting.
-
-    5x faster than sequential Gear hash while maintaining content-defined
-    boundaries for effective deduplication.
-
-    Args:
-        content: Raw bytes to chunk
-        min_size: Minimum chunk size (default: 2KB)
-        max_size: Maximum chunk size (default: 64KB)
-        mask_bits: Selectivity (default: 13 for ~8KB expected chunks)
-
-    Yields:
-        Content chunks with content-defined boundaries
-    """
+    """Yield CDC chunks via SIMD fingerprinting — 5x faster than sequential Gear hash."""
     for start, end in hypercdc_simd_boundaries(content, min_size, max_size, mask_bits):
         yield content[start:end]
 
 
 def get_optimal_chunker(prefer_simd: bool = True):
-    """Get the optimal chunking function based on numpy availability.
-
-    Args:
-        prefer_simd: Prefer SIMD implementation when available (default: True)
-
-    Returns:
-        Chunking function (hypercdc_simd_chunks or hypercdc_chunks)
-    """
+    """Return the fastest available chunker (SIMD if numpy present, Gear hash otherwise)."""
     if prefer_simd:
         return hypercdc_simd_chunks
 

@@ -1,4 +1,4 @@
-"""Smart read operations for the cache package."""
+"""Smart read operations."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ MAX_BATCH_TOKENS = 200_000
 
 
 def _fit_content_to_max_size(content: str, max_size: int, cache: SemanticCache) -> tuple[str, bool]:
-    """Bound returned content to max_size using semantic summarization when needed."""
+    """Truncate content to max_size via semantic summarization; returns (content, truncated)."""
     if len(content) <= max_size:
         return content, False
 
@@ -56,16 +56,6 @@ async def smart_read(
     3. Similar file in cache -> reference + diff (70-90% reduction)
     4. Large file -> smart truncation (50-80% reduction)
     5. New file -> full content with caching for future reads
-
-    Args:
-        cache: SemanticCache instance
-        path: Path to file
-        max_size: Maximum content size to return
-        diff_mode: Enable diff-based responses
-        force_full: Force full content even if cached
-
-    Returns:
-        ReadResult with content and metadata
     """
     file_path = Path(path).expanduser().resolve()
 
@@ -263,15 +253,8 @@ async def batch_smart_read(
 ) -> BatchReadResult:
     """Read multiple files with token budget, priority ordering, and unchanged detection.
 
-    Args:
-        cache: SemanticCache instance
-        paths: List of file paths
-        max_total_tokens: Token budget (capped at 200K)
-        priority: Paths to read first (order preserved). Does NOT override budget.
-        diff_mode: When False, always return full content (use after context compression).
-
-    Returns:
-        BatchReadResult with contents, summaries, and unchanged_paths
+    priority paths are read first but do NOT override the token budget.
+    diff_mode=False forces full content (use after context compression).
     """
     # DoS protection
     paths = paths[:MAX_BATCH_FILES]

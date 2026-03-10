@@ -1,5 +1,3 @@
-"""Embedding model singleton: initialization, warmup, and provider management."""
-
 from __future__ import annotations
 
 import logging
@@ -25,7 +23,7 @@ _execution_provider: str = "unknown"
 
 
 def _get_model() -> TextEmbedding:
-    """Get or initialize the embedding model singleton."""
+    """Lazy-init the embedding model singleton."""
     global _embedding_model, _execution_provider
 
     if _embedding_model is None:
@@ -34,7 +32,6 @@ def _get_model() -> TextEmbedding:
         logger.info(f"Loading embedding model: {FASTEMBED_MODEL}")
         logger.info(f"Model cache directory: {FASTEMBED_CACHE_DIR}")
 
-        # Ensure cache directory exists
         FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         init_kwargs: dict[str, Any] = {
@@ -123,7 +120,7 @@ def _get_model() -> TextEmbedding:
             _embedding_model, _execution_provider = _init_or_fallback(init_kwargs)
 
         logger.info(f"Embedding execution provider: {_execution_provider}")
-        logger.info("Embedding model loaded successfully")
+        logger.info("Embedding model loaded")
 
     return _embedding_model
 

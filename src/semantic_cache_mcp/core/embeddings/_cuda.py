@@ -1,5 +1,3 @@
-"""CUDA provider availability check for ONNX Runtime."""
-
 from __future__ import annotations
 
 import logging
@@ -8,7 +6,6 @@ logger = logging.getLogger(__name__)
 
 
 def _cuda_provider_is_available() -> bool:
-    """Return True when ONNX Runtime reports CUDA provider support."""
     try:
         import onnxruntime as ort
     except Exception as e:

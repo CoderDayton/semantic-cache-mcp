@@ -1,5 +1,3 @@
-"""Shared constants for the embeddings package."""
-
 from __future__ import annotations
 
 from ...config import CACHE_DIR, EMBEDDING_MODEL

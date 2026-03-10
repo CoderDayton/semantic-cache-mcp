@@ -1,4 +1,4 @@
-"""SemanticCache class - high-level cache interface with semantic similarity support."""
+"""SemanticCache — orchestration facade over VectorStorage, SQLite metrics, and embeddings."""
 
 from __future__ import annotations
 
@@ -275,23 +275,11 @@ def _file_label(path: str) -> str:
 
 
 class SemanticCache:
-    """High-level cache interface with semantic similarity support.
-
-    This facade coordinates:
-    - VectorStorage backend (simplevecdb with HNSW index)
-    - SQLiteStorage for session metrics persistence
-    - Local embedding generation (FastEmbed)
-    - Caching strategies (diff, truncate, semantic match)
-    """
+    """Facade over VectorStorage (simplevecdb/HNSW), SQLite metrics, and FastEmbed embeddings."""
 
     __slots__ = ("_storage", "_metrics_storage", "_metrics", "_closed")
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
-        """Initialize cache.
-
-        Args:
-            db_path: Path to simplevecdb database
-        """
         self._storage = VectorStorage(db_path)
         # Keep SQLiteStorage only for session metrics persistence
         metrics_db = CACHE_DIR / "metrics.db"
@@ -335,20 +323,9 @@ class SemanticCache:
     # -------------------------------------------------------------------------
 
     def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
-        """Get embedding vector for text using local FastEmbed model.
-
-        When *path* is provided a semantic file-type label is prepended so the
-        model receives rich context (e.g. "npm package manifest …: {content}").
-        This dramatically improves retrieval for structured formats like JSON,
-        YAML, and well-known config files whose syntactic noise otherwise
-        dilutes the semantic signal.
-
-        Args:
-            text: Text to embed
-            path: Optional file path — used to derive a semantic label prefix
-
-        Returns:
-            Embedding as array.array or None if unavailable
+        """Embed text using FastEmbed. When path is given, prepends a file-type label
+        (e.g. "Python source code: ...") so the model gets intent-rich context instead
+        of raw syntactic noise — improves retrieval for JSON, YAML, and config files.
         """
         try:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
@@ -371,7 +348,6 @@ class SemanticCache:
     # -------------------------------------------------------------------------
 
     async def get(self, path: str) -> CacheEntry | None:
-        """Get cached entry for path."""
         entry = await self._storage.get(path)
         if entry:
             logger.debug(f"Cache hit: {path}")
@@ -384,17 +360,14 @@ class SemanticCache:
         mtime: float,
         embedding: EmbeddingVector | None = None,
     ) -> None:
-        """Store file in cache."""
         tokens = count_tokens(content)
         await self._storage.put(path, content, mtime, embedding)
         logger.info(f"Cached file: {path} ({tokens} tokens)")
 
     async def get_content(self, entry: CacheEntry) -> str:
-        """Get full content from cache entry."""
         return await self._storage.get_content(entry)
 
     async def record_access(self, path: str) -> None:
-        """Record access for LRU-K tracking."""
         await self._storage.record_access(path)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
@@ -404,11 +377,10 @@ class SemanticCache:
     async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
-        """Find semantically similar cached file."""
         return await self._storage.find_similar(embedding, exclude_path)
 
     async def get_stats(self) -> dict[str, Any]:
-        """Get cache statistics including memory, session, and lifetime metrics."""
+        """Cache statistics: occupancy, process memory, session, and lifetime metrics."""
         stats: dict[str, Any] = {**await self._storage.get_stats()}
 
         # Add process memory stats
@@ -443,17 +415,7 @@ class SemanticCache:
     def get_embeddings_batch(
         self, path_content_pairs: list[tuple[str, str]]
     ) -> list[EmbeddingVector | None]:
-        """Get embeddings for multiple files in a single model call.
-
-        Prepends the file-type semantic label (same as get_embedding) before
-        batching, so retrieval quality is identical to single-file embedding.
-
-        Args:
-            path_content_pairs: List of (resolved_path, content) tuples
-
-        Returns:
-            Embeddings in the same order as input, None on individual failures
-        """
+        """Batch-embed files in one model call. Prepends file-type labels like get_embedding."""
         from . import embed_batch as _embed_batch  # noqa: PLC0415
 
         texts = [
@@ -463,5 +425,4 @@ class SemanticCache:
         return cast(list[EmbeddingVector | None], _embed_batch(texts))
 
     async def clear(self) -> int:
-        """Clear all cache entries."""
         return await self._storage.clear()

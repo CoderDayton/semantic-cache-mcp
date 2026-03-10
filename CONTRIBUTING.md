@@ -1,7 +1,5 @@
 # Contributing to Semantic Cache MCP
 
-Thanks for contributing. This document covers setup, standards, and workflow.
-
 ## Development Setup
 
 ```bash
@@ -32,22 +30,11 @@ uv run python -m bandit -r src/      # Security scan
 
 The pre-commit hooks (lefthook) run ruff-check, ruff-format, mypy, and bandit automatically on every commit. Tests run on push.
 
-## Package Structure
+## Architecture
 
-```
-src/semantic_cache_mcp/
-├── cache/          # Orchestration: store.py, read.py, write.py, search.py
-├── server/         # MCP interface: tools.py, response.py, _mcp.py
-├── core/
-│   ├── chunking/   # _gear.py (HyperCDC), _simd.py (parallel CDC)
-│   ├── similarity/ # _cosine.py
-│   └── text/       # _diff.py, _summarize.py
-├── storage/        # vector.py (VectorStorage via simplevecdb)
-├── config.py       # Environment-variable configuration
-└── types.py        # All shared data models
-```
+See `docs/architecture.md` for the full package layout.
 
-**Architecture rules:**
+**Rules:**
 - `core/` must remain **stateless and I/O-free** — no file reads, no DB access, no subprocess calls
 - New algorithms belong in the appropriate sub-package (`chunking/`, `similarity/`, `text/`)
 - New MCP tools go in `server/tools.py` only; business logic stays in `cache/`
@@ -168,9 +155,7 @@ test: add property tests for int8 quantization round-trip
    git checkout -b feat/your-feature
    ```
 
-2. **Implement** following the code standards above
-
-3. **Run the full pipeline** before opening a PR:
+2. **Run the full pipeline** before opening a PR:
    ```bash
    uv run python -m pytest --cov
    uv run ruff check src/ tests/
@@ -178,9 +163,9 @@ test: add property tests for int8 quantization round-trip
    uv run python -m bandit -r src/
    ```
 
-4. **Commit** using conventional commits
+3. **Commit** using conventional commits
 
-5. **Open the PR** with:
+4. **Open the PR** with:
    - Clear description of what changed and *why*
    - Benchmark results if touching a hot path
    - Any migration notes if the public API changed
@@ -195,10 +180,4 @@ test: add property tests for int8 quantization round-trip
 - [ ] `core/` changes are still I/O-free (grep for `open(`, `sqlite3`, `subprocess`)
 - [ ] Performance impact considered; benchmarks included if touching hot paths
 
-## Questions
-
-Open an issue or start a discussion on [GitHub](https://github.com/CoderDayton/semantic-cache-mcp).
-
----
-
-[← Back to README](../README.md)
+[← Back to README](README.md)

@@ -1,5 +1,3 @@
-"""Text sub-package: diff, delta, truncation, and semantic summarization."""
-
 from __future__ import annotations
 
 from ._diff import (

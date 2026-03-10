@@ -1,9 +1,3 @@
-"""FastEmbed-based embedding service with local model inference.
-
-Provides fast, local text embeddings using ONNX models without external API calls.
-Uses CUDA provider when available and falls back to CPU automatically.
-"""
-
 from __future__ import annotations
 
 import array
@@ -28,14 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def embed(text: str) -> array.array[float] | None:
-    """Generate embedding for text.
-
-    Args:
-        text: Text to embed (truncated to 8000 chars)
-
-    Returns:
-        Embedding as array.array or None on error
-    """
+    """Generate embedding, truncated to 8000 chars."""
     try:
         model = _get_model()
 
@@ -54,16 +41,10 @@ def embed(text: str) -> array.array[float] | None:
 
 
 def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
-    """Generate embeddings for multiple texts in a single model call.
+    """Embed N texts in one model call.
 
-    Amortizes ONNX Runtime overhead across N texts — critical for
-    batch_smart_read where N files need embedding on first cache miss.
-
-    Args:
-        texts: Texts to embed (each truncated to 8000 chars)
-
-    Returns:
-        List of embeddings (same length as input, None entries on failure)
+    Amortizes ONNX Runtime overhead — critical for batch_smart_read where N files
+    need embedding on first cache miss. Returns same-length list; None on failure.
     """
     if not texts:
         return []
@@ -83,16 +64,7 @@ def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
 
 
 def embed_query(text: str) -> array.array[float] | None:
-    """Generate embedding for a search query.
-
-    Uses 'Represent this sentence:' prefix for bge retrieval.
-
-    Args:
-        text: Query text to embed
-
-    Returns:
-        Embedding as array.array or None on error
-    """
+    """Embed a search query with the bge retrieval prefix."""
     try:
         model = _get_model()
 
@@ -112,22 +84,15 @@ def embed_query(text: str) -> array.array[float] | None:
 
 
 def get_embedding_dim() -> int:
-    """Return the embedding dimension of the loaded model.
-
-    Falls back to 0 if the model hasn't been warmed up yet.
-    """
-    # Import from module to get current singleton value
+    """Return embedding dimension; 0 if model not yet warmed up."""
+    # Must re-import to read current singleton value
     import semantic_cache_mcp.core.embeddings._model as _m
 
     return _m._embedding_dim
 
 
 def get_model_info() -> dict[str, str | int]:
-    """Get information about the loaded model.
-
-    Returns:
-        Dict with model name, dimension, provider, and readiness
-    """
+    """Return model name, dim, provider, cache_dir, and readiness flag."""
     import semantic_cache_mcp.core.embeddings._model as _m
 
     return {

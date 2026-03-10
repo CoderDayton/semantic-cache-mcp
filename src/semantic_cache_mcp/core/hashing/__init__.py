@@ -1,5 +1,3 @@
-"""Public API for content hashing. Implementation lives in _blake.py."""
-
 from __future__ import annotations
 
 from ._blake import (

@@ -1,14 +1,4 @@
-"""
-Advanced text processing: Myers diff, delta compression, semantic truncation, and streaming.
-
-Features:
-- Myers diff algorithm (faster than unified_diff for small changes)
-- Delta compression (store diff, not full file)
-- Semantic-aware truncation (split at function/class boundaries)
-- Streaming diff for multi-GB files (memory-efficient)
-- Diff inversion (revert changes)
-- Syntax-aware truncation (preserve code structure)
-"""
+"""Myers diff, delta compression, semantic truncation, and streaming diff."""
 
 from __future__ import annotations
 
@@ -23,11 +13,7 @@ from difflib import SequenceMatcher, unified_diff
 
 
 def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
-    """
-    Myers diff algorithm: optimal edit script for sequences.
-
-    Faster than unified_diff for small changes (1-20% modifications).
-    Returns (op, line) tuples where op is '+', '-', or ' ' (unchanged).
+    """Optimal edit script. op is '+', '-', or ' ' (unchanged).
 
     Reference: "An O(ND) Difference Algorithm" by Myers (1986)
     """
@@ -63,7 +49,6 @@ def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
 
 
 def _unified_diff_fast(old: str, new: str, context_lines: int = 3) -> str:
-    """Fast unified diff using Python's built-in."""
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
@@ -78,7 +63,7 @@ def _unified_diff_fast(old: str, new: str, context_lines: int = 3) -> str:
 
 @dataclass
 class DiffDelta:
-    """Compressed representation of changes between two texts."""
+    """Compact diff for files that change minimally (10-100x smaller than storing both texts)."""
 
     old_hash: str  # Hash of original text
     new_hash: str  # Hash of updated text
@@ -89,22 +74,15 @@ class DiffDelta:
 
 
 def compute_delta(old: str, new: str) -> DiffDelta:
-    """
-    Compute delta between two texts (compact representation).
-
-    For large files that change minimally, delta is 10-100× smaller than
-    storing both full texts.
-    """
     from ..hashing import hash_content  # noqa: PLC0415
 
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
-    # Compute hashes (use first 16 chars for compact representation)
+    # Truncate to 16 chars for compact storage — still collision-free at this scale
     old_hash = hash_content(old)[:16]
     new_hash = hash_content(new)[:16]
 
-    # Get diff operations
     sm = SequenceMatcher(None, old_lines, new_lines)
     opcodes = sm.get_opcodes()
 
@@ -150,11 +128,10 @@ def compute_delta(old: str, new: str) -> DiffDelta:
 
 
 def apply_delta(old: str, delta: DiffDelta) -> str:
-    """Apply delta to reconstruct new text."""
     old_lines = old.splitlines(keepends=True)
     result_lines = old_lines.copy()
 
-    # Apply deletions (in reverse order to avoid index shifting)
+    # Reverse order to avoid index shifting as lines are removed
     for line_num, _ in sorted(delta.deletions, reverse=True):
         if line_num < len(result_lines):
             del result_lines[line_num]
@@ -179,10 +156,10 @@ def apply_delta(old: str, delta: DiffDelta) -> str:
 # Regex patterns for semantic boundaries (Python/TypeScript/Go)
 _SEMANTIC_PATTERNS = {
     "python": [
-        r"^\s*class\s+\w+",  # Class definition
-        r"^\s*def\s+\w+",  # Function definition
-        r"^\s*@\w+",  # Decorator
-        r"^\s*if\s+__name__",  # Main block
+        r"^\s*class\s+\w+",
+        r"^\s*def\s+\w+",
+        r"^\s*@\w+",
+        r"^\s*if\s+__name__",
     ],
     "typescript": [
         r"^\s*(export\s+)?(class|interface|type|function)",
@@ -198,7 +175,6 @@ _SEMANTIC_PATTERNS = {
 
 
 def _detect_language(content: str) -> str:
-    """Detect file language from content."""
     if "import " in content and "def " in content:
         return "python"
     elif "interface" in content or "export" in content:
@@ -209,7 +185,6 @@ def _detect_language(content: str) -> str:
 
 
 def _find_semantic_boundaries(lines: list[str], language: str) -> list[int]:
-    """Find line numbers of semantic boundaries (class/function defs)."""
     patterns = _SEMANTIC_PATTERNS.get(language, [])
     if not patterns:
         return []
@@ -232,12 +207,7 @@ def truncate_semantic(
     keep_top: int = 10,
     keep_bottom: int = 5,
 ) -> str:
-    """
-    Semantic-aware truncation: preserves function/class boundaries.
-
-    Tries to cut at semantic boundaries (class/function defs) rather than
-    arbitrary line numbers, preserving code structure integrity.
-    """
+    """Truncate at semantic boundaries (class/function defs) rather than arbitrary line numbers."""
     if len(content) <= max_size:
         return content
 
@@ -247,7 +217,6 @@ def truncate_semantic(
     if n_lines <= keep_top + keep_bottom:
         return content[: max_size - 20] + "\n// [TRUNCATED]"
 
-    # Detect language for semantic boundaries
     language = _detect_language(content)
     boundaries = _find_semantic_boundaries(lines, language)
 
@@ -288,23 +257,9 @@ def truncate_smart(
     keep_bottom: int = 40,
     use_semantic: bool = True,
 ) -> str:
-    """
-    Smart truncation with optional semantic awareness.
-
-    Args:
-        content: Text to truncate
-        max_size: Maximum output size
-        keep_top: Lines to keep from start
-        keep_bottom: Lines to keep from end
-        use_semantic: Use semantic boundaries if detected
-
-    Returns:
-        Truncated content with indicator
-    """
     if use_semantic:
         return truncate_semantic(content, max_size, keep_top, keep_bottom)
 
-    # Original simple truncation
     if len(content) <= max_size:
         return content
 
@@ -336,20 +291,7 @@ def generate_diff_streaming(
     context_lines: int = 3,
     chunk_size: int = 64 * 1024,
 ) -> Iterator[str]:
-    """
-    Generate diff for huge files without loading into memory.
-
-    Yields diff chunks as they're computed.
-
-    Args:
-        old_path: Path to original file
-        new_path: Path to updated file
-        context_lines: Context lines around changes
-        chunk_size: Read buffer size
-
-    Yields:
-        Lines of diff output
-    """
+    """Diff huge files without loading into memory; yields diff lines."""
     with (
         open(old_path, encoding="utf-8", errors="replace") as old_f,
         open(new_path, encoding="utf-8", errors="replace") as new_f,
@@ -363,18 +305,7 @@ def generate_diff_streaming(
 
 
 def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = True) -> str:
-    """
-    Generate unified diff between two texts.
-
-    Args:
-        old: Original text
-        new: Updated text
-        context_lines: Lines of context around changes
-        use_fast: Use Myers-based fast diff for small deltas
-
-    Returns:
-        Unified diff string or "// No changes"
-    """
+    """Return unified diff string, or '// No changes' if identical."""
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
@@ -390,9 +321,6 @@ def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = T
 
 
 def diff_stats(old: str, new: str) -> dict:
-    """
-    Compute diff statistics: insertions, deletions, modifications.
-    """
     delta = compute_delta(old, new)
 
     return {
@@ -406,9 +334,5 @@ def diff_stats(old: str, new: str) -> dict:
 
 
 def invert_diff(old: str, new: str) -> str:
-    """
-    Generate inverse diff (revert changes).
-
-    Returns diff that would transform new back to old.
-    """
+    """Diff that would transform new back to old."""
     return generate_diff(new, old)

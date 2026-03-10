@@ -1,4 +1,4 @@
-"""Semantic search and similarity operations for the cache package."""
+"""Semantic search and similarity operations."""
 
 from __future__ import annotations
 
@@ -38,17 +38,7 @@ async def semantic_search(
     k: int = 10,
     directory: str | None = None,
 ) -> SearchResult:
-    """Search cached files by semantic meaning using hybrid BM25+vector search.
-
-    Args:
-        cache: SemanticCache instance
-        query: Search query text
-        k: Max results (capped at 100)
-        directory: Optional directory filter
-
-    Returns:
-        SearchResult with matches sorted by similarity
-    """
+    """Search cached files by semantic meaning using hybrid BM25+vector search."""
     # DoS protection
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
@@ -121,17 +111,7 @@ async def compare_files(
     path2: str,
     context_lines: int = 3,
 ) -> DiffResult:
-    """Compare two files using cache.
-
-    Args:
-        cache: SemanticCache instance
-        path1: First file path
-        path2: Second file path
-        context_lines: Lines of context in diff
-
-    Returns:
-        DiffResult with diff and similarity
-    """
+    """Compare two files using cache. Returns diff and semantic similarity score."""
     # Cap context_lines to prevent excessive diff output
     context_lines = max(0, min(context_lines, 50))
 
@@ -223,16 +203,7 @@ async def find_similar_files(
     path: str,
     k: int = 5,
 ) -> SimilarFilesResult:
-    """Find files semantically similar to given file.
-
-    Args:
-        cache: SemanticCache instance
-        path: Source file path
-        k: Max results (capped at 50)
-
-    Returns:
-        SimilarFilesResult with similar files
-    """
+    """Find files semantically similar to the given file using HNSW search."""
     k = max(1, min(k, MAX_SIMILAR_K))
     file_path = Path(path).expanduser().resolve()
 
@@ -312,16 +283,9 @@ async def glob_with_cache_status(
     directory: str = ".",
     cached_only: bool = False,
 ) -> GlobResult:
-    """Find files by pattern with cache status.
+    """Find files by glob pattern with cache status.
 
-    Args:
-        cache: SemanticCache instance
-        pattern: Glob pattern (e.g., "**/*.py")
-        directory: Base directory
-        cached_only: Only return files already in cache (reduces noise for large codebases)
-
-    Returns:
-        GlobResult with matches and cache info
+    cached_only=True reduces noise on large repos.
     """
     dir_path = Path(directory).expanduser().resolve()
 

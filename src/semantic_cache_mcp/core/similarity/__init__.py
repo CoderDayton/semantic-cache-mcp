@@ -1,5 +1,3 @@
-"""Similarity sub-package: cosine similarity and dimension pruning."""
-
 from __future__ import annotations
 
 from ._cosine import (

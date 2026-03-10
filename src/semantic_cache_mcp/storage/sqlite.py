@@ -24,12 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectionPool:
-    """Thread-safe SQLite connection pool with WAL mode.
-
-    Attributes:
-        db_path: Path to SQLite database
-        max_size: Maximum connections in pool
-    """
+    """Thread-safe SQLite connection pool with WAL mode."""
 
     __slots__ = ("_all_conns", "_available", "_closed", "_lock", "_total", "db_path", "max_size")
 
@@ -43,7 +38,6 @@ class ConnectionPool:
         self._closed = False
 
     def _create_connection(self) -> sqlite3.Connection:
-        """Create a new SQLite connection with optimized settings."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(self.db_path),
@@ -61,7 +55,6 @@ class ConnectionPool:
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Get a connection from the pool."""
         conn: sqlite3.Connection | None = None
         try:
             conn = self._available.get_nowait()
@@ -118,28 +111,17 @@ class ConnectionPool:
 
 
 class SQLiteStorage:
-    """SQLite storage for session metrics persistence.
-
-    Only handles session_metrics table — file content storage is handled
-    by VectorStorage via simplevecdb.
-    """
+    """Session metrics persistence. File content lives in VectorStorage."""
 
     __slots__ = ("_pool", "db_path")
 
     def __init__(self, db_path: Path = DB_PATH, pool_size: int = 5) -> None:
-        """Initialize storage with connection pool.
-
-        Args:
-            db_path: Path to SQLite database file
-            pool_size: Maximum connections in pool (default: 5)
-        """
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._pool = ConnectionPool(db_path, max_size=pool_size)
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """Initialize session metrics table."""
         with self._pool.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS session_metrics (
@@ -160,11 +142,7 @@ class SQLiteStorage:
             """)
 
     def save_session(self, data: dict[str, object]) -> None:
-        """Persist a session metrics snapshot.
-
-        Args:
-            data: Dict with session_id, started_at, ended_at, counters, tool_calls_json
-        """
+        """Persist a session metrics snapshot."""
         with self._pool.get_connection() as conn:
             conn.execute(
                 """
@@ -194,11 +172,7 @@ class SQLiteStorage:
             )
 
     def get_lifetime_stats(self) -> dict[str, int]:
-        """Aggregate metrics across all completed sessions.
-
-        Returns:
-            Dict with total_sessions, sum of each counter
-        """
+        """Aggregate counters across all completed sessions."""
         with self._pool.get_connection() as conn:
             row = conn.execute(
                 """

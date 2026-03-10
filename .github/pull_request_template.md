@@ -1,7 +1,5 @@
 ## Summary
 
-Brief description of the changes and motivation.
-
 ## Changes
 
 - 

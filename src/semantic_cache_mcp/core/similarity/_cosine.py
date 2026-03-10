@@ -44,7 +44,6 @@ DEFAULT_CONFIG = SimilarityConfig()
 
 
 def _to_f32(v: array.array | list | np.ndarray) -> np.ndarray:
-    """Convert any vector input to a contiguous f32 ndarray (zero-copy when possible)."""
     if isinstance(v, array.array):
         return np.frombuffer(v, dtype=np.float32)
     return np.asarray(v, dtype=np.float32)
@@ -59,12 +58,11 @@ def _quantize_i8(v: np.ndarray) -> np.ndarray:
 
 
 def _quantize_matrix_i8(matrix: np.ndarray) -> np.ndarray:
-    """Quantize a (N, D) f32 matrix to int8 in-place."""
+    """Quantize (N, D) f32 matrix to int8."""
     return np.clip(np.round(matrix * _QUANT_SCALE), -127, 127).astype(np.int8)
 
 
 def _dot_i8(a: np.ndarray, b: np.ndarray) -> float:
-    """int8 dot product with int32 accumulation, rescaled to [-1, 1]."""
     return float(np.dot(a.astype(np.int32), b.astype(np.int32))) / _QUANT_SCALE_SQ
 
 
@@ -113,13 +111,9 @@ def cosine_similarity(
     a: array.array | list | np.ndarray,
     b: array.array | list | np.ndarray,
 ) -> float:
-    """Cosine similarity between two pre-normalized embedding vectors.
+    """Cosine similarity between two L2-normalized vectors.
 
-    Vectors MUST be L2-normalized (as from BAAI/bge models). Internally
-    quantizes to int8 for the dot product — <0.5% ranking error vs f32.
-
-    Returns:
-        Similarity score in [-1, 1]
+    Quantizes to int8 internally — <0.5% ranking error vs f32.
     """
     return _dot_i8(_quantize_i8(_to_f32(a)), _quantize_i8(_to_f32(b)))
 
@@ -146,7 +140,6 @@ def cosine_similarity_with_pruning(
 
 
 def _build_matrix(vectors: list[array.array | list | np.ndarray]) -> np.ndarray:
-    """Stack vector list into a contiguous (N, D) f32 matrix."""
     dim = len(vectors[0])
     matrix = np.empty((len(vectors), dim), dtype=np.float32)
     for i, v in enumerate(vectors):
@@ -182,7 +175,6 @@ def cosine_similarity_batch_matrix(
     query: array.array | list | np.ndarray,
     vectors: list[array.array | list | np.ndarray],
 ) -> np.ndarray:
-    """Batch similarity via single int8 matrix operation (fastest for large batches)."""
     q_i8 = _quantize_i8(_to_f32(query))
     m_i8 = _quantize_matrix_i8(_build_matrix(vectors))
     scores = m_i8.astype(np.int32) @ q_i8.astype(np.int32)
@@ -199,7 +191,6 @@ def top_k_similarities(
     vectors: list[array.array | list | np.ndarray],
     k: int = 10,
 ) -> list[tuple[int, float]]:
-    """Find top-K most similar vectors efficiently."""
     k = min(k, len(vectors))
     sims = cosine_similarity_batch_matrix(query, vectors)
 

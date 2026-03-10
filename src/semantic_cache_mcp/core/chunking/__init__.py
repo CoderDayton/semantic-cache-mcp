@@ -1,5 +1,3 @@
-"""Chunking sub-package: Gear-hash HyperCDC and SIMD-accelerated CDC."""
-
 from __future__ import annotations
 
 from ._gear import (

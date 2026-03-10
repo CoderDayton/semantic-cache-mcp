@@ -1,4 +1,4 @@
-"""Smart write and edit operations for the cache package."""
+"""Smart write and edit operations."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ MAX_BATCH_EDITS = 50
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write file atomically via temp-file + rename to prevent data loss on crash."""
+    """Atomic write via temp-file + rename. Preserves original permissions."""
     # Write to temp file in same directory (same filesystem for atomic rename)
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
@@ -64,28 +64,12 @@ async def smart_write(
 ) -> WriteResult:
     """Write file with cache integration.
 
-    Benefits over built-in Write:
-    - Returns diff instead of echoing content (token savings)
-    - Updates cache for future reads
-    - Tracks operation metadata
-    - Optional auto-formatting after write
-
-    Args:
-        cache: SemanticCache instance
-        path: Absolute path to file
-        content: Content to write (or append)
-        create_parents: Create parent directories if missing
-        dry_run: Preview changes without writing
-        auto_format: Run formatter after write (default: false)
-        append: Append content to existing file instead of overwriting (default: false)
-
-    Returns:
-        WriteResult with diff and metadata
+    Returns diff instead of full content for overwrites (token savings).
 
     Raises:
         FileNotFoundError: Parent directory doesn't exist and create_parents=False
         PermissionError: Insufficient permissions
-        ValueError: Path is not a file, binary content detected, or content too large
+        ValueError: Not a regular file, binary content, or content exceeds 10MB
     """
     # Validate content size early (fail fast)
     if len(content) > MAX_WRITE_SIZE:
@@ -247,24 +231,10 @@ async def smart_edit(
 ) -> EditResult:
     """Edit file using find/replace with cached read.
 
-    Three modes of operation:
+    Three modes:
     - Mode A (find/replace): old_string + new_string — full-file search.
     - Mode B (scoped): old_string + new_string + start_line/end_line — search within range only.
     - Mode C (line replace): new_string + start_line/end_line (no old_string) — replace range.
-
-    Args:
-        cache: SemanticCache instance
-        path: Absolute path to file
-        old_string: Exact string to find (None for Mode C line replacement)
-        new_string: Replacement string
-        replace_all: Replace all occurrences (Mode A/B only)
-        dry_run: Preview changes without writing
-        auto_format: Run formatter after edit (default: false)
-        start_line: Start of line range, 1-based inclusive (Modes B/C)
-        end_line: End of line range, 1-based inclusive (Modes B/C)
-
-    Returns:
-        EditResult with diff and match locations
 
     Raises:
         FileNotFoundError: File doesn't exist
@@ -514,20 +484,10 @@ async def smart_batch_edit(
     Each edit is processed independently - some can succeed while others fail.
     Successful edits are applied even if some fail (partial apply).
 
-    Each edit tuple is (old_string, new_string, start_line, end_line):
+    Each edit tuple is (old_string | None, new_string, start_line | None, end_line | None):
     - (old, new, None, None) — Mode A: full-file find/replace
     - (old, new, start, end) — Mode B: scoped search within line range
     - (None, new, start, end) — Mode C: replace entire line range
-
-    Args:
-        cache: SemanticCache instance
-        path: Absolute path to file
-        edits: List of (old_string | None, new_string, start_line | None, end_line | None) tuples
-        dry_run: Preview changes without writing
-        auto_format: Run formatter after edits (default: false)
-
-    Returns:
-        BatchEditResult with per-edit outcomes and combined diff
 
     Raises:
         FileNotFoundError: File doesn't exist

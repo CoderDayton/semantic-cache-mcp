@@ -1,5 +1,3 @@
-"""Core algorithms for semantic caching."""
-
 from .chunking import (
     get_optimal_chunker,
     hypercdc_chunks,

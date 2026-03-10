@@ -21,10 +21,9 @@ logger = logging.getLogger(__name__)
 
 
 class SessionMetrics:
-    """Thread-safe session metrics accumulator.
+    """Thread-safe in-memory counters.
 
-    Each tool call feeds ``record(tool_name, result)`` after success.
-    ``persist()`` writes the final snapshot to SQLite for lifetime aggregation.
+    ``record()`` feeds from tool call results; ``persist()`` flushes to SQLite on shutdown.
     """
 
     __slots__ = (
@@ -111,7 +110,7 @@ class SessionMetrics:
                 self.files_edited += 1
 
     def snapshot(self) -> dict[str, object]:
-        """Return a thread-safe copy of current metrics with computed uptime."""
+        """Thread-safe snapshot of current metrics with computed uptime."""
         with self._lock:
             return {
                 "session_id": self.session_id,
@@ -129,7 +128,7 @@ class SessionMetrics:
             }
 
     def persist(self) -> None:
-        """Write session metrics to SQLite. Called on server shutdown."""
+        """Flush session metrics to SQLite."""
         now = time.time()
         with self._lock:
             data: dict[str, object] = {

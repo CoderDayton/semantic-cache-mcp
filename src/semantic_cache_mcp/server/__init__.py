@@ -1,4 +1,4 @@
-"""Server package - MCP server entry point."""
+"""MCP server entry point."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ __all__ = ["mcp", "main", "_expand_globs"]
 
 
 def main() -> None:
-    """Run the MCP server."""
     _setup_signal_handlers()
     mcp.run()
 
