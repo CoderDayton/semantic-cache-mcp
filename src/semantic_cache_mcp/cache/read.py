@@ -275,7 +275,7 @@ async def batch_smart_read(
     """
     # DoS protection
     paths = paths[:MAX_BATCH_FILES]
-    max_total_tokens = min(max_total_tokens, MAX_BATCH_TOKENS)
+    max_total_tokens = max(1, min(max_total_tokens, MAX_BATCH_TOKENS))
 
     # Estimate tokens for sorting and skipped-file enrichment.
     async def estimate_min_tokens(p: str) -> int:

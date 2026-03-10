@@ -132,6 +132,9 @@ async def compare_files(
     Returns:
         DiffResult with diff and similarity
     """
+    # Cap context_lines to prevent excessive diff output
+    context_lines = max(0, min(context_lines, 50))
+
     file1 = Path(path1).expanduser().resolve()
     file2 = Path(path2).expanduser().resolve()
 
@@ -233,10 +236,21 @@ async def find_similar_files(
     k = max(1, min(k, MAX_SIMILAR_K))
     file_path = Path(path).expanduser().resolve()
 
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    # Guard against binary files before read_text
+    raw = file_path.read_bytes()
+    if _is_binary_content(raw):
+        raise ValueError(f"Binary file not supported: {path}")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        content = raw.decode("utf-8", errors="replace")
+
     # Get/compute embedding for source file
     cached = await cache.get(str(file_path))
     source_tokens = 0
-    content = file_path.read_text(encoding="utf-8")
 
     file_mtime = file_path.stat().st_mtime
     if cached and cached.mtime >= file_mtime:

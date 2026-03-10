@@ -31,14 +31,16 @@ class ConnectionPool:
         max_size: Maximum connections in pool
     """
 
-    __slots__ = ("_available", "_lock", "_total", "db_path", "max_size")
+    __slots__ = ("_all_conns", "_available", "_closed", "_lock", "_total", "db_path", "max_size")
 
     def __init__(self, db_path: Path, max_size: int = 5) -> None:
         self.db_path = db_path
         self.max_size = max_size
         self._available: queue.Queue[sqlite3.Connection] = queue.Queue()
+        self._all_conns: set[sqlite3.Connection] = set()
         self._total = 0
         self._lock = threading.Lock()
+        self._closed = False
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create a new SQLite connection with optimized settings."""
@@ -54,6 +56,7 @@ class ConnectionPool:
         conn.execute("PRAGMA cache_size=-8000")  # 8MB
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self._all_conns.add(conn)
         return conn
 
     @contextmanager
@@ -90,14 +93,23 @@ class ConnectionPool:
                     conn.close()
 
     def close_all(self) -> None:
-        """Close all pooled connections."""
+        """Close all connections — both pooled and in-use. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+
+        # Drain the available queue first
         while True:
             try:
-                conn = self._available.get_nowait()
-                with contextlib.suppress(Exception):
-                    conn.close()
+                self._available.get_nowait()
             except queue.Empty:
                 break
+
+        # Close every connection we ever created (includes in-use ones)
+        for conn in self._all_conns:
+            with contextlib.suppress(Exception):
+                conn.close()
+        self._all_conns.clear()
 
 
 # ---------------------------------------------------------------------------

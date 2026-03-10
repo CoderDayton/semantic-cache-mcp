@@ -284,7 +284,7 @@ class SemanticCache:
     - Caching strategies (diff, truncate, semantic match)
     """
 
-    __slots__ = ("_storage", "_metrics_storage", "_metrics")
+    __slots__ = ("_storage", "_metrics_storage", "_metrics", "_closed")
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
         """Initialize cache.
@@ -297,6 +297,7 @@ class SemanticCache:
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
         self._metrics = SessionMetrics(self._metrics_storage._pool)
+        self._closed = False
 
     @property
     def metrics(self) -> SessionMetrics:
@@ -306,10 +307,14 @@ class SemanticCache:
     def close(self) -> None:
         """Persist metrics and close all storage backends.
 
-        Called from the lifespan finally block. Must be safe to call multiple
-        times (idempotent) and must not raise — a failed close should not mask
+        Called from the lifespan finally block. Idempotent — safe to call
+        multiple times. Must not raise — a failed close should not mask
         the original shutdown reason.
         """
+        if self._closed:
+            return
+        self._closed = True
+
         try:
             self._metrics.persist()
         except Exception as e:

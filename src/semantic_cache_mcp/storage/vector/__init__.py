@@ -61,7 +61,7 @@ class VectorStorage:
     - LRU-K eviction via access_history metadata
     """
 
-    __slots__ = ("_db", "_collection", "_db_path")
+    __slots__ = ("_db", "_collection", "_db_path", "_closed")
 
     # Quantization currently in use — stored in sidecar to detect future changes.
     _QUANTIZATION = Quantization.INT8
@@ -77,6 +77,7 @@ class VectorStorage:
             quantization=self._QUANTIZATION,
         )
         self._collection = self._db.collection(self._COLLECTION_NAME)
+        self._closed = False
         logger.info(f"VectorStorage initialized at {db_path}")
 
     @classmethod
@@ -142,9 +143,7 @@ class VectorStorage:
                     stale.unlink()
                     logger.info(f"Deleted stale index: {stale}")
             # Clear all documents from SQLite so stale embeddings don't persist.
-            # Uses get_event_loop because this method is intentionally sync
-            # (called from __init__ before any event loop is running in tests).
-            asyncio.get_event_loop().run_until_complete(self.clear())
+            self._clear_sync()
             logger.info("Cleared all cached embeddings")
 
         meta["embedding_model"] = model_name
@@ -156,16 +155,28 @@ class VectorStorage:
 
         Uses a background thread so a hung usearch/SQLite save cannot block
         the asyncio event loop or delay process exit past *timeout* seconds.
+        Idempotent — safe to call multiple times.
         """
+        if self._closed:
+            return
+
         import threading  # noqa: PLC0415
 
+        self._closed = True
         close_error: BaseException | None = None
 
         def _do_close() -> None:
             nonlocal close_error
             try:
-                self._db._db.save()
-                self._db._db.close()
+                # Access the sync VectorDB via AsyncVectorDB._db.
+                # Guard with getattr so a simplevecdb API change logs a
+                # warning instead of crashing during shutdown.
+                sync_db = getattr(self._db, "_db", None)
+                if sync_db is None:
+                    logger.warning("simplevecdb internal API changed — cannot access sync VectorDB")
+                    return
+                sync_db.save()
+                sync_db.close()
             except Exception as exc:
                 close_error = exc
 
@@ -622,6 +633,11 @@ class VectorStorage:
     # Grep — regex/literal content search across cached files
     # -------------------------------------------------------------------------
 
+    # Upper bounds for grep parameters — prevent excessive memory/CPU usage
+    _GREP_MAX_CONTEXT_LINES = 20
+    _GREP_MAX_MATCHES = 10_000
+    _GREP_MAX_FILES = 500
+
     async def grep(
         self,
         pattern: str,
@@ -650,6 +666,11 @@ class VectorStorage:
             List of dicts: {path, matches: [{line_number, line, before, after}]}
         """
         import re  # noqa: PLC0415
+
+        # Clamp inputs to prevent excessive memory/CPU usage
+        context_lines = max(0, min(context_lines, self._GREP_MAX_CONTEXT_LINES))
+        max_matches = max(1, min(max_matches, self._GREP_MAX_MATCHES))
+        max_files = max(1, min(max_files, self._GREP_MAX_FILES))
 
         flags = 0 if case_sensitive else re.IGNORECASE
         if fixed_string:
@@ -714,6 +735,20 @@ class VectorStorage:
     # Statistics and management
     # -------------------------------------------------------------------------
 
+    def is_healthy(self) -> bool:
+        """Lightweight probe: True when the catalog and index are accessible.
+
+        Intended for post-startup validation and observability. Does not
+        perform I/O beyond a single count query on the in-memory catalog.
+        """
+        if self._closed:
+            return False
+        try:
+            self._collection._collection.count()
+            return True
+        except Exception:
+            return False
+
     async def get_stats(self) -> dict[str, int | float]:
         """Get cache statistics."""
         count = self._collection._collection.count()
@@ -741,17 +776,26 @@ class VectorStorage:
             "db_size_mb": round(db_size / 1024 / 1024, 2),
         }
 
-    async def clear(self) -> int:
-        """Clear all cache entries. Returns count of files removed."""
+    def _clear_sync(self) -> int:
+        """Synchronous clear — safe to call without an event loop.
+
+        Used by clear_if_model_changed() which runs before the async
+        server starts. Avoids the fragile get_event_loop().run_until_complete()
+        pattern that breaks when called from within a running loop.
+        """
         sync_coll = self._collection._collection
         count = sync_coll.count()
         if count > 0:
             all_docs = sync_coll._catalog.get_all_docs_with_text()
             doc_ids = [doc_id for doc_id, _, _ in all_docs]
             if doc_ids:
-                await self._collection.delete_by_ids(doc_ids)
+                sync_coll.delete_by_ids(doc_ids)
                 sync_coll.save()
         return count
+
+    async def clear(self) -> int:
+        """Clear all cache entries. Returns count of files removed."""
+        return self._clear_sync()
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -840,4 +884,6 @@ class VectorStorage:
     def save(self) -> None:
         """Persist index to disk."""
         self._collection._collection.save()
-        self._db._db.save()
+        sync_db = getattr(self._db, "_db", None)
+        if sync_db is not None:
+            sync_db.save()
