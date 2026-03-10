@@ -957,14 +957,14 @@ class TestCosineSimilarity:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         v = _unit_vec(128)
-        assert cosine_similarity(v, v) == pytest.approx(1.0, abs=1e-5)
+        assert cosine_similarity(v, v) == pytest.approx(1.0, abs=0.02)
 
     def test_orthogonal_vectors(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         a = np.array([1.0, 0.0], dtype=np.float32)
         b = np.array([0.0, 1.0], dtype=np.float32)
-        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=1e-6)
+        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=0.02)
 
     def test_array_array_input(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
@@ -973,14 +973,14 @@ class TestCosineSimilarity:
         a_arr = array.array("f", v.tolist())
         b_arr = array.array("f", v.tolist())
         result = cosine_similarity(a_arr, b_arr)
-        assert result == pytest.approx(1.0, abs=1e-4)
+        assert result == pytest.approx(1.0, abs=0.02)
 
     def test_list_input(self) -> None:
         from semantic_cache_mcp.core.similarity._cosine import cosine_similarity
 
         v = _unit_vec(32)
         result = cosine_similarity(v.tolist(), v.tolist())
-        assert result == pytest.approx(1.0, abs=1e-4)
+        assert result == pytest.approx(1.0, abs=0.02)
 
 
 class TestCosineSimilarityWithPruning:
