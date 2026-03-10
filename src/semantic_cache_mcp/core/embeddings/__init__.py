@@ -9,11 +9,7 @@ from ._constants import FASTEMBED_CACHE_DIR
 from ._cuda import _cuda_provider_is_available
 from ._model import (
     FASTEMBED_MODEL,
-    _embedding_dim,
-    _embedding_model,
-    _execution_provider,
     _get_model,
-    _model_ready,
     warmup,
 )
 from ._registry import _register_custom_model
@@ -117,8 +113,4 @@ __all__ = [
     "_get_model",
     "FASTEMBED_MODEL",
     "FASTEMBED_CACHE_DIR",
-    "_embedding_model",
-    "_model_ready",
-    "_embedding_dim",
-    "_execution_provider",
 ]

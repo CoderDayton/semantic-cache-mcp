@@ -141,36 +141,6 @@ class SQLiteStorage:
                 ) WITHOUT ROWID;
             """)
 
-    def save_session(self, data: dict[str, object]) -> None:
-        """Persist a session metrics snapshot."""
-        with self._pool.get_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO session_metrics
-                (session_id, started_at, ended_at,
-                 tokens_saved, tokens_original, tokens_returned,
-                 cache_hits, cache_misses,
-                 files_read, files_written, files_edited,
-                 diffs_served, tool_calls_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    data["session_id"],
-                    data["started_at"],
-                    data["ended_at"],
-                    data["tokens_saved"],
-                    data["tokens_original"],
-                    data["tokens_returned"],
-                    data["cache_hits"],
-                    data["cache_misses"],
-                    data["files_read"],
-                    data["files_written"],
-                    data["files_edited"],
-                    data["diffs_served"],
-                    data["tool_calls_json"],
-                ),
-            )
-
     def get_lifetime_stats(self) -> dict[str, int]:
         """Aggregate counters across all completed sessions."""
         with self._pool.get_connection() as conn:

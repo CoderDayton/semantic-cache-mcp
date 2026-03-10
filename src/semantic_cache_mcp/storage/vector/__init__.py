@@ -319,7 +319,7 @@ class VectorStorage:
         # the underlying sync collection directly via run_in_executor.
         child_metas: list[dict] = []
         child_embeddings: list[list[float]] = []
-        zero_emb = self._zero_embedding()
+        zero_emb = self._resolve_embedding(None)
 
         for i, text in enumerate(chunk_texts):
             child_meta = {
@@ -362,12 +362,6 @@ class VectorStorage:
         dim = self._collection._collection._dim
         if dim is None:
             dim = 384  # Default: matches BAAI/bge-small-en-v1.5
-        return [0.0] * dim
-
-    def _zero_embedding(self) -> list[float]:
-        dim = self._collection._collection._dim
-        if dim is None:
-            dim = 384
         return [0.0] * dim
 
     async def get_content(self, entry: CacheEntry) -> str:
@@ -804,7 +798,7 @@ class VectorStorage:
             if evicted >= evict_count:
                 break
             ids_to_delete.extend(doc_ids)
-            evicted += len(doc_ids)
+            evicted += 1
 
         if ids_to_delete:
             await self._collection.delete_by_ids(ids_to_delete)

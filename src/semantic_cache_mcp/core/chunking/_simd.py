@@ -109,8 +109,6 @@ def _parallel_cdc_boundaries(
             if b - prev >= min_size:
                 result.append(b)
                 prev = b
-            continue
-        continue
 
     # Handle tail
     while n - prev > max_size:

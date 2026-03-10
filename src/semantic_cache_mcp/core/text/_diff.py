@@ -1,60 +1,10 @@
-"""Myers diff, delta compression, semantic truncation, and streaming diff."""
+"""Delta compression, semantic truncation, and diff utilities."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass
 from difflib import SequenceMatcher, unified_diff
-
-# ---------------------------------------------------------------------------
-# Myers diff algorithm (faster for small deltas)
-# ---------------------------------------------------------------------------
-
-
-def _myers_diff(old: list[str], new: list[str]) -> list[tuple[str, str]]:
-    """Optimal edit script. op is '+', '-', or ' ' (unchanged).
-
-    Reference: "An O(ND) Difference Algorithm" by Myers (1986)
-    """
-
-    m, n = len(old), len(new)
-    if m == 0 and n == 0:
-        return []
-    if m == 0:
-        return [("+", line) for line in new]
-    if n == 0:
-        return [("-", line) for line in old]
-
-    # Simple SequenceMatcher-based fallback (not true Myers for simplicity)
-    sm = SequenceMatcher(None, old, new)
-    opcodes = sm.get_opcodes()
-    edits = []
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "equal":
-            for line in old[i1:i2]:
-                edits.append((" ", line))
-        elif tag == "replace":
-            for line in old[i1:i2]:
-                edits.append(("-", line))
-            for line in new[j1:j2]:
-                edits.append(("+", line))
-        elif tag == "delete":
-            for line in old[i1:i2]:
-                edits.append(("-", line))
-        elif tag == "insert":
-            for line in new[j1:j2]:
-                edits.append(("+", line))
-    return edits
-
-
-def _unified_diff_fast(old: str, new: str, context_lines: int = 3) -> str:
-    old_lines = old.splitlines(keepends=True)
-    new_lines = new.splitlines(keepends=True)
-
-    diff = unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=context_lines)
-    return "".join(diff)
-
 
 # ---------------------------------------------------------------------------
 # Delta compression
@@ -96,9 +46,7 @@ def compute_delta(old: str, new: str) -> DiffDelta:
             if i2 - i1 == j2 - j1:
                 # Line-by-line modification
                 for i, j in zip(range(i1, i2), range(j1, j2), strict=True):
-                    modifications.append(
-                        (i1 + i - i1, old_lines[i].rstrip(), new_lines[j].rstrip())
-                    )
+                    modifications.append((i, old_lines[i].rstrip(), new_lines[j].rstrip()))
             else:
                 # Treat as deletion + insertion
                 for i in range(i1, i2):
@@ -125,28 +73,6 @@ def compute_delta(old: str, new: str) -> DiffDelta:
         modifications=modifications,
         size_bytes=size_bytes,
     )
-
-
-def apply_delta(old: str, delta: DiffDelta) -> str:
-    old_lines = old.splitlines(keepends=True)
-    result_lines = old_lines.copy()
-
-    # Reverse order to avoid index shifting as lines are removed
-    for line_num, _ in sorted(delta.deletions, reverse=True):
-        if line_num < len(result_lines):
-            del result_lines[line_num]
-
-    # Apply insertions
-    for line_num, content in delta.insertions:
-        if line_num <= len(result_lines):
-            result_lines.insert(line_num, content)
-
-    # Apply modifications
-    for line_num, _, new_content in delta.modifications:
-        if line_num < len(result_lines):
-            result_lines[line_num] = new_content + "\n"
-
-    return "".join(result_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -280,31 +206,7 @@ def truncate_smart(
     return f"{top_content}{truncation_msg}{bottom_content}"
 
 
-# ---------------------------------------------------------------------------
-# Streaming diff (for huge files)
-# ---------------------------------------------------------------------------
-
-
-def generate_diff_streaming(
-    old_path: str,
-    new_path: str,
-    context_lines: int = 3,
-    chunk_size: int = 64 * 1024,
-) -> Iterator[str]:
-    """Diff huge files without loading into memory; yields diff lines."""
-    with (
-        open(old_path, encoding="utf-8", errors="replace") as old_f,
-        open(new_path, encoding="utf-8", errors="replace") as new_f,
-    ):
-        old_lines = old_f.readlines()
-        new_lines = new_f.readlines()
-
-    diff = unified_diff(old_lines, new_lines, fromfile=old_path, tofile=new_path, n=context_lines)
-
-    yield from diff
-
-
-def generate_diff(old: str, new: str, context_lines: int = 3, use_fast: bool = True) -> str:
+def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     """Return unified diff string, or '// No changes' if identical."""
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
@@ -331,8 +233,3 @@ def diff_stats(old: str, new: str) -> dict:
         "original_size": len(old.encode()),
         "compression_ratio": delta.size_bytes / len(old.encode()) if old else 0,
     }
-
-
-def invert_diff(old: str, new: str) -> str:
-    """Diff that would transform new back to old."""
-    return generate_diff(new, old)

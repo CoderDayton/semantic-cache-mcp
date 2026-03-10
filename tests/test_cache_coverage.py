@@ -521,7 +521,7 @@ class TestVectorStorageSearchHybrid:
 
 
 class TestFitContentToMaxSize:
-    """Lines 26-40 — _fit_content_to_max_size via smart_read large file path."""
+    """Smart_read large file path triggers summarization."""
 
     async def test_large_file_triggers_summarization(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
@@ -1152,48 +1152,6 @@ class TestBatchReadTokenBudgetFlush:
         skipped = [s for s in result.files if s.status == "skipped"]
         # At least the small file should be skipped with est_tokens populated
         assert any(s.est_tokens is not None and s.est_tokens > 0 for s in skipped)
-
-
-class TestReadFitContentToMaxSizeDirectly:
-    """Lines 26-40 — _fit_content_to_max_size directly."""
-
-    def test_fit_content_within_limit_returns_unchanged(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.cache.read import _fit_content_to_max_size
-
-        cache = _make_cache(tmp_path)
-        content = "short content"
-        result, truncated = _fit_content_to_max_size(content, 10_000, cache)
-        assert result == content
-        assert truncated is False
-
-    def test_fit_content_exceeds_limit_summarizes(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.cache.read import _fit_content_to_max_size
-
-        cache = _make_cache(tmp_path)
-        big = "word " * 1000
-        with patch("semantic_cache_mcp.cache.read.summarize_semantic", return_value="summary"):
-            result, truncated = _fit_content_to_max_size(big, 10, cache)
-        assert truncated is True
-        assert result == "summary"
-
-    def test_fit_content_summarization_fallback(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.cache.read import _fit_content_to_max_size
-
-        cache = _make_cache(tmp_path)
-        big = "word " * 1000
-        with (
-            patch(
-                "semantic_cache_mcp.cache.read.summarize_semantic",
-                side_effect=Exception("fail"),
-            ),
-            patch(
-                "semantic_cache_mcp.cache.read.truncate_semantic",
-                return_value="truncated_fallback",
-            ),
-        ):
-            result, truncated = _fit_content_to_max_size(big, 10, cache)
-        assert truncated is True
-        assert result == "truncated_fallback"
 
 
 class TestVectorStorageSaveClose:

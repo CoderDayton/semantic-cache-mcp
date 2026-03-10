@@ -210,7 +210,7 @@ def _compute_diversity_penalty(
     threshold: float = 0.85,
 ) -> float:
     """Penalty that ramps linearly when similarity to any selected segment exceeds threshold."""
-    if not selected_indices or segment_idx >= len(embeddings):
+    if not selected_indices:
         return 0.0
 
     seg_emb = embeddings[segment_idx]

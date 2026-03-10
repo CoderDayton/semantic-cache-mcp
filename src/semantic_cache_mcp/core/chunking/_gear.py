@@ -117,6 +117,7 @@ def _snap_semantic_boundary(content: bytes, pos: int, window: int) -> int:
 
     best_pos = pos
     best_dist = 0
+    found = False
 
     segment = content[left:right]
 
@@ -131,13 +132,9 @@ def _snap_semantic_boundary(content: bytes, pos: int, window: int) -> int:
             cut = left + idx + tlen  # cut *after* token
             dist = abs(cut - pos)
             # Prefer closer cuts; if equal, prefer right side to avoid micro-chunks
-            if (
-                best_pos == pos
-                and best_dist == 0
-                or dist < best_dist
-                or (dist == best_dist and cut >= pos > best_pos)
-            ):
+            if not found or dist < best_dist or (dist == best_dist and cut >= pos > best_pos):
                 best_pos, best_dist = cut, dist
+                found = True
             start = idx + 1
 
     # Only snap if we actually found something

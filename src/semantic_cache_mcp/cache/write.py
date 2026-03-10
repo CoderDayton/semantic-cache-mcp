@@ -529,7 +529,7 @@ async def smart_batch_edit(
             from_cache = True
         else:
             # mtime changed — check content hash before falling back to disk
-            disk_content = file_path.read_text(encoding="utf-8")
+            disk_content = file_path.read_text(encoding="utf-8", errors="replace")
             if hash_content(disk_content) == cached.content_hash:
                 await cache.update_mtime(str(file_path), mtime)
                 content = await cache.get_content(cached)

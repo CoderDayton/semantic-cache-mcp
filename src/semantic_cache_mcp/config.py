@@ -12,9 +12,10 @@ from typing import Final
 LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-_handler = logging.StreamHandler(sys.stderr)
-_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logging.root.addHandler(_handler)
+if not logging.root.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.root.addHandler(_handler)
 logging.root.setLevel(LOG_LEVEL)
 
 

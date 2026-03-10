@@ -288,7 +288,11 @@ class HierarchicalHasher:
         return block_hash
 
     def finalize_content(self) -> tuple[ContentHash, list[BlockHash], list[ChunkHash]]:
-        """Return (content_hash, block_hashes, chunk_hashes)."""
+        """Return (content_hash, block_hashes, chunk_hashes).
+
+        Save chunk hashes before finalize_block() clears them.
+        """
+        remaining_chunks = list(self._chunk_hashes)
         if self._chunk_hashes:
             self.finalize_block()
 
@@ -298,7 +302,7 @@ class HierarchicalHasher:
         combined_blocks = b"".join(b.encode() for b in self._blocks)
         content_hash = hash_content(combined_blocks)
 
-        return content_hash, self._blocks.copy(), self._chunk_hashes.copy()
+        return content_hash, self._blocks.copy(), remaining_chunks
 
 
 # ---------------------------------------------------------------------------

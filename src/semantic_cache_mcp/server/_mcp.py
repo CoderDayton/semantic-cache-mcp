@@ -29,11 +29,15 @@ def _migrate_v2_to_v3() -> None:
         import sqlite3
 
         conn = sqlite3.connect(str(DB_PATH))
-        tables = {
-            r[0]
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
-        conn.close()
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
         # Only delete if it has the old v0.2.0 schema — don't touch unrelated DBs
         if {"chunks", "files", "lsh_index"} <= tables:
             DB_PATH.unlink()

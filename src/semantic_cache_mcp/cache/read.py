@@ -21,25 +21,6 @@ MAX_BATCH_FILES = 50
 MAX_BATCH_TOKENS = 200_000
 
 
-def _fit_content_to_max_size(content: str, max_size: int, cache: SemanticCache) -> tuple[str, bool]:
-    """Truncate content to max_size via semantic summarization; returns (content, truncated)."""
-    if len(content) <= max_size:
-        return content, False
-
-    try:
-        # Keep summarization embed_fn local to avoid extra allocations when unneeded.
-        def embed_fn(text: str):
-            emb = cache.get_embedding(text)
-            if emb is None:
-                return None
-            return np.asarray(emb, dtype=np.float32)
-
-        return summarize_semantic(content, max_size, embed_fn=embed_fn), True
-    except Exception as e:
-        logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
-        return truncate_semantic(content, max_size), True
-
-
 async def smart_read(
     cache: SemanticCache,
     path: str,
@@ -269,15 +250,9 @@ async def batch_smart_read(
             if cached.mtime >= file_mtime:
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
-            # Content hash check — treat as unchanged if content identical
-            try:
-                disk_content = resolved.read_text(encoding="utf-8")
-                if hash_content(disk_content) == cached.content_hash:
-                    await cache.update_mtime(str(resolved), file_mtime)
-                    unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
-                    return min(cached.tokens, count_tokens(unchanged_msg))
-            except Exception:  # nosec B110 — estimate is best-effort
-                pass
+            # mtime changed — return cached tokens as conservative estimate
+            # (reading and hashing the file is too expensive for a budget estimator)
+            return cached.tokens
         if not resolved.exists() or not resolved.is_file():
             return 1
         # Rough estimate for uncached content: ~4 characters per token.

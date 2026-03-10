@@ -226,17 +226,16 @@ async def find_similar_files(
     file_mtime = file_path.stat().st_mtime
     if cached and cached.mtime >= file_mtime:
         source_tokens = cached.tokens
+        source_embedding = cache.get_embedding(content, str(file_path))
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
         await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
+        source_embedding = cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
         source_embedding = cache.get_embedding(content, str(file_path))
         await cache.put(str(file_path), content, file_mtime, source_embedding)
-
-    # VectorStorage doesn't return embeddings from get() — always compute
-    source_embedding = cache.get_embedding(content, str(file_path))
 
     if source_embedding is None:
         return SimilarFilesResult(

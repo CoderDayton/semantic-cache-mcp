@@ -396,10 +396,10 @@ class SemanticCache:
             stats["merge_cache_maxsize"] = _tokenizer._merge_cache_maxsize
 
         # Add embedding model readiness
-        from ..core.embeddings import _execution_provider, _model_ready  # noqa: PLC0415
+        import semantic_cache_mcp.core.embeddings._model as _emb_model  # noqa: PLC0415
 
-        stats["embedding_ready"] = _model_ready
-        stats["embedding_provider"] = _execution_provider
+        stats["embedding_ready"] = _emb_model._model_ready
+        stats["embedding_provider"] = _emb_model._execution_provider
 
         # Session metrics
         stats["session"] = self._metrics.snapshot()

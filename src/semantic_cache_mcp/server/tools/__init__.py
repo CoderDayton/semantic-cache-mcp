@@ -345,9 +345,7 @@ async def stats(
         return "\n".join(lines)
 
     # debug — full raw dump
-    import json as _json  # noqa: PLC0415
-
-    return f"```json\n{_json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```"
+    return f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```"
 
 
 @mcp.tool()
@@ -607,8 +605,6 @@ async def batch_edit(
             )
 
         edit_list = json.loads(edits_str)
-        if not isinstance(edit_list, list):
-            return _render_error("batch_edit", "edits must be a JSON array", max_response_tokens)
 
         # Convert to list of 4-tuples: (old | None, new, start_line | None, end_line | None)
         edit_tuples: list[tuple[str | None, str, int | None, int | None]] = []
@@ -1094,11 +1090,14 @@ async def grep(
     max_response_tokens = _response_token_cap()
 
     try:
+        # In compact mode, context lines are dropped in the response anyway —
+        # skip fetching them to avoid wasted storage work.
+        effective_context = context_lines if mode in _MODE_NORMAL else 0
         results = await cache._storage.grep(
             pattern,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
-            context_lines=context_lines,
+            context_lines=effective_context,
             max_matches=max_matches,
             max_files=max_files,
         )
@@ -1115,7 +1114,7 @@ async def grep(
                     "line_number": m["line_number"],
                     "line": m["line"],
                 }
-                if context_lines > 0 and mode in _MODE_NORMAL:
+                if effective_context > 0:
                     if "before" in m:
                         item["before"] = m["before"]
                     if "after" in m:
