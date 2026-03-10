@@ -157,24 +157,34 @@ class VectorStorage:
         Uses a background thread so a hung usearch/SQLite save cannot block
         the asyncio event loop or delay process exit past *timeout* seconds.
         """
-        import concurrent.futures  # noqa: PLC0415
+        import threading  # noqa: PLC0415
+
+        close_error: BaseException | None = None
 
         def _do_close() -> None:
-            self._db._db.save()
-            self._db._db.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(_do_close)
+            nonlocal close_error
             try:
-                fut.result(timeout=timeout)
-                logger.info("VectorStorage closed cleanly")
-            except concurrent.futures.TimeoutError:
-                logger.warning(
-                    f"VectorStorage close timed out after {timeout}s — "
-                    "index may need recovery on next startup"
-                )
-            except Exception as e:
-                logger.warning(f"VectorStorage close error: {e}")
+                self._db._db.save()
+                self._db._db.close()
+            except Exception as exc:
+                close_error = exc
+
+        # Use a daemon thread so a hung save doesn't prevent process exit.
+        # ThreadPoolExecutor.__exit__ calls shutdown(wait=True) which would
+        # block indefinitely if _do_close hangs — daemon thread avoids this.
+        t = threading.Thread(target=_do_close, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+
+        if t.is_alive():
+            logger.warning(
+                f"VectorStorage close timed out after {timeout}s — "
+                "index may need recovery on next startup"
+            )
+        elif close_error is not None:
+            logger.warning(f"VectorStorage close error: {close_error}")
+        else:
+            logger.info("VectorStorage closed cleanly")
 
     # -------------------------------------------------------------------------
     # File operations
