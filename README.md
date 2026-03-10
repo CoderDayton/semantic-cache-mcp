@@ -48,7 +48,7 @@ Add to Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
-**Option 2** — `uv tool install` (recommended for multiple clients):
+**Option 2** — `uv tool install`:
 
 ```bash
 uv tool install semantic-cache-mcp
@@ -65,8 +65,6 @@ uv tool install semantic-cache-mcp
 ```
 
 Restart Claude Code.
-
-> **Why Option 2?** — `uvx` spawns an isolated process per invocation, each loading its own embedding model (~200MB). If you run multiple Claude Code instances concurrently (e.g. across different projects), each one loads a separate copy, multiplying RAM usage. `uv tool install` puts the binary on your `PATH` so all projects share one installed copy and the model is loaded once per process.
 
 ### GPU Acceleration (Optional)
 
@@ -125,17 +123,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```markdown
 ## Tools
 
-- MUST use `semantic-cache` instead of native Read/Write/Edit (80%+ token savings)
-  - `read` / `batch_read` → file reading with diff-mode (set diff_mode=false after context compression)
-  - `write` → new files or full rewrites; `append=true` for large files
-  - `edit` / `batch_edit` → find/replace (full-file / scoped / line-replace)
-  - `search` / `similar` → semantic search (seed cache first with read/batch_read)
-  - `grep` → regex/literal pattern search across cached files
-  - `glob` → find files by pattern; `cached_only=true` to filter to cached files
-  - `diff` → compare two files with semantic similarity score
-  - `stats` / `clear` → cache metrics and reset
+- MUST use `semantic-cache-mcp` instead of native I/O tools (80%+ token savings)
 ```
-
 ---
 
 ## Tools

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-03-10
+
+### Fixed
+
+- **Eviction miscounting** — LRU-K eviction counted documents instead of files, under-evicting at cache capacity.
+- **Semantic boundary snapping** — Zero-distance sentinel allowed worse candidates to overwrite perfect matches.
+- **`HierarchicalHasher.finalize_content`** — Always returned empty chunk list due to clearing before copy.
+- **SQLite connection leak** — Migration helper leaked connection on query exception.
+- **Duplicate log handlers** — Module re-import added redundant stderr handlers.
+- **Batch edit crash** — Non-UTF-8 files caused unhandled `UnicodeDecodeError`.
+- **Shutdown hang** — Graceful shutdown could block indefinitely on client disconnect.
+- **Input validation** — Hardened storage layer against missing/malformed inputs.
+- **`close()` blocking** — Cache close could hang when background save was stuck.
+
+### Changed
+
+- Stripped padding, repetition, and template prose across all `.py` and `.md` (net −1,350 lines).
+
+### Removed
+
+- Dead code: `_myers_diff`, `_unified_diff_fast`, `generate_diff_streaming`, `invert_diff`, `apply_delta`, `_fit_content_to_max_size`, `save_session`, `_zero_embedding`, stale singleton re-exports.
+
+### Performance
+
+- `estimate_min_tokens` returns cached token counts instead of re-reading full files.
+- `find_similar_files` no longer double-computes embeddings for uncached files.
+- `grep` skips fetching context lines in compact mode.
+
 ## [0.3.2] - 2026-03-08
 
 ### Added
