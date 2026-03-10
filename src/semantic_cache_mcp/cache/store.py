@@ -303,6 +303,28 @@ class SemanticCache:
         """Current session metrics accumulator."""
         return self._metrics
 
+    def close(self) -> None:
+        """Persist metrics and close all storage backends.
+
+        Called from the lifespan finally block. Must be safe to call multiple
+        times (idempotent) and must not raise — a failed close should not mask
+        the original shutdown reason.
+        """
+        try:
+            self._metrics.persist()
+        except Exception as e:
+            logger.warning(f"Failed to persist metrics on close: {e}")
+
+        try:
+            self._storage.close()
+        except Exception as e:
+            logger.warning(f"Failed to close VectorStorage: {e}")
+
+        try:
+            self._metrics_storage._pool.close_all()
+        except Exception as e:
+            logger.warning(f"Failed to close metrics pool: {e}")
+
     # -------------------------------------------------------------------------
     # Embedding
     # -------------------------------------------------------------------------

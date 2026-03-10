@@ -101,7 +101,13 @@ async def app_lifespan(server: FastMCP):
     try:
         yield {"cache": cache}
     finally:
-        cache.metrics.persist()
+        cache.close()
+        # Flush streams before exit — prevents lost log output when running
+        # as a subprocess (stdio transport) or in containers.
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                if not stream.closed:
+                    stream.flush()
         logger.info("Semantic cache MCP server stopped")
 
 

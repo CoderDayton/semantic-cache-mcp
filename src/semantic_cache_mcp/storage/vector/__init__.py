@@ -151,13 +151,30 @@ class VectorStorage:
         meta["embedding_dim"] = dim
         meta_path.write_text(json.dumps(meta))
 
-    def __del__(self) -> None:
-        if hasattr(self, "_db"):
+    def close(self, *, timeout: float = 5.0) -> None:
+        """Save and close the database with a deadline.
+
+        Uses a background thread so a hung usearch/SQLite save cannot block
+        the asyncio event loop or delay process exit past *timeout* seconds.
+        """
+        import concurrent.futures  # noqa: PLC0415
+
+        def _do_close() -> None:
+            self._db._db.save()
+            self._db._db.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_do_close)
             try:
-                self._db._db.save()
-                self._db._db.close()
-            except Exception:  # nosec B110 — best-effort cleanup in __del__
-                pass
+                fut.result(timeout=timeout)
+                logger.info("VectorStorage closed cleanly")
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    f"VectorStorage close timed out after {timeout}s — "
+                    "index may need recovery on next startup"
+                )
+            except Exception as e:
+                logger.warning(f"VectorStorage close error: {e}")
 
     # -------------------------------------------------------------------------
     # File operations
@@ -814,11 +831,3 @@ class VectorStorage:
         """Persist index to disk."""
         self._collection._collection.save()
         self._db._db.save()
-
-    def close(self) -> None:
-        """Close the database."""
-        try:
-            self._db._db.save()
-            self._db._db.close()
-        except Exception as e:
-            logger.warning(f"Error closing VectorStorage: {e}")

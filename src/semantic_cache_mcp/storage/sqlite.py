@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import logging
 import queue
@@ -40,7 +39,6 @@ class ConnectionPool:
         self._available: queue.Queue[sqlite3.Connection] = queue.Queue()
         self._total = 0
         self._lock = threading.Lock()
-        atexit.register(self.close_all)
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create a new SQLite connection with optimized settings."""
@@ -127,11 +125,6 @@ class SQLiteStorage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._pool = ConnectionPool(db_path, max_size=pool_size)
         self._init_schema()
-
-    def __del__(self) -> None:
-        """Clean up connection pool on deletion."""
-        if hasattr(self, "_pool"):
-            self._pool.close_all()
 
     def _init_schema(self) -> None:
         """Initialize session metrics table."""

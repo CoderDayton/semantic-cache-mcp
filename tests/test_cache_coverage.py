@@ -338,10 +338,10 @@ class TestSemanticCacheStore:
             stats = await cache.get_stats()
         assert "files_cached" in stats
 
-    def test_vector_storage_del_called_on_garbage_collection(self, tmp_path: Path) -> None:
-        """VectorStorage.__del__ save+close should not raise."""
+    def test_vector_storage_close(self, tmp_path: Path) -> None:
+        """VectorStorage.close() saves and closes without raising."""
         vs = _make_vector_storage(tmp_path)
-        vs.__del__()  # explicitly call to exercise the branch
+        vs.close()  # should complete without error
 
     def test_get_embeddings_batch(self, tmp_path: Path) -> None:
         """get_embeddings_batch returns list of same length as input."""
