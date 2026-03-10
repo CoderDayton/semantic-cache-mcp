@@ -19,9 +19,9 @@ from benchmark_token_savings import run_benchmark
 
 
 @pytest.fixture(scope="module")
-def benchmark_results() -> dict[str, float]:
+async def benchmark_results() -> dict[str, float]:
     """Run benchmark once for all tests in this module."""
-    return run_benchmark(file_limit=5, seed=42, quiet=True)
+    return await run_benchmark(file_limit=5, seed=42, quiet=True)
 
 
 def test_unchanged_reread_savings(benchmark_results: dict[str, float]) -> None:

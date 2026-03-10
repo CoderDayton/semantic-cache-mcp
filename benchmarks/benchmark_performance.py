@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sys
 import tempfile
@@ -76,6 +77,22 @@ def _timed(label: str, fn, *args, iterations: int = 1, **kwargs):
     return result
 
 
+async def _timed_async(label: str, fn, *args, iterations: int = 1, **kwargs):
+    """Run async fn, print timing, return result of last call."""
+    times: list[float] = []
+    result = None
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        result = await fn(*args, **kwargs)
+        times.append(time.perf_counter() - t0)
+    avg = sum(times) / len(times)
+    if iterations > 1:
+        print(f"  {label:<40s}  {avg*1000:>8.1f} ms  (avg of {iterations})")
+    else:
+        print(f"  {label:<40s}  {avg*1000:>8.1f} ms")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Benchmarks
 # ---------------------------------------------------------------------------
@@ -105,49 +122,49 @@ def bench_tokenizer(files: list[Path]) -> None:
     _timed(f"count_tokens ({len(all_text)} chars, all files)", count_tokens, all_text, iterations=3)
 
 
-def bench_cache_read(cache: SemanticCache, files: list[Path]) -> None:
+async def bench_cache_read(cache: SemanticCache, files: list[Path]) -> None:
     print("\n--- Cache Read ---")
 
     # Cold read (first time, populates cache)
     t0 = time.perf_counter()
     for f in files:
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
     elapsed = time.perf_counter() - t0
     print(f"  {'Cold read (' + str(len(files)) + ' files)':<40s}  {elapsed*1000:>8.1f} ms")
 
     # Warm read (unchanged, should be near-instant)
     t0 = time.perf_counter()
     for f in files:
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
     elapsed = time.perf_counter() - t0
     print(f"  {'Unchanged re-read (' + str(len(files)) + ' files)':<40s}  {elapsed*1000:>8.1f} ms")
 
     # Single file unchanged
-    _timed("Single unchanged read", smart_read, cache, str(files[0]), iterations=20)
+    await _timed_async("Single unchanged read", smart_read, cache, str(files[0]), iterations=20)
 
 
-def bench_batch_read(cache: SemanticCache, files: list[Path]) -> None:
+async def bench_batch_read(cache: SemanticCache, files: list[Path]) -> None:
     print("\n--- Batch Read ---")
     paths = [str(f) for f in files]
-    _timed(
+    await _timed_async(
         f"batch_read ({len(files)} files, diff_mode)",
         batch_smart_read, cache, paths,
         max_total_tokens=200_000, diff_mode=True,
     )
 
 
-def bench_write_edit(cache: SemanticCache, tmp: Path) -> None:
+async def bench_write_edit(cache: SemanticCache, tmp: Path) -> None:
     print("\n--- Write + Edit ---")
 
     test_file = tmp / "bench_write_test.py"
     content = "def hello():\n    return 'world'\n" * 100
 
-    _timed("Write (new file, 200 lines)", smart_write, cache, str(test_file), content)
+    await _timed_async("Write (new file, 200 lines)", smart_write, cache, str(test_file), content)
 
     # Read it first so edit has cache
-    smart_read(cache, str(test_file))
+    await smart_read(cache, str(test_file))
 
-    _timed(
+    await _timed_async(
         "Edit (scoped find/replace)",
         smart_edit, cache, str(test_file),
         old_string="def hello():\n    return 'world'",
@@ -156,33 +173,33 @@ def bench_write_edit(cache: SemanticCache, tmp: Path) -> None:
     )
 
 
-def bench_search(cache: SemanticCache) -> None:
+async def bench_search(cache: SemanticCache) -> None:
     print("\n--- Search ---")
-    _timed(
+    await _timed_async(
         "Semantic search k=5", semantic_search, cache,
         "embedding model configuration", k=5, iterations=3,
     )
-    _timed(
+    await _timed_async(
         "Semantic search k=10", semantic_search, cache,
         "file caching and diff", k=10, iterations=3,
     )
 
 
-def bench_similar(cache: SemanticCache, files: list[Path]) -> None:
+async def bench_similar(cache: SemanticCache, files: list[Path]) -> None:
     print("\n--- Similar ---")
-    _timed("Find similar k=3", find_similar_files, cache, str(files[0]), k=3, iterations=3)
-    _timed("Find similar k=10", find_similar_files, cache, str(files[0]), k=10, iterations=3)
+    await _timed_async("Find similar k=3", find_similar_files, cache, str(files[0]), k=3, iterations=3)
+    await _timed_async("Find similar k=10", find_similar_files, cache, str(files[0]), k=10, iterations=3)
 
 
-def bench_grep(cache: SemanticCache) -> None:
+async def bench_grep(cache: SemanticCache) -> None:
     print("\n--- Grep ---")
     storage = cache._storage
-    _timed(
+    await _timed_async(
         "Grep (literal, 'def ')",
         storage.grep, "def ", fixed_string=True, max_matches=100,
         iterations=3,
     )
-    _timed(
+    await _timed_async(
         "Grep (regex, 'class\\s+\\w+')",
         storage.grep, r"class\s+\w+", max_matches=100,
         iterations=3,
@@ -194,7 +211,7 @@ def bench_grep(cache: SemanticCache) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+async def main() -> None:
     print("Semantic Cache Performance Benchmark")
     print("=" * 55)
 
@@ -218,16 +235,16 @@ def main() -> None:
 
         bench_tokenizer(files)
         bench_embedding(files)
-        bench_cache_read(cache, files)
-        bench_batch_read(cache, files)
-        bench_write_edit(cache, tmp)
-        bench_search(cache)
-        bench_similar(cache, files)
-        bench_grep(cache)
+        await bench_cache_read(cache, files)
+        await bench_batch_read(cache, files)
+        await bench_write_edit(cache, tmp)
+        await bench_search(cache)
+        await bench_similar(cache, files)
+        await bench_grep(cache)
 
     print(f"\n{'=' * 55}")
     print("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

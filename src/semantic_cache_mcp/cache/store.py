@@ -343,14 +343,14 @@ class SemanticCache:
     # Delegated operations
     # -------------------------------------------------------------------------
 
-    def get(self, path: str) -> CacheEntry | None:
+    async def get(self, path: str) -> CacheEntry | None:
         """Get cached entry for path."""
-        entry = self._storage.get(path)
+        entry = await self._storage.get(path)
         if entry:
             logger.debug(f"Cache hit: {path}")
         return entry
 
-    def put(
+    async def put(
         self,
         path: str,
         content: str,
@@ -359,30 +359,30 @@ class SemanticCache:
     ) -> None:
         """Store file in cache."""
         tokens = count_tokens(content)
-        self._storage.put(path, content, mtime, embedding)
+        await self._storage.put(path, content, mtime, embedding)
         logger.info(f"Cached file: {path} ({tokens} tokens)")
 
-    def get_content(self, entry: CacheEntry) -> str:
+    async def get_content(self, entry: CacheEntry) -> str:
         """Get full content from cache entry."""
-        return self._storage.get_content(entry)
+        return await self._storage.get_content(entry)
 
-    def record_access(self, path: str) -> None:
+    async def record_access(self, path: str) -> None:
         """Record access for LRU-K tracking."""
-        self._storage.record_access(path)
+        await self._storage.record_access(path)
 
-    def update_mtime(self, path: str, new_mtime: float) -> None:
+    async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding."""
-        self._storage.update_mtime(path, new_mtime)
+        await self._storage.update_mtime(path, new_mtime)
 
-    def find_similar(
+    async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
         """Find semantically similar cached file."""
-        return self._storage.find_similar(embedding, exclude_path)
+        return await self._storage.find_similar(embedding, exclude_path)
 
-    def get_stats(self) -> dict[str, Any]:
+    async def get_stats(self) -> dict[str, Any]:
         """Get cache statistics including memory, session, and lifetime metrics."""
-        stats: dict[str, Any] = {**self._storage.get_stats()}
+        stats: dict[str, Any] = {**await self._storage.get_stats()}
 
         # Add process memory stats
         rss = _get_rss_mb()
@@ -435,6 +435,6 @@ class SemanticCache:
         ]
         return cast(list[EmbeddingVector | None], _embed_batch(texts))
 
-    def clear(self) -> int:
+    async def clear(self) -> int:
         """Clear all cache entries."""
-        return self._storage.clear()
+        return await self._storage.clear()

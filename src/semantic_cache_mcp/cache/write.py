@@ -53,7 +53,7 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def smart_write(
+async def smart_write(
     cache: SemanticCache,
     path: str,
     content: str,
@@ -137,11 +137,11 @@ def smart_write(
             raise PermissionError(f"Cannot read existing file: {e}") from e
 
         # Try to get content from cache first (saves tokens!)
-        cached = cache.get(str(file_path))
+        cached = await cache.get(str(file_path))
         if cached:
             mtime = file_path.stat().st_mtime
             if cached.mtime >= mtime:
-                old_content = cache.get_content(cached)
+                old_content = await cache.get_content(cached)
                 from_cache = True
                 logger.debug(f"Using cached content for diff: {path}")
             else:
@@ -149,8 +149,8 @@ def smart_write(
                 try:
                     disk_bytes = file_path.read_bytes()
                     if hash_content(disk_bytes) == cached.content_hash:
-                        cache.update_mtime(str(file_path), mtime)
-                        old_content = cache.get_content(cached)
+                        await cache.update_mtime(str(file_path), mtime)
+                        old_content = await cache.get_content(cached)
                         from_cache = True
                         logger.debug(f"Content hash match for diff: {path}")
                 except Exception:  # nosec B110 — fall through to disk read
@@ -215,7 +215,7 @@ def smart_write(
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(content, path)
-        cache.put(str(file_path), content, mtime, embedding)
+        await cache.put(str(file_path), content, mtime, embedding)
         action = "Created" if created else "Updated"
         if formatted:
             action += " and formatted"
@@ -234,7 +234,7 @@ def smart_write(
     )
 
 
-def smart_edit(
+async def smart_edit(
     cache: SemanticCache,
     path: str,
     old_string: str | None,
@@ -319,12 +319,12 @@ def smart_edit(
     # Try to get content from cache first (huge token savings!)
     content: str
     from_cache = False
-    cached = cache.get(str(file_path))
+    cached = await cache.get(str(file_path))
 
     if cached:
         mtime = file_path.stat().st_mtime
         if cached.mtime >= mtime:
-            content = cache.get_content(cached)
+            content = await cache.get_content(cached)
             from_cache = True
             logger.debug(f"Using cached content for edit: {path}")
         else:
@@ -334,8 +334,8 @@ def smart_edit(
             except UnicodeDecodeError:
                 disk_content = file_path.read_text(encoding="utf-8", errors="replace")
             if hash_content(disk_content) == cached.content_hash:
-                cache.update_mtime(str(file_path), mtime)
-                content = cache.get_content(cached)
+                await cache.update_mtime(str(file_path), mtime)
+                content = await cache.get_content(cached)
                 from_cache = True
                 logger.debug(f"Content hash match for edit: {path}")
             else:
@@ -483,7 +483,7 @@ def smart_edit(
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content, path)
-        cache.put(str(file_path), new_content, mtime, embedding)
+        await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
             action += " and formatted"
@@ -502,7 +502,7 @@ def smart_edit(
     )
 
 
-def smart_batch_edit(
+async def smart_batch_edit(
     cache: SemanticCache,
     path: str,
     edits: (list[tuple[str | None, str, int | None, int | None]] | list[tuple[str, str]]),
@@ -560,19 +560,19 @@ def smart_batch_edit(
     # Get content (from cache if possible)
     content: str
     from_cache = False
-    cached = cache.get(str(file_path))
+    cached = await cache.get(str(file_path))
 
     if cached:
         mtime = file_path.stat().st_mtime
         if cached.mtime >= mtime:
-            content = cache.get_content(cached)
+            content = await cache.get_content(cached)
             from_cache = True
         else:
             # mtime changed — check content hash before falling back to disk
             disk_content = file_path.read_text(encoding="utf-8")
             if hash_content(disk_content) == cached.content_hash:
-                cache.update_mtime(str(file_path), mtime)
-                content = cache.get_content(cached)
+                await cache.update_mtime(str(file_path), mtime)
+                content = await cache.get_content(cached)
                 from_cache = True
             else:
                 content = disk_content
@@ -732,7 +732,7 @@ def smart_batch_edit(
         # Update cache with final content
         mtime = file_path.stat().st_mtime
         embedding = cache.get_embedding(new_content, path)
-        cache.put(str(file_path), new_content, mtime, embedding)
+        await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
             action += " and formatted"

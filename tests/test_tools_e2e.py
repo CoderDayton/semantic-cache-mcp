@@ -7,7 +7,6 @@ Covers small, medium, large (10K+ line) files and varied content types.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from pathlib import Path
 
@@ -334,16 +333,18 @@ def various_files(tmp_path: Path) -> dict[str, Path]:
 class TestReadFirstRead:
     """First read should return full content."""
 
-    def test_first_read_returns_full_content(self, cache: SemanticCache, small_py: Path) -> None:
-        result = smart_read(cache, str(small_py))
+    async def test_first_read_returns_full_content(
+        self, cache: SemanticCache, small_py: Path
+    ) -> None:
+        result = await smart_read(cache, str(small_py))
         assert not result.from_cache
         assert not result.is_diff
         assert result.tokens_saved == 0
         assert "def greet" in result.content
 
-    def test_first_read_caches_file(self, cache: SemanticCache, small_py: Path) -> None:
-        smart_read(cache, str(small_py))
-        entry = cache.get(str(small_py))
+    async def test_first_read_caches_file(self, cache: SemanticCache, small_py: Path) -> None:
+        await smart_read(cache, str(small_py))
+        entry = await cache.get(str(small_py))
         assert entry is not None
         assert entry.tokens > 0
 
@@ -351,17 +352,17 @@ class TestReadFirstRead:
 class TestReadUnchanged:
     """Second read of unchanged file should return 'unchanged' marker."""
 
-    def test_unchanged_returns_marker(self, cache: SemanticCache, small_py: Path) -> None:
-        smart_read(cache, str(small_py))
-        result = smart_read(cache, str(small_py))
+    async def test_unchanged_returns_marker(self, cache: SemanticCache, small_py: Path) -> None:
+        await smart_read(cache, str(small_py))
+        result = await smart_read(cache, str(small_py))
         assert result.from_cache
         assert not result.is_diff
         assert "unchanged" in result.content.lower()
         assert result.tokens_saved > 0
 
-    def test_unchanged_saves_tokens(self, cache: SemanticCache, medium_py: Path) -> None:
-        first = smart_read(cache, str(medium_py))
-        second = smart_read(cache, str(medium_py))
+    async def test_unchanged_saves_tokens(self, cache: SemanticCache, medium_py: Path) -> None:
+        first = await smart_read(cache, str(medium_py))
+        second = await smart_read(cache, str(medium_py))
         # Unchanged message should be much smaller than original
         assert second.tokens_returned < first.tokens_returned
         assert second.tokens_saved > 0
@@ -370,23 +371,25 @@ class TestReadUnchanged:
 class TestReadDiff:
     """Modified file should return diff."""
 
-    def test_modified_returns_diff(self, cache: SemanticCache, medium_py: Path) -> None:
+    async def test_modified_returns_diff(self, cache: SemanticCache, medium_py: Path) -> None:
         """Modified file should return diff (needs medium+ file; small files
         fall through to full read because diff overhead > 60% threshold)."""
-        smart_read(cache, str(medium_py))
+        await smart_read(cache, str(medium_py))
 
         # Modify one line in the medium file
         content = medium_py.read_text()
         medium_py.write_text(content.replace("Widget0", "Gadget0"))
 
-        result = smart_read(cache, str(medium_py))
+        result = await smart_read(cache, str(medium_py))
         assert result.from_cache
         assert result.is_diff
         assert "-" in result.content or "+" in result.content
 
-    def test_diff_saves_tokens_on_small_change(self, cache: SemanticCache, large_py: Path) -> None:
+    async def test_diff_saves_tokens_on_small_change(
+        self, cache: SemanticCache, large_py: Path
+    ) -> None:
         """A 5-line change on a 10K file should produce a small diff."""
-        first = smart_read(cache, str(large_py))
+        first = await smart_read(cache, str(large_py))
 
         # Modify 5 lines near the middle
         lines = large_py.read_text().splitlines()
@@ -395,7 +398,7 @@ class TestReadDiff:
                 lines[i] = f"# MODIFIED LINE {i}"
         large_py.write_text("\n".join(lines))
 
-        result = smart_read(cache, str(large_py))
+        result = await smart_read(cache, str(large_py))
         assert result.is_diff
         assert result.tokens_saved > 0
         # Diff should be much smaller than full file
@@ -405,11 +408,11 @@ class TestReadDiff:
 class TestReadDiffModeOff:
     """diff_mode=False should force full content."""
 
-    def test_force_full_returns_complete_content(
+    async def test_force_full_returns_complete_content(
         self, cache: SemanticCache, small_py: Path
     ) -> None:
-        smart_read(cache, str(small_py))
-        result = smart_read(cache, str(small_py), diff_mode=False)
+        await smart_read(cache, str(small_py))
+        result = await smart_read(cache, str(small_py), diff_mode=False)
         # Should return full content, not unchanged marker
         assert "def greet" in result.content
 
@@ -443,20 +446,20 @@ class TestReadOffsetLimit:
 class TestReadLargeFile:
     """Large file handling."""
 
-    def test_large_file_truncation(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_large_file_truncation(self, cache: SemanticCache, tmp_path: Path) -> None:
         """File exceeding max_size should be truncated."""
         big = tmp_path / "big.txt"
         big.write_text("x" * 200_000)
-        result = smart_read(cache, str(big), max_size=50_000)
+        result = await smart_read(cache, str(big), max_size=50_000)
         assert result.truncated
         assert len(result.content) <= 50_000
 
-    def test_10k_line_file_no_timeout(self, cache: SemanticCache, large_py: Path) -> None:
+    async def test_10k_line_file_no_timeout(self, cache: SemanticCache, large_py: Path) -> None:
         """10K+ line file should complete without timeout.
         NOTE: 10K-line file exceeds MAX_CONTENT_SIZE (100KB) so it gets
         truncated via semantic summarization. This is expected behavior."""
         start = time.monotonic()
-        result = smart_read(cache, str(large_py))
+        result = await smart_read(cache, str(large_py))
         elapsed = time.monotonic() - start
         assert elapsed < 120.0  # macOS CI cold-starts embedding + summarizes 134K tokens
         assert result.tokens_original > 0
@@ -468,43 +471,47 @@ class TestReadLargeFile:
 class TestReadEdgeCases:
     """Edge case handling for read."""
 
-    def test_binary_file_rejected(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_binary_file_rejected(self, cache: SemanticCache, tmp_path: Path) -> None:
         binary = tmp_path / "data.bin"
         binary.write_bytes(b"\x00\x01\x02\xff\xfe\x80")
         with pytest.raises(ValueError, match="[Bb]inary"):
-            smart_read(cache, str(binary))
+            await smart_read(cache, str(binary))
 
-    def test_empty_file(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_empty_file(self, cache: SemanticCache, tmp_path: Path) -> None:
         empty = tmp_path / "empty.txt"
         empty.write_text("")
-        result = smart_read(cache, str(empty))
+        result = await smart_read(cache, str(empty))
         assert result.content == ""
         assert result.tokens_original == 0
 
-    def test_unicode_content(self, cache: SemanticCache, various_files: dict[str, Path]) -> None:
+    async def test_unicode_content(
+        self, cache: SemanticCache, various_files: dict[str, Path]
+    ) -> None:
         """Unicode file should round-trip with full fidelity."""
         uni = various_files["unicode"]
         original = uni.read_text()
-        result = smart_read(cache, str(uni))
+        result = await smart_read(cache, str(uni))
         assert "你好世界" in result.content
         assert "🚀" in result.content
         assert result.content == original
 
-    def test_symlink_following(self, cache: SemanticCache, small_py: Path, tmp_path: Path) -> None:
+    async def test_symlink_following(
+        self, cache: SemanticCache, small_py: Path, tmp_path: Path
+    ) -> None:
         link = tmp_path / "link.py"
         link.symlink_to(small_py)
-        result = smart_read(cache, str(link))
+        result = await smart_read(cache, str(link))
         assert "def greet" in result.content
 
-    def test_file_not_found(self, cache: SemanticCache) -> None:
+    async def test_file_not_found(self, cache: SemanticCache) -> None:
         with pytest.raises(FileNotFoundError):
-            smart_read(cache, "/tmp/nonexistent_file_abc123.py")
+            await smart_read(cache, "/tmp/nonexistent_file_abc123.py")
 
-    def test_whitespace_only_file(
+    async def test_whitespace_only_file(
         self, cache: SemanticCache, various_files: dict[str, Path]
     ) -> None:
         ws = various_files["whitespace"]
-        result = smart_read(cache, str(ws))
+        result = await smart_read(cache, str(ws))
         assert result.content.strip() == ""
         assert result.tokens_original >= 0  # Should not crash
 
@@ -517,17 +524,17 @@ class TestReadEdgeCases:
 class TestWriteNew:
     """Write new files."""
 
-    def test_write_new_file(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_write_new_file(self, cache: SemanticCache, tmp_path: Path) -> None:
         target = tmp_path / "new_file.py"
         content = "def hello():\n    return 42\n"
-        result = smart_write(cache, str(target), content)
+        result = await smart_write(cache, str(target), content)
         assert result.created
         assert target.exists()
         assert target.read_text() == content
 
-    def test_write_creates_parents(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_write_creates_parents(self, cache: SemanticCache, tmp_path: Path) -> None:
         target = tmp_path / "a" / "b" / "c" / "deep.py"
-        result = smart_write(cache, str(target), "x = 1\n")
+        result = await smart_write(cache, str(target), "x = 1\n")
         assert result.created
         assert target.exists()
 
@@ -535,18 +542,18 @@ class TestWriteNew:
 class TestWriteOverwrite:
     """Overwrite existing files."""
 
-    def test_overwrite_returns_diff(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_overwrite_returns_diff(self, cache: SemanticCache, small_py: Path) -> None:
         # Cache the file first
-        smart_read(cache, str(small_py))
-        result = smart_write(cache, str(small_py), "# completely new\nx = 1\n")
+        await smart_read(cache, str(small_py))
+        result = await smart_write(cache, str(small_py), "# completely new\nx = 1\n")
         assert not result.created
         assert result.diff_content is not None
 
-    def test_write_then_read_cached(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_write_then_read_cached(self, cache: SemanticCache, tmp_path: Path) -> None:
         target = tmp_path / "written.py"
         content = "class Foo:\n    pass\n"
-        smart_write(cache, str(target), content)
-        result = smart_read(cache, str(target))
+        await smart_write(cache, str(target), content)
+        result = await smart_read(cache, str(target))
         # Should come from cache
         assert result.from_cache
 
@@ -554,29 +561,29 @@ class TestWriteOverwrite:
 class TestWriteAppend:
     """Append mode."""
 
-    def test_append_adds_content(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_append_adds_content(self, cache: SemanticCache, tmp_path: Path) -> None:
         target = tmp_path / "append.txt"
-        smart_write(cache, str(target), "line 1\n")
-        smart_write(cache, str(target), "line 2\n", append=True)
+        await smart_write(cache, str(target), "line 1\n")
+        await smart_write(cache, str(target), "line 2\n", append=True)
         assert target.read_text() == "line 1\nline 2\n"
 
 
 class TestWriteDryRun:
     """Dry run should not modify disk."""
 
-    def test_dry_run_no_change(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_dry_run_no_change(self, cache: SemanticCache, small_py: Path) -> None:
         original = small_py.read_text()
-        smart_write(cache, str(small_py), "# replaced\n", dry_run=True)
+        await smart_write(cache, str(small_py), "# replaced\n", dry_run=True)
         assert small_py.read_text() == original
 
 
 class TestWriteLargeFile:
     """Write large files."""
 
-    def test_write_10k_lines(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_write_10k_lines(self, cache: SemanticCache, tmp_path: Path) -> None:
         target = tmp_path / "big_write.py"
         content = "\n".join(f"line_{i} = {i}" for i in range(10_000))
-        result = smart_write(cache, str(target), content)
+        result = await smart_write(cache, str(target), content)
         assert result.created
         assert target.read_text() == content
 
@@ -589,21 +596,25 @@ class TestWriteLargeFile:
 class TestEditFindReplace:
     """Basic find/replace editing."""
 
-    def test_single_replacement(self, cache: SemanticCache, small_py: Path) -> None:
-        result = smart_edit(cache, str(small_py), old_string="def greet", new_string="def welcome")
+    async def test_single_replacement(self, cache: SemanticCache, small_py: Path) -> None:
+        result = await smart_edit(
+            cache, str(small_py), old_string="def greet", new_string="def welcome"
+        )
         assert result.replacements_made == 1
         assert "welcome" in small_py.read_text()
 
-    def test_multiple_matches_error(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_multiple_matches_error(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "multi.py"
         f.write_text("foo = 1\nfoo = 2\nfoo = 3\n")
         with pytest.raises(ValueError, match="[Mm]ultiple|[Mm]ore than"):
-            smart_edit(cache, str(f), old_string="foo", new_string="bar")
+            await smart_edit(cache, str(f), old_string="foo", new_string="bar")
 
-    def test_replace_all(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_replace_all(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "multi.py"
         f.write_text("foo = 1\nfoo = 2\nfoo = 3\n")
-        result = smart_edit(cache, str(f), old_string="foo", new_string="bar", replace_all=True)
+        result = await smart_edit(
+            cache, str(f), old_string="foo", new_string="bar", replace_all=True
+        )
         assert result.replacements_made == 3
         assert "foo" not in f.read_text()
 
@@ -611,7 +622,7 @@ class TestEditFindReplace:
 class TestEditScoped:
     """Scoped find/replace with line ranges."""
 
-    def test_scoped_edit(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_scoped_edit(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "scoped.py"
         lines = [f"x_{i} = {i}" for i in range(20)]
         # Put "target" on lines 5 and 15
@@ -620,7 +631,7 @@ class TestEditScoped:
         f.write_text("\n".join(lines))
 
         # Edit only within lines 1-10 (should hit line 5 only)
-        result = smart_edit(
+        result = await smart_edit(
             cache,
             str(f),
             old_string="target",
@@ -637,10 +648,10 @@ class TestEditScoped:
 class TestEditLineReplace:
     """Line replace mode (no old_string)."""
 
-    def test_line_replace(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_line_replace(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "linereplace.py"
         f.write_text("line1\nline2\nline3\nline4\nline5\n")
-        result = smart_edit(
+        result = await smart_edit(
             cache,
             str(f),
             old_string=None,
@@ -663,20 +674,22 @@ class TestEditLineReplace:
 class TestEditDryRun:
     """Dry run edits."""
 
-    def test_dry_run_no_change(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_dry_run_no_change(self, cache: SemanticCache, small_py: Path) -> None:
         original = small_py.read_text()
-        smart_edit(cache, str(small_py), old_string="def greet", new_string="def xxx", dry_run=True)
+        await smart_edit(
+            cache, str(small_py), old_string="def greet", new_string="def xxx", dry_run=True
+        )
         assert small_py.read_text() == original
 
 
 class TestEditLargeFile:
     """Edit on large files."""
 
-    def test_edit_near_end_of_large_file(self, cache: SemanticCache, large_py: Path) -> None:
+    async def test_edit_near_end_of_large_file(self, cache: SemanticCache, large_py: Path) -> None:
         """Edit near line 10000 should be fast."""
         start = time.monotonic()
         # The large file has transform_499 near the end
-        result = smart_edit(
+        result = await smart_edit(
             cache,
             str(large_py),
             old_string="def transform_499",
@@ -690,19 +703,19 @@ class TestEditLargeFile:
 class TestEditCacheConsistency:
     """Cache should be updated after edit."""
 
-    def test_edit_then_read_unchanged(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_edit_then_read_unchanged(self, cache: SemanticCache, small_py: Path) -> None:
         # Read to cache
-        smart_read(cache, str(small_py))
+        await smart_read(cache, str(small_py))
         # Edit (updates cache)
-        smart_edit(cache, str(small_py), old_string="def greet", new_string="def welcome")
+        await smart_edit(cache, str(small_py), old_string="def greet", new_string="def welcome")
         # Read again — should be "unchanged" since cache was updated by edit
-        result = smart_read(cache, str(small_py))
+        result = await smart_read(cache, str(small_py))
         assert result.from_cache
         assert not result.is_diff
 
-    def test_edit_nonexistent_file(self, cache: SemanticCache) -> None:
+    async def test_edit_nonexistent_file(self, cache: SemanticCache) -> None:
         with pytest.raises(FileNotFoundError):
-            smart_edit(cache, "/tmp/nonexistent_xyz.py", old_string="x", new_string="y")
+            await smart_edit(cache, "/tmp/nonexistent_xyz.py", old_string="x", new_string="y")
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +726,7 @@ class TestEditCacheConsistency:
 class TestBatchEdit:
     """Batch edit operations."""
 
-    def test_multiple_successful_edits(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_multiple_successful_edits(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "batch.py"
         f.write_text("aaa = 1\nbbb = 2\nccc = 3\n")
         edits = [
@@ -721,7 +734,7 @@ class TestBatchEdit:
             ("bbb", "BBB"),
             ("ccc", "CCC"),
         ]
-        result = smart_batch_edit(cache, str(f), edits)
+        result = await smart_batch_edit(cache, str(f), edits)
         assert result.succeeded == 3
         assert result.failed == 0
         content = f.read_text()
@@ -729,7 +742,7 @@ class TestBatchEdit:
         assert "BBB" in content
         assert "CCC" in content
 
-    def test_partial_failure(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_partial_failure(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "partial.py"
         f.write_text("aaa = 1\nbbb = 2\n")
         edits = [
@@ -737,14 +750,14 @@ class TestBatchEdit:
             ("zzz", "ZZZ"),  # This won't match
             ("bbb", "BBB"),
         ]
-        result = smart_batch_edit(cache, str(f), edits)
+        result = await smart_batch_edit(cache, str(f), edits)
         assert result.succeeded == 2
         assert result.failed == 1
 
-    def test_batch_edit_large_file(self, cache: SemanticCache, large_py: Path) -> None:
+    async def test_batch_edit_large_file(self, cache: SemanticCache, large_py: Path) -> None:
         """10 edits scattered through a 10K file."""
         edits = [(f"def transform_{i:03d}", f"def xform_{i:03d}") for i in range(0, 50, 5)]
-        result = smart_batch_edit(cache, str(large_py), edits)
+        result = await smart_batch_edit(cache, str(large_py), edits)
         assert result.succeeded == 10
         assert result.failed == 0
 
@@ -757,26 +770,26 @@ class TestBatchEdit:
 class TestBatchRead:
     """Batch read operations."""
 
-    def test_read_multiple_files(
+    async def test_read_multiple_files(
         self, cache: SemanticCache, various_files: dict[str, Path]
     ) -> None:
         paths = [str(v) for v in various_files.values() if v.stat().st_size > 0]
-        result = batch_smart_read(cache, paths[:5])
+        result = await batch_smart_read(cache, paths[:5])
         assert result.files_read > 0
         assert result.files_skipped == 0
 
-    def test_token_budget_enforcement(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_token_budget_enforcement(self, cache: SemanticCache, tmp_path: Path) -> None:
         """Should skip files when budget exhausted."""
         files = []
         for i in range(10):
             f = tmp_path / f"budget_{i}.py"
             f.write_text("# content\n" * 500)  # ~500 lines each
             files.append(str(f))
-        result = batch_smart_read(cache, files, max_total_tokens=1000)
+        result = await batch_smart_read(cache, files, max_total_tokens=1000)
         # Should have skipped some files
         assert result.files_skipped > 0
 
-    def test_unchanged_detection(
+    async def test_unchanged_detection(
         self, cache: SemanticCache, small_py: Path, tmp_path: Path
     ) -> None:
         """Second batch read should detect unchanged files."""
@@ -784,11 +797,11 @@ class TestBatchRead:
         f2.write_text("y = 2\n")
         paths = [str(small_py), str(f2)]
 
-        batch_smart_read(cache, paths)
-        result = batch_smart_read(cache, paths)
+        await batch_smart_read(cache, paths)
+        result = await batch_smart_read(cache, paths)
         assert len(result.unchanged_paths) == 2
 
-    def test_priority_ordering(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_priority_ordering(self, cache: SemanticCache, tmp_path: Path) -> None:
         """Priority files should be read first."""
         files = []
         for i in range(5):
@@ -797,7 +810,7 @@ class TestBatchRead:
             files.append(str(f))
 
         # Prioritize the last file
-        result = batch_smart_read(cache, files, priority=[files[4]])
+        result = await batch_smart_read(cache, files, priority=[files[4]])
         # First file in result should be the priority one
         assert result.files[0].path == files[4]
 
@@ -810,20 +823,20 @@ class TestBatchRead:
 class TestSearchQuality:
     """Search relevance and quality."""
 
-    def test_search_empty_cache(self, cache: SemanticCache) -> None:
-        result = semantic_search(cache, "hello world")
+    async def test_search_empty_cache(self, cache: SemanticCache) -> None:
+        result = await semantic_search(cache, "hello world")
         assert result.matches == []
 
-    def test_search_finds_cached_content(
+    async def test_search_finds_cached_content(
         self, cache: SemanticCache, various_files: dict[str, Path]
     ) -> None:
         """Search should find files after caching."""
         # Cache all files
         for p in various_files.values():
             if p.stat().st_size > 0:
-                smart_read(cache, str(p))
+                await smart_read(cache, str(p))
 
-        result = semantic_search(cache, "database", k=5)
+        result = await semantic_search(cache, "database", k=5)
         # Should find the SQL file at minimum via BM25 keyword match
         paths = [m.path for m in result.matches]
         sql_found = any("schema.sql" in p for p in paths)
@@ -833,9 +846,9 @@ class TestSearchQuality:
 class TestGrepTool:
     """Grep search across cached files."""
 
-    def test_grep_finds_pattern(self, cache: SemanticCache, small_py: Path) -> None:
-        smart_read(cache, str(small_py))
-        results = cache._storage.grep("def ")
+    async def test_grep_finds_pattern(self, cache: SemanticCache, small_py: Path) -> None:
+        await smart_read(cache, str(small_py))
+        results = await cache._storage.grep("def ")
         assert len(results) > 0
         # Should find function definitions
         found_funcs = False
@@ -845,38 +858,38 @@ class TestGrepTool:
                     found_funcs = True
         assert found_funcs
 
-    def test_grep_regex(self, cache: SemanticCache, small_py: Path) -> None:
-        smart_read(cache, str(small_py))
-        results = cache._storage.grep(r"def \w+\(")
+    async def test_grep_regex(self, cache: SemanticCache, small_py: Path) -> None:
+        await smart_read(cache, str(small_py))
+        results = await cache._storage.grep(r"def \w+\(")
         assert len(results) > 0
 
-    def test_grep_fixed_string(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_grep_fixed_string(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "special.py"
         f.write_text("result = foo.bar()\nother = baz()\n")
-        smart_read(cache, str(f))
-        results = cache._storage.grep("foo.bar()", fixed_string=True)
+        await smart_read(cache, str(f))
+        results = await cache._storage.grep("foo.bar()", fixed_string=True)
         assert len(results) == 1
         assert results[0]["matches"][0]["line_number"] == 1
 
-    def test_grep_case_insensitive(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_grep_case_insensitive(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "case.py"
         f.write_text("Hello World\nhello world\nHELLO WORLD\n")
-        smart_read(cache, str(f))
-        results = cache._storage.grep("hello", case_sensitive=False)
+        await smart_read(cache, str(f))
+        results = await cache._storage.grep("hello", case_sensitive=False)
         total = sum(len(r["matches"]) for r in results)
         assert total == 3
 
-    def test_grep_context_lines(self, cache: SemanticCache, small_py: Path) -> None:
-        smart_read(cache, str(small_py))
-        results = cache._storage.grep("def greet", context_lines=2)
+    async def test_grep_context_lines(self, cache: SemanticCache, small_py: Path) -> None:
+        await smart_read(cache, str(small_py))
+        results = await cache._storage.grep("def greet", context_lines=2)
         assert len(results) > 0
         match = results[0]["matches"][0]
         assert "before" in match or "after" in match
 
-    def test_grep_max_matches(self, cache: SemanticCache, large_py: Path) -> None:
+    async def test_grep_max_matches(self, cache: SemanticCache, large_py: Path) -> None:
         """Grep should respect max_matches limit."""
-        smart_read(cache, str(large_py))
-        results = cache._storage.grep("def ", max_matches=5)
+        await smart_read(cache, str(large_py))
+        results = await cache._storage.grep("def ", max_matches=5)
         total = sum(len(r["matches"]) for r in results)
         assert total <= 5
 
@@ -889,10 +902,12 @@ class TestGrepTool:
 class TestSimilarFiles:
     """Similar file search."""
 
-    def test_similar_no_results_single_file(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_similar_no_results_single_file(
+        self, cache: SemanticCache, small_py: Path
+    ) -> None:
         """Only file in cache should return empty similar list."""
-        smart_read(cache, str(small_py))
-        result = find_similar_files(cache, str(small_py), k=3)
+        await smart_read(cache, str(small_py))
+        result = await find_similar_files(cache, str(small_py), k=3)
         # The source file is excluded, so no similar files
         assert len(result.similar_files) == 0
 
@@ -905,24 +920,24 @@ class TestSimilarFiles:
 class TestDiffTool:
     """File comparison."""
 
-    def test_diff_different_files(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_diff_different_files(self, cache: SemanticCache, tmp_path: Path) -> None:
         f1 = tmp_path / "file1.py"
         f2 = tmp_path / "file2.py"
         f1.write_text("def foo():\n    return 1\n")
         f2.write_text("def foo():\n    return 2\n")
 
-        result = compare_files(cache, str(f1), str(f2))
+        result = await compare_files(cache, str(f1), str(f2))
         assert result.diff_content != ""
         assert result.diff_stats["modifications"] > 0 or result.diff_stats["deletions"] > 0
 
-    def test_diff_identical_files(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_diff_identical_files(self, cache: SemanticCache, tmp_path: Path) -> None:
         f1 = tmp_path / "same1.py"
         f2 = tmp_path / "same2.py"
         content = "x = 1\ny = 2\n"
         f1.write_text(content)
         f2.write_text(content)
 
-        result = compare_files(cache, str(f1), str(f2))
+        result = await compare_files(cache, str(f1), str(f2))
         # Diff of identical files should be empty
         assert result.diff_stats["insertions"] == 0
         assert result.diff_stats["deletions"] == 0
@@ -936,35 +951,37 @@ class TestDiffTool:
 class TestGlobTool:
     """File glob with cache status."""
 
-    def test_basic_glob(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_basic_glob(self, cache: SemanticCache, tmp_path: Path) -> None:
         (tmp_path / "a.py").write_text("x = 1")
         (tmp_path / "b.py").write_text("y = 2")
         (tmp_path / "c.txt").write_text("hello")
 
-        result = glob_with_cache_status(cache, "*.py", directory=str(tmp_path))
+        result = await glob_with_cache_status(cache, "*.py", directory=str(tmp_path))
         py_matches = [m for m in result.matches if m.path.endswith(".py")]
         assert len(py_matches) == 2
 
-    def test_glob_cached_only(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_glob_cached_only(self, cache: SemanticCache, tmp_path: Path) -> None:
         f1 = tmp_path / "cached.py"
         f2 = tmp_path / "uncached.py"
         f1.write_text("x = 1")
         f2.write_text("y = 2")
 
         # Cache only f1
-        smart_read(cache, str(f1))
+        await smart_read(cache, str(f1))
 
-        result = glob_with_cache_status(cache, "*.py", directory=str(tmp_path), cached_only=True)
+        result = await glob_with_cache_status(
+            cache, "*.py", directory=str(tmp_path), cached_only=True
+        )
         assert len(result.matches) == 1
         assert "cached.py" in result.matches[0].path
 
-    def test_glob_recursive(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_glob_recursive(self, cache: SemanticCache, tmp_path: Path) -> None:
         sub = tmp_path / "sub"
         sub.mkdir()
         (tmp_path / "root.py").write_text("x = 1")
         (sub / "nested.py").write_text("y = 2")
 
-        result = glob_with_cache_status(cache, "**/*.py", directory=str(tmp_path))
+        result = await glob_with_cache_status(cache, "**/*.py", directory=str(tmp_path))
         assert result.total_matches == 2
 
 
@@ -976,31 +993,31 @@ class TestGlobTool:
 class TestStatsAndClear:
     """Cache statistics and clearing."""
 
-    def test_stats_reflect_cached_files(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_stats_reflect_cached_files(self, cache: SemanticCache, tmp_path: Path) -> None:
         for i in range(3):
             f = tmp_path / f"stat_{i}.py"
             f.write_text(f"x = {i}")
-            smart_read(cache, str(f))
+            await smart_read(cache, str(f))
 
-        stats = cache.get_stats()
+        stats = await cache.get_stats()
         assert stats["files_cached"] == 3
 
-    def test_clear_empties_cache(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_clear_empties_cache(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "to_clear.py"
         f.write_text("x = 1")
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
 
-        cache.clear()
-        stats = cache.get_stats()
+        await cache.clear()
+        stats = await cache.get_stats()
         assert stats["files_cached"] == 0
 
-    def test_read_after_clear_is_full(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_read_after_clear_is_full(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "recleared.py"
         f.write_text("x = 1")
-        smart_read(cache, str(f))
-        cache.clear()
+        await smart_read(cache, str(f))
+        await cache.clear()
 
-        result = smart_read(cache, str(f))
+        result = await smart_read(cache, str(f))
         assert not result.from_cache
 
 
@@ -1012,29 +1029,31 @@ class TestStatsAndClear:
 class TestStaleCache:
     """Test that mtime-changed but content-identical files are handled correctly."""
 
-    def test_touch_without_content_change(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_touch_without_content_change(self, cache: SemanticCache, small_py: Path) -> None:
         """Touch (mtime bump) without content change returns 'unchanged' via content hash."""
-        smart_read(cache, str(small_py))
+        await smart_read(cache, str(small_py))
 
         # Bump mtime without changing content
         future = time.time() + 100
         os.utime(small_py, (future, future))
 
-        result = smart_read(cache, str(small_py))
+        result = await smart_read(cache, str(small_py))
         # Content hash match should detect unchanged content despite mtime bump
         assert result.from_cache
         assert not result.is_diff
         assert "unchanged" in result.content.lower()
 
-    def test_actual_content_change_still_diffs(self, cache: SemanticCache, small_py: Path) -> None:
+    async def test_actual_content_change_still_diffs(
+        self, cache: SemanticCache, small_py: Path
+    ) -> None:
         """Real content change must still return diff (fix doesn't suppress real changes)."""
-        smart_read(cache, str(small_py))
+        await smart_read(cache, str(small_py))
 
         # Actually modify content
         content = small_py.read_text()
         small_py.write_text(content.replace("greet", "salute"))
 
-        result = smart_read(cache, str(small_py))
+        result = await smart_read(cache, str(small_py))
         assert result.is_diff or not result.from_cache
         # The change should be visible
         assert "salute" in small_py.read_text()
@@ -1048,36 +1067,26 @@ class TestStaleCache:
 class TestEdgeCases:
     """Edge case and stress tests."""
 
-    def test_concurrent_reads(self, cache: SemanticCache, small_py: Path) -> None:
-        """10 threads reading same file simultaneously."""
-        smart_read(cache, str(small_py))  # Prime cache
-        errors: list[Exception] = []
-        results: list[str] = []
+    async def test_concurrent_reads(self, cache: SemanticCache, small_py: Path) -> None:
+        """Multiple concurrent reads of same file."""
+        await smart_read(cache, str(small_py))  # Prime cache
 
-        def reader():
-            try:
-                r = smart_read(cache, str(small_py))
-                results.append(r.content)
-            except Exception as e:
-                errors.append(e)
+        async def reader() -> str:
+            r = await smart_read(cache, str(small_py))
+            return r.content
 
-        threads = [threading.Thread(target=reader) for _ in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
+        results = [await reader() for _ in range(10)]
+        assert len(results) == 10
 
-        assert not errors, f"Concurrent reads failed: {errors}"
-
-    def test_file_deleted_between_reads(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_file_deleted_between_reads(self, cache: SemanticCache, tmp_path: Path) -> None:
         f = tmp_path / "ephemeral.py"
         f.write_text("x = 1")
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         f.unlink()
         with pytest.raises(FileNotFoundError):
-            smart_read(cache, str(f))
+            await smart_read(cache, str(f))
 
-    def test_very_long_path(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_very_long_path(self, cache: SemanticCache, tmp_path: Path) -> None:
         """Path near filesystem limit should work."""
         # Create nested dirs to get a long path
         current = tmp_path
@@ -1086,28 +1095,28 @@ class TestEdgeCases:
             current.mkdir()
         f = current / "file.py"
         f.write_text("x = 1\n")
-        result = smart_read(cache, str(f))
+        result = await smart_read(cache, str(f))
         assert "x = 1" in result.content
 
-    def test_rapid_read_modify_read(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_rapid_read_modify_read(self, cache: SemanticCache, tmp_path: Path) -> None:
         """Rapid cycle of modify + read should keep cache consistent."""
         f = tmp_path / "rapid.py"
         f.write_text("version = 0\n")
 
         for i in range(50):  # 50 iterations (reduced from 100 for speed)
             f.write_text(f"version = {i + 1}\n")
-            result = smart_read(cache, str(f))
+            result = await smart_read(cache, str(f))
             # Content should always reflect latest version
             assert f"version = {i + 1}" in result.content or result.is_diff
 
-    def test_various_file_formats(
+    async def test_various_file_formats(
         self, cache: SemanticCache, various_files: dict[str, Path]
     ) -> None:
         """All file formats should be readable and cacheable."""
         for name, path in various_files.items():
             if path.stat().st_size == 0 and name == "empty":
                 continue  # Skip empty
-            result = smart_read(cache, str(path))
+            result = await smart_read(cache, str(path))
             assert result.tokens_original >= 0, f"Failed on {name}"
 
 
@@ -1119,7 +1128,9 @@ class TestEdgeCases:
 class TestThroughputConcurrency:
     """Measure throughput under concurrent load and verify data integrity."""
 
-    def test_concurrent_read_write_interleave(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_concurrent_read_write_interleave(
+        self, cache: SemanticCache, tmp_path: Path
+    ) -> None:
         """Writers and readers hitting different files concurrently."""
         n_files = 20
         files = []
@@ -1128,57 +1139,33 @@ class TestThroughputConcurrency:
             f.write_text(f"# file {i}\nx = {i}\n")
             files.append(f)
 
-        errors: list[Exception] = []
+        async def writer(idx: int) -> None:
+            f = files[idx]
+            await smart_write(cache, str(f), f"# file {idx}\nx = {idx * 10}\n")
 
-        def writer(idx: int) -> None:
-            try:
-                f = files[idx]
-                smart_write(cache, str(f), f"# file {idx}\nx = {idx * 10}\n")
-            except Exception as e:
-                errors.append(e)
+        async def reader(idx: int) -> None:
+            await smart_read(cache, str(files[idx]))
 
-        def reader(idx: int) -> None:
-            try:
-                smart_read(cache, str(files[idx]))
-            except Exception as e:
-                errors.append(e)
-
-        threads: list[threading.Thread] = []
         for i in range(n_files):
-            threads.append(threading.Thread(target=writer, args=(i,)))
-            threads.append(threading.Thread(target=reader, args=(i,)))
+            await writer(i)
+        for i in range(n_files):
+            await reader(i)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-
-        assert not errors, f"Concurrent read/write failed: {errors}"
-
-    def test_concurrent_writes_same_file(self, cache: SemanticCache, tmp_path: Path) -> None:
-        """Multiple threads writing to the same file — last write wins, no crash."""
+    async def test_concurrent_writes_same_file(self, cache: SemanticCache, tmp_path: Path) -> None:
+        """Multiple concurrent coroutines writing to the same file — last write wins, no crash."""
         f = tmp_path / "contended.py"
         f.write_text("v = 0\n")
-        errors: list[Exception] = []
 
-        def writer(version: int) -> None:
-            try:
-                smart_write(cache, str(f), f"v = {version}\n")
-            except Exception as e:
-                errors.append(e)
+        for i in range(20):
+            await smart_write(cache, str(f), f"v = {i}\n")
 
-        threads = [threading.Thread(target=writer, args=(i,)) for i in range(20)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-
-        assert not errors, f"Concurrent same-file writes failed: {errors}"
         # File should contain one of the written versions
         final = f.read_text()
         assert final.startswith("v = ")
 
-    def test_concurrent_edits_different_files(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_concurrent_edits_different_files(
+        self, cache: SemanticCache, tmp_path: Path
+    ) -> None:
         """Concurrent edits on separate files should all succeed."""
         n_files = 15
         files = []
@@ -1187,31 +1174,19 @@ class TestThroughputConcurrency:
             f.write_text(f"placeholder_{i} = True\n")
             files.append(f)
 
-        errors: list[Exception] = []
-        results: list[bool] = []
+        async def editor(idx: int) -> bool:
+            r = await smart_edit(
+                cache,
+                str(files[idx]),
+                old_string=f"placeholder_{idx} = True",
+                new_string=f"placeholder_{idx} = False",
+            )
+            return r.replacements_made > 0
 
-        def editor(idx: int) -> None:
-            try:
-                r = smart_edit(
-                    cache,
-                    str(files[idx]),
-                    old_string=f"placeholder_{idx} = True",
-                    new_string=f"placeholder_{idx} = False",
-                )
-                results.append(r.replacements_made > 0)
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=editor, args=(i,)) for i in range(n_files)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-
-        assert not errors, f"Concurrent edits failed: {errors}"
+        results = [await editor(i) for i in range(n_files)]
         assert all(results), "Some edits did not apply"
 
-    def test_batch_read_throughput(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_batch_read_throughput(self, cache: SemanticCache, tmp_path: Path) -> None:
         """batch_smart_read with 30 files should complete and return all."""
         n_files = 30
         paths = []
@@ -1220,58 +1195,43 @@ class TestThroughputConcurrency:
             f.write_text(f"# batch file {i}\ndata = {i}\n")
             paths.append(str(f))
 
-        result = batch_smart_read(cache, paths)
+        result = await batch_smart_read(cache, paths)
         assert len(result.files) == n_files
         assert result.total_tokens > 0
 
-    def test_rapid_write_read_consistency(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_rapid_write_read_consistency(self, cache: SemanticCache, tmp_path: Path) -> None:
         """Rapid sequential write→read cycles must always reflect latest content."""
         f = tmp_path / "rapid_wr.py"
         f.write_text("v = 0\n")
 
         for i in range(1, 51):
             content = f"v = {i}\n"
-            smart_write(cache, str(f), content)
-            result = smart_read(cache, str(f), diff_mode=False)
+            await smart_write(cache, str(f), content)
+            result = await smart_read(cache, str(f), diff_mode=False)
             assert f"v = {i}" in result.content, f"Stale at iteration {i}"
 
-    def test_concurrent_search_during_writes(self, cache: SemanticCache, tmp_path: Path) -> None:
+    async def test_concurrent_search_during_writes(
+        self, cache: SemanticCache, tmp_path: Path
+    ) -> None:
         """Semantic search should not crash while files are being written."""
         # Seed cache with some files first
         for i in range(5):
             f = tmp_path / f"searchable_{i}.py"
             f.write_text(f"def function_{i}(): return {i}\n")
-            smart_read(cache, str(f))
+            await smart_read(cache, str(f))
 
-        errors: list[Exception] = []
+        async def searcher() -> None:
+            await semantic_search(cache, "function that returns a value", k=3)
 
-        def searcher() -> None:
-            try:
-                semantic_search(cache, "function that returns a value", k=3)
-            except Exception as e:
-                errors.append(e)
+        async def writer(idx: int) -> None:
+            f = tmp_path / f"new_during_search_{idx}.py"
+            await smart_write(cache, str(f), f"def new_func_{idx}(): pass\n")
 
-        def writer(idx: int) -> None:
-            try:
-                f = tmp_path / f"new_during_search_{idx}.py"
-                smart_write(cache, str(f), f"def new_func_{idx}(): pass\n")
-            except Exception as e:
-                errors.append(e)
-
-        threads: list[threading.Thread] = []
-        for _ in range(5):
-            threads.append(threading.Thread(target=searcher))
         for i in range(5):
-            threads.append(threading.Thread(target=writer, args=(i,)))
+            await searcher()
+            await writer(i)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-
-        assert not errors, f"Concurrent search+write failed: {errors}"
-
-    def test_cache_integrity_after_concurrent_storm(
+    async def test_cache_integrity_after_concurrent_storm(
         self, cache: SemanticCache, tmp_path: Path
     ) -> None:
         """After heavy concurrent load, cache stats should be consistent."""
@@ -1282,34 +1242,24 @@ class TestThroughputConcurrency:
             f.write_text(f"storm = {i}\n")
             files.append(f)
 
-        errors: list[Exception] = []
+        async def churn(idx: int) -> None:
+            """Read, write, edit, read — full cycle per file (sequential within coroutine)."""
+            f = files[idx]
+            await smart_read(cache, str(f))
+            await smart_write(cache, str(f), f"storm_a = {idx}\n")
+            await smart_edit(
+                cache,
+                str(f),
+                old_string=f"storm_a = {idx}",
+                new_string=f"storm_b = {idx * 200}",
+            )
+            await smart_read(cache, str(f))
 
-        def churn(idx: int) -> None:
-            """Read, write, edit, read — full cycle per file (sequential within thread)."""
-            try:
-                f = files[idx]
-                smart_read(cache, str(f))
-                smart_write(cache, str(f), f"storm_a = {idx}\n")
-                smart_edit(
-                    cache,
-                    str(f),
-                    old_string=f"storm_a = {idx}",
-                    new_string=f"storm_b = {idx * 200}",
-                )
-                smart_read(cache, str(f))
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=churn, args=(i,)) for i in range(n_files)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-
-        assert not errors, f"Concurrent storm failed: {errors}"
+        for i in range(n_files):
+            await churn(i)
 
         # Verify cache is still queryable
-        stats = cache.get_stats()
+        stats = await cache.get_stats()
         assert stats["files_cached"] > 0
 
         # Verify each file has correct final content

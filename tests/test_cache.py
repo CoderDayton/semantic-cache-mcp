@@ -12,41 +12,41 @@ from semantic_cache_mcp.types import EmbeddingVector
 class TestSmartReadUnchangedFile:
     """Tests for smart_read with unchanged files."""
 
-    def test_unchanged_file_returns_minimal_response(
+    async def test_unchanged_file_returns_minimal_response(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Unchanged file should return cached content."""
         file_path = sample_files["simple"]
 
         # First read - caches the file
-        result1 = smart_read(semantic_cache_no_embeddings, str(file_path))
+        result1 = await smart_read(semantic_cache_no_embeddings, str(file_path))
         assert result1.from_cache is False
 
         # Second read - file unchanged, should come from cache
-        result2 = smart_read(semantic_cache_no_embeddings, str(file_path))
+        result2 = await smart_read(semantic_cache_no_embeddings, str(file_path))
         assert result2.from_cache is True
         # For small files, full content is returned (more efficient than message)
         # For large files, "unchanged" message would be returned
         assert result2.content is not None
 
-    def test_unchanged_file_tokens_saved(
+    async def test_unchanged_file_tokens_saved(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Unchanged file should save tokens."""
         file_path = sample_files["python"]
 
         # First read
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Second read
-        result = smart_read(semantic_cache_no_embeddings, str(file_path))
+        result = await smart_read(semantic_cache_no_embeddings, str(file_path))
         assert result.tokens_saved >= 0
 
 
 class TestSmartReadChangedFile:
     """Tests for smart_read with changed files."""
 
-    def test_changed_file_returns_diff(
+    async def test_changed_file_returns_diff(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Changed file should return unified diff when diff is significantly smaller."""
@@ -56,37 +56,37 @@ class TestSmartReadChangedFile:
         file_path.write_text("".join(original_lines))
 
         # First read
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Small modification (diff should be much smaller than full content)
         file_path.write_text("".join(original_lines) + "New line added at the end\n")
 
         # Second read - should get diff since it's much smaller than full content
-        result = smart_read(semantic_cache_no_embeddings, str(file_path))
+        result = await smart_read(semantic_cache_no_embeddings, str(file_path))
         assert result.from_cache is True
         assert result.is_diff is True
         assert "Diff" in result.content or "+" in result.content
 
-    def test_changed_file_updates_cache(
+    async def test_changed_file_updates_cache(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Changed file should update cache entry."""
         file_path = sample_files["simple"]
 
         # First read
-        smart_read(semantic_cache_no_embeddings, str(file_path))
-        entry1 = semantic_cache_no_embeddings.get(str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
+        entry1 = await semantic_cache_no_embeddings.get(str(file_path))
 
         # Modify and read again
         file_path.write_text("Modified content\n")
-        smart_read(semantic_cache_no_embeddings, str(file_path))
-        entry2 = semantic_cache_no_embeddings.get(str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
+        entry2 = await semantic_cache_no_embeddings.get(str(file_path))
 
         assert entry1 is not None
         assert entry2 is not None
         assert entry1.content_hash != entry2.content_hash
 
-    def test_changed_file_respects_max_size_when_full_is_cheapest(
+    async def test_changed_file_respects_max_size_when_full_is_cheapest(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Changed cached reads should still respect max_size when full beats diff."""
@@ -94,11 +94,11 @@ class TestSmartReadChangedFile:
         file_path.write_text("A" * 120_000)
 
         # Prime cache with original content.
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Rewrite completely so diff is expensive; bounded full content should win.
         file_path.write_text("B" * 120_000)
-        result = smart_read(semantic_cache_no_embeddings, str(file_path), max_size=5_000)
+        result = await smart_read(semantic_cache_no_embeddings, str(file_path), max_size=5_000)
 
         assert result.truncated is True
         assert len(result.content) <= 5_000
@@ -107,7 +107,7 @@ class TestSmartReadChangedFile:
 class TestSmartReadSemanticMatch:
     """Tests for smart_read with semantic similarity."""
 
-    def test_semantic_match_with_similar_file(
+    async def test_semantic_match_with_similar_file(
         self, temp_dir: Path, mock_embeddings: EmbeddingVector
     ) -> None:
         """Should find and reference semantically similar cached file."""
@@ -125,14 +125,14 @@ class TestSmartReadSemanticMatch:
             file2.write_text("def hello():\n    return 'Hi'\n")
 
             # Cache first file
-            smart_read(cache, str(file1))
+            await smart_read(cache, str(file1))
 
             # Read second file - might find semantic match
-            result = smart_read(cache, str(file2))
+            result = await smart_read(cache, str(file2))
             # The result should indicate it processed the file
             assert result.content is not None
 
-    def test_semantic_diff_includes_base_file_context(
+    async def test_semantic_diff_includes_base_file_context(
         self, temp_dir: Path, mock_embeddings: EmbeddingVector
     ) -> None:
         """Semantic diff responses should include the base cached path."""
@@ -151,8 +151,8 @@ class TestSmartReadSemanticMatch:
             base.write_text("".join(base_lines))
             variant.write_text("".join(variant_lines))
 
-            smart_read(cache, str(base))
-            result = smart_read(cache, str(variant))
+            await smart_read(cache, str(base))
+            result = await smart_read(cache, str(variant))
 
             assert result.is_diff is True
             assert result.semantic_match == str(base)
@@ -162,13 +162,13 @@ class TestSmartReadSemanticMatch:
 class TestSmartReadLargeFile:
     """Tests for smart_read with large files."""
 
-    def test_large_file_truncation(
+    async def test_large_file_truncation(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """Large files should be truncated."""
         file_path = sample_files["large"]
 
-        result = smart_read(
+        result = await smart_read(
             semantic_cache_no_embeddings,
             str(file_path),
             max_size=10000,  # Much smaller than 150KB file
@@ -176,7 +176,7 @@ class TestSmartReadLargeFile:
         assert result.truncated is True
         assert len(result.content) <= 10000
 
-    def test_large_file_preserves_structure(
+    async def test_large_file_preserves_structure(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
     ) -> None:
         """Truncation should preserve file structure (top + bottom)."""
@@ -185,7 +185,7 @@ class TestSmartReadLargeFile:
         large_file = temp_dir / "structured_large.txt"
         large_file.write_text("".join(lines))
 
-        result = smart_read(
+        result = await smart_read(
             semantic_cache_no_embeddings,
             str(large_file),
             max_size=5000,
@@ -199,7 +199,7 @@ class TestSmartReadLargeFile:
 class TestSmartReadDiffModeDisabled:
     """Tests for smart_read with diff_mode=False to get full content."""
 
-    def test_diff_mode_false_bypasses_cache(
+    async def test_diff_mode_false_bypasses_cache(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """diff_mode=False should return full content even if cached."""
@@ -207,10 +207,10 @@ class TestSmartReadDiffModeDisabled:
         content = file_path.read_text()
 
         # First read to cache
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Read with diff_mode=False to get full content
-        result = smart_read(
+        result = await smart_read(
             semantic_cache_no_embeddings,
             str(file_path),
             diff_mode=False,
@@ -222,30 +222,30 @@ class TestSmartReadDiffModeDisabled:
 class TestCacheOperations:
     """Tests for SemanticCache operations."""
 
-    def test_get_stats_returns_metrics(
+    async def test_get_stats_returns_metrics(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """get_stats should return cache metrics."""
         # Cache some files
-        smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
-        smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
+        await smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
+        await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
 
-        stats = semantic_cache_no_embeddings.get_stats()
+        stats = await semantic_cache_no_embeddings.get_stats()
         assert stats["files_cached"] == 2
         assert stats["total_tokens_cached"] > 0
 
-    def test_clear_removes_all(
+    async def test_clear_removes_all(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """clear should remove all cache entries."""
         # Cache files
-        smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
-        smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
+        await smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
+        await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
 
-        count = semantic_cache_no_embeddings.clear()
+        count = await semantic_cache_no_embeddings.clear()
         assert count == 2
 
-        stats = semantic_cache_no_embeddings.get_stats()
+        stats = await semantic_cache_no_embeddings.get_stats()
         assert stats["files_cached"] == 0
 
     def test_get_embedding_without_embeddings_service(
@@ -272,11 +272,11 @@ class TestCacheOperations:
 class TestCacheReadResult:
     """Tests for ReadResult structure."""
 
-    def test_read_result_fields(
+    async def test_read_result_fields(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """ReadResult should have all expected fields."""
-        result = smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
+        result = await smart_read(semantic_cache_no_embeddings, str(sample_files["simple"]))
 
         assert hasattr(result, "content")
         assert hasattr(result, "from_cache")
@@ -287,11 +287,11 @@ class TestCacheReadResult:
         assert hasattr(result, "truncated")
         assert hasattr(result, "compression_ratio")
 
-    def test_compression_ratio_calculation(
+    async def test_compression_ratio_calculation(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """compression_ratio should be calculated correctly."""
-        result = smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
+        result = await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
 
         assert 0 < result.compression_ratio <= 1.0
 
@@ -299,17 +299,17 @@ class TestCacheReadResult:
 class TestSmartReadDiffMode:
     """Tests for diff_mode parameter."""
 
-    def test_diff_mode_disabled_returns_full(
+    async def test_diff_mode_disabled_returns_full(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
         """diff_mode=False should always return full content."""
         file_path = sample_files["simple"]
 
         # Cache the file
-        smart_read(semantic_cache_no_embeddings, str(file_path))
+        await smart_read(semantic_cache_no_embeddings, str(file_path))
 
         # Read again with diff_mode disabled
-        result = smart_read(
+        result = await smart_read(
             semantic_cache_no_embeddings,
             str(file_path),
             diff_mode=False,
@@ -321,7 +321,9 @@ class TestSmartReadDiffMode:
 class TestEmbeddingsIntegration:
     """Tests for FastEmbed integration."""
 
-    def test_embed_function_called(self, temp_dir: Path, mock_embeddings: EmbeddingVector) -> None:
+    async def test_embed_function_called(
+        self, temp_dir: Path, mock_embeddings: EmbeddingVector
+    ) -> None:
         """Verify embed function is called when generating embeddings."""
         db_path = temp_dir / "embed_test.db"
 
@@ -332,12 +334,12 @@ class TestEmbeddingsIntegration:
             test_file = temp_dir / "test.txt"
             test_file.write_text("Test content for embedding")
 
-            smart_read(cache, str(test_file))
+            await smart_read(cache, str(test_file))
 
             # Verify embed was called
             assert mock_embed.called
 
-    def test_embedding_stored_in_cache(
+    async def test_embedding_stored_in_cache(
         self, temp_dir: Path, mock_embeddings: EmbeddingVector
     ) -> None:
         """Verify embedding is stored and file is retrievable."""
@@ -349,11 +351,11 @@ class TestEmbeddingsIntegration:
             test_file = temp_dir / "test.txt"
             test_file.write_text("Test content")
 
-            smart_read(cache, str(test_file))
+            await smart_read(cache, str(test_file))
 
-            entry = cache.get(str(test_file))
+            entry = await cache.get(str(test_file))
             assert entry is not None
             # Embedding is stored in HNSW index, not returned on CacheEntry
             # Verify the file is findable via similarity search
-            similar = cache.find_similar(mock_embeddings)
+            similar = await cache.find_similar(mock_embeddings)
             assert similar is not None

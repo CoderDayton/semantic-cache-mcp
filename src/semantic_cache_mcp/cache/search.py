@@ -32,7 +32,7 @@ MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
 
-def semantic_search(
+async def semantic_search(
     cache: SemanticCache,
     query: str,
     k: int = 10,
@@ -66,14 +66,14 @@ def semantic_search(
     # Request extra results when directory filtering will reduce the set
     storage = cache._storage
     search_k = k * 3 if resolved_dir else k
-    results = storage.search_hybrid(
+    results = await storage.search_hybrid(
         query=query,
         embedding=query_embedding,
         k=search_k,
     )
 
     if not results:
-        stats = storage.get_stats()
+        stats = await storage.get_stats()
         total = stats.get("files_cached", 0)
         return SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
 
@@ -92,7 +92,7 @@ def semantic_search(
     max_score = filtered[0][2] if filtered else 1.0
     matches: list[SearchMatch] = []
     for path, preview, score in filtered:
-        entry = cache.get(path)
+        entry = await cache.get(path)
         tokens = entry.tokens if entry else 0
         normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
@@ -104,7 +104,7 @@ def semantic_search(
             )
         )
 
-    stats = storage.get_stats()
+    stats = await storage.get_stats()
     total = stats.get("files_cached", 0)
 
     return SearchResult(
@@ -115,7 +115,7 @@ def semantic_search(
     )
 
 
-def compare_files(
+async def compare_files(
     cache: SemanticCache,
     path1: str,
     path2: str,
@@ -148,9 +148,9 @@ def compare_files(
     from_cache2 = False
 
     # File 1
-    cached1 = cache.get(str(file1))
+    cached1 = await cache.get(str(file1))
     if cached1 and cached1.mtime >= file1.stat().st_mtime:
-        content1 = cache.get_content(cached1)
+        content1 = await cache.get_content(cached1)
         from_cache1 = True
     else:
         try:
@@ -162,12 +162,12 @@ def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
         mtime1 = file1.stat().st_mtime
         emb1 = cache.get_embedding(content1, str(file1))
-        cache.put(str(file1), content1, mtime1, emb1)
+        await cache.put(str(file1), content1, mtime1, emb1)
 
     # File 2
-    cached2 = cache.get(str(file2))
+    cached2 = await cache.get(str(file2))
     if cached2 and cached2.mtime >= file2.stat().st_mtime:
-        content2 = cache.get_content(cached2)
+        content2 = await cache.get_content(cached2)
         from_cache2 = True
     else:
         try:
@@ -179,7 +179,7 @@ def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
         mtime2 = file2.stat().st_mtime
         emb2 = cache.get_embedding(content2, str(file2))
-        cache.put(str(file2), content2, mtime2, emb2)
+        await cache.put(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
@@ -189,8 +189,8 @@ def compare_files(
 
     # Compute semantic similarity between embeddings (normalized)
     similarity = 0.0
-    entry1 = cache.get(str(file1))
-    entry2 = cache.get(str(file2))
+    entry1 = await cache.get(str(file1))
+    entry2 = await cache.get(str(file2))
     if entry1 and entry1.embedding and entry2 and entry2.embedding:
         # Normalize to proper cosine similarity in [0, 1] range
         raw_sim = cosine_similarity(entry1.embedding, entry2.embedding)
@@ -215,7 +215,7 @@ def compare_files(
     )
 
 
-def find_similar_files(
+async def find_similar_files(
     cache: SemanticCache,
     path: str,
     k: int = 5,
@@ -234,7 +234,7 @@ def find_similar_files(
     file_path = Path(path).expanduser().resolve()
 
     # Get/compute embedding for source file
-    cached = cache.get(str(file_path))
+    cached = await cache.get(str(file_path))
     source_tokens = 0
     content = file_path.read_text(encoding="utf-8")
 
@@ -243,12 +243,12 @@ def find_similar_files(
         source_tokens = cached.tokens
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
-        cache.update_mtime(str(file_path), file_mtime)
+        await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
     else:
         source_tokens = count_tokens(content)
         source_embedding = cache.get_embedding(content, str(file_path))
-        cache.put(str(file_path), content, file_mtime, source_embedding)
+        await cache.put(str(file_path), content, file_mtime, source_embedding)
 
     # VectorStorage doesn't return embeddings from get() — always compute
     source_embedding = cache.get_embedding(content, str(file_path))
@@ -263,7 +263,7 @@ def find_similar_files(
 
     # Use VectorStorage HNSW search
     storage = cache._storage
-    results = storage.find_similar_multi(
+    results = await storage.find_similar_multi(
         embedding=source_embedding,
         exclude_path=str(file_path),
         k=k,
@@ -271,7 +271,7 @@ def find_similar_files(
 
     similar_files: list[SimilarFile] = []
     for sim_path, sim_score in results:
-        entry = cache.get(sim_path)
+        entry = await cache.get(sim_path)
         tokens = entry.tokens if entry else 0
         similar_files.append(
             SimilarFile(
@@ -281,7 +281,7 @@ def find_similar_files(
             )
         )
 
-    stats = storage.get_stats()
+    stats = await storage.get_stats()
     total = stats.get("files_cached", 0)
 
     return SimilarFilesResult(
@@ -292,7 +292,7 @@ def find_similar_files(
     )
 
 
-def glob_with_cache_status(
+async def glob_with_cache_status(
     cache: SemanticCache,
     pattern: str,
     directory: str = ".",
@@ -334,7 +334,7 @@ def glob_with_cache_status(
         mtime = file_path.stat().st_mtime
 
         # Check cache status
-        cached = cache.get(path_str)
+        cached = await cache.get(path_str)
         is_cached = cached is not None
         tokens = cached.tokens if cached else None
 
