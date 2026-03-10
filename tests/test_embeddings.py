@@ -9,11 +9,11 @@ import pytest
 
 
 def _reset_embedding_state() -> None:
-    from semantic_cache_mcp.core import embeddings
+    from semantic_cache_mcp.core.embeddings import _model as _emb_model
 
-    embeddings._embedding_model = None
-    embeddings._model_ready = False
-    embeddings._execution_provider = "unknown"
+    _emb_model._embedding_model = None
+    _emb_model._model_ready = False
+    _emb_model._execution_provider = "unknown"
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +30,7 @@ class TestEmbeddingProviders:
     def test_uses_cuda_provider_when_available(self, monkeypatch) -> None:
         """Model init should request CUDA provider when runtime supports it."""
         from semantic_cache_mcp.core import embeddings
+        from semantic_cache_mcp.core.embeddings import _model as _emb_model
 
         calls: list[dict] = []
 
@@ -40,8 +41,8 @@ class TestEmbeddingProviders:
             def embed(self, items):
                 return []
 
-        monkeypatch.setattr(embeddings, "EMBEDDING_DEVICE", "auto")
-        monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
+        monkeypatch.setattr(_emb_model, "EMBEDDING_DEVICE", "auto")
+        monkeypatch.setattr(_emb_model, "_cuda_provider_is_available", lambda: True)
         monkeypatch.setitem(
             sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
         )
@@ -54,11 +55,12 @@ class TestEmbeddingProviders:
         assert len(providers) == 1
         provider_name = providers[0] if isinstance(providers[0], str) else providers[0][0]
         assert provider_name == "CUDAExecutionProvider"
-        assert embeddings._execution_provider == "CUDAExecutionProvider"
+        assert _emb_model._execution_provider == "CUDAExecutionProvider"
 
     def test_falls_back_to_cpu_when_cuda_not_available(self, monkeypatch) -> None:
         """Model init should not set CUDA providers when unavailable."""
         from semantic_cache_mcp.core import embeddings
+        from semantic_cache_mcp.core.embeddings import _model as _emb_model
 
         calls: list[dict] = []
 
@@ -69,7 +71,7 @@ class TestEmbeddingProviders:
             def embed(self, items):
                 return []
 
-        monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: False)
+        monkeypatch.setattr(_emb_model, "_cuda_provider_is_available", lambda: False)
         monkeypatch.setitem(
             sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
         )
@@ -78,11 +80,12 @@ class TestEmbeddingProviders:
 
         assert len(calls) == 1
         assert "providers" not in calls[0]
-        assert embeddings._execution_provider == "CPUExecutionProvider"
+        assert _emb_model._execution_provider == "CPUExecutionProvider"
 
     def test_falls_back_if_providers_argument_unsupported(self, monkeypatch) -> None:
         """If providers arg is unsupported, retry initialization without it."""
         from semantic_cache_mcp.core import embeddings
+        from semantic_cache_mcp.core.embeddings import _model as _emb_model
 
         calls: list[dict] = []
 
@@ -95,8 +98,8 @@ class TestEmbeddingProviders:
             def embed(self, items):
                 return []
 
-        monkeypatch.setattr(embeddings, "EMBEDDING_DEVICE", "auto")
-        monkeypatch.setattr(embeddings, "_cuda_provider_is_available", lambda: True)
+        monkeypatch.setattr(_emb_model, "EMBEDDING_DEVICE", "auto")
+        monkeypatch.setattr(_emb_model, "_cuda_provider_is_available", lambda: True)
         monkeypatch.setitem(
             sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
         )
@@ -106,7 +109,7 @@ class TestEmbeddingProviders:
         assert len(calls) == 2
         assert "providers" in calls[0]
         assert "providers" not in calls[1]
-        assert embeddings._execution_provider == "CPUExecutionProvider"
+        assert _emb_model._execution_provider == "CPUExecutionProvider"
 
 
 class TestCustomModelRegistration:

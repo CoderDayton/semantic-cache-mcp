@@ -6,7 +6,7 @@ import array
 import os
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -192,7 +192,7 @@ class TestTokenizerThreadSafety:
 
     def test_download_hash_mismatch(self) -> None:
         """Hash verification failure on download → returns None, sets loaded."""
-        from semantic_cache_mcp.core import tokenizer
+        import semantic_cache_mcp.core.tokenizer._bpe as tokenizer
 
         original_loaded = tokenizer._tokenizer_loaded
         original_tokenizer = tokenizer._tokenizer
@@ -221,7 +221,7 @@ class TestTokenizerThreadSafety:
         """Download failure → returns None, sets loaded."""
         import urllib.error
 
-        from semantic_cache_mcp.core import tokenizer
+        import semantic_cache_mcp.core.tokenizer._bpe as tokenizer
 
         original_loaded = tokenizer._tokenizer_loaded
         original_tokenizer = tokenizer._tokenizer
@@ -287,7 +287,7 @@ class TestConnectionPoolLock:
 class TestDirectoryFilterBypass:
     """Cover line 129: Path.is_relative_to instead of startswith."""
 
-    def test_is_relative_to_rejects_prefix_attack(
+    async def test_is_relative_to_rejects_prefix_attack(
         self, temp_dir: Path, semantic_cache: SemanticCache
     ) -> None:
         """'/project_evil' not matched when filtering for '/project'."""
@@ -301,14 +301,16 @@ class TestDirectoryFilterBypass:
 
         from semantic_cache_mcp.cache import smart_read
 
-        smart_read(semantic_cache, str(project / "good.py"), max_size=100000)
-        smart_read(semantic_cache, str(project_evil / "evil.py"), max_size=100000)
+        await smart_read(semantic_cache, str(project / "good.py"), max_size=100000)
+        await smart_read(semantic_cache, str(project_evil / "evil.py"), max_size=100000)
 
         with patch(
             "semantic_cache_mcp.cache.search.embed_query",
             return_value=array.array("f", [0.1] * TEST_EMBEDDING_DIM),
         ):
-            result = semantic_search(semantic_cache, query="test", k=10, directory=str(project))
+            result = await semantic_search(
+                semantic_cache, query="test", k=10, directory=str(project)
+            )
 
         paths = [m.path for m in result.matches]
         for p in paths:
@@ -318,15 +320,15 @@ class TestDirectoryFilterBypass:
 class TestCompareFilesSafety:
     """Cover lines 190-193 and 208-216: existence, binary, unicode checks."""
 
-    def test_missing_file_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
+    async def test_missing_file_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
         """compare_files with missing file → FileNotFoundError."""
         existing = temp_dir / "exists.py"
         existing.write_text("x = 1\n")
 
         with pytest.raises(FileNotFoundError, match="File not found"):
-            compare_files(semantic_cache, str(existing), str(temp_dir / "nope.py"))
+            await compare_files(semantic_cache, str(existing), str(temp_dir / "nope.py"))
 
-    def test_binary_file_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
+    async def test_binary_file_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
         """compare_files with binary file → ValueError."""
         text_file = temp_dir / "text.py"
         text_file.write_text("x = 1\n")
@@ -336,12 +338,12 @@ class TestCompareFilesSafety:
         # Cache the text file first
         from semantic_cache_mcp.cache import smart_read
 
-        smart_read(semantic_cache, str(text_file), max_size=100000)
+        await smart_read(semantic_cache, str(text_file), max_size=100000)
 
         with pytest.raises(ValueError, match="binary"):
-            compare_files(semantic_cache, str(text_file), str(binary_file))
+            await compare_files(semantic_cache, str(text_file), str(binary_file))
 
-    def test_invalid_utf8_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
+    async def test_invalid_utf8_raises(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
         """compare_files with non-UTF-8 file → ValueError."""
         text_file = temp_dir / "text.py"
         text_file.write_text("x = 1\n")
@@ -350,16 +352,16 @@ class TestCompareFilesSafety:
 
         from semantic_cache_mcp.cache import smart_read
 
-        smart_read(semantic_cache, str(text_file), max_size=100000)
+        await smart_read(semantic_cache, str(text_file), max_size=100000)
 
         with pytest.raises(ValueError, match="not valid UTF-8"):
-            compare_files(semantic_cache, str(text_file), str(bad_file))
+            await compare_files(semantic_cache, str(text_file), str(bad_file))
 
 
 class TestSymlinkScope:
     """Cover line 382: symlink escaping base directory."""
 
-    def test_symlink_outside_base_skipped(
+    async def test_symlink_outside_base_skipped(
         self, temp_dir: Path, semantic_cache: SemanticCache
     ) -> None:
         """Symlinks pointing outside base directory are skipped in glob."""
@@ -372,7 +374,7 @@ class TestSymlinkScope:
         (base / "link.py").symlink_to(outside / "secret.py")
         (base / "real.py").write_text("real = True\n")
 
-        result = glob_with_cache_status(semantic_cache, "**/*.py", str(base))
+        result = await glob_with_cache_status(semantic_cache, "**/*.py", str(base))
         paths = [m.path for m in result.matches]
 
         assert any("real.py" in p for p in paths)
@@ -382,20 +384,22 @@ class TestSymlinkScope:
 class TestSearchKValidation:
     """Cover k = max(1, min(k, MAX)) in search and similar."""
 
-    def test_k_zero_clamped(self, semantic_cache: SemanticCache) -> None:
+    async def test_k_zero_clamped(self, semantic_cache: SemanticCache) -> None:
         """k=0 clamped to 1 instead of returning empty."""
         with patch(
             "semantic_cache_mcp.cache.search.embed_query",
             return_value=array.array("f", [0.1] * TEST_EMBEDDING_DIM),
         ):
-            result = semantic_search(semantic_cache, query="test", k=0)
+            result = await semantic_search(semantic_cache, query="test", k=0)
         assert result.matches is not None
 
-    def test_similar_k_zero_clamped(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
+    async def test_similar_k_zero_clamped(
+        self, temp_dir: Path, semantic_cache: SemanticCache
+    ) -> None:
         """find_similar_files with k=0 doesn't crash."""
         f = temp_dir / "test.py"
         f.write_text("x = 1\n")
-        result = find_similar_files(semantic_cache, str(f), k=0)
+        result = await find_similar_files(semantic_cache, str(f), k=0)
         assert result.similar_files is not None
 
 
@@ -438,7 +442,7 @@ class TestAtomicWrite:
 class TestTypeErrorOnNoneLineRange:
     """Cover assert→TypeError replacements in smart_edit and smart_batch_edit."""
 
-    def test_edit_line_replace_both_none(
+    async def test_edit_line_replace_both_none(
         self, temp_dir: Path, semantic_cache: SemanticCache
     ) -> None:
         """Line-replace mode (old_string=None) requires both start_line and end_line.
@@ -454,12 +458,12 @@ class TestTypeErrorOnNoneLineRange:
 
         from semantic_cache_mcp.cache import smart_read
 
-        smart_read(semantic_cache, str(f), max_size=100000)
+        await smart_read(semantic_cache, str(f), max_size=100000)
 
         # Test that providing neither start_line nor end_line with old_string=None
         # raises ValueError (from the earlier validation)
         with pytest.raises(ValueError, match="old_string.*or.*start_line.*end_line"):
-            smart_edit(
+            await smart_edit(
                 cache=semantic_cache,
                 path=str(f),
                 old_string=None,
@@ -468,7 +472,7 @@ class TestTypeErrorOnNoneLineRange:
                 end_line=None,
             )
 
-    def test_edit_line_replace_both_provided(
+    async def test_edit_line_replace_both_provided(
         self, temp_dir: Path, semantic_cache: SemanticCache
     ) -> None:
         """Line-replace mode works when both start_line and end_line provided."""
@@ -477,10 +481,10 @@ class TestTypeErrorOnNoneLineRange:
 
         from semantic_cache_mcp.cache import smart_read
 
-        smart_read(semantic_cache, str(f), max_size=100000)
+        await smart_read(semantic_cache, str(f), max_size=100000)
 
         # This should work (covers the non-error path through the TypeError guard)
-        result = smart_edit(
+        result = await smart_edit(
             cache=semantic_cache,
             path=str(f),
             old_string=None,
@@ -499,7 +503,7 @@ class TestTypeErrorOnNoneLineRange:
 class TestToolsBoundsValidation:
     """Cover lines 81-85: offset, limit, max_size validation."""
 
-    def test_read_negative_offset(self, semantic_cache: SemanticCache) -> None:
+    async def test_read_negative_offset(self, semantic_cache: SemanticCache) -> None:
         """offset < 1 returns error."""
         from unittest.mock import MagicMock
 
@@ -508,20 +512,22 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
+        result = await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
         assert "offset must be >= 1" in result
 
-    def test_read_negative_limit(self, semantic_cache: SemanticCache) -> None:
+    async def test_read_negative_limit(self, semantic_cache: SemanticCache) -> None:
         """limit < 1 returns error."""
         from semantic_cache_mcp.server.tools import read
 
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
+        result = await read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
         assert "limit must be >= 1" in result
 
-    def test_read_max_size_clamped(self, temp_dir: Path, semantic_cache: SemanticCache) -> None:
+    async def test_read_max_size_clamped(
+        self, temp_dir: Path, semantic_cache: SemanticCache
+    ) -> None:
         """max_size is clamped to valid range."""
         from semantic_cache_mcp.server.tools import read
 
@@ -532,7 +538,7 @@ class TestToolsBoundsValidation:
         ctx.lifespan_context = {"cache": semantic_cache}
 
         # Negative max_size clamped to 1 (won't crash)
-        result = read(ctx=ctx, path=str(f), max_size=-999)
+        result = await read(ctx=ctx, path=str(f), max_size=-999)
         assert isinstance(result, str)
 
 
@@ -655,7 +661,7 @@ class TestTokenizerCachePaths:
 
     def test_hash_mismatch_triggers_redownload(self, tmp_path: Path) -> None:
         """If cached file has wrong hash, it should be deleted."""
-        import semantic_cache_mcp.core.tokenizer as tok_mod
+        import semantic_cache_mcp.core.tokenizer._bpe as tok_mod
 
         # Reset global state for this test
         original_loaded = tok_mod._tokenizer_loaded
@@ -686,7 +692,7 @@ class TestTokenizerCachePaths:
 
     def test_download_hash_mismatch_returns_none(self, tmp_path: Path) -> None:
         """If downloaded file has wrong hash, return None without init."""
-        import semantic_cache_mcp.core.tokenizer as tok_mod
+        import semantic_cache_mcp.core.tokenizer._bpe as tok_mod
 
         original_loaded = tok_mod._tokenizer_loaded
         original_tok = tok_mod._tokenizer
@@ -714,7 +720,7 @@ class TestTokenizerCachePaths:
 
     def test_download_success_inits_tokenizer(self, tmp_path: Path) -> None:
         """Successful download + hash match should init tokenizer."""
-        import semantic_cache_mcp.core.tokenizer as tok_mod
+        import semantic_cache_mcp.core.tokenizer._bpe as tok_mod
 
         original_loaded = tok_mod._tokenizer_loaded
         original_tok = tok_mod._tokenizer
@@ -747,7 +753,7 @@ class TestTokenizerCachePaths:
         """URLError during download should return None gracefully."""
         import urllib.error
 
-        import semantic_cache_mcp.core.tokenizer as tok_mod
+        import semantic_cache_mcp.core.tokenizer._bpe as tok_mod
 
         original_loaded = tok_mod._tokenizer_loaded
         original_tok = tok_mod._tokenizer
@@ -773,7 +779,7 @@ class TestTokenizerCachePaths:
 class TestGlobSymlinkEscape:
     """Cover symlink escape filtering in glob_with_cache_status."""
 
-    def test_symlink_outside_dir_is_skipped(self, tmp_path: Path) -> None:
+    async def test_symlink_outside_dir_is_skipped(self, tmp_path: Path) -> None:
         """Symlinks pointing outside the glob directory are filtered out."""
         import os
 
@@ -787,16 +793,16 @@ class TestGlobSymlinkEscape:
         link = search_dir / "escape.txt"
         os.symlink(outside, link)
 
-        with patch("semantic_cache_mcp.cache.search.SemanticCache") as mock_cache:
-            mock_cache.get.return_value = None
-            result = glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
+        mock_cache = MagicMock()
+        mock_cache.get = AsyncMock(return_value=None)
+        result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]
         assert str(search_dir / "real.txt") in paths
         # symlink pointing outside should be filtered
         assert str(link) not in paths
 
-    def test_symlink_inside_dir_is_kept(self, tmp_path: Path) -> None:
+    async def test_symlink_inside_dir_is_kept(self, tmp_path: Path) -> None:
         """Symlinks pointing within the glob directory are kept."""
         import os
 
@@ -808,9 +814,9 @@ class TestGlobSymlinkEscape:
         link = search_dir / "alias.txt"
         os.symlink(real, link)
 
-        with patch("semantic_cache_mcp.cache.search.SemanticCache") as mock_cache:
-            mock_cache.get.return_value = None
-            result = glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
+        mock_cache = MagicMock()
+        mock_cache.get = AsyncMock(return_value=None)
+        result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]
         assert str(link) in paths
@@ -819,28 +825,26 @@ class TestGlobSymlinkEscape:
 class TestSemanticSearchDirectoryFilter:
     """Cover directory filter path in semantic_search."""
 
-    def test_directory_filter_excludes_outside_files(self, tmp_path: Path) -> None:
+    async def test_directory_filter_excludes_outside_files(self, tmp_path: Path) -> None:
         """Files outside the directory filter should be excluded."""
         with patch("semantic_cache_mcp.cache.search.embed_query") as mock_embed:
             mock_embed.return_value = list(np.zeros(64, dtype=np.float32))
 
             mock_cache = MagicMock()
             mock_storage = MagicMock()
-            mock_pool = MagicMock()
             mock_cache._storage = mock_storage
-            mock_storage._pool = mock_pool
 
-            # Return files in different directories
-            mock_conn = MagicMock()
-            mock_conn.execute.return_value.fetchall.return_value = [
-                ("/home/user/project/a.py", 100, b"\x00" * 64),
-                ("/other/path/b.py", 200, b"\x00" * 64),
-            ]
-            mock_pool.get_connection.return_value.__enter__ = lambda s: mock_conn
-            mock_pool.get_connection.return_value.__exit__ = MagicMock(return_value=False)
+            # Return files in different directories; all outside /nonexistent/dir
+            mock_storage.search_hybrid = AsyncMock(
+                return_value=[
+                    ("/home/user/project/a.py", "preview a", 0.9),
+                    ("/other/path/b.py", "preview b", 0.8),
+                ]
+            )
+            mock_storage.get_stats = AsyncMock(return_value={"files_cached": 2})
 
             # All filtered out → empty result
-            result = semantic_search(
+            result = await semantic_search(
                 mock_cache,
                 query="test",
                 k=5,

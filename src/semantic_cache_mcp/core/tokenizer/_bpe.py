@@ -24,7 +24,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..config import CACHE_DIR
+from ...config import CACHE_DIR
 
 if TYPE_CHECKING:
     from collections.abc import Set

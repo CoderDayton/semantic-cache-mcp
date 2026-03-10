@@ -180,7 +180,7 @@ class TestEmbeddingsPublicAPI:
         fake_vec = np.zeros(384, dtype=np.float32)
         mock_model.embed.return_value = iter([fake_vec])
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             result = embed("hello world")
 
         assert result is not None
@@ -192,7 +192,7 @@ class TestEmbeddingsPublicAPI:
         mock_model = MagicMock()
         mock_model.embed.side_effect = RuntimeError("model broken")
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             result = embed("hello")
 
         assert result is None
@@ -204,7 +204,7 @@ class TestEmbeddingsPublicAPI:
         fake_vecs = [np.zeros(384, dtype=np.float32)] * 3
         mock_model.embed.return_value = iter(fake_vecs)
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             results = embed_batch(["a", "b", "c"])
 
         assert len(results) == 3
@@ -222,7 +222,7 @@ class TestEmbeddingsPublicAPI:
         mock_model = MagicMock()
         mock_model.embed.side_effect = RuntimeError("batch failed")
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             results = embed_batch(["a", "b"])
 
         assert results == [None, None]
@@ -240,7 +240,7 @@ class TestEmbeddingsPublicAPI:
 
         mock_model.embed.side_effect = capture_embed
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             embed_query("search term")
 
         assert captured
@@ -252,25 +252,25 @@ class TestEmbeddingsPublicAPI:
         mock_model = MagicMock()
         mock_model.embed.side_effect = Exception("fail")
 
-        with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
             result = embed_query("query")
 
         assert result is None
 
     def test_warmup_skips_if_already_ready(self) -> None:
-        from semantic_cache_mcp.core import embeddings as emb_module
+        from semantic_cache_mcp.core.embeddings import _model as _emb_model
         from semantic_cache_mcp.core.embeddings import warmup
 
-        original = emb_module._model_ready
+        original = _emb_model._model_ready
         try:
-            emb_module._model_ready = True
+            _emb_model._model_ready = True
             mock_model = MagicMock()
-            with patch("semantic_cache_mcp.core.embeddings._embedding_model", mock_model):
+            with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
                 warmup()
             # embed should NOT have been called since already ready
             mock_model.embed.assert_not_called()
         finally:
-            emb_module._model_ready = original
+            _emb_model._model_ready = original
 
     def test_get_model_info_returns_dict(self) -> None:
         from semantic_cache_mcp.core.embeddings import get_model_info
@@ -311,31 +311,31 @@ class TestSemanticCacheStore:
         result = _get_rss_mb()
         assert result is None or isinstance(result, float)
 
-    def test_get_stats_includes_expected_keys(self, tmp_path: Path) -> None:
+    async def test_get_stats_includes_expected_keys(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
-        stats = cache.get_stats()
+        stats = await cache.get_stats()
         assert "files_cached" in stats
         assert "total_tokens_cached" in stats
         assert "embedding_ready" in stats
         assert "session" in stats
 
-    def test_get_stats_with_process_rss(self, tmp_path: Path) -> None:
+    async def test_get_stats_with_process_rss(self, tmp_path: Path) -> None:
         from semantic_cache_mcp.cache.store import _get_rss_mb
 
         cache = _make_cache(tmp_path)
         rss = _get_rss_mb()
-        stats = cache.get_stats()
+        stats = await cache.get_stats()
         if rss is not None:
             assert "process_rss_mb" in stats
 
-    def test_get_stats_lifetime_metrics_exception(self, tmp_path: Path) -> None:
+    async def test_get_stats_lifetime_metrics_exception(self, tmp_path: Path) -> None:
         """Lifetime metrics failure is silently swallowed."""
         cache = _make_cache(tmp_path)
         from semantic_cache_mcp.storage.sqlite import SQLiteStorage  # noqa: PLC0415
 
         with patch.object(SQLiteStorage, "get_lifetime_stats", side_effect=Exception("db error")):
             # Should not raise
-            stats = cache.get_stats()
+            stats = await cache.get_stats()
         assert "files_cached" in stats
 
     def test_vector_storage_del_called_on_garbage_collection(self, tmp_path: Path) -> None:
@@ -359,80 +359,80 @@ class TestSemanticCacheStore:
 class TestVectorStoragePutChunked:
     """Lines 81-82 (_put_chunked) — large file storage path."""
 
-    def test_put_large_file_chunked(self, tmp_path: Path) -> None:
+    async def test_put_large_file_chunked(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         # CHUNK_THRESHOLD = 8192 bytes; create content above that
         big_content = ("abcdefghij" * 1000) + "\n"  # ~10KB
-        vs.put("/large/file.txt", big_content, mtime=1.0, embedding=None)
+        await vs.put("/large/file.txt", big_content, mtime=1.0, embedding=None)
 
-        entry = vs.get("/large/file.txt")
+        entry = await vs.get("/large/file.txt")
         assert entry is not None
         assert entry.path == "/large/file.txt"
 
-        content = vs.get_content(entry)
+        content = await vs.get_content(entry)
         assert content == big_content
 
-    def test_put_chunked_with_embedding(self, tmp_path: Path) -> None:
+    async def test_put_chunked_with_embedding(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         emb = _make_embedding()
         big_content = ("xyz " * 3000) + "\n"
-        vs.put("/chunked/emb.txt", big_content, mtime=2.0, embedding=emb)
+        await vs.put("/chunked/emb.txt", big_content, mtime=2.0, embedding=emb)
 
-        entry = vs.get("/chunked/emb.txt")
+        entry = await vs.get("/chunked/emb.txt")
         assert entry is not None
 
 
 class TestVectorStorageGrep:
     """Lines 255-311 — grep regex search on cached content."""
 
-    def test_grep_literal_match(self, tmp_path: Path) -> None:
+    async def test_grep_literal_match(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/grep/a.txt", "hello world\nfoo bar\n", mtime=1.0)
-        results = vs.grep("hello", fixed_string=True)
+        await vs.put("/grep/a.txt", "hello world\nfoo bar\n", mtime=1.0)
+        results = await vs.grep("hello", fixed_string=True)
         assert any(r["path"] == "/grep/a.txt" for r in results)
         match_lines = [m["line"] for r in results for m in r["matches"]]
         assert any("hello" in line_text for line_text in match_lines)
 
-    def test_grep_regex_match(self, tmp_path: Path) -> None:
+    async def test_grep_regex_match(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/grep/b.txt", "error: code 404\ninfo: all good\n", mtime=1.0)
-        results = vs.grep(r"error: code \d+")
+        await vs.put("/grep/b.txt", "error: code 404\ninfo: all good\n", mtime=1.0)
+        results = await vs.grep(r"error: code \d+")
         paths = [r["path"] for r in results]
         assert "/grep/b.txt" in paths
 
-    def test_grep_case_insensitive(self, tmp_path: Path) -> None:
+    async def test_grep_case_insensitive(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/grep/c.txt", "Hello World\n", mtime=1.0)
-        results = vs.grep("hello world", fixed_string=True, case_sensitive=False)
+        await vs.put("/grep/c.txt", "Hello World\n", mtime=1.0)
+        results = await vs.grep("hello world", fixed_string=True, case_sensitive=False)
         assert any(r["path"] == "/grep/c.txt" for r in results)
 
-    def test_grep_with_context_lines(self, tmp_path: Path) -> None:
+    async def test_grep_with_context_lines(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         content = "line1\nTARGET\nline3\n"
-        vs.put("/grep/ctx.txt", content, mtime=1.0)
-        results = vs.grep("TARGET", fixed_string=True, context_lines=1)
+        await vs.put("/grep/ctx.txt", content, mtime=1.0)
+        results = await vs.grep("TARGET", fixed_string=True, context_lines=1)
         assert results
         match = results[0]["matches"][0]
         assert "before" in match or "after" in match
 
-    def test_grep_no_match(self, tmp_path: Path) -> None:
+    async def test_grep_no_match(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/grep/nomatch.txt", "nothing here\n", mtime=1.0)
-        results = vs.grep("XYZZY_NOT_PRESENT", fixed_string=True)
+        await vs.put("/grep/nomatch.txt", "nothing here\n", mtime=1.0)
+        results = await vs.grep("XYZZY_NOT_PRESENT", fixed_string=True)
         paths = [r["path"] for r in results]
         assert "/grep/nomatch.txt" not in paths
 
-    def test_grep_invalid_regex_returns_empty(self, tmp_path: Path) -> None:
+    async def test_grep_invalid_regex_returns_empty(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/grep/bad.txt", "content\n", mtime=1.0)
-        results = vs.grep("[invalid regex(")
+        await vs.put("/grep/bad.txt", "content\n", mtime=1.0)
+        results = await vs.grep("[invalid regex(")
         assert results == []
 
-    def test_grep_max_matches_limit(self, tmp_path: Path) -> None:
+    async def test_grep_max_matches_limit(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         content = "match\n" * 200
-        vs.put("/grep/many.txt", content, mtime=1.0)
-        results = vs.grep("match", fixed_string=True, max_matches=5)
+        await vs.put("/grep/many.txt", content, mtime=1.0)
+        results = await vs.grep("match", fixed_string=True, max_matches=5)
         total = sum(len(r["matches"]) for r in results)
         assert total <= 5
 
@@ -440,21 +440,21 @@ class TestVectorStorageGrep:
 class TestVectorStorageGetStats:
     """Lines 387-389, 434-441 — stats and eviction."""
 
-    def test_get_stats_empty_storage(self, tmp_path: Path) -> None:
+    async def test_get_stats_empty_storage(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        stats = vs.get_stats()
+        stats = await vs.get_stats()
         assert stats["files_cached"] == 0
         assert stats["total_tokens_cached"] == 0
         assert stats["db_size_mb"] >= 0
 
-    def test_get_stats_after_put(self, tmp_path: Path) -> None:
+    async def test_get_stats_after_put(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/stats/file.txt", "hello world\n", mtime=1.0)
-        stats = vs.get_stats()
+        await vs.put("/stats/file.txt", "hello world\n", mtime=1.0)
+        stats = await vs.get_stats()
         assert stats["files_cached"] == 1
         assert stats["total_tokens_cached"] > 0
 
-    def test_evict_if_needed_triggered(self, tmp_path: Path) -> None:
+    async def test_evict_if_needed_triggered(self, tmp_path: Path) -> None:
         """Patch MAX_CACHE_ENTRIES to force eviction after a few puts."""
         vs = _make_vector_storage(tmp_path)
         from semantic_cache_mcp.storage import vector as vec_mod
@@ -463,9 +463,9 @@ class TestVectorStorageGetStats:
         try:
             vec_mod.MAX_CACHE_ENTRIES = 3
             for i in range(6):
-                vs.put(f"/evict/file{i}.txt", f"content {i}\n" * 5, mtime=float(i))
+                await vs.put(f"/evict/file{i}.txt", f"content {i}\n" * 5, mtime=float(i))
             # After eviction, count should be <= original_max * doc_count
-            stats = vs.get_stats()
+            stats = await vs.get_stats()
             assert stats["files_cached"] >= 0  # Just verifying no crash
         finally:
             vec_mod.MAX_CACHE_ENTRIES = original_max
@@ -474,44 +474,44 @@ class TestVectorStorageGetStats:
 class TestVectorStorageSearchHybrid:
     """Lines 492, 494, 499 — search_hybrid and search_by_query."""
 
-    def test_search_by_query_returns_list(self, tmp_path: Path) -> None:
+    async def test_search_by_query_returns_list(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/search/doc.py", "def hello(): return 42\n", mtime=1.0)
-        results = vs.search_by_query("hello")
+        await vs.put("/search/doc.py", "def hello(): return 42\n", mtime=1.0)
+        results = await vs.search_by_query("hello")
         # May be empty if FTS not indexed yet, but must return list
         assert isinstance(results, list)
 
-    def test_search_hybrid_no_embedding(self, tmp_path: Path) -> None:
+    async def test_search_hybrid_no_embedding(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/search/doc2.py", "class Foo: pass\n", mtime=1.0)
-        results = vs.search_hybrid("Foo", embedding=None)
+        await vs.put("/search/doc2.py", "class Foo: pass\n", mtime=1.0)
+        results = await vs.search_hybrid("Foo", embedding=None)
         assert isinstance(results, list)
 
-    def test_search_hybrid_with_embedding(self, tmp_path: Path) -> None:
+    async def test_search_hybrid_with_embedding(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/search/doc3.py", "import os\n", mtime=1.0)
+        await vs.put("/search/doc3.py", "import os\n", mtime=1.0)
         emb = _make_embedding()
-        results = vs.search_hybrid("import", embedding=emb)
+        results = await vs.search_hybrid("import", embedding=emb)
         assert isinstance(results, list)
 
-    def test_search_by_query_keyword_search_exception(self, tmp_path: Path) -> None:
+    async def test_search_by_query_keyword_search_exception(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         # Patch the underlying collection to raise
         vs._collection.keyword_search = MagicMock(side_effect=Exception("fts error"))
-        results = vs.search_by_query("anything")
+        results = await vs.search_by_query("anything")
         assert results == []
 
-    def test_search_hybrid_exception(self, tmp_path: Path) -> None:
+    async def test_search_hybrid_exception(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         vs._collection.hybrid_search = MagicMock(side_effect=Exception("hybrid error"))
-        results = vs.search_hybrid("anything")
+        results = await vs.search_hybrid("anything")
         assert results == []
 
-    def test_find_similar_multi(self, tmp_path: Path) -> None:
+    async def test_find_similar_multi(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         emb = _make_embedding()
-        vs.put("/sim/a.txt", "hello", mtime=1.0, embedding=emb)
-        results = vs.find_similar_multi(emb, k=3)
+        await vs.put("/sim/a.txt", "hello", mtime=1.0, embedding=emb)
+        results = await vs.find_similar_multi(emb, k=3)
         assert isinstance(results, list)
 
 
@@ -523,7 +523,7 @@ class TestVectorStorageSearchHybrid:
 class TestFitContentToMaxSize:
     """Lines 26-40 — _fit_content_to_max_size via smart_read large file path."""
 
-    def test_large_file_triggers_summarization(self, tmp_path: Path) -> None:
+    async def test_large_file_triggers_summarization(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         # Create file > MAX_CONTENT_SIZE (default 100K) to trigger summarization
         big_file = tmp_path / "big.txt"
@@ -532,11 +532,11 @@ class TestFitContentToMaxSize:
         big_file.write_text(content)
 
         with patch("semantic_cache_mcp.cache.read.summarize_semantic", return_value="summary"):
-            result = smart_read(cache, str(big_file), max_size=100)
+            result = await smart_read(cache, str(big_file), max_size=100)
 
         assert result.truncated is True
 
-    def test_large_file_summarization_exception_fallback(self, tmp_path: Path) -> None:
+    async def test_large_file_summarization_exception_fallback(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         big_file = tmp_path / "big2.txt"
         content = "Line of content.\n" * 500
@@ -552,7 +552,7 @@ class TestFitContentToMaxSize:
                 return_value="truncated",
             ),
         ):
-            result = smart_read(cache, str(big_file), max_size=100)
+            result = await smart_read(cache, str(big_file), max_size=100)
 
         assert result.truncated is True
         assert result.content == "truncated"
@@ -561,81 +561,81 @@ class TestFitContentToMaxSize:
 class TestSmartReadEdgeCases:
     """Lines 76, 91-93, 227, 231-234 — binary detection, unicode replacement, offset/limit."""
 
-    def test_binary_file_raises_value_error(self, tmp_path: Path) -> None:
+    async def test_binary_file_raises_value_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         binary_file = tmp_path / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\x02\x03\xff\xfe\x80")
         with pytest.raises(ValueError, match="Binary file"):
-            smart_read(cache, str(binary_file))
+            await smart_read(cache, str(binary_file))
 
-    def test_unicode_replacement_on_decode_error(self, tmp_path: Path) -> None:
+    async def test_unicode_replacement_on_decode_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         bad_utf8 = tmp_path / "bad.txt"
         # Write bytes that are valid Latin-1 but not UTF-8
         bad_utf8.write_bytes(b"hello \x80\x81 world\n")
         # Should not raise; replacement chars used
-        result = smart_read(cache, str(bad_utf8))
+        result = await smart_read(cache, str(bad_utf8))
         assert result.content is not None
         assert "hello" in result.content
 
-    def test_file_not_found_raises(self, tmp_path: Path) -> None:
+    async def test_file_not_found_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         with pytest.raises(FileNotFoundError):
-            smart_read(cache, str(tmp_path / "nonexistent.txt"))
+            await smart_read(cache, str(tmp_path / "nonexistent.txt"))
 
-    def test_directory_raises_value_error(self, tmp_path: Path) -> None:
+    async def test_directory_raises_value_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         d = tmp_path / "adir"
         d.mkdir()
         with pytest.raises(ValueError, match="Not a regular file"):
-            smart_read(cache, str(d))
+            await smart_read(cache, str(d))
 
-    def test_symlink_resolved_transparently(self, tmp_path: Path) -> None:
+    async def test_symlink_resolved_transparently(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         real = tmp_path / "real.txt"
         real.write_text("hello from real\n")
         link = tmp_path / "link.txt"
         link.symlink_to(real)
-        result = smart_read(cache, str(link))
+        result = await smart_read(cache, str(link))
         assert "hello" in result.content
 
 
 class TestBatchSmartRead:
     """Lines 285-292, 321-327, 363-375, 405, 407 — batch read paths."""
 
-    def test_batch_read_basic(self, tmp_path: Path) -> None:
+    async def test_batch_read_basic(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f1 = tmp_path / "a.txt"
         f1.write_text("File A content\n")
         f2 = tmp_path / "b.txt"
         f2.write_text("File B content\n")
 
-        result = batch_smart_read(cache, [str(f1), str(f2)])
+        result = await batch_smart_read(cache, [str(f1), str(f2)])
         assert result.files_read >= 1
         assert len(result.contents) >= 1
 
-    def test_batch_read_skips_nonexistent(self, tmp_path: Path) -> None:
+    async def test_batch_read_skips_nonexistent(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f1 = tmp_path / "exists.txt"
         f1.write_text("content\n")
         bad = str(tmp_path / "missing.txt")
 
-        result = batch_smart_read(cache, [str(f1), bad])
+        result = await batch_smart_read(cache, [str(f1), bad])
         statuses = {s.path: s.status for s in result.files}
         assert statuses.get(bad) == "skipped"
 
-    def test_batch_read_skips_binary(self, tmp_path: Path) -> None:
+    async def test_batch_read_skips_binary(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         bin_file = tmp_path / "bin.bin"
         bin_file.write_bytes(b"\x00\x01\x02\x03")
         txt_file = tmp_path / "text.txt"
         txt_file.write_text("readable\n")
 
-        result = batch_smart_read(cache, [str(bin_file), str(txt_file)])
+        result = await batch_smart_read(cache, [str(bin_file), str(txt_file)])
         statuses = {s.path: s.status for s in result.files}
         assert statuses.get(str(bin_file)) == "skipped"
 
-    def test_batch_read_token_budget_overflow(self, tmp_path: Path) -> None:
+    async def test_batch_read_token_budget_overflow(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         files = []
         for i in range(5):
@@ -644,11 +644,11 @@ class TestBatchSmartRead:
             files.append(str(f))
 
         # Very tight budget forces skipping
-        result = batch_smart_read(cache, files, max_total_tokens=30)
+        result = await batch_smart_read(cache, files, max_total_tokens=30)
         skipped = [s for s in result.files if s.status == "skipped"]
         assert len(skipped) > 0
 
-    def test_batch_read_max_files_dos_limit(self, tmp_path: Path) -> None:
+    async def test_batch_read_max_files_dos_limit(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         # Create 60 files — MAX_BATCH_FILES=50 should cap at 50
         paths = []
@@ -657,40 +657,40 @@ class TestBatchSmartRead:
             f.write_text(f"content {i}\n")
             paths.append(str(f))
 
-        result = batch_smart_read(cache, paths)
+        result = await batch_smart_read(cache, paths)
         assert result.files_read + result.files_skipped <= 50
 
-    def test_batch_read_unchanged_detection(self, tmp_path: Path) -> None:
+    async def test_batch_read_unchanged_detection(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "unchanged.txt"
         f.write_text("stable content\n")
 
         # First read populates cache
-        batch_smart_read(cache, [str(f)])
+        await batch_smart_read(cache, [str(f)])
         # Second read should detect unchanged
-        result = batch_smart_read(cache, [str(f)])
+        result = await batch_smart_read(cache, [str(f)])
         assert str(f) in result.unchanged_paths
 
-    def test_batch_read_priority_ordering(self, tmp_path: Path) -> None:
+    async def test_batch_read_priority_ordering(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f1 = tmp_path / "p1.txt"
         f1.write_text("priority one\n")
         f2 = tmp_path / "p2.txt"
         f2.write_text("normal two\n")
 
-        result = batch_smart_read(cache, [str(f2), str(f1)], priority=[str(f1)])
+        result = await batch_smart_read(cache, [str(f2), str(f1)], priority=[str(f1)])
         # f1 is priority — should appear first in files list (if budget allows)
         read_paths = [s.path for s in result.files if s.status != "skipped"]
         if len(read_paths) >= 2:
             assert read_paths.index(str(f1)) < read_paths.index(str(f2))
 
-    def test_batch_read_content_hash_fallback_on_exception(self, tmp_path: Path) -> None:
+    async def test_batch_read_content_hash_fallback_on_exception(self, tmp_path: Path) -> None:
         """Pre-scan read exception during hash check should be swallowed (best-effort)."""
         cache = _make_cache(tmp_path)
         f = tmp_path / "hashfail.txt"
         f.write_text("content\n")
         # First populate cache
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         # Touch mtime to force hash-check path, then patch read_text to raise
         # so the pre-scan except clause (nosec B112) is exercised.
         import os
@@ -709,7 +709,7 @@ class TestBatchSmartRead:
             return original_read_text(self_path, *args, **kwargs)
 
         with patch.object(Path, "read_text", failing_read_text):
-            result = batch_smart_read(cache, [str(f)])
+            result = await batch_smart_read(cache, [str(f)])
 
         assert result is not None
 
@@ -722,78 +722,78 @@ class TestBatchSmartRead:
 class TestSmartWriteEdgeCases:
     """Lines 92, 101, 105, 137, 152-157, 163-165, 192-193 — write edge paths."""
 
-    def test_binary_existing_file_raises(self, tmp_path: Path) -> None:
+    async def test_binary_existing_file_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         bin_file = tmp_path / "bin.bin"
         bin_file.write_bytes(b"\x00\x01\x02\x03")
         with pytest.raises(ValueError, match="Binary file"):
-            smart_write(cache, str(bin_file), "new content")
+            await smart_write(cache, str(bin_file), "new content")
 
-    def test_create_parents_false_missing_dir_raises(self, tmp_path: Path) -> None:
+    async def test_create_parents_false_missing_dir_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         deep = tmp_path / "does" / "not" / "exist" / "file.txt"
         with pytest.raises(FileNotFoundError):
-            smart_write(cache, str(deep), "content", create_parents=False)
+            await smart_write(cache, str(deep), "content", create_parents=False)
 
-    def test_create_parents_true_creates_directories(self, tmp_path: Path) -> None:
+    async def test_create_parents_true_creates_directories(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         deep = tmp_path / "new" / "dir" / "file.txt"
-        result = smart_write(cache, str(deep), "hello\n", create_parents=True)
+        result = await smart_write(cache, str(deep), "hello\n", create_parents=True)
         assert deep.exists()
         assert result.created is True
 
-    def test_dry_run_does_not_write(self, tmp_path: Path) -> None:
+    async def test_dry_run_does_not_write(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "dryrun.txt"
-        result = smart_write(cache, str(f), "content\n", dry_run=True)
+        result = await smart_write(cache, str(f), "content\n", dry_run=True)
         assert not f.exists()
         assert result.bytes_written > 0
 
-    def test_append_mode(self, tmp_path: Path) -> None:
+    async def test_append_mode(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "append.txt"
         f.write_text("first\n")
-        result = smart_write(cache, str(f), "second\n", append=True)
+        result = await smart_write(cache, str(f), "second\n", append=True)
         assert result.bytes_written > 0
         content = f.read_text()
         assert "first" in content
         assert "second" in content
 
-    def test_content_too_large_raises(self, tmp_path: Path) -> None:
+    async def test_content_too_large_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "toobig.txt"
         with pytest.raises(ValueError, match="Content too large"):
-            smart_write(cache, str(f), "x" * (10 * 1024 * 1024 + 1))
+            await smart_write(cache, str(f), "x" * (10 * 1024 * 1024 + 1))
 
-    def test_directory_path_raises(self, tmp_path: Path) -> None:
+    async def test_directory_path_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         d = tmp_path / "somedir"
         d.mkdir()
         with pytest.raises(ValueError, match="Not a regular file"):
-            smart_write(cache, str(d), "content")
+            await smart_write(cache, str(d), "content")
 
-    def test_auto_format_called_when_requested(self, tmp_path: Path) -> None:
+    async def test_auto_format_called_when_requested(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "fmt.py"
         f.write_text("x=1\n")
         with patch("semantic_cache_mcp.cache.write._format_file", return_value=True) as mock_fmt:
             f.write_text("x=2\n")  # ensure re-read works
-            smart_write(cache, str(f), "x = 2\n", auto_format=True)
+            await smart_write(cache, str(f), "x = 2\n", auto_format=True)
         mock_fmt.assert_called_once()
 
-    def test_cached_content_used_for_diff(self, tmp_path: Path) -> None:
+    async def test_cached_content_used_for_diff(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "cached_diff.txt"
         original = "line one\nline two\n"
         f.write_text(original)
         # Populate cache
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         # Now write new content — diff should come from cache
-        result = smart_write(cache, str(f), "line one\nline three\n")
+        result = await smart_write(cache, str(f), "line one\nline three\n")
         assert result.from_cache is True
         assert result.diff_content is not None
 
-    def test_write_permission_error(self, tmp_path: Path) -> None:
+    async def test_write_permission_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "perm.txt"
         with (
@@ -803,34 +803,34 @@ class TestSmartWriteEdgeCases:
             ),
             pytest.raises(PermissionError),
         ):
-            smart_write(cache, str(f), "content\n")
+            await smart_write(cache, str(f), "content\n")
 
-    def test_write_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
+    async def test_write_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
         """When mtime changed but hash matches, cache content is used for diff."""
         cache = _make_cache(tmp_path)
         f = tmp_path / "mtime_hash.txt"
         content = "stable content\n"
         f.write_text(content)
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         # Touch mtime without changing content
         import os
 
         os.utime(str(f), (time.time() + 10, time.time() + 10))
-        result = smart_write(cache, str(f), "stable content\nnew line\n")
+        result = await smart_write(cache, str(f), "stable content\nnew line\n")
         assert result.from_cache is True
 
 
 class TestSmartEditEdgeCases:
     """Lines 293, 304, 309, 317, 332-342, 347-348, 352 — edit paths."""
 
-    def test_edit_binary_file_raises(self, tmp_path: Path) -> None:
+    async def test_edit_binary_file_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         bin_file = tmp_path / "edit_bin.bin"
         bin_file.write_bytes(b"\x00\x01\x02\x03")
         with pytest.raises(ValueError, match="Binary file"):
-            smart_edit(cache, str(bin_file), "old", "new")
+            await smart_edit(cache, str(bin_file), "old", "new")
 
-    def test_edit_permission_error_on_read(self, tmp_path: Path) -> None:
+    async def test_edit_permission_error_on_read(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "permerr.txt"
         f.write_text("content")
@@ -838,37 +838,37 @@ class TestSmartEditEdgeCases:
             patch.object(Path, "read_bytes", side_effect=OSError("no permission")),
             pytest.raises(PermissionError),
         ):
-            smart_edit(cache, str(f), "content", "new")
+            await smart_edit(cache, str(f), "content", "new")
 
-    def test_edit_not_found_raises(self, tmp_path: Path) -> None:
+    async def test_edit_not_found_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         with pytest.raises(FileNotFoundError):
-            smart_edit(cache, str(tmp_path / "nope.txt"), "old", "new")
+            await smart_edit(cache, str(tmp_path / "nope.txt"), "old", "new")
 
-    def test_edit_old_equals_new_raises(self, tmp_path: Path) -> None:
+    async def test_edit_old_equals_new_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "same.txt"
         f.write_text("content")
         with pytest.raises(ValueError, match="identical"):
-            smart_edit(cache, str(f), "content", "content")
+            await smart_edit(cache, str(f), "content", "content")
 
-    def test_edit_from_cache(self, tmp_path: Path) -> None:
+    async def test_edit_from_cache(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "edit_cache.txt"
         f.write_text("hello world\n")
-        smart_read(cache, str(f))  # Populate cache
-        result = smart_edit(cache, str(f), "hello", "goodbye")
+        await smart_read(cache, str(f))  # Populate cache
+        result = await smart_edit(cache, str(f), "hello", "goodbye")
         assert result.from_cache is True
         assert result.replacements_made == 1
 
-    def test_edit_auto_format(self, tmp_path: Path) -> None:
+    async def test_edit_auto_format(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "fmt_edit.py"
         f.write_text("x = 1\ny = 2\n")
         with patch("semantic_cache_mcp.cache.write._format_file", return_value=True):
-            smart_edit(cache, str(f), "x = 1", "x = 10", auto_format=True)
+            await smart_edit(cache, str(f), "x = 1", "x = 10", auto_format=True)
 
-    def test_edit_permission_error_on_write(self, tmp_path: Path) -> None:
+    async def test_edit_permission_error_on_write(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "writeperm.txt"
         f.write_text("hello world\n")
@@ -879,13 +879,13 @@ class TestSmartEditEdgeCases:
             ),
             pytest.raises(PermissionError),
         ):
-            smart_edit(cache, str(f), "hello", "goodbye")
+            await smart_edit(cache, str(f), "hello", "goodbye")
 
-    def test_edit_mode_c_line_replace(self, tmp_path: Path) -> None:
+    async def test_edit_mode_c_line_replace(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "linereplace.txt"
         f.write_text("line1\nline2\nline3\n")
-        result = smart_edit(
+        result = await smart_edit(
             cache,
             str(f),
             old_string=None,
@@ -896,46 +896,46 @@ class TestSmartEditEdgeCases:
         assert result.replacements_made >= 1
         assert "REPLACED" in f.read_text()
 
-    def test_edit_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
+    async def test_edit_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "edit_mtime.txt"
         content = "stable content here\n"
         f.write_text(content)
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         import os
 
         os.utime(str(f), (time.time() + 10, time.time() + 10))
-        result = smart_edit(cache, str(f), "stable", "changed")
+        result = await smart_edit(cache, str(f), "stable", "changed")
         assert result.from_cache is True
 
 
 class TestSmartBatchEdit:
     """Lines 360, 373, 379, 421, 466-467, 475-481, 489 — batch edit paths."""
 
-    def test_batch_edit_empty_raises(self, tmp_path: Path) -> None:
+    async def test_batch_edit_empty_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batch.txt"
         f.write_text("content\n")
         with pytest.raises(ValueError, match="No edits"):
-            smart_batch_edit(cache, str(f), [])
+            await smart_batch_edit(cache, str(f), [])
 
-    def test_batch_edit_not_found_raises(self, tmp_path: Path) -> None:
+    async def test_batch_edit_not_found_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         with pytest.raises(FileNotFoundError):
-            smart_batch_edit(cache, str(tmp_path / "nope.txt"), [("old", "new")])
+            await smart_batch_edit(cache, str(tmp_path / "nope.txt"), [("old", "new")])
 
-    def test_batch_edit_binary_file_raises(self, tmp_path: Path) -> None:
+    async def test_batch_edit_binary_file_raises(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         bin_file = tmp_path / "batch_bin.bin"
         bin_file.write_bytes(b"\x00\x01\x02\x03")
         with pytest.raises(ValueError, match="Binary file"):
-            smart_batch_edit(cache, str(bin_file), [("a", "b")])
+            await smart_batch_edit(cache, str(bin_file), [("a", "b")])
 
-    def test_batch_edit_partial_failure(self, tmp_path: Path) -> None:
+    async def test_batch_edit_partial_failure(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "partial.txt"
         f.write_text("alpha beta gamma\n")
-        result = smart_batch_edit(
+        result = await smart_batch_edit(
             cache,
             str(f),
             [
@@ -947,12 +947,12 @@ class TestSmartBatchEdit:
         assert result.failed == 1
         assert "ALPHA" in f.read_text()
 
-    def test_batch_edit_all_fail_no_write(self, tmp_path: Path) -> None:
+    async def test_batch_edit_all_fail_no_write(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "allfail.txt"
         original = "abc def\n"
         f.write_text(original)
-        result = smart_batch_edit(
+        result = await smart_batch_edit(
             cache,
             str(f),
             [("nope1", "x"), ("nope2", "y")],
@@ -961,27 +961,27 @@ class TestSmartBatchEdit:
         assert result.failed == 2
         assert f.read_text() == original  # unchanged
 
-    def test_batch_edit_from_cache(self, tmp_path: Path) -> None:
+    async def test_batch_edit_from_cache(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batch_cache.txt"
         f.write_text("foo bar baz\n")
-        smart_read(cache, str(f))  # populate cache
-        result = smart_batch_edit(cache, str(f), [("foo", "FOO")])
+        await smart_read(cache, str(f))  # populate cache
+        result = await smart_batch_edit(cache, str(f), [("foo", "FOO")])
         assert result.from_cache is True
 
-    def test_batch_edit_auto_format(self, tmp_path: Path) -> None:
+    async def test_batch_edit_auto_format(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batch_fmt.py"
         f.write_text("x = 1\ny = 2\n")
         with patch("semantic_cache_mcp.cache.write._format_file", return_value=True):
-            result = smart_batch_edit(cache, str(f), [("x = 1", "x = 10")], auto_format=True)
+            result = await smart_batch_edit(cache, str(f), [("x = 1", "x = 10")], auto_format=True)
         assert result.succeeded == 1
 
-    def test_batch_edit_mode_c(self, tmp_path: Path) -> None:
+    async def test_batch_edit_mode_c(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "mode_c.txt"
         f.write_text("line1\nline2\nline3\n")
-        result = smart_batch_edit(
+        result = await smart_batch_edit(
             cache,
             str(f),
             [(None, "REPLACED\n", 2, 2)],
@@ -989,11 +989,11 @@ class TestSmartBatchEdit:
         assert result.succeeded == 1
         assert "REPLACED" in f.read_text()
 
-    def test_batch_edit_mode_b_scoped(self, tmp_path: Path) -> None:
+    async def test_batch_edit_mode_b_scoped(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "mode_b.txt"
         f.write_text("alpha\nbeta\ngamma\n")
-        result = smart_batch_edit(
+        result = await smart_batch_edit(
             cache,
             str(f),
             [("beta", "BETA", 2, 2)],
@@ -1001,7 +1001,7 @@ class TestSmartBatchEdit:
         assert result.succeeded == 1
         assert "BETA" in f.read_text()
 
-    def test_batch_edit_write_permission_error(self, tmp_path: Path) -> None:
+    async def test_batch_edit_write_permission_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batchperm.txt"
         f.write_text("hello world\n")
@@ -1012,36 +1012,36 @@ class TestSmartBatchEdit:
             ),
             pytest.raises(PermissionError),
         ):
-            smart_batch_edit(cache, str(f), [("hello", "goodbye")])
+            await smart_batch_edit(cache, str(f), [("hello", "goodbye")])
 
-    def test_batch_edit_old_equals_new_fails(self, tmp_path: Path) -> None:
+    async def test_batch_edit_old_equals_new_fails(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "same_batch.txt"
         f.write_text("content here\n")
-        result = smart_batch_edit(cache, str(f), [("content", "content")])
+        result = await smart_batch_edit(cache, str(f), [("content", "content")])
         assert result.failed == 1
 
-    def test_batch_edit_dos_limit(self, tmp_path: Path) -> None:
+    async def test_batch_edit_dos_limit(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "dos_batch.txt"
         # 60 unique tokens for 60 edits
         lines = [f"token{i}" for i in range(60)]
         f.write_text("\n".join(lines) + "\n")
         edits = [(f"token{i}", f"TOKEN{i}") for i in range(60)]
-        result = smart_batch_edit(cache, str(f), edits)
+        result = await smart_batch_edit(cache, str(f), edits)
         # MAX_BATCH_EDITS=50, so at most 50 processed
         assert result.succeeded + result.failed <= 50
 
-    def test_batch_edit_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
+    async def test_batch_edit_mtime_hash_match_uses_cache(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batch_mtime.txt"
         content = "stable line\n"
         f.write_text(content)
-        smart_read(cache, str(f))
+        await smart_read(cache, str(f))
         import os
 
         os.utime(str(f), (time.time() + 10, time.time() + 10))
-        result = smart_batch_edit(cache, str(f), [("stable", "changed")])
+        result = await smart_batch_edit(cache, str(f), [("stable", "changed")])
         assert result.from_cache is True
 
 
@@ -1136,7 +1136,9 @@ class TestGetRssMbExceptionPath:
 class TestBatchReadTokenBudgetFlush:
     """Lines 363-375 — remaining paths enriched with est_tokens when budget exhausted."""
 
-    def test_remaining_paths_have_est_tokens_when_budget_exhausted(self, tmp_path: Path) -> None:
+    async def test_remaining_paths_have_est_tokens_when_budget_exhausted(
+        self, tmp_path: Path
+    ) -> None:
         cache = _make_cache(tmp_path)
         # Create files — first one will consume the full budget
         large = tmp_path / "large.txt"
@@ -1146,7 +1148,7 @@ class TestBatchReadTokenBudgetFlush:
         small.write_text("tiny\n")
 
         # Budget of 50 will be exhausted after first file
-        result = batch_smart_read(cache, [str(large), str(small)], max_total_tokens=50)
+        result = await batch_smart_read(cache, [str(large), str(small)], max_total_tokens=50)
         skipped = [s for s in result.files if s.status == "skipped"]
         # At least the small file should be skipped with est_tokens populated
         assert any(s.est_tokens is not None and s.est_tokens > 0 for s in skipped)
@@ -1197,9 +1199,9 @@ class TestReadFitContentToMaxSizeDirectly:
 class TestVectorStorageSaveClose:
     """Lines 717-726 in vector.py — save() and close() methods."""
 
-    def test_save_and_close(self, tmp_path: Path) -> None:
+    async def test_save_and_close(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
-        vs.put("/close/test.txt", "some content\n", mtime=1.0)
+        await vs.put("/close/test.txt", "some content\n", mtime=1.0)
         vs.save()
         vs.close()
         # After close, no exception should have been raised
