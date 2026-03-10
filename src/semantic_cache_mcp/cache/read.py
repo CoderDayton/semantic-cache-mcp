@@ -258,15 +258,18 @@ async def batch_smart_read(
         # Rough estimate for uncached content: ~4 characters per token.
         return max(1, int(resolved.stat().st_size / 4))
 
+    # Pre-compute token estimates for smallest-first sorting (budget-optimal).
+    token_estimates = {p: await estimate_min_tokens(p) for p in paths}
+
     # Priority-aware ordering: priority paths first (in given order), then remainder smallest-first.
     if priority:
         priority_set = set(priority)
         priority_ordered = [p for p in priority if p in set(paths)]
         remainder = [p for p in paths if p not in priority_set]
-        remainder_sorted = sorted(remainder)  # sort key uses async fn; sort by path name
+        remainder_sorted = sorted(remainder, key=lambda p: token_estimates[p])
         paths_sorted = priority_ordered + remainder_sorted
     else:
-        paths_sorted = sorted(paths)  # sort key uses async fn; sort by path name
+        paths_sorted = sorted(paths, key=lambda p: token_estimates[p])
 
     # Pre-scan: batch embed all new/changed files in a single model call.
     # This amortizes ONNX Runtime inference overhead from N calls → 1.
