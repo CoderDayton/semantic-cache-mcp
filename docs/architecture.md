@@ -18,15 +18,15 @@ src/semantic_cache_mcp/
 │   ├── __init__.py
 │   ├── _mcp.py             # FastMCP app instance, lifespan, startup warmup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
-│   └── tools.py            # All 12 MCP tool definitions
+│   └── tools/              # All 12 MCP tool definitions + _shielded_write helper
 ├── core/                   # Pure algorithms — stateless, zero I/O
 │   ├── __init__.py         # Flat re-exports from all sub-packages
 │   ├── chunking/           # Content-defined chunking (used for large file splitting)
 │   │   ├── __init__.py
 │   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
 │   │   └── _simd.py        # SIMD-accelerated parallel CDC
-│   ├── embeddings.py       # FastEmbed local embeddings (embed, embed_batch, embed_query)
-│   ├── hashing.py          # BLAKE3/BLAKE2b content hashing, DeduplicateIndex
+│   ├── embeddings/         # FastEmbed local embeddings (embed, embed_batch, embed_query)
+│   ├── hashing/            # BLAKE3/BLAKE2b content hashing, DeduplicateIndex
 │   ├── similarity/         # Cosine similarity utilities
 │   │   ├── __init__.py
 │   │   └���─ _cosine.py      # cosine_similarity, batch operations
@@ -37,7 +37,7 @@ src/semantic_cache_mcp/
 │   └── tokenizer.py        # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
-    ├── vector.py           # VectorStorage: simplevecdb with HNSW + FTS5
+    ├── vector/             # VectorStorage: simplevecdb with HNSW + FTS5
     └── sqlite.py           # SQLiteStorage: session metrics persistence only
 ```
 
@@ -60,7 +60,7 @@ The primary storage backend uses [SimpleVecDB](https://github.com/CoderDayton/Si
 - **FTS5 full-text search** — BM25 keyword search for grep and hybrid queries
 - **Hybrid search** — Reciprocal Rank Fusion (RRF) combines HNSW + BM25 results
 - **Raw text storage** — File contents stored as plain text in `page_content` (no compression)
-- **Float16 quantization** — 2× smaller vectors in the HNSW index with negligible quality loss
+- **INT8 quantization** — 4× smaller vectors in the HNSW index with negligible quality loss
 
 ### Document Model
 
@@ -165,7 +165,8 @@ Local text embeddings via FastEmbed (configurable model, default `BAAI/bge-small
 - **384-dimensional** (default), 33M parameters, 512 token context window
 - Runs via ONNX Runtime — `cpu` by default, `cuda` when configured
 - Singleton model instance — loaded once, reused across all calls
-- Warmup pass at server startup for predictable first-request latency
+- Dedicated single-thread `ThreadPoolExecutor` — ONNX serializes inference internally, so embedding calls don't starve the default thread pool
+- Warmup pass at server startup (in `asyncio.to_thread`) for predictable first-request latency
 - `"Represent this sentence for searching relevant passages:"` prefix for query embedding
 - File-type semantic labels prepended to document content before embedding (e.g., `"python source file: ..."`)
 
@@ -209,6 +210,36 @@ Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files 
 
 ---
 
+## Threading Model & Graceful Shutdown
+
+### Thread Pools
+
+The server runs a single asyncio event loop. Blocking operations are offloaded to thread pools:
+
+| Executor | Workers | Used for |
+|----------|---------|----------|
+| **Embed executor** | 1 | ONNX `model.embed()` — serialized because ONNX Runtime holds a session lock |
+| **Default executor** | N (OS-dependent) | `VectorStorage` catalog ops, `sync_coll.save()`, `summarize_semantic()` |
+| **Async subprocess** | — | `_format_file()` (ruff, prettier, etc.) |
+
+Embedding uses a dedicated single-thread executor so concurrent ONNX calls don't consume default pool slots. Storage I/O runs on the default pool and is never blocked by embedding work.
+
+### Graceful Shutdown
+
+On SIGTERM/SIGINT:
+
+1. `cache.request_shutdown()` — sets `_shutting_down` flag, new `begin_operation()` calls return `False`
+2. Signal handler cancels all asyncio tasks — `CancelledError` propagates, running `finally` blocks
+3. Write/edit tool handlers use `asyncio.shield()` via `_shielded_write()` — the inner task completes even if the outer handler is cancelled
+4. Lifespan `finally` calls `async_close()`:
+   - Waits up to 8 seconds for in-flight operations to drain (`_drained` event)
+   - Catches `CancelledError` during drain so close always proceeds
+   - Persists session metrics → closes VectorStorage → closes SQLite pool → shuts down embed executor
+5. All `VectorStorage` async methods guard `_closed` — return safe defaults instead of crashing
+6. Second signal forces `os._exit()` for hard termination
+
+---
+
 ## Data Flow
 
 ### Read
@@ -240,14 +271,16 @@ After context compression, use `diff_mode=False` to force full content.
 ```
 Client ──→ batch_smart_read(paths, diff_mode=True)
                 │
-         1. Pre-scan: filter new/changed paths (mtime check)
+         1. Gather all cache.get() in parallel (asyncio.gather)
                 │
-         2. embed_batch([...all new/changed texts...])
+         2. Pre-scan: filter new/changed paths (mtime check, reuses gathered entries)
+                │
+         3. embed_batch([...all new/changed texts...])
             ── single ONNX inference call ──
                 │
-         3. smart_read() per file (embedding prefetched, no model call)
+         4. smart_read() per file (embedding prefetched, no model call)
                 │
-         4. Return BatchReadResult with per-file status
+         5. Return BatchReadResult with per-file status
 ```
 
 ### Write / Edit
