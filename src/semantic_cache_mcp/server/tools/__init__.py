@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
@@ -40,25 +38,23 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
-@contextlib.asynccontextmanager
-async def _tracked_operation(cache: SemanticCache, *, shield: bool = False) -> AsyncIterator[None]:
-    """Track an in-flight operation for graceful shutdown.
+async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
+    """Run a write coroutine protected from cancellation during shutdown.
 
-    If *shield* is True, the body is protected from CancelledError so that
-    critical writes (file I/O + cache update) are not interrupted mid-operation.
+    Uses asyncio.shield so the inner task runs to completion even when
+    the tool handler's task is cancelled (e.g. SIGTERM). end_operation()
+    fires only after the write actually finishes, keeping the drain
+    counter accurate for async_close().
     """
     if not cache.begin_operation():
         raise RuntimeError("Server is shutting down")
+    task = asyncio.ensure_future(coro)
     try:
-        if shield:
-            # Shield prevents CancelledError from propagating into the body.
-            # The caller's cancellation is re-raised after the body completes.
-            yield
-        else:
-            yield
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
-        logger.debug("Operation cancelled during shutdown")
-        raise
+        # Outer task was cancelled, but the write must finish.
+        # Re-await the real task (shield kept it alive).
+        return await task
     finally:
         cache.end_operation()
 
@@ -427,8 +423,9 @@ async def write(
     max_response_tokens = _response_token_cap()
 
     try:
-        async with _tracked_operation(cache, shield=True):
-            result = await smart_write(
+        result = await _shielded_write(
+            cache,
+            smart_write(
                 cache=cache,
                 path=path,
                 content=content,
@@ -436,8 +433,9 @@ async def write(
                 dry_run=dry_run,
                 auto_format=auto_format,
                 append=append,
-            )
-            cache.metrics.record("write", result)
+            ),
+        )
+        cache.metrics.record("write", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -532,8 +530,9 @@ async def edit(
     max_response_tokens = _response_token_cap()
 
     try:
-        async with _tracked_operation(cache, shield=True):
-            result = await smart_edit(
+        result = await _shielded_write(
+            cache,
+            smart_edit(
                 cache=cache,
                 path=path,
                 old_string=old_string,
@@ -543,8 +542,9 @@ async def edit(
                 auto_format=auto_format,
                 start_line=start_line,
                 end_line=end_line,
-            )
-            cache.metrics.record("edit", result)
+            ),
+        )
+        cache.metrics.record("edit", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -666,15 +666,17 @@ async def batch_edit(
                     max_response_tokens,
                 )
 
-        async with _tracked_operation(cache, shield=True):
-            result = await smart_batch_edit(
+        result = await _shielded_write(
+            cache,
+            smart_batch_edit(
                 cache=cache,
                 path=path,
                 edits=edit_tuples,
                 dry_run=dry_run,
                 auto_format=auto_format,
-            )
-            cache.metrics.record("batch_edit", result)
+            ),
+        )
+        cache.metrics.record("batch_edit", result)
 
         status = (
             "edited"

@@ -308,10 +308,16 @@ class SemanticCache:
         """Current session metrics accumulator."""
         return self._metrics
 
+    def request_shutdown(self) -> None:
+        """Signal that shutdown has been requested. New operations will be rejected."""
+        self._shutting_down = True
+
     def begin_operation(self) -> bool:
         """Mark the start of an in-flight operation.
 
         Returns False if shutdown is in progress (caller should bail out).
+        No lock needed: asyncio is cooperative and there is no await between
+        the guard check and the counter increment.
         """
         if self._shutting_down:
             return False
@@ -336,7 +342,9 @@ class SemanticCache:
             return
         self._shutting_down = True
 
-        # Wait for in-flight operations to drain
+        # Wait for in-flight operations to drain.
+        # Catch CancelledError so cleanup proceeds even if our task is cancelled
+        # during asyncio.run()'s shutdown (after loop.stop from signal handler).
         if self._inflight > 0:
             logger.info(f"Waiting for {self._inflight} in-flight operation(s) to finish...")
             try:
@@ -345,6 +353,11 @@ class SemanticCache:
             except TimeoutError:
                 logger.warning(
                     f"Drain timeout ({self._DRAIN_TIMEOUT}s) expired with "
+                    f"{self._inflight} operation(s) still running — forcing close"
+                )
+            except asyncio.CancelledError:
+                logger.warning(
+                    f"Drain interrupted by cancellation with "
                     f"{self._inflight} operation(s) still running — forcing close"
                 )
 

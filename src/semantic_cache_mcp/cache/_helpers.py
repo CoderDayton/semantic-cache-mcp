@@ -69,11 +69,11 @@ async def _format_file(path: Path) -> bool:
         cmd = [*formatter, str(path)]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,  # formatters write in-place
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         except TimeoutError:
             proc.kill()
             await proc.wait()

@@ -115,12 +115,16 @@ async def app_lifespan(server: FastMCP):
         if not shutdown_received:
             shutdown_received = True
             logger.info(f"Received {sig_name} — initiating graceful shutdown")
-            cache._shutting_down = True
-            # Stop the event loop, which triggers the lifespan finally block
-            loop.stop()
+            cache.request_shutdown()
+            # Cancel all tasks so their finally blocks run (including lifespan
+            # cleanup → async_close). Shielded writes continue to completion.
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
         else:
             logger.warning(f"Received {sig_name} again — forcing exit")
-            raise SystemExit(128 + sig)
+            import os  # noqa: PLC0415
+
+            os._exit(128 + sig)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, OSError):

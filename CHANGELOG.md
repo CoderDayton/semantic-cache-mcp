@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-03-15
+
+### Fixed
+
+- **Event loop blocking** — ONNX embedding inference, SQLite catalog operations, and subprocess formatter calls were running synchronously on the asyncio event loop, causing the server to hang under load. All blocking calls now run via `asyncio.to_thread()`.
+- **Graceful shutdown** — Added SIGTERM/SIGINT handlers that drain in-flight operations (8s timeout) before closing storage. Write/edit operations are shielded from `CancelledError` to prevent file corruption.
+- **Use-after-close crashes** — All VectorStorage async methods now guard against closed state, returning safe defaults instead of crashing during shutdown.
+- **`_format_file` blocking** — Replaced `subprocess.run()` with `asyncio.create_subprocess_exec()` so auto-formatting no longer freezes the server.
+- **`_expand_globs` unbounded** — Added 5-second deadline to prevent recursive `**` glob patterns from blocking indefinitely.
+- **Connection pool timeout** — Reduced SQLite pool wait from 10s to 5s to surface exhaustion faster.
+
 ## [0.3.3] - 2026-03-10
 
 ### Fixed
