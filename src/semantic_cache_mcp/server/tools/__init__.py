@@ -49,6 +49,7 @@ async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
     if not cache.begin_operation():
         raise RuntimeError("Server is shutting down")
     task = asyncio.ensure_future(coro)
+    task.set_name("shielded-write")
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:

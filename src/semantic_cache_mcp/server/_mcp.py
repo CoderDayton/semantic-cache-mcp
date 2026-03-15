@@ -117,9 +117,11 @@ async def app_lifespan(server: FastMCP):
             logger.info(f"Received {sig_name} — initiating graceful shutdown")
             cache.request_shutdown()
             # Cancel all tasks so their finally blocks run (including lifespan
-            # cleanup → async_close). Shielded writes continue to completion.
+            # cleanup → async_close). Skip shielded-write tasks — they must
+            # finish to avoid file corruption; the drain in async_close waits.
             for task in asyncio.all_tasks(loop):
-                task.cancel()
+                if task.get_name() != "shielded-write":
+                    task.cancel()
         else:
             logger.warning(f"Received {sig_name} again — forcing exit")
             import os  # noqa: PLC0415
