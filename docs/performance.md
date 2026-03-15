@@ -89,6 +89,19 @@ uv run python benchmarks/benchmark_performance.py
 
 ---
 
+## Concurrency Optimizations (0.3.4)
+
+| Optimization | Effect |
+|--------------|--------|
+| Dedicated embed executor (1 thread) | ONNX calls don't starve the default thread pool |
+| `asyncio.gather()` in `batch_smart_read` | N cache lookups run in parallel instead of serial |
+| No double-fetch on diff path | Eliminates 1 SQLite query per changed-file read |
+| Embedding reuse in `find_similar_files` | Skips ONNX when `cached.embedding` is available |
+| All blocking calls in `asyncio.to_thread()` | Event loop never blocked by I/O or ONNX |
+| Async subprocess for formatters | `_format_file` no longer freezes the event loop |
+
+---
+
 ## Profiling
 
 ```bash

@@ -66,7 +66,10 @@ class ConnectionPool:
 
             if conn is None:
                 try:
-                    conn = self._available.get(timeout=10)
+                    # Timeout prevents indefinite blocking when all connections
+                    # are checked out. 5s is generous enough for normal workloads
+                    # but short enough to surface pool exhaustion quickly.
+                    conn = self._available.get(timeout=5)
                 except queue.Empty as e:
                     msg = "Connection pool exhausted"
                     raise RuntimeError(msg) from e

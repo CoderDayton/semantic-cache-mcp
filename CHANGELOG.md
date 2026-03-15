@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-03-15
+
+### Fixed
+
+- **Event loop blocking** — ONNX embedding inference, SQLite catalog operations, and subprocess formatter calls were running synchronously on the asyncio event loop, causing the server to hang under load. All blocking calls now run via `asyncio.to_thread()`.
+- **Graceful shutdown** — SIGTERM/SIGINT handlers cancel all tasks so lifespan cleanup runs. Write/edit operations are shielded from `CancelledError` via `asyncio.shield()` to prevent file corruption. `async_close()` drains in-flight operations (8s timeout) before closing storage.
+- **Use-after-close crashes** — All VectorStorage async methods now guard against closed state, returning safe defaults instead of crashing during shutdown.
+- **Embedding dimension mismatch** — `_resolve_embedding` now queries the actual model dimension instead of hardcoding 384, preventing `Vector dimension 384 != index dimension N` errors with non-default models (e.g. `Snowflake/snowflake-arctic-embed-m-v2.0`).
+- **`_format_file` blocking** — Replaced `subprocess.run()` with `asyncio.create_subprocess_exec()` so auto-formatting no longer freezes the server.
+- **`_expand_globs` unbounded** — Added 5-second deadline to prevent recursive `**` glob patterns from blocking indefinitely.
+- **Connection pool timeout** — Reduced SQLite pool wait from 10s to 5s to surface exhaustion faster.
+
+### Performance
+
+- **Dedicated embedding executor** — ONNX calls use a single-thread `ThreadPoolExecutor` so concurrent embeddings don't starve the default thread pool (used by storage I/O).
+- **Parallel cache lookups** — `batch_smart_read` gathers all `cache.get()` calls via `asyncio.gather()` instead of N serial awaits, and reuses results in the pre-scan loop (eliminates ~N redundant SQLite queries per batch).
+- **No double-fetch on diff path** — `smart_read` saves the cache entry before the sentinel-null and restores it for diff generation (eliminates 1 SQLite query per changed-file read).
+- **Embedding reuse** — `find_similar_files` reuses `cached.embedding` when available instead of calling ONNX (saves 20–100ms per cached file).
+
 ## [0.3.3] - 2026-03-10
 
 ### Fixed

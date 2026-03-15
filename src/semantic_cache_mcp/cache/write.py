@@ -179,7 +179,7 @@ async def smart_write(
         # Auto-format if requested
         formatted = False
         if auto_format:
-            formatted = _format_file(file_path)
+            formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
                 content = file_path.read_text(encoding="utf-8")
@@ -198,7 +198,7 @@ async def smart_write(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(content, path)
+        embedding = await cache.get_embedding(content, path)
         await cache.put(str(file_path), content, mtime, embedding)
         action = "Created" if created else "Updated"
         if formatted:
@@ -439,7 +439,7 @@ async def smart_edit(
         # Auto-format if requested
         formatted = False
         if auto_format:
-            formatted = _format_file(file_path)
+            formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
                 new_content = file_path.read_text(encoding="utf-8")
@@ -452,7 +452,7 @@ async def smart_edit(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(new_content, path)
+        embedding = await cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
@@ -678,7 +678,7 @@ async def smart_batch_edit(
         # Auto-format if requested
         formatted = False
         if auto_format:
-            formatted = _format_file(file_path)
+            formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
                 new_content = file_path.read_text(encoding="utf-8")
@@ -691,7 +691,7 @@ async def smart_batch_edit(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(new_content, path)
+        embedding = await cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:

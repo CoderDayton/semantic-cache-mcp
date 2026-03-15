@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -78,6 +79,7 @@ async def smart_read(
             await cache.update_mtime(str(file_path), mtime)
         else:
             # Content actually changed — fall through to diff logic below
+            _original_cached = cached  # save before nulling
             cached = None  # sentinel: forces diff path
 
         if cached is not None:
@@ -111,8 +113,9 @@ async def smart_read(
                 compression_ratio=1.0,
             )
 
-        # Re-fetch cached for diff — we nulled it as sentinel above
-        cached = await cache.get(str(file_path))
+        # Restore the original entry — we nulled it as sentinel above.
+        # No re-fetch needed; the entry hasn't changed in storage.
+        cached = _original_cached
 
         # File changed - generate diff with stats
         if cached is not None:
@@ -131,7 +134,9 @@ async def smart_read(
                     f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
                 )
                 embedding = (
-                    _embedding if _embedding is not None else cache.get_embedding(content, path)
+                    _embedding
+                    if _embedding is not None
+                    else (await cache.get_embedding(content, path))
                 )
                 await cache.put(str(file_path), content, mtime, embedding)
 
@@ -149,7 +154,9 @@ async def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
+        embedding = (
+            _embedding if _embedding is not None else (await cache.get_embedding(content, path))
+        )
         if embedding:
             similar_path = await cache.find_similar(embedding, str(file_path))
             if similar_path:
@@ -196,20 +203,26 @@ async def smart_read(
         try:
             # Convert EmbeddingVector to NDArray for summarization
             def embed_fn(text: str):
-                emb = cache.get_embedding(text)
+                # Direct sync call — this runs inside asyncio.to_thread via
+                # summarize_semantic, so it won't block the event loop.
+                from ..core.embeddings import embed as _embed_sync  # noqa: PLC0415
+
+                emb = _embed_sync(text)
                 if emb is None:
                     return None
                 # Convert array.array or list to numpy array
                 return np.asarray(emb, dtype=np.float32)
 
-            final_content = summarize_semantic(content, max_size, embed_fn=embed_fn)
+            final_content = await asyncio.to_thread(
+                summarize_semantic, content, max_size, embed_fn=embed_fn
+            )
             truncated = True
         except Exception as e:
             logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
+    embedding = _embedding if _embedding is not None else await cache.get_embedding(content, path)
     await cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
@@ -241,25 +254,26 @@ async def batch_smart_read(
     paths = paths[:MAX_BATCH_FILES]
     max_total_tokens = max(1, min(max_total_tokens, MAX_BATCH_TOKENS))
 
+    # Batch-fetch all cache entries in parallel (one gather instead of N serial awaits).
+    resolved_map = {p: str(Path(p).expanduser().resolve()) for p in paths}
+    _entries = await asyncio.gather(*(cache.get(rp) for rp in resolved_map.values()))
+    _cache_map = dict(zip(resolved_map.values(), _entries, strict=True))
+
     # Estimate tokens for sorting and skipped-file enrichment.
-    async def estimate_min_tokens(p: str) -> int:
-        resolved = Path(p).expanduser().resolve()
-        cached = await cache.get(str(resolved))
+    def estimate_min_tokens(p: str) -> int:
+        resolved = Path(resolved_map[p])
+        cached = _cache_map.get(resolved_map[p])
         if cached and resolved.exists():
             file_mtime = resolved.stat().st_mtime
             if cached.mtime >= file_mtime:
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
-            # mtime changed — return cached tokens as conservative estimate
-            # (reading and hashing the file is too expensive for a budget estimator)
             return cached.tokens
         if not resolved.exists() or not resolved.is_file():
             return 1
-        # Rough estimate for uncached content: ~4 characters per token.
         return max(1, int(resolved.stat().st_size / 4))
 
-    # Pre-compute token estimates for smallest-first sorting (budget-optimal).
-    token_estimates = {p: await estimate_min_tokens(p) for p in paths}
+    token_estimates = {p: estimate_min_tokens(p) for p in paths}
 
     # Priority-aware ordering: priority paths first (in given order), then remainder smallest-first.
     if priority:
@@ -278,7 +292,7 @@ async def batch_smart_read(
     _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
     for _path in paths_sorted:
         _resolved = Path(_path).expanduser().resolve()
-        _cached = await cache.get(str(_resolved))
+        _cached = _cache_map.get(str(_resolved))
         if _cached and _resolved.exists():
             _file_mtime = _resolved.stat().st_mtime
             if _cached.mtime >= _file_mtime:
@@ -308,7 +322,7 @@ async def batch_smart_read(
         from ..core.embeddings import embed_batch as _embed_batch  # noqa: PLC0415
 
         _texts = [(f"{_file_label(_rpath)}: {_cnt}")[:8000] for _, _rpath, _cnt in _to_embed]
-        _results = _embed_batch(_texts)
+        _results = await asyncio.to_thread(_embed_batch, _texts)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
             if _emb is not None:
                 _prefetched[_rpath] = _emb
@@ -327,7 +341,7 @@ async def batch_smart_read(
         if total_tokens >= max_total_tokens:
             # Enrich remaining paths with est_tokens
             for remaining in paths_sorted[processed - 1 :]:
-                est = await estimate_min_tokens(remaining)
+                est = estimate_min_tokens(remaining)
                 files.append(
                     FileReadSummary(
                         path=remaining,
@@ -376,7 +390,7 @@ async def batch_smart_read(
 
             # Check token budget
             if total_tokens + result.tokens_returned > max_total_tokens:
-                est = await estimate_min_tokens(path)
+                est = estimate_min_tokens(path)
                 files.append(
                     FileReadSummary(
                         path=path,

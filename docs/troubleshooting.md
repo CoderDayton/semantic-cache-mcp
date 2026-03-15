@@ -58,6 +58,23 @@
 
 ---
 
+## Server Hangs
+
+**Server freezes during read/write/search operations**
+- **Cause (pre-0.3.4):** ONNX embedding inference, SQLite catalog scans, and subprocess formatter calls ran synchronously on the asyncio event loop, blocking all other operations for the duration.
+- **Fix:** Upgrade to 0.3.4+. All blocking calls now run in thread pools via `asyncio.to_thread()`. ONNX uses a dedicated single-thread executor to prevent pool starvation.
+
+**Server hangs on shutdown (SIGTERM/SIGINT)**
+- **Cause (pre-0.3.4):** No signal handlers; SIGTERM killed the process before storage cleanup.
+- **Fix:** 0.3.4+ installs graceful shutdown handlers. First signal drains in-flight operations (8s timeout) and closes cleanly. Second signal forces `os._exit()`.
+
+**Server hangs during concurrent batch operations**
+- **Cause:** ONNX Runtime serializes model inference internally. With many concurrent embedding requests, they queue on the dedicated executor.
+- **Effect:** Event loop stays responsive, but embedding throughput is single-threaded. Other operations (reads, searches, grep) are unaffected.
+- **Mitigation:** `batch_smart_read` batches all embeddings into a single `embed_batch()` call instead of N individual calls.
+
+---
+
 ## Performance Issues
 
 **High memory usage**
