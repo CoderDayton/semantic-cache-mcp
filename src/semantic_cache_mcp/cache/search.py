@@ -227,12 +227,13 @@ async def find_similar_files(
     file_mtime = file_path.stat().st_mtime
     if cached and cached.mtime >= file_mtime:
         source_tokens = cached.tokens
-        source_embedding = await cache.get_embedding(content, str(file_path))
+        # Reuse stored embedding; only call ONNX if it was never stored
+        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
         await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
-        source_embedding = await cache.get_embedding(content, str(file_path))
+        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
         source_embedding = await cache.get_embedding(content, str(file_path))
