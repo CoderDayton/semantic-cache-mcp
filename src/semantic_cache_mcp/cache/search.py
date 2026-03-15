@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -44,7 +45,7 @@ async def semantic_search(
     query = query[:MAX_SEARCH_QUERY_LEN]
 
     # Embed query for vector component of hybrid search
-    query_embedding = embed_query(query)
+    query_embedding = await asyncio.to_thread(embed_query, query)
 
     # Resolve directory for post-search filtering (is_relative_to is secure
     # against prefix attacks like /project vs /project_evil)
@@ -144,7 +145,7 @@ async def compare_files(
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
         mtime1 = file1.stat().st_mtime
-        emb1 = cache.get_embedding(content1, str(file1))
+        emb1 = await cache.get_embedding(content1, str(file1))
         await cache.put(str(file1), content1, mtime1, emb1)
 
     # File 2
@@ -161,7 +162,7 @@ async def compare_files(
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
         mtime2 = file2.stat().st_mtime
-        emb2 = cache.get_embedding(content2, str(file2))
+        emb2 = await cache.get_embedding(content2, str(file2))
         await cache.put(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
@@ -226,15 +227,15 @@ async def find_similar_files(
     file_mtime = file_path.stat().st_mtime
     if cached and cached.mtime >= file_mtime:
         source_tokens = cached.tokens
-        source_embedding = cache.get_embedding(content, str(file_path))
+        source_embedding = await cache.get_embedding(content, str(file_path))
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
         await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
-        source_embedding = cache.get_embedding(content, str(file_path))
+        source_embedding = await cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
-        source_embedding = cache.get_embedding(content, str(file_path))
+        source_embedding = await cache.get_embedding(content, str(file_path))
         await cache.put(str(file_path), content, file_mtime, source_embedding)
 
     if source_embedding is None:

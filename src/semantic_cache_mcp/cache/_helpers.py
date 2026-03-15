@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import logging
 import shutil
 import stat as stat_module
-import subprocess  # nosec B404 - used for formatter execution with hardcoded commands
 from pathlib import Path
 
 from ..core import count_tokens
@@ -40,10 +40,11 @@ FORMATTERS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _format_file(path: Path) -> bool:
+async def _format_file(path: Path) -> bool:
     """Format file in-place using the appropriate formatter.
 
     Returns False if the formatter is absent or fails.
+    Uses async subprocess to avoid blocking the event loop.
     """
     formatter = FORMATTERS.get(path.suffix.lower())
     if not formatter:
@@ -66,21 +67,24 @@ def _format_file(path: Path) -> bool:
 
     try:
         cmd = [*formatter, str(path)]
-        result = subprocess.run(  # nosec B603 - commands from hardcoded FORMATTERS dict
-            cmd,
-            capture_output=True,
-            timeout=10,
-            check=False,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode == 0:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning(f"Formatter {cmd_name} timed out on {path}")
+            return False
+        if proc.returncode == 0:
             logger.debug(f"Formatted {path} with {cmd_name}")
             return True
         else:
-            logger.warning(f"Formatter {cmd_name} failed: {result.stderr.decode()[:200]}")
+            logger.warning(f"Formatter {cmd_name} failed: {stderr.decode()[:200]}")
             return False
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Formatter {cmd_name} timed out on {path}")
-        return False
     except OSError as e:
         logger.warning(f"Failed to run {cmd_name}: {e}")
         return False

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
+from collections.abc import AsyncIterator
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,29 @@ from ..response import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def _tracked_operation(cache: SemanticCache, *, shield: bool = False) -> AsyncIterator[None]:
+    """Track an in-flight operation for graceful shutdown.
+
+    If *shield* is True, the body is protected from CancelledError so that
+    critical writes (file I/O + cache update) are not interrupted mid-operation.
+    """
+    if not cache.begin_operation():
+        raise RuntimeError("Server is shutting down")
+    try:
+        if shield:
+            # Shield prevents CancelledError from propagating into the body.
+            # The caller's cancellation is re-raised after the body completes.
+            yield
+        else:
+            yield
+    except asyncio.CancelledError:
+        logger.debug("Operation cancelled during shutdown")
+        raise
+    finally:
+        cache.end_operation()
 
 
 @mcp.tool(
@@ -401,16 +427,17 @@ async def write(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await smart_write(
-            cache=cache,
-            path=path,
-            content=content,
-            create_parents=create_parents,
-            dry_run=dry_run,
-            auto_format=auto_format,
-            append=append,
-        )
-        cache.metrics.record("write", result)
+        async with _tracked_operation(cache, shield=True):
+            result = await smart_write(
+                cache=cache,
+                path=path,
+                content=content,
+                create_parents=create_parents,
+                dry_run=dry_run,
+                auto_format=auto_format,
+                append=append,
+            )
+            cache.metrics.record("write", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -436,6 +463,10 @@ async def write(
 
         return _render_response(payload, max_response_tokens)
 
+    except RuntimeError as e:
+        if "shutting down" in str(e):
+            return _render_error("write", "server is shutting down", max_response_tokens)
+        return _render_error("write", str(e), max_response_tokens)
     except FileNotFoundError as e:
         return _render_error("write", str(e), max_response_tokens)
     except PermissionError as e:
@@ -501,18 +532,19 @@ async def edit(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await smart_edit(
-            cache=cache,
-            path=path,
-            old_string=old_string,
-            new_string=new_string,
-            replace_all=replace_all,
-            dry_run=dry_run,
-            auto_format=auto_format,
-            start_line=start_line,
-            end_line=end_line,
-        )
-        cache.metrics.record("edit", result)
+        async with _tracked_operation(cache, shield=True):
+            result = await smart_edit(
+                cache=cache,
+                path=path,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=replace_all,
+                dry_run=dry_run,
+                auto_format=auto_format,
+                start_line=start_line,
+                end_line=end_line,
+            )
+            cache.metrics.record("edit", result)
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -541,6 +573,10 @@ async def edit(
 
         return _render_response(payload, max_response_tokens)
 
+    except RuntimeError as e:
+        if "shutting down" in str(e):
+            return _render_error("edit", "server is shutting down", max_response_tokens)
+        return _render_error("edit", str(e), max_response_tokens)
     except FileNotFoundError as e:
         return _render_error("edit", str(e), max_response_tokens)
     except PermissionError as e:
@@ -630,14 +666,15 @@ async def batch_edit(
                     max_response_tokens,
                 )
 
-        result = await smart_batch_edit(
-            cache=cache,
-            path=path,
-            edits=edit_tuples,
-            dry_run=dry_run,
-            auto_format=auto_format,
-        )
-        cache.metrics.record("batch_edit", result)
+        async with _tracked_operation(cache, shield=True):
+            result = await smart_batch_edit(
+                cache=cache,
+                path=path,
+                edits=edit_tuples,
+                dry_run=dry_run,
+                auto_format=auto_format,
+            )
+            cache.metrics.record("batch_edit", result)
 
         status = (
             "edited"
@@ -687,6 +724,10 @@ async def batch_edit(
 
         return _render_response(payload, max_response_tokens)
 
+    except RuntimeError as e:
+        if "shutting down" in str(e):
+            return _render_error("batch_edit", "server is shutting down", max_response_tokens)
+        return _render_error("batch_edit", str(e), max_response_tokens)
     except json.JSONDecodeError as e:
         return _render_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
     except FileNotFoundError as e:
@@ -1148,11 +1189,24 @@ async def grep(
         return _render_error("grep", str(e), max_response_tokens)
 
 
+_EXPAND_GLOBS_TIMEOUT = 5  # seconds — matches GLOB_TIMEOUT_SECONDS
+
+
 def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
-    """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
+    """Expand glob patterns in path list. Non-glob paths pass through unchanged.
+
+    Uses a deadline to prevent recursive ``**`` patterns from blocking
+    the caller for an unbounded amount of time.
+    """
+    import time  # noqa: PLC0415
+
+    deadline = time.monotonic() + _EXPAND_GLOBS_TIMEOUT
     expanded: list[str] = []
     glob_chars = frozenset("*?[")
     for p in raw_paths:
+        if time.monotonic() > deadline:
+            logger.warning(f"Glob expansion timed out after {_EXPAND_GLOBS_TIMEOUT}s")
+            break
         if any(c in p for c in glob_chars):
             try:
                 # Split into directory + pattern for Path.glob
@@ -1177,8 +1231,19 @@ def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
                 if not base.is_dir():
                     expanded.append(p)  # Base doesn't exist — treat as literal
                 else:
-                    matches = sorted(str(m) for m in base.glob(pattern) if m.is_file())
-                    expanded.extend(matches[: max_files - len(expanded)])
+                    # Iterate lazily with deadline to avoid materializing huge trees
+                    remaining = max_files - len(expanded)
+                    matches: list[str] = []
+                    for m in base.glob(pattern):
+                        if time.monotonic() > deadline:
+                            logger.warning(f"Glob pattern timed out: {pattern}")
+                            break
+                        if m.is_file():
+                            matches.append(str(m))
+                            if len(matches) >= remaining:
+                                break
+                    matches.sort()
+                    expanded.extend(matches)
             except (OSError, ValueError):
                 expanded.append(p)  # Treat invalid pattern as literal
         else:

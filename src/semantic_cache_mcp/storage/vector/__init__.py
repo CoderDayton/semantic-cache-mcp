@@ -196,6 +196,8 @@ class VectorStorage:
 
     async def get(self, path: str) -> CacheEntry | None:
         """Return metadata for path. For chunked files, uses the parent document."""
+        if self._closed:
+            return None
         results = await self._find_docs_by_path(path)
         if not results:
             return None
@@ -240,6 +242,8 @@ class VectorStorage:
         embedding: EmbeddingVector | None = None,
     ) -> None:
         """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
+        if self._closed:
+            return
         content_hash = hash_content(content)
         tokens = count_tokens(content)
         now = time.time()
@@ -366,6 +370,8 @@ class VectorStorage:
 
     async def get_content(self, entry: CacheEntry) -> str:
         """Reassemble full text from simplevecdb chunks (sorted by chunk_index)."""
+        if self._closed:
+            raise ValueError(f"Storage closed, cannot read content for {entry.path}")
         results = await self._find_docs_by_path(entry.path)
         if not results:
             raise ValueError(f"No cached content found for {entry.path}")
@@ -384,6 +390,8 @@ class VectorStorage:
         return "".join(r[2] for r in children)
 
     async def record_access(self, path: str) -> None:
+        if self._closed:
+            return
         results = await self._find_docs_by_path(path)
         if not results:
             return
@@ -398,7 +406,8 @@ class VectorStorage:
             updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
 
         if updates:
-            self._collection._collection._catalog.update_metadata_batch(updates)
+            catalog = self._collection._collection._catalog
+            await asyncio.to_thread(catalog.update_metadata_batch, updates)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding.
@@ -406,6 +415,8 @@ class VectorStorage:
         Used when content hash matches but mtime changed (touch, git checkout).
         Prevents repeated hash checks on subsequent reads.
         """
+        if self._closed:
+            return
         results = await self._find_docs_by_path(path)
         if not results:
             return
@@ -415,7 +426,8 @@ class VectorStorage:
             updates.append((doc_id, {_META_MTIME: new_mtime}))
 
         if updates:
-            self._collection._collection._catalog.update_metadata_batch(updates)
+            catalog = self._collection._collection._catalog
+            await asyncio.to_thread(catalog.update_metadata_batch, updates)
 
     # -------------------------------------------------------------------------
     # Similarity search
@@ -425,6 +437,8 @@ class VectorStorage:
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
         """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None."""
+        if self._closed:
+            return None
         emb_list = list(embedding)
 
         try:
@@ -466,6 +480,8 @@ class VectorStorage:
         threshold: float | None = None,
     ) -> list[tuple[str, float]]:
         """Return up to k (path, similarity) tuples above threshold."""
+        if self._closed:
+            return []
         if threshold is None:
             threshold = SIMILARITY_THRESHOLD
 
@@ -514,6 +530,8 @@ class VectorStorage:
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
         """BM25 keyword search over cached content. FTS5 syntax supported."""
+        if self._closed:
+            return []
         try:
             results = await self._collection.keyword_search(query, k=k * 2, filter=filter)
         except Exception as e:
@@ -533,6 +551,8 @@ class VectorStorage:
 
         Falls back to keyword-only if no embedding provided.
         """
+        if self._closed:
+            return []
         query_vector = list(embedding) if embedding is not None else None
 
         try:
@@ -594,6 +614,8 @@ class VectorStorage:
 
         Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
         """
+        if self._closed:
+            return []
         import re  # noqa: PLC0415
 
         # Clamp inputs to prevent excessive memory/CPU usage
@@ -612,7 +634,9 @@ class VectorStorage:
                 return []
 
         # Collect all cached file content grouped by path
-        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
+        all_docs = await asyncio.to_thread(
+            self._collection._collection._catalog.get_all_docs_with_text
+        )
         files: dict[str, list[tuple[int, str]]] = {}  # path -> [(chunk_index, text)]
         for _doc_id, text, meta in all_docs:
             if meta.get(_META_IS_PARENT, False):
@@ -679,14 +703,22 @@ class VectorStorage:
             return False
 
     async def get_stats(self) -> dict[str, int | float]:
-        count = self._collection._collection.count()
+        if self._closed:
+            return {
+                "files_cached": 0,
+                "total_tokens_cached": 0,
+                "total_documents": 0,
+                "db_size_mb": 0,
+            }
+        sync_coll = self._collection._collection
+        count = await asyncio.to_thread(sync_coll.count)
         db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
         # Count unique files (not chunks)
         unique_paths: set[str] = set()
         total_tokens = 0
 
-        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
+        all_docs = await asyncio.to_thread(sync_coll._catalog.get_all_docs_with_text)
         for _doc_id, _text, meta in all_docs:
             path = meta.get(_META_PATH, "")
             if path:
@@ -723,7 +755,7 @@ class VectorStorage:
 
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of files removed."""
-        return self._clear_sync()
+        return await asyncio.to_thread(self._clear_sync)
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -757,7 +789,7 @@ class VectorStorage:
         """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
         # Get all docs once — used for both the file-count check and LRU scoring.
         sync_coll = self._collection._collection
-        all_docs = sync_coll._catalog.get_all_docs_with_text()
+        all_docs = await asyncio.to_thread(sync_coll._catalog.get_all_docs_with_text)
 
         # Count unique files, not documents. Chunked files span multiple
         # documents, so using doc count fires eviction too early.
@@ -802,7 +834,7 @@ class VectorStorage:
 
         if ids_to_delete:
             await self._collection.delete_by_ids(ids_to_delete)
-            sync_coll.save()
+            await asyncio.to_thread(sync_coll.save)
             logger.info(f"Cache eviction: removed {evicted} documents")
 
     def save(self) -> None:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import signal
 import sys
 
 from fastmcp import FastMCP
@@ -78,7 +80,7 @@ async def app_lifespan(server: FastMCP):
             _migrate_v2_to_v3()
 
             logger.info("Initializing embedding model...")
-            warmup()
+            await asyncio.to_thread(warmup)
 
             model_info = get_model_info()
             # Detect embedding model change and rebuild index if needed
@@ -102,10 +104,36 @@ async def app_lifespan(server: FastMCP):
     if cache is None:
         raise RuntimeError("Cache failed to initialize")
 
+    # Install graceful shutdown handlers so SIGTERM/SIGINT trigger the
+    # lifespan cleanup path instead of raising KeyboardInterrupt mid-operation.
+    loop = asyncio.get_running_loop()
+    shutdown_received = False
+
+    def _graceful_shutdown(sig: int) -> None:
+        nonlocal shutdown_received
+        sig_name = signal.Signals(sig).name
+        if not shutdown_received:
+            shutdown_received = True
+            logger.info(f"Received {sig_name} — initiating graceful shutdown")
+            cache._shutting_down = True
+            # Stop the event loop, which triggers the lifespan finally block
+            loop.stop()
+        else:
+            logger.warning(f"Received {sig_name} again — forcing exit")
+            raise SystemExit(128 + sig)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, OSError):
+            loop.add_signal_handler(sig, _graceful_shutdown, sig)
+
     try:
         yield {"cache": cache}
     finally:
-        cache.close()
+        # Remove signal handlers before cleanup to avoid re-entrance
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, OSError):
+                loop.remove_signal_handler(sig)
+        await cache.async_close()
         # Flush streams before exit — prevents lost log output when running
         # as a subprocess (stdio transport) or in containers.
         for stream in (sys.stdout, sys.stderr):

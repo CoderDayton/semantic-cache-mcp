@@ -32,25 +32,25 @@ from tests.constants import TEST_EMBEDDING_DIM
 class TestFormatFileSpecialFileRejection:
     """Cover lines 62-69: stat.S_ISREG check and OSError handler."""
 
-    def test_rejects_non_regular_file(self, temp_dir: Path) -> None:
+    async def test_rejects_non_regular_file(self, temp_dir: Path) -> None:
         """FIFO (named pipe) rejected before subprocess."""
         fifo_path = temp_dir / "test.py"
         os.mkfifo(fifo_path)  # Creates a named pipe
-        assert not _format_file(fifo_path)
+        assert not await _format_file(fifo_path)
 
-    def test_oserror_on_stat_returns_false(self, temp_dir: Path) -> None:
+    async def test_oserror_on_stat_returns_false(self, temp_dir: Path) -> None:
         """OSError during stat (e.g. dangling symlink) → False."""
         dangling = temp_dir / "dangling.py"
         dangling.symlink_to(temp_dir / "nonexistent.py")
-        assert not _format_file(dangling)
+        assert not await _format_file(dangling)
 
-    def test_regular_file_passes_check(self, temp_dir: Path) -> None:
+    async def test_regular_file_passes_check(self, temp_dir: Path) -> None:
         """Regular .py file is not blocked by S_ISREG check."""
         py_file = temp_dir / "valid.py"
         py_file.write_text("x = 1\n")
         # Even if formatter not installed, the check itself should pass
         # (function returns False for missing formatter, not for stat check)
-        result = _format_file(py_file)
+        result = await _format_file(py_file)
         # Result depends on whether ruff is installed; we just verify no crash
         assert isinstance(result, bool)
 
@@ -568,6 +568,8 @@ class TestMcpLifespan:
         ):
             mock_cache = MagicMock()
             mock_cache.metrics = MagicMock()
+            mock_cache.async_close = AsyncMock()
+            mock_cache._shutting_down = False
             mock_cache_cls.return_value = mock_cache
 
             from semantic_cache_mcp.server._mcp import app_lifespan
@@ -607,6 +609,8 @@ class TestMcpLifespan:
         ):
             mock_cache = MagicMock()
             mock_cache.metrics = MagicMock()
+            mock_cache.async_close = AsyncMock()
+            mock_cache._shutting_down = False
             mock_cache_cls.return_value = mock_cache
 
             from semantic_cache_mcp.server._mcp import app_lifespan

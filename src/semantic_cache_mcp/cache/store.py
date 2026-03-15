@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -277,7 +278,18 @@ def _file_label(path: str) -> str:
 class SemanticCache:
     """Facade over VectorStorage (simplevecdb/HNSW), SQLite metrics, and FastEmbed embeddings."""
 
-    __slots__ = ("_storage", "_metrics_storage", "_metrics", "_closed")
+    __slots__ = (
+        "_storage",
+        "_metrics_storage",
+        "_metrics",
+        "_closed",
+        "_shutting_down",
+        "_inflight",
+        "_drained",
+    )
+
+    # Grace period for in-flight operations to finish during shutdown.
+    _DRAIN_TIMEOUT: float = 8.0
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
         self._storage = VectorStorage(db_path)
@@ -286,21 +298,82 @@ class SemanticCache:
         self._metrics_storage = SQLiteStorage(metrics_db)
         self._metrics = SessionMetrics(self._metrics_storage._pool)
         self._closed = False
+        self._shutting_down = False
+        self._inflight = 0
+        self._drained: asyncio.Event = asyncio.Event()
+        self._drained.set()  # starts drained (no inflight ops)
 
     @property
     def metrics(self) -> SessionMetrics:
         """Current session metrics accumulator."""
         return self._metrics
 
-    def close(self) -> None:
-        """Persist metrics and close all storage backends.
+    def begin_operation(self) -> bool:
+        """Mark the start of an in-flight operation.
 
-        Called from the lifespan finally block. Idempotent — safe to call
-        multiple times. Must not raise — a failed close should not mask
-        the original shutdown reason.
+        Returns False if shutdown is in progress (caller should bail out).
+        """
+        if self._shutting_down:
+            return False
+        self._inflight += 1
+        self._drained.clear()
+        return True
+
+    def end_operation(self) -> None:
+        """Mark the end of an in-flight operation."""
+        self._inflight = max(0, self._inflight - 1)
+        if self._inflight == 0:
+            self._drained.set()
+
+    async def async_close(self) -> None:
+        """Graceful shutdown: drain in-flight ops, persist metrics, close backends.
+
+        Called from the lifespan finally block. Waits up to _DRAIN_TIMEOUT
+        seconds for in-flight operations to finish before forcing close.
+        Idempotent — safe to call multiple times.
         """
         if self._closed:
             return
+        self._shutting_down = True
+
+        # Wait for in-flight operations to drain
+        if self._inflight > 0:
+            logger.info(f"Waiting for {self._inflight} in-flight operation(s) to finish...")
+            try:
+                await asyncio.wait_for(self._drained.wait(), timeout=self._DRAIN_TIMEOUT)
+                logger.info("All in-flight operations drained")
+            except TimeoutError:
+                logger.warning(
+                    f"Drain timeout ({self._DRAIN_TIMEOUT}s) expired with "
+                    f"{self._inflight} operation(s) still running — forcing close"
+                )
+
+        self._closed = True
+
+        try:
+            self._metrics.persist()
+        except Exception as e:
+            logger.warning(f"Failed to persist metrics on close: {e}")
+
+        try:
+            self._storage.close()
+        except Exception as e:
+            logger.warning(f"Failed to close VectorStorage: {e}")
+
+        try:
+            self._metrics_storage._pool.close_all()
+        except Exception as e:
+            logger.warning(f"Failed to close metrics pool: {e}")
+
+    def close(self) -> None:
+        """Synchronous close fallback (no drain wait).
+
+        Prefer async_close() in async contexts. This exists for atexit
+        and signal handler safety.
+        """
+        if self._closed:
+            return
+        self._shutting_down = True
         self._closed = True
 
         try:
@@ -322,10 +395,12 @@ class SemanticCache:
     # Embedding
     # -------------------------------------------------------------------------
 
-    def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
+    async def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
         """Embed text using FastEmbed. When path is given, prepends a file-type label
         (e.g. "Python source code: ...") so the model gets intent-rich context instead
         of raw syntactic noise — improves retrieval for JSON, YAML, and config files.
+
+        Runs ONNX inference in a thread to avoid blocking the asyncio event loop.
         """
         try:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
@@ -335,7 +410,7 @@ class SemanticCache:
             if path:
                 text = f"{_file_label(path)}: {text}"
 
-            result = _embed(text)
+            result = await asyncio.to_thread(_embed, text)
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result
@@ -406,23 +481,26 @@ class SemanticCache:
 
         # Lifetime metrics (aggregated from all completed sessions)
         try:
-            stats["lifetime"] = self._metrics_storage.get_lifetime_stats()
+            stats["lifetime"] = await asyncio.to_thread(self._metrics_storage.get_lifetime_stats)
         except Exception as e:
             logger.warning(f"Failed to load lifetime stats: {e}")
 
         return stats
 
-    def get_embeddings_batch(
+    async def get_embeddings_batch(
         self, path_content_pairs: list[tuple[str, str]]
     ) -> list[EmbeddingVector | None]:
-        """Batch-embed files in one model call. Prepends file-type labels like get_embedding."""
+        """Batch-embed files in one model call. Prepends file-type labels like get_embedding.
+
+        Runs ONNX inference in a thread to avoid blocking the asyncio event loop.
+        """
         from . import embed_batch as _embed_batch  # noqa: PLC0415
 
         texts = [
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
-        return cast(list[EmbeddingVector | None], _embed_batch(texts))
+        return cast(list[EmbeddingVector | None], await asyncio.to_thread(_embed_batch, texts))
 
     async def clear(self) -> int:
         return await self._storage.clear()

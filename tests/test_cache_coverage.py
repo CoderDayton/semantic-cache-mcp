@@ -14,7 +14,7 @@ from __future__ import annotations
 import array
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -144,25 +144,25 @@ class TestSuppressLargeDiff:
 class TestFormatFile:
     """Lines 59-60 (binary skip) and formatter not found path."""
 
-    def test_unsupported_extension_returns_false(self, tmp_path: Path) -> None:
+    async def test_unsupported_extension_returns_false(self, tmp_path: Path) -> None:
         f = tmp_path / "file.unsupported_xyz"
         f.write_text("content")
-        assert _format_file(f) is False
+        assert await _format_file(f) is False
 
-    def test_missing_formatter_returns_false(self, tmp_path: Path) -> None:
+    async def test_missing_formatter_returns_false(self, tmp_path: Path) -> None:
         f = tmp_path / "file.py"
         f.write_text("x = 1\n")
         with patch("shutil.which", return_value=None):
-            assert _format_file(f) is False
+            assert await _format_file(f) is False
 
-    def test_formatter_non_regular_file_returns_false(self, tmp_path: Path) -> None:
+    async def test_formatter_non_regular_file_returns_false(self, tmp_path: Path) -> None:
         """Non-regular file (symlink to dir) should return False."""
         d = tmp_path / "mydir"
         d.mkdir()
         link = tmp_path / "link.py"
         link.symlink_to(d)
         # stat() on symlink → directory → not S_ISREG → False
-        assert _format_file(link) is False
+        assert await _format_file(link) is False
 
 
 # ===========================================================================
@@ -343,11 +343,11 @@ class TestSemanticCacheStore:
         vs = _make_vector_storage(tmp_path)
         vs.close()  # should complete without error
 
-    def test_get_embeddings_batch(self, tmp_path: Path) -> None:
+    async def test_get_embeddings_batch(self, tmp_path: Path) -> None:
         """get_embeddings_batch returns list of same length as input."""
         cache = _make_cache(tmp_path)
         with patch("semantic_cache_mcp.cache.embed_batch", return_value=[None, None]):
-            results = cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
+            results = await cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
         assert len(results) == 2
 
 
@@ -776,7 +776,9 @@ class TestSmartWriteEdgeCases:
         cache = _make_cache(tmp_path)
         f = tmp_path / "fmt.py"
         f.write_text("x=1\n")
-        with patch("semantic_cache_mcp.cache.write._format_file", return_value=True) as mock_fmt:
+        with patch(
+            "semantic_cache_mcp.cache.write._format_file", new_callable=AsyncMock, return_value=True
+        ) as mock_fmt:
             f.write_text("x=2\n")  # ensure re-read works
             await smart_write(cache, str(f), "x = 2\n", auto_format=True)
         mock_fmt.assert_called_once()
@@ -865,7 +867,9 @@ class TestSmartEditEdgeCases:
         cache = _make_cache(tmp_path)
         f = tmp_path / "fmt_edit.py"
         f.write_text("x = 1\ny = 2\n")
-        with patch("semantic_cache_mcp.cache.write._format_file", return_value=True):
+        with patch(
+            "semantic_cache_mcp.cache.write._format_file", new_callable=AsyncMock, return_value=True
+        ):
             await smart_edit(cache, str(f), "x = 1", "x = 10", auto_format=True)
 
     async def test_edit_permission_error_on_write(self, tmp_path: Path) -> None:
@@ -973,7 +977,9 @@ class TestSmartBatchEdit:
         cache = _make_cache(tmp_path)
         f = tmp_path / "batch_fmt.py"
         f.write_text("x = 1\ny = 2\n")
-        with patch("semantic_cache_mcp.cache.write._format_file", return_value=True):
+        with patch(
+            "semantic_cache_mcp.cache.write._format_file", new_callable=AsyncMock, return_value=True
+        ):
             result = await smart_batch_edit(cache, str(f), [("x = 1", "x = 10")], auto_format=True)
         assert result.succeeded == 1
 
@@ -1084,40 +1090,54 @@ class TestChooseMinTokenContent:
 class TestFormatFileSubprocessEdgeCases:
     """Lines 83-90 — formatter timeout and OSError paths."""
 
-    def test_formatter_timeout_returns_false(self, tmp_path: Path) -> None:
-        import subprocess
-
+    async def test_formatter_timeout_returns_false(self, tmp_path: Path) -> None:
         f = tmp_path / "timeout.py"
         f.write_text("x = 1\n")
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError)
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
         with (
             patch("shutil.which", return_value="/usr/bin/ruff"),
-            patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ruff", 10)),
+            patch(
+                "semantic_cache_mcp.cache._helpers.asyncio.create_subprocess_exec",
+                return_value=mock_proc,
+            ),
         ):
-            result = _format_file(f)
+            result = await _format_file(f)
         assert result is False
 
-    def test_formatter_oserror_returns_false(self, tmp_path: Path) -> None:
+    async def test_formatter_oserror_returns_false(self, tmp_path: Path) -> None:
         f = tmp_path / "oserr.py"
         f.write_text("x = 1\n")
         with (
             patch("shutil.which", return_value="/usr/bin/ruff"),
-            patch("subprocess.run", side_effect=OSError("exec failed")),
+            patch(
+                "semantic_cache_mcp.cache._helpers.asyncio.create_subprocess_exec",
+                side_effect=OSError("exec failed"),
+            ),
         ):
-            result = _format_file(f)
+            result = await _format_file(f)
         assert result is False
 
-    def test_formatter_nonzero_returncode_returns_false(self, tmp_path: Path) -> None:
-
+    async def test_formatter_nonzero_returncode_returns_false(self, tmp_path: Path) -> None:
         f = tmp_path / "fail.py"
         f.write_text("x = 1\n")
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = b"syntax error"
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"syntax error"))
+        mock_proc.returncode = 1
+
         with (
             patch("shutil.which", return_value="/usr/bin/ruff"),
-            patch("subprocess.run", return_value=mock_result),
+            patch(
+                "semantic_cache_mcp.cache._helpers.asyncio.create_subprocess_exec",
+                return_value=mock_proc,
+            ),
         ):
-            result = _format_file(f)
+            result = await _format_file(f)
         assert result is False
 
 

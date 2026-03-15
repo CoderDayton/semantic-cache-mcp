@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -131,7 +132,9 @@ async def smart_read(
                     f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
                 )
                 embedding = (
-                    _embedding if _embedding is not None else cache.get_embedding(content, path)
+                    _embedding
+                    if _embedding is not None
+                    else (await cache.get_embedding(content, path))
                 )
                 await cache.put(str(file_path), content, mtime, embedding)
 
@@ -149,7 +152,9 @@ async def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
+        embedding = (
+            _embedding if _embedding is not None else (await cache.get_embedding(content, path))
+        )
         if embedding:
             similar_path = await cache.find_similar(embedding, str(file_path))
             if similar_path:
@@ -196,20 +201,26 @@ async def smart_read(
         try:
             # Convert EmbeddingVector to NDArray for summarization
             def embed_fn(text: str):
-                emb = cache.get_embedding(text)
+                # Direct sync call — this runs inside asyncio.to_thread via
+                # summarize_semantic, so it won't block the event loop.
+                from ..core.embeddings import embed as _embed_sync  # noqa: PLC0415
+
+                emb = _embed_sync(text)
                 if emb is None:
                     return None
                 # Convert array.array or list to numpy array
                 return np.asarray(emb, dtype=np.float32)
 
-            final_content = summarize_semantic(content, max_size, embed_fn=embed_fn)
+            final_content = await asyncio.to_thread(
+                summarize_semantic, content, max_size, embed_fn=embed_fn
+            )
             truncated = True
         except Exception as e:
             logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
+    embedding = _embedding if _embedding is not None else await cache.get_embedding(content, path)
     await cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
@@ -308,7 +319,7 @@ async def batch_smart_read(
         from ..core.embeddings import embed_batch as _embed_batch  # noqa: PLC0415
 
         _texts = [(f"{_file_label(_rpath)}: {_cnt}")[:8000] for _, _rpath, _cnt in _to_embed]
-        _results = _embed_batch(_texts)
+        _results = await asyncio.to_thread(_embed_batch, _texts)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
             if _emb is not None:
                 _prefetched[_rpath] = _emb
