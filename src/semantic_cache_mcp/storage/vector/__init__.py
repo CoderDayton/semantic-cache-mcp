@@ -365,7 +365,11 @@ class VectorStorage:
             return list(embedding)
         dim = self._collection._collection._dim
         if dim is None:
-            dim = 384  # Default: matches BAAI/bge-small-en-v1.5
+            # Query the actual embedding model dimension instead of assuming 384.
+            # Falls back to 384 (bge-small-en-v1.5) only if model isn't loaded yet.
+            from ...core.embeddings import get_embedding_dim  # noqa: PLC0415
+
+            dim = get_embedding_dim() or 384
         return [0.0] * dim
 
     async def get_content(self, entry: CacheEntry) -> str:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -286,6 +287,7 @@ class SemanticCache:
         "_shutting_down",
         "_inflight",
         "_drained",
+        "_embed_executor",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -302,6 +304,10 @@ class SemanticCache:
         self._inflight = 0
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
+        # Dedicated single-thread executor for ONNX embedding calls.
+        # ONNX Runtime serializes inference internally, so >1 thread just
+        # wastes default-pool slots waiting on its session lock.
+        self._embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
 
     @property
     def metrics(self) -> SessionMetrics:
@@ -378,6 +384,8 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._embed_executor.shutdown(wait=False)
+
     def close(self) -> None:
         """Synchronous close fallback (no drain wait).
 
@@ -404,6 +412,8 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._embed_executor.shutdown(wait=False)
+
     # -------------------------------------------------------------------------
     # Embedding
     # -------------------------------------------------------------------------
@@ -423,7 +433,8 @@ class SemanticCache:
             if path:
                 text = f"{_file_label(path)}: {text}"
 
-            result = await asyncio.to_thread(_embed, text)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._embed_executor, _embed, text)
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result
@@ -513,7 +524,11 @@ class SemanticCache:
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
-        return cast(list[EmbeddingVector | None], await asyncio.to_thread(_embed_batch, texts))
+        loop = asyncio.get_running_loop()
+        return cast(
+            list[EmbeddingVector | None],
+            await loop.run_in_executor(self._embed_executor, _embed_batch, texts),
+        )
 
     async def clear(self) -> int:
         return await self._storage.clear()
