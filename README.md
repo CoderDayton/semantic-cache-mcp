@@ -83,7 +83,7 @@ Any HuggingFace model with an ONNX export works — set `EMBEDDING_MODEL` in you
 
 ```json
 "env": {
-  "EMBEDDING_MODEL": "nomic-ai/nomic-embed-text-v1.5"
+  "EMBEDDING_MODEL": "Snowflake/snowflake-arctic-embed-m-v2.0"
 }
 ```
 
