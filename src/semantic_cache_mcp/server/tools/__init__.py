@@ -47,6 +47,7 @@ async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
     counter accurate for async_close().
     """
     if not cache.begin_operation():
+        coro.close()  # prevent 'coroutine was never awaited' warning
         raise RuntimeError("Server is shutting down")
     task = asyncio.ensure_future(coro)
     task.set_name("shielded-write")
@@ -85,17 +86,16 @@ async def read(
 
     Timing guidance:
     - Use for single-file inspection and verification.
-    - For 2+ files, prefer batch_read first.
-    - Keep diff_mode=true during iteration; set false when you need full content again.
-    - Use offset/limit to read specific line ranges of large files.
+    - For 2+ files, prefer batch_read instead.
+    - Keep diff_mode=true during iteration; set false after context compression.
+    - Use offset/limit to read specific line ranges without re-reading the whole file.
 
-    When a file is truncated:
-    - The response includes a "hint" with the offset to continue reading.
-    - Use read with that offset to get the next section. Do NOT re-read from the beginning.
-    - Example: if hint says offset=500, call read(path, offset=500, limit=500).
+    Truncated files: the response includes a hint with the offset to continue.
+    Use read(path, offset=N, limit=M) to get the next section — do NOT re-read
+    from the beginning.
 
     Args:
-        path: Path to the file to read
+        path: File path (absolute or relative)
         max_size: Maximum content size to return (default: 100000)
         diff_mode: Return diff if previously read (default: true). Set false for full content.
         offset: Line number to start reading from (1-based)
@@ -399,20 +399,20 @@ async def write(
 ) -> str:
     """Write file content with cache integration.
 
-    Timing guidance:
+    Timing:
     - Use when creating files or replacing most/all content.
-    - For focused substitutions, prefer edit or batch_edit.
-    - Keep auto_format=false during rapid iterations; enable at stabilization points.
+    - For targeted substitutions, prefer edit or batch_edit.
+    - Use auto_format=true at stabilization points, not during rapid iteration.
 
-    For large files that exceed output limits, use append=True to write in chunks:
+    Large files: use append=true to write in chunks:
       write(path, chunk1)                               # creates file
-      write(path, chunk2, append=True)                   # appends
-      write(path, chunk3, append=True, auto_format=True) # final chunk + format
+      write(path, chunk2, append=true)                   # appends
+      write(path, chunk3, append=true, auto_format=true) # final chunk + format
 
     Response: returns a diff for overwrites/appends, or just status for new files.
 
     Args:
-        path: Absolute path to file
+        path: File path (absolute or relative)
         content: Content to write (or content to append when append=true)
         create_parents: Create parent directories (default: true)
         dry_run: Preview changes without writing (default: false)
@@ -496,27 +496,23 @@ async def edit(
 ) -> str:
     """Edit file using find/replace with cached reads.
 
-    Three modes — use line numbers from `read` output to save tokens:
+    Three modes — use line numbers from `read` to save tokens:
     - **find/replace**: old_string + new_string. Searches entire file.
-    - **scoped find/replace**: old_string + new_string + start_line/end_line.
-      Searches only within the line range — shorter old_string suffices.
-    - **line replace**: new_string + start_line/end_line (no old_string).
-      Replaces the entire line range. Maximum token savings.
+    - **scoped**: old_string + new_string + start_line/end_line. Shorter context suffices.
+    - **line replace**: new_string + start_line/end_line only. Maximum token savings.
 
-    Timing guidance:
-    - Use for a single targeted replacement.
-    - For 2+ independent replacements in one file, use batch_edit.
-    - Use dry_run when validating match uniqueness before committing edits.
-    - When you know exact line numbers, prefer scoped or line replace mode
-      to avoid sending large old_string context.
+    Timing:
+    - Use for a single targeted change. For 2+ changes, use batch_edit.
+    - When you have line numbers from read, prefer scoped or line replace mode.
+    - Use dry_run to validate match uniqueness before committing.
 
-    Multiple matches: if old_string appears more than once (within scope),
-    the call fails with a hint to add more context or use replace_all=true.
+    Multiple matches: fails with match count and hint. Add more context or
+    set replace_all=true.
 
-    Response: returns a unified diff of the change and the line numbers affected.
+    Response: unified diff of the change with affected line numbers.
 
     Args:
-        path: Absolute path to file
+        path: File path (absolute or relative)
         old_string: Exact string to find (whitespace-sensitive).
             Omit for line-replace mode (requires start_line/end_line).
         new_string: Replacement string
@@ -755,22 +751,20 @@ async def search(
     k: int = 10,
     directory: str | None = None,
 ) -> str:
-    """Search cached files by hybrid keyword + semantic similarity (BM25 + vector RRF).
+    """Search cached files by meaning and keywords (hybrid BM25 + vector RRF).
 
-    IMPORTANT: Only searches files already in the cache. You must read or batch_read
-    files first before they become searchable. Returns nothing on an empty cache.
+    Only searches files already in the cache. Seed with batch_read first.
+    Use `glob cached_only=true` to check what's cached.
 
-    Timing guidance:
-    - Seed cache first via read or batch_read — unseen files won't appear.
-    - Start with k=3 to k=5 and increase only if recall is insufficient.
-    - Use directory filter early to limit response size.
-
-    Response: ranked list of files with relevance scores and content previews.
+    Timing:
+    - batch_read target files first, then search across them.
+    - Start with k=3–5; increase only if recall is insufficient.
+    - Use directory to limit scope on large codebases.
 
     Args:
         query: Natural language or keyword search (both work — results are fused)
         k: Max results (default: 10, max: 100)
-        directory: Optional absolute directory path to limit search scope
+        directory: Optional directory path to limit search scope
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -816,14 +810,12 @@ async def diff(
     path2: str,
     context_lines: int = 3,
 ) -> str:
-    """Compare two files using cache. Returns unified diff and semantic similarity score.
+    """Compare two files. Returns unified diff and semantic similarity score.
 
-    Timing guidance:
-    - Use only for explicit two-file comparisons.
-    - Prefer read for normal iterative file updates.
-    - Lower context_lines for tighter outputs when reviewing many diffs.
+    Use for explicit side-by-side comparison. For checking changes to a single
+    file over time, use read (which returns diffs automatically).
 
-    Large diffs are automatically summarized to avoid excessive token usage.
+    Large diffs are auto-summarized to stay within token budget.
 
     Args:
         path1: First file path
@@ -872,16 +864,15 @@ async def batch_read(
 ) -> str:
     """Read multiple files under a token budget. Supports glob patterns in paths.
 
-    Timing guidance:
+    Timing:
     - Prefer over repeated read calls when working with 2+ files.
-    - Start with a tight max_total_tokens budget, then increase only if needed.
-    - Use this early to seed cache before search/similar operations.
-    - After context compression (when you no longer have file content in memory),
-      call with diff_mode=false to get full content in one batch instead of
-      making individual read calls for each file.
+    - Use early to seed the cache before search/similar/grep.
+    - After context compression, call with diff_mode=false to reload content.
+    - Start with a tight token budget; increase only if files are skipped.
 
-    With diff_mode=true (default), previously read unchanged files return as
-    "unchanged" with no content. Set diff_mode=false to force full content.
+    Response includes per-file status: full, diff, unchanged, or skipped.
+    Skipped files include est_tokens so you can retry them individually or
+    increase the budget. Unchanged files cost ~0 tokens.
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns (e.g. "src/**/*.py")
@@ -991,17 +982,18 @@ async def similar(
     path: str,
     k: int = 5,
 ) -> str:
-    """Find cached files semantically similar to given file.
+    """Find files semantically similar to a given file using cached embeddings.
 
-    Only compares against files already in the cache. Read files into cache first.
+    Compares against files already in the cache. The source file is cached
+    automatically, but neighbors must be cached first (via batch_read) to appear.
 
-    Timing guidance:
-    - Use after reading source and likely neighbors into cache.
-    - Start with small k (3-5) and increase only if needed.
-    - Prefer this after a focused read to find adjacent implementation/test files.
+    Timing:
+    - Use to discover related implementations, tests, or config files.
+    - batch_read a directory first, then use similar to find connections.
+    - Start with k=3–5.
 
     Args:
-        path: Source file path
+        path: Source file path (absolute or relative)
         k: Max results (default: 5, max: 50)
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
@@ -1046,13 +1038,15 @@ async def glob(
     directory: str = ".",
     cached_only: bool = False,
 ) -> str:
-    """Find files by pattern with cache status. Max 1000 matches, 5s timeout.
+    """Find files by glob pattern with cache status. Max 1000 matches, 5s timeout.
 
-    Timing guidance:
-    - Use early to shortlist candidate files before reading content.
-    - Follow with batch_read on selected files instead of reading all matches.
-    - Keep patterns specific to avoid large low-value result lists.
-    - Use cached_only=true to see what files are already cached.
+    Timing:
+    - Use first to discover files, then batch_read the results.
+    - Keep patterns specific (e.g. "src/**/*.py" not "**/*").
+    - Use cached_only=true to see what's already cached before search/grep.
+
+    Each match shows: path, cached (bool), tokens, mtime. Pipe results
+    directly into batch_read paths.
 
     Args:
         pattern: Glob pattern (e.g., "**/*.py")
@@ -1108,18 +1102,16 @@ async def grep(
     max_matches: int = 100,
     max_files: int = 50,
 ) -> str:
-    """Search cached file content by regex or literal pattern with line numbers.
+    """Exact pattern search across cached files with line numbers and context.
 
-    Like ripgrep but searches the semantic cache — returns matching lines with context.
-    Unlike `search` (ranked BM25+vector), this does exact pattern matching.
+    Like ripgrep on the cache. For semantic/fuzzy queries, use `search` instead.
+    Only searches cached files — seed with batch_read first.
 
-    IMPORTANT: Only searches files already in the cache. Read files first.
-
-    Timing guidance:
+    Timing:
     - Use for exact code patterns: function names, imports, error strings.
-    - Use `search` instead for semantic/fuzzy queries like "error handling logic".
-    - Set fixed_string=true for patterns with special regex chars (e.g. "foo.bar()").
-    - Add context_lines=2-3 to see surrounding code.
+    - Use `search` for meaning-based queries like "error handling logic".
+    - Set fixed_string=true for literals with regex chars (e.g. "foo.bar()").
+    - Add context_lines=2–3 to see surrounding code.
 
     Args:
         pattern: Regex pattern (or literal string if fixed_string=true)

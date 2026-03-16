@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import signal
 import sys
 
 from fastmcp import FastMCP
@@ -13,7 +12,7 @@ from fastmcp.server.lifespan import lifespan
 
 from ..cache import SemanticCache
 from ..config import DB_PATH
-from ..core.embeddings import get_model_info, warmup
+from ..core.embeddings import embed, get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -80,7 +79,7 @@ async def app_lifespan(server: FastMCP):
             _migrate_v2_to_v3()
 
             logger.info("Initializing embedding model...")
-            await asyncio.to_thread(warmup)
+            warmup()
 
             model_info = get_model_info()
             # Detect embedding model change and rebuild index if needed
@@ -104,41 +103,28 @@ async def app_lifespan(server: FastMCP):
     if cache is None:
         raise RuntimeError("Cache failed to initialize")
 
-    # Install graceful shutdown handlers so SIGTERM/SIGINT trigger the
-    # lifespan cleanup path instead of raising KeyboardInterrupt mid-operation.
-    loop = asyncio.get_running_loop()
-    shutdown_received = False
+    # Background keepalive: run a tiny embedding every 5 minutes to prevent
+    # the ONNX model from being paged out or GC'd during long idle periods.
+    _keepalive_task: asyncio.Task[None] | None = None
 
-    def _graceful_shutdown(sig: int) -> None:
-        nonlocal shutdown_received
-        sig_name = signal.Signals(sig).name
-        if not shutdown_received:
-            shutdown_received = True
-            logger.info(f"Received {sig_name} — initiating graceful shutdown")
-            cache.request_shutdown()
-            # Cancel all tasks so their finally blocks run (including lifespan
-            # cleanup → async_close). Skip shielded-write tasks — they must
-            # finish to avoid file corruption; the drain in async_close waits.
-            for task in asyncio.all_tasks(loop):
-                if task.get_name() != "shielded-write":
-                    task.cancel()
-        else:
-            logger.warning(f"Received {sig_name} again — forcing exit")
-            import os  # noqa: PLC0415
+    async def _embedding_keepalive() -> None:
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            try:
+                embed("keepalive")
+                logger.debug("Embedding keepalive ping")
+            except Exception:
+                logger.debug("Embedding keepalive failed", exc_info=True)
 
-            os._exit(128 + sig)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError, OSError):
-            loop.add_signal_handler(sig, _graceful_shutdown, sig)
+    _keepalive_task = asyncio.create_task(_embedding_keepalive())
 
     try:
         yield {"cache": cache}
     finally:
-        # Remove signal handlers before cleanup to avoid re-entrance
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            with contextlib.suppress(NotImplementedError, OSError):
-                loop.remove_signal_handler(sig)
+        if _keepalive_task is not None:
+            _keepalive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _keepalive_task
         await cache.async_close()
         # Flush streams before exit — prevents lost log output when running
         # as a subprocess (stdio transport) or in containers.
