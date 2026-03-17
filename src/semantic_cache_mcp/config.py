@@ -49,6 +49,11 @@ def _get_cache_dir() -> Path:
 CACHE_DIR: Final = _get_cache_dir()
 DB_PATH: Final = CACHE_DIR / "cache.db"
 
+# Crash sentinel — written on startup, removed on clean shutdown.
+# If present at next startup → previous run crashed → wipe vecdb to avoid
+# heap corruption from corrupted usearch index files.
+STARTUP_SENTINEL: Final = CACHE_DIR / ".startup.lock"
+
 
 def _env_int(name: str, default: int) -> int:
     raw = environ.get(name)

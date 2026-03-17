@@ -16,6 +16,7 @@ from ...config import (
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
     SIMILARITY_THRESHOLD,
+    STARTUP_SENTINEL,
 )
 from ...core.chunking import get_optimal_chunker
 from ...core.hashing import hash_content
@@ -64,6 +65,7 @@ class VectorStorage:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._clear_if_quantization_changed(db_path)
+        self._recover_if_crashed(db_path)
         self._db = AsyncVectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
@@ -71,7 +73,45 @@ class VectorStorage:
         )
         self._collection = self._db.collection(self._COLLECTION_NAME)
         self._closed = False
+        # Write sentinel — removed on clean shutdown by _remove_sentinel().
+        STARTUP_SENTINEL.touch()
         logger.info(f"VectorStorage initialized at {db_path}")
+
+    @staticmethod
+    def _remove_sentinel() -> None:
+        """Remove crash sentinel on clean shutdown."""
+        STARTUP_SENTINEL.unlink(missing_ok=True)
+
+    @classmethod
+    def _recover_if_crashed(cls, db_path: Path) -> None:
+        """Wipe vecdb if the previous run crashed (sentinel still present).
+
+        A C-level crash (SIGABRT from malloc corruption, SIGSEGV) kills the
+        process before Python cleanup runs, leaving the sentinel behind.
+        On next startup we detect this and delete the potentially corrupted
+        usearch index + SQLite WAL so the DB rebuilds cleanly.
+        """
+        if not STARTUP_SENTINEL.exists():
+            return
+
+        logger.warning(
+            "Crash sentinel detected — previous run did not shut down cleanly. "
+            "Clearing vecdb to prevent heap corruption from stale index files."
+        )
+        # Delete usearch index, SQLite DB, WAL, SHM, and metadata sidecar.
+        for pattern in (
+            f".{cls._COLLECTION_NAME}.usearch",
+            "",
+            "-wal",
+            "-shm",
+            ".meta.json",
+        ):
+            target = db_path.parent / (db_path.name + pattern) if pattern else db_path
+            if target.exists():
+                target.unlink()
+                logger.info(f"Deleted stale file: {target}")
+
+        STARTUP_SENTINEL.unlink(missing_ok=True)
 
     @classmethod
     def _clear_if_quantization_changed(cls, db_path: Path) -> None:

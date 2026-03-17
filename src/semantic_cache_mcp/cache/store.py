@@ -381,6 +381,9 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        # Remove crash sentinel — signals clean shutdown.
+        VectorStorage._remove_sentinel()
+
     def close(self) -> None:
         """Synchronous close fallback (no drain wait).
 
@@ -406,6 +409,9 @@ class SemanticCache:
             self._metrics_storage._pool.close_all()
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
+
+        # Remove crash sentinel — signals clean shutdown.
+        VectorStorage._remove_sentinel()
 
     # -------------------------------------------------------------------------
     # Embedding
