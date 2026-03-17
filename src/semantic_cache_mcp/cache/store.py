@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -287,7 +286,6 @@ class SemanticCache:
         "_shutting_down",
         "_inflight",
         "_drained",
-        "_embed_executor",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -307,7 +305,6 @@ class SemanticCache:
         # Dedicated single-thread executor for ONNX embedding calls.
         # ONNX Runtime serializes inference internally, so >1 thread just
         # wastes default-pool slots waiting on its session lock.
-        self._embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
 
     @property
     def metrics(self) -> SessionMetrics:
@@ -384,8 +381,6 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
-        self._embed_executor.shutdown(wait=False)
-
     def close(self) -> None:
         """Synchronous close fallback (no drain wait).
 
@@ -412,18 +407,14 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
-        self._embed_executor.shutdown(wait=False)
-
     # -------------------------------------------------------------------------
     # Embedding
     # -------------------------------------------------------------------------
 
-    async def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
+    def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
         """Embed text using FastEmbed. When path is given, prepends a file-type label
         (e.g. "Python source code: ...") so the model gets intent-rich context instead
         of raw syntactic noise — improves retrieval for JSON, YAML, and config files.
-
-        Runs ONNX inference in a thread to avoid blocking the asyncio event loop.
         """
         try:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
@@ -433,8 +424,7 @@ class SemanticCache:
             if path:
                 text = f"{_file_label(path)}: {text}"
 
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(self._embed_executor, _embed, text)
+            result = _embed(text)
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result
@@ -505,30 +495,23 @@ class SemanticCache:
 
         # Lifetime metrics (aggregated from all completed sessions)
         try:
-            stats["lifetime"] = await asyncio.to_thread(self._metrics_storage.get_lifetime_stats)
+            stats["lifetime"] = self._metrics_storage.get_lifetime_stats()
         except Exception as e:
             logger.warning(f"Failed to load lifetime stats: {e}")
 
         return stats
 
-    async def get_embeddings_batch(
+    def get_embeddings_batch(
         self, path_content_pairs: list[tuple[str, str]]
     ) -> list[EmbeddingVector | None]:
-        """Batch-embed files in one model call. Prepends file-type labels like get_embedding.
-
-        Runs ONNX inference in a thread to avoid blocking the asyncio event loop.
-        """
+        """Batch-embed files in one model call. Prepends file-type labels like get_embedding."""
         from . import embed_batch as _embed_batch  # noqa: PLC0415
 
         texts = [
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
-        loop = asyncio.get_running_loop()
-        return cast(
-            list[EmbeddingVector | None],
-            await loop.run_in_executor(self._embed_executor, _embed_batch, texts),
-        )
+        return cast(list[EmbeddingVector | None], _embed_batch(texts))
 
     async def clear(self) -> int:
         return await self._storage.clear()

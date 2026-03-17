@@ -343,11 +343,11 @@ class TestSemanticCacheStore:
         vs = _make_vector_storage(tmp_path)
         vs.close()  # should complete without error
 
-    async def test_get_embeddings_batch(self, tmp_path: Path) -> None:
+    def test_get_embeddings_batch(self, tmp_path: Path) -> None:
         """get_embeddings_batch returns list of same length as input."""
         cache = _make_cache(tmp_path)
         with patch("semantic_cache_mcp.cache.embed_batch", return_value=[None, None]):
-            results = await cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
+            results = cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
         assert len(results) == 2
 
 

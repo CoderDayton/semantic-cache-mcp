@@ -410,8 +410,7 @@ class VectorStorage:
             updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
 
         if updates:
-            catalog = self._collection._collection._catalog
-            await asyncio.to_thread(catalog.update_metadata_batch, updates)
+            self._collection._collection._catalog.update_metadata_batch(updates)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding.
@@ -430,8 +429,7 @@ class VectorStorage:
             updates.append((doc_id, {_META_MTIME: new_mtime}))
 
         if updates:
-            catalog = self._collection._collection._catalog
-            await asyncio.to_thread(catalog.update_metadata_batch, updates)
+            self._collection._collection._catalog.update_metadata_batch(updates)
 
     # -------------------------------------------------------------------------
     # Similarity search
@@ -638,9 +636,7 @@ class VectorStorage:
                 return []
 
         # Collect all cached file content grouped by path
-        all_docs = await asyncio.to_thread(
-            self._collection._collection._catalog.get_all_docs_with_text
-        )
+        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
         files: dict[str, list[tuple[int, str]]] = {}  # path -> [(chunk_index, text)]
         for _doc_id, text, meta in all_docs:
             if meta.get(_META_IS_PARENT, False):
@@ -715,14 +711,14 @@ class VectorStorage:
                 "db_size_mb": 0,
             }
         sync_coll = self._collection._collection
-        count = await asyncio.to_thread(sync_coll.count)
+        count = sync_coll.count()
         db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
         # Count unique files (not chunks)
         unique_paths: set[str] = set()
         total_tokens = 0
 
-        all_docs = await asyncio.to_thread(sync_coll._catalog.get_all_docs_with_text)
+        all_docs = sync_coll._catalog.get_all_docs_with_text()
         for _doc_id, _text, meta in all_docs:
             path = meta.get(_META_PATH, "")
             if path:
@@ -759,7 +755,7 @@ class VectorStorage:
 
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of files removed."""
-        return await asyncio.to_thread(self._clear_sync)
+        return self._clear_sync()
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -793,7 +789,7 @@ class VectorStorage:
         """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
         # Get all docs once — used for both the file-count check and LRU scoring.
         sync_coll = self._collection._collection
-        all_docs = await asyncio.to_thread(sync_coll._catalog.get_all_docs_with_text)
+        all_docs = sync_coll._catalog.get_all_docs_with_text()
 
         # Count unique files, not documents. Chunked files span multiple
         # documents, so using doc count fires eviction too early.
@@ -838,7 +834,7 @@ class VectorStorage:
 
         if ids_to_delete:
             await self._collection.delete_by_ids(ids_to_delete)
-            await asyncio.to_thread(sync_coll.save)
+            sync_coll.save()
             logger.info(f"Cache eviction: removed {evicted} documents")
 
     def save(self) -> None:

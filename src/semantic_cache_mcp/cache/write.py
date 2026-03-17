@@ -198,7 +198,7 @@ async def smart_write(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = await cache.get_embedding(content, path)
+        embedding = cache.get_embedding(content, path)
         await cache.put(str(file_path), content, mtime, embedding)
         action = "Created" if created else "Updated"
         if formatted:
@@ -452,7 +452,7 @@ async def smart_edit(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = await cache.get_embedding(new_content, path)
+        embedding = cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
@@ -691,7 +691,7 @@ async def smart_batch_edit(
 
         # Update cache with final content
         mtime = file_path.stat().st_mtime
-        embedding = await cache.get_embedding(new_content, path)
+        embedding = cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
