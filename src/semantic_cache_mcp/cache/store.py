@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -286,6 +287,7 @@ class SemanticCache:
         "_shutting_down",
         "_inflight",
         "_drained",
+        "_io_executor",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -293,6 +295,8 @@ class SemanticCache:
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
         self._storage = VectorStorage(db_path)
+        # Share the IO executor with VectorStorage so all blocking ops
+        # (file I/O, ONNX, usearch) serialize on the same thread.
         # Keep SQLiteStorage only for session metrics persistence
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
@@ -302,9 +306,15 @@ class SemanticCache:
         self._inflight = 0
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
-        # Dedicated single-thread executor for ONNX embedding calls.
-        # ONNX Runtime serializes inference internally, so >1 thread just
-        # wastes default-pool slots waiting on its session lock.
+        # Single-thread executor shared by ALL blocking operations:
+        # file I/O, ONNX embedding inference, and vecdb index saves.
+        # MUST be single-threaded — ONNX Runtime and usearch use
+        # incompatible allocators that segfault under concurrent access
+        # from different threads.
+        self._io_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="semantic-cache-io"
+        )
+        self._storage._io_executor = self._io_executor
 
     @property
     def metrics(self) -> SessionMetrics:
@@ -381,6 +391,8 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._io_executor.shutdown(wait=False)
+
         # Remove crash sentinel — signals clean shutdown.
         VectorStorage._remove_sentinel()
 
@@ -410,6 +422,8 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._io_executor.shutdown(wait=False)
+
         # Remove crash sentinel — signals clean shutdown.
         VectorStorage._remove_sentinel()
 
@@ -417,10 +431,12 @@ class SemanticCache:
     # Embedding
     # -------------------------------------------------------------------------
 
-    def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
+    async def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
         """Embed text using FastEmbed. When path is given, prepends a file-type label
         (e.g. "Python source code: ...") so the model gets intent-rich context instead
         of raw syntactic noise — improves retrieval for JSON, YAML, and config files.
+
+        Runs ONNX inference in a thread executor to avoid blocking the event loop.
         """
         try:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
@@ -430,7 +446,8 @@ class SemanticCache:
             if path:
                 text = f"{_file_label(path)}: {text}"
 
-            result = _embed(text)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._io_executor, _embed, text)
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result

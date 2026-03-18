@@ -12,6 +12,7 @@ from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
+from ..utils import aread_bytes, aread_text, astat
 from ._helpers import _is_binary_content
 from .store import SemanticCache, _file_label
 
@@ -53,7 +54,7 @@ async def smart_read(
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
     # Single read: binary check + decode in one I/O operation
-    raw = file_path.read_bytes()
+    raw = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw):
         raise ValueError(
             f"Binary file not supported: {path}. Semantic cache only handles text files."
@@ -64,7 +65,7 @@ async def smart_read(
         content = raw.decode("utf-8", errors="replace")
         logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
 
-    mtime = file_path.stat().st_mtime
+    mtime = (await astat(file_path, cache._io_executor)).st_mtime
     tokens_original = count_tokens(content)
 
     cached = await cache.get(str(file_path))
@@ -134,7 +135,9 @@ async def smart_read(
                     f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
                 )
                 embedding = (
-                    _embedding if _embedding is not None else (cache.get_embedding(content, path))
+                    _embedding
+                    if _embedding is not None
+                    else (await cache.get_embedding(content, path))
                 )
                 await cache.put(str(file_path), content, mtime, embedding)
 
@@ -152,7 +155,9 @@ async def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = _embedding if _embedding is not None else (cache.get_embedding(content, path))
+        embedding = (
+            _embedding if _embedding is not None else (await cache.get_embedding(content, path))
+        )
         if embedding:
             similar_path = await cache.find_similar(embedding, str(file_path))
             if similar_path:
@@ -199,7 +204,11 @@ async def smart_read(
         try:
             # Convert EmbeddingVector to NDArray for summarization
             def embed_fn(text: str):
-                emb = cache.get_embedding(text)
+                # Call sync embed directly — this closure is passed to the
+                # sync summarize_semantic function, so it cannot use await.
+                from . import embed as _sync_embed  # noqa: PLC0415
+
+                emb = _sync_embed(text)
                 if emb is None:
                     return None
                 # Convert array.array or list to numpy array
@@ -212,7 +221,7 @@ async def smart_read(
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = _embedding if _embedding is not None else cache.get_embedding(content, path)
+    embedding = _embedding if _embedding is not None else await cache.get_embedding(content, path)
     await cache.put(str(file_path), content, mtime, embedding)
 
     tokens_returned = count_tokens(final_content)
@@ -289,7 +298,7 @@ async def batch_smart_read(
                 continue  # unchanged — no embedding needed
             # Check content hash before assuming changed
             try:
-                _raw_text = _resolved.read_text(encoding="utf-8")
+                _raw_text = await aread_text(_resolved, executor=cache._io_executor)
                 if hash_content(_raw_text) == _cached.content_hash:
                     await cache.update_mtime(str(_resolved), _file_mtime)
                     continue  # content unchanged — no embedding needed
@@ -298,7 +307,7 @@ async def batch_smart_read(
         if not _resolved.exists() or not _resolved.is_file():
             continue  # will error in smart_read, skip pre-scan
         try:
-            _raw = _resolved.read_bytes()
+            _raw = await aread_bytes(_resolved, cache._io_executor)
             if _is_binary_content(_raw):
                 continue  # binary file — smart_read will raise ValueError
             _content = _raw.decode("utf-8")
@@ -312,7 +321,8 @@ async def batch_smart_read(
         from ..core.embeddings import embed_batch as _embed_batch  # noqa: PLC0415
 
         _texts = [(f"{_file_label(_rpath)}: {_cnt}")[:8000] for _, _rpath, _cnt in _to_embed]
-        _results = _embed_batch(_texts)
+        _loop = asyncio.get_running_loop()
+        _results = await _loop.run_in_executor(cache._io_executor, _embed_batch, _texts)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
             if _emb is not None:
                 _prefetched[_rpath] = _emb

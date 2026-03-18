@@ -289,7 +289,7 @@ class TestWriteTool:
         p = tmp_path / "readonly.txt"
         p.write_text("content")
         with patch(
-            "semantic_cache_mcp.cache.write._atomic_write",
+            "semantic_cache_mcp.utils._async_io._atomic_write_sync",
             side_effect=PermissionError("[Errno 13] Permission denied"),
         ):
             d = _parse(await write(ctx, str(p), "new"))
@@ -378,7 +378,7 @@ class TestEditTool:
     async def test_edit_permission_error(self, ctx: MagicMock, py_file: Path) -> None:
         """PermissionError from atomic write maps to ok=False response."""
         with patch(
-            "semantic_cache_mcp.cache.write._atomic_write",
+            "semantic_cache_mcp.utils._async_io._atomic_write_sync",
             side_effect=PermissionError("[Errno 13] Permission denied"),
         ):
             d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))

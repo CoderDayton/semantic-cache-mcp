@@ -7,7 +7,9 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from simplevecdb import AsyncVectorDB, DistanceStrategy, Quantization
 
@@ -24,6 +26,8 @@ from ...core.tokenizer import count_tokens
 from ...types import CacheEntry, EmbeddingVector
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 VECDB_PATH = CACHE_DIR / "vecdb.db"
 
@@ -55,7 +59,16 @@ class VectorStorage:
     - LRU-K eviction via access_history metadata
     """
 
-    __slots__ = ("_db", "_collection", "_db_path", "_closed")
+    __slots__ = ("_db", "_collection", "_db_path", "_closed", "_io_executor")
+
+    async def _run_sync(self, fn: Callable[[], _T]) -> _T:
+        """Run a blocking function in the shared IO executor.
+
+        Uses the single-threaded executor set by SemanticCache to prevent
+        segfaults from ONNX/usearch allocator conflicts.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._io_executor, fn)
 
     # Quantization currently in use — stored in sidecar to detect future changes.
     _QUANTIZATION = Quantization.INT8
@@ -73,6 +86,7 @@ class VectorStorage:
         )
         self._collection = self._db.collection(self._COLLECTION_NAME)
         self._closed = False
+        self._io_executor = self._db._executor  # default; overridden by SemanticCache
         # Write sentinel — removed on clean shutdown by _remove_sentinel().
         STARTUP_SENTINEL.touch()
         logger.info(f"VectorStorage initialized at {db_path}")
@@ -386,7 +400,7 @@ class VectorStorage:
         sync_coll = self._collection._collection
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            self._db._executor,
+            self._io_executor,
             lambda: sync_coll.add_texts(
                 texts=chunk_texts,
                 metadatas=child_metas,
@@ -751,6 +765,7 @@ class VectorStorage:
                 "db_size_mb": 0,
             }
         sync_coll = self._collection._collection
+
         count = sync_coll.count()
         db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
@@ -795,7 +810,7 @@ class VectorStorage:
 
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of files removed."""
-        return self._clear_sync()
+        return await self._run_sync(self._clear_sync)
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -874,7 +889,7 @@ class VectorStorage:
 
         if ids_to_delete:
             await self._collection.delete_by_ids(ids_to_delete)
-            sync_coll.save()
+            await self._run_sync(sync_coll.save)
             logger.info(f"Cache eviction: removed {evicted} documents")
 
     def save(self) -> None:

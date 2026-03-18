@@ -19,6 +19,7 @@ from ..types import (
     SimilarFile,
     SimilarFilesResult,
 )
+from ..utils import aread_bytes, astat
 from ._helpers import _is_binary_content, _suppress_large_diff
 from .store import SemanticCache
 
@@ -132,36 +133,36 @@ async def compare_files(
 
     # File 1
     cached1 = await cache.get(str(file1))
-    if cached1 and cached1.mtime >= file1.stat().st_mtime:
+    if cached1 and cached1.mtime >= (await astat(file1, cache._io_executor)).st_mtime:
         content1 = await cache.get_content(cached1)
         from_cache1 = True
     else:
         try:
-            raw_bytes1 = file1.read_bytes()
+            raw_bytes1 = await aread_bytes(file1, cache._io_executor)
             if _is_binary_content(raw_bytes1):
                 raise ValueError(f"File is binary and cannot be diffed: {path1}")
             content1 = raw_bytes1.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
-        mtime1 = file1.stat().st_mtime
-        emb1 = cache.get_embedding(content1, str(file1))
+        mtime1 = (await astat(file1, cache._io_executor)).st_mtime
+        emb1 = await cache.get_embedding(content1, str(file1))
         await cache.put(str(file1), content1, mtime1, emb1)
 
     # File 2
     cached2 = await cache.get(str(file2))
-    if cached2 and cached2.mtime >= file2.stat().st_mtime:
+    if cached2 and cached2.mtime >= (await astat(file2, cache._io_executor)).st_mtime:
         content2 = await cache.get_content(cached2)
         from_cache2 = True
     else:
         try:
-            raw_bytes2 = file2.read_bytes()
+            raw_bytes2 = await aread_bytes(file2, cache._io_executor)
             if _is_binary_content(raw_bytes2):
                 raise ValueError(f"File is binary and cannot be diffed: {path2}")
             content2 = raw_bytes2.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
-        mtime2 = file2.stat().st_mtime
-        emb2 = cache.get_embedding(content2, str(file2))
+        mtime2 = (await astat(file2, cache._io_executor)).st_mtime
+        emb2 = await cache.get_embedding(content2, str(file2))
         await cache.put(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
@@ -211,7 +212,7 @@ async def find_similar_files(
         raise FileNotFoundError(f"File not found: {path}")
 
     # Guard against binary files before read_text
-    raw = file_path.read_bytes()
+    raw = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw):
         raise ValueError(f"Binary file not supported: {path}")
     try:
@@ -223,19 +224,19 @@ async def find_similar_files(
     cached = await cache.get(str(file_path))
     source_tokens = 0
 
-    file_mtime = file_path.stat().st_mtime
+    file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
     if cached and cached.mtime >= file_mtime:
         source_tokens = cached.tokens
         # Reuse stored embedding; only call ONNX if it was never stored
-        source_embedding = cached.embedding or cache.get_embedding(content, str(file_path))
+        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
     elif cached and hash_content(content) == cached.content_hash:
         # Content identical despite mtime change — update mtime, treat as cached
         await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
-        source_embedding = cached.embedding or cache.get_embedding(content, str(file_path))
+        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
-        source_embedding = cache.get_embedding(content, str(file_path))
+        source_embedding = await cache.get_embedding(content, str(file_path))
         await cache.put(str(file_path), content, file_mtime, source_embedding)
 
     if source_embedding is None:

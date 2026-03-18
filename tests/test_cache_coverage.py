@@ -800,7 +800,7 @@ class TestSmartWriteEdgeCases:
         f = tmp_path / "perm.txt"
         with (
             patch(
-                "semantic_cache_mcp.cache.write._atomic_write",
+                "semantic_cache_mcp.utils._async_io._atomic_write_sync",
                 side_effect=OSError("permission denied"),
             ),
             pytest.raises(PermissionError),
@@ -878,7 +878,7 @@ class TestSmartEditEdgeCases:
         f.write_text("hello world\n")
         with (
             patch(
-                "semantic_cache_mcp.cache.write._atomic_write",
+                "semantic_cache_mcp.utils._async_io._atomic_write_sync",
                 side_effect=OSError("write denied"),
             ),
             pytest.raises(PermissionError),
@@ -1013,7 +1013,7 @@ class TestSmartBatchEdit:
         f.write_text("hello world\n")
         with (
             patch(
-                "semantic_cache_mcp.cache.write._atomic_write",
+                "semantic_cache_mcp.utils._async_io._atomic_write_sync",
                 side_effect=OSError("denied"),
             ),
             pytest.raises(PermissionError),
