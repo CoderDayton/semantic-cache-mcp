@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -44,8 +45,10 @@ async def semantic_search(
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
 
-    # Embed query for vector component of hybrid search
-    query_embedding = embed_query(query)
+    # Embed query for vector component of hybrid search.
+    # MUST go through executor — ONNX is not thread-safe.
+    loop = asyncio.get_running_loop()
+    query_embedding = await loop.run_in_executor(cache._io_executor, embed_query, query)
 
     # Resolve directory for post-search filtering (is_relative_to is secure
     # against prefix attacks like /project vs /project_evil)

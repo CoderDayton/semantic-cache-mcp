@@ -831,10 +831,13 @@ class TestSemanticSearchDirectoryFilter:
 
     async def test_directory_filter_excludes_outside_files(self, tmp_path: Path) -> None:
         """Files outside the directory filter should be excluded."""
+        from concurrent.futures import ThreadPoolExecutor
+
         with patch("semantic_cache_mcp.cache.search.embed_query") as mock_embed:
             mock_embed.return_value = list(np.zeros(64, dtype=np.float32))
 
             mock_cache = MagicMock()
+            mock_cache._io_executor = ThreadPoolExecutor(max_workers=1)
             mock_storage = MagicMock()
             mock_cache._storage = mock_storage
 

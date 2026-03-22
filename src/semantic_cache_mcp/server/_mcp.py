@@ -111,7 +111,9 @@ async def app_lifespan(server: FastMCP):
         while True:
             await asyncio.sleep(300)  # 5 minutes
             try:
-                embed("keepalive")
+                # MUST go through executor — ONNX is not thread-safe.
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(cache._io_executor, embed, "keepalive")
                 logger.debug("Embedding keepalive ping")
             except Exception:
                 logger.debug("Embedding keepalive failed", exc_info=True)

@@ -199,22 +199,25 @@ async def smart_read(
     final_content = content
 
     if len(content) > max_size:
-        # Use semantic summarization to preserve important content
-        # Falls back to simple truncation for very small limits
+        # Use semantic summarization to preserve important content.
+        # The entire summarize_semantic call (including its embed_fn callback)
+        # MUST run in the executor — ONNX is not thread-safe and embed_fn
+        # calls it synchronously.
         try:
-            # Convert EmbeddingVector to NDArray for summarization
-            def embed_fn(text: str):
-                # Call sync embed directly — this closure is passed to the
-                # sync summarize_semantic function, so it cannot use await.
+
+            def _summarize() -> str:
                 from . import embed as _sync_embed  # noqa: PLC0415
 
-                emb = _sync_embed(text)
-                if emb is None:
-                    return None
-                # Convert array.array or list to numpy array
-                return np.asarray(emb, dtype=np.float32)
+                def embed_fn(text: str):
+                    emb = _sync_embed(text)
+                    if emb is None:
+                        return None
+                    return np.asarray(emb, dtype=np.float32)
 
-            final_content = summarize_semantic(content, max_size, embed_fn=embed_fn)
+                return summarize_semantic(content, max_size, embed_fn=embed_fn)
+
+            loop = asyncio.get_running_loop()
+            final_content = await loop.run_in_executor(cache._io_executor, _summarize)
             truncated = True
         except Exception as e:
             logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
