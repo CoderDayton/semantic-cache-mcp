@@ -323,6 +323,25 @@ class SemanticCache:
         coll = self._storage._collection
         coll._executor = self._io_executor
 
+    def reset_executor(self) -> None:
+        """Replace the IO executor with a fresh one after a timeout/hang.
+
+        Abandons the stuck thread (it will be GC'd when its task completes or
+        the process exits) and creates a new single-threaded executor. All
+        references on VectorStorage and simplevecdb are updated atomically.
+        """
+        logger.warning("Resetting IO executor — previous thread may be stuck")
+        old = self._io_executor
+        # Don't wait for the old executor — it's stuck.
+        old.shutdown(wait=False)
+
+        new_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="semantic-cache-io")
+        self._io_executor = new_executor
+        self._storage._io_executor = new_executor
+        self._storage._db._executor = new_executor
+        self._storage._collection._executor = new_executor
+        logger.info("IO executor replaced with fresh instance")
+
     @property
     def metrics(self) -> SessionMetrics:
         """Current session metrics accumulator."""

@@ -38,6 +38,20 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
+# Maximum time (seconds) any tool call is allowed to run before returning an error.
+# Prevents indefinite hangs from executor deadlocks or slow I/O.
+_TOOL_TIMEOUT: float = 30.0
+
+
+def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:
+    """Reset the executor after a timeout so subsequent calls don't hang."""
+    msg = f"{tool} timed out after {_TOOL_TIMEOUT}s"
+    if detail:
+        msg += f": {detail}"
+    logger.warning(msg)
+    cache.reset_executor()
+
+
 async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
     """Run a write coroutine protected from cancellation during shutdown.
 
@@ -115,12 +129,15 @@ async def read(
     try:
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
-            result = await smart_read(
-                cache=cache,
-                path=path,
-                max_size=max_size,
-                diff_mode=False,  # Line ranges bypass diff mode
-                force_full=True,
+            result = await asyncio.wait_for(
+                smart_read(
+                    cache=cache,
+                    path=path,
+                    max_size=max_size,
+                    diff_mode=False,  # Line ranges bypass diff mode
+                    force_full=True,
+                ),
+                timeout=_TOOL_TIMEOUT,
             )
             cache.metrics.record("read", result)
             lines = result.content.splitlines(keepends=True)
@@ -153,11 +170,14 @@ async def read(
 
             return _render_response(payload, max_response_tokens)
 
-        result = await smart_read(
-            cache=cache,
-            path=path,
-            max_size=max_size,
-            diff_mode=diff_mode,
+        result = await asyncio.wait_for(
+            smart_read(
+                cache=cache,
+                path=path,
+                max_size=max_size,
+                diff_mode=diff_mode,
+            ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
         payload = {
@@ -199,6 +219,9 @@ async def read(
 
     except FileNotFoundError as e:
         return _render_error("read", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "read", path)
+        return _render_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except Exception as e:
         return _render_error("read", f"reading failed: {e}", max_response_tokens)
 
@@ -424,17 +447,20 @@ async def write(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await _shielded_write(
-            cache,
-            smart_write(
-                cache=cache,
-                path=path,
-                content=content,
-                create_parents=create_parents,
-                dry_run=dry_run,
-                auto_format=auto_format,
-                append=append,
+        result = await asyncio.wait_for(
+            _shielded_write(
+                cache,
+                smart_write(
+                    cache=cache,
+                    path=path,
+                    content=content,
+                    create_parents=create_parents,
+                    dry_run=dry_run,
+                    auto_format=auto_format,
+                    append=append,
+                ),
             ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("write", result)
 
@@ -472,6 +498,9 @@ async def write(
         return _render_error("write", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
         return _render_error("write", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "write", path)
+        return _render_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in write: {e}")
         return _render_error("write", f"I/O operation failed - {e}", max_response_tokens)
@@ -527,19 +556,22 @@ async def edit(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await _shielded_write(
-            cache,
-            smart_edit(
-                cache=cache,
-                path=path,
-                old_string=old_string,
-                new_string=new_string,
-                replace_all=replace_all,
-                dry_run=dry_run,
-                auto_format=auto_format,
-                start_line=start_line,
-                end_line=end_line,
+        result = await asyncio.wait_for(
+            _shielded_write(
+                cache,
+                smart_edit(
+                    cache=cache,
+                    path=path,
+                    old_string=old_string,
+                    new_string=new_string,
+                    replace_all=replace_all,
+                    dry_run=dry_run,
+                    auto_format=auto_format,
+                    start_line=start_line,
+                    end_line=end_line,
+                ),
             ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("edit", result)
 
@@ -580,6 +612,9 @@ async def edit(
         return _render_error("edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
         return _render_error("edit", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "edit", path)
+        return _render_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
         return _render_error("edit", f"I/O operation failed - {e}", max_response_tokens)
@@ -663,15 +698,18 @@ async def batch_edit(
                     max_response_tokens,
                 )
 
-        result = await _shielded_write(
-            cache,
-            smart_batch_edit(
-                cache=cache,
-                path=path,
-                edits=edit_tuples,
-                dry_run=dry_run,
-                auto_format=auto_format,
+        result = await asyncio.wait_for(
+            _shielded_write(
+                cache,
+                smart_batch_edit(
+                    cache=cache,
+                    path=path,
+                    edits=edit_tuples,
+                    dry_run=dry_run,
+                    auto_format=auto_format,
+                ),
             ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("batch_edit", result)
 
@@ -735,6 +773,9 @@ async def batch_edit(
         return _render_error("batch_edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
         return _render_error("batch_edit", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "batch_edit", path)
+        return _render_error("batch_edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except Exception:
         logger.exception("Unexpected error in batch_edit")
         return _render_error(
@@ -771,7 +812,10 @@ async def search(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await semantic_search(cache, query, k=k, directory=directory)
+        result = await asyncio.wait_for(
+            semantic_search(cache, query, k=k, directory=directory),
+            timeout=_TOOL_TIMEOUT,
+        )
         cache.metrics.record("search", result)
 
         match_payload: list[dict[str, Any]] = []
@@ -798,6 +842,9 @@ async def search(
 
         return _render_response(payload, max_response_tokens)
 
+    except TimeoutError:
+        _handle_timeout(cache, "search", query[:50])
+        return _render_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except Exception as e:
         logger.exception("Error in search")
         return _render_error("search", str(e), max_response_tokens)
@@ -827,7 +874,10 @@ async def diff(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await compare_files(cache, path1, path2, context_lines=context_lines)
+        result = await asyncio.wait_for(
+            compare_files(cache, path1, path2, context_lines=context_lines),
+            timeout=_TOOL_TIMEOUT,
+        )
         cache.metrics.record("diff", result)
 
         payload: dict[str, Any] = {
@@ -849,6 +899,9 @@ async def diff(
 
     except FileNotFoundError as e:
         return _render_error("diff", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "diff")
+        return _render_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except Exception as e:
         logger.exception("Error in diff")
         return _render_error("diff", str(e), max_response_tokens)
@@ -904,13 +957,16 @@ async def batch_read(
             else:
                 priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
 
-        result = await batch_smart_read(
-            cache,
-            path_list,
-            max_total_tokens=max_total_tokens,
-            priority=priority_list,
-            diff_mode=diff_mode,
-        )
+        result = await asyncio.wait_for(
+            batch_smart_read(
+                cache,
+                path_list,
+                max_total_tokens=max_total_tokens,
+                priority=priority_list,
+                diff_mode=diff_mode,
+            ),
+            timeout=_TOOL_TIMEOUT * 2,
+        )  # batch gets double timeout
         cache.metrics.record("batch_read", result)
 
         # Build restructured response — separate unchanged, skipped, and content files
@@ -971,6 +1027,11 @@ async def batch_read(
             "Invalid paths format. Use comma-separated or JSON array.",
             max_response_tokens,
         )
+    except TimeoutError:
+        _handle_timeout(cache, "batch_read")
+        return _render_error(
+            "batch_read", f"timed out after {_TOOL_TIMEOUT * 2}s", max_response_tokens
+        )
     except Exception as e:
         logger.exception("Error in batch_read")
         return _render_error("batch_read", str(e), max_response_tokens)
@@ -1001,7 +1062,7 @@ async def similar(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await find_similar_files(cache, path, k=k)
+        result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
         cache.metrics.record("similar", result)
 
         similar_payload = [
@@ -1026,6 +1087,9 @@ async def similar(
 
     except FileNotFoundError as e:
         return _render_error("similar", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "similar", path)
+        return _render_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except Exception as e:
         logger.exception("Error in similar")
         return _render_error("similar", str(e), max_response_tokens)
