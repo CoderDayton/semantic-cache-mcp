@@ -269,12 +269,19 @@ class VectorStorage:
         access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
 
         # Retrieve embedding from catalog so compare_files() can compute similarity.
+        # Must run in executor — catalog is not thread-safe.
         embedding: EmbeddingVector | None = None
         try:
-            emb_map = self._collection._collection._catalog.get_embeddings_by_ids([selected_id])
-            raw = emb_map.get(selected_id)
-            if raw is not None:
-                embedding = array.array("f", raw)
+
+            def _get_emb() -> EmbeddingVector | None:
+                catalog = self._collection._collection._catalog
+                emb_map = catalog.get_embeddings_by_ids([selected_id])
+                raw = emb_map.get(selected_id)
+                if raw is not None:
+                    return array.array("f", raw)
+                return None
+
+            embedding = await self._run_sync(_get_emb)
         except Exception:  # nosec B110 — best-effort embedding retrieval
             pass
 
@@ -464,7 +471,9 @@ class VectorStorage:
             updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
 
         if updates:
-            self._collection._collection._catalog.update_metadata_batch(updates)
+            await self._run_sync(
+                lambda: self._collection._collection._catalog.update_metadata_batch(updates)
+            )
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding.
@@ -483,7 +492,9 @@ class VectorStorage:
             updates.append((doc_id, {_META_MTIME: new_mtime}))
 
         if updates:
-            self._collection._collection._catalog.update_metadata_batch(updates)
+            await self._run_sync(
+                lambda: self._collection._collection._catalog.update_metadata_batch(updates)
+            )
 
     # -------------------------------------------------------------------------
     # Similarity search
@@ -689,8 +700,11 @@ class VectorStorage:
                 logger.warning(f"Invalid regex pattern: {e}")
                 return []
 
-        # Collect all cached file content grouped by path
-        all_docs = self._collection._collection._catalog.get_all_docs_with_text()
+        # Collect all cached file content grouped by path.
+        # Must run in executor — catalog is not thread-safe.
+        all_docs = await self._run_sync(
+            self._collection._collection._catalog.get_all_docs_with_text
+        )
         files: dict[str, list[tuple[int, str]]] = {}  # path -> [(chunk_index, text)]
         for _doc_id, text, meta in all_docs:
             if meta.get(_META_IS_PARENT, False):
@@ -742,7 +756,7 @@ class VectorStorage:
     # Statistics and management
     # -------------------------------------------------------------------------
 
-    def is_healthy(self) -> bool:
+    async def is_healthy(self) -> bool:
         """Lightweight probe: True when the catalog and index are accessible.
 
         Intended for post-startup validation and observability. Does not
@@ -751,7 +765,7 @@ class VectorStorage:
         if self._closed:
             return False
         try:
-            self._collection._collection.count()
+            await self._run_sync(self._collection._collection.count)
             return True
         except Exception:
             return False
@@ -766,14 +780,14 @@ class VectorStorage:
             }
         sync_coll = self._collection._collection
 
-        count = sync_coll.count()
+        count = await self._run_sync(sync_coll.count)
         db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
 
         # Count unique files (not chunks)
         unique_paths: set[str] = set()
         total_tokens = 0
 
-        all_docs = sync_coll._catalog.get_all_docs_with_text()
+        all_docs = await self._run_sync(sync_coll._catalog.get_all_docs_with_text)
         for _doc_id, _text, meta in all_docs:
             path = meta.get(_META_PATH, "")
             if path:
@@ -818,12 +832,16 @@ class VectorStorage:
 
     async def _find_docs_by_path(self, path: str) -> list[tuple[int, dict, str]]:
         """Return [(doc_id, metadata, text)] for all documents at path."""
-        catalog = self._collection._collection._catalog
         try:
-            docs = catalog.get_all_docs_with_text(
-                filter_dict={_META_PATH: path},
-                filter_builder=catalog.build_filter_clause,
-            )
+
+            def _lookup() -> list[tuple[int, str, dict]]:
+                catalog = self._collection._collection._catalog
+                return catalog.get_all_docs_with_text(
+                    filter_dict={_META_PATH: path},
+                    filter_builder=catalog.build_filter_clause,
+                )
+
+            docs = await self._run_sync(_lookup)
         except Exception as e:
             logger.debug(f"Filter lookup failed for {path}: {e}")
             return []
@@ -844,7 +862,7 @@ class VectorStorage:
         """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
         # Get all docs once — used for both the file-count check and LRU scoring.
         sync_coll = self._collection._collection
-        all_docs = sync_coll._catalog.get_all_docs_with_text()
+        all_docs = await self._run_sync(sync_coll._catalog.get_all_docs_with_text)
 
         # Count unique files, not documents. Chunked files span multiple
         # documents, so using doc count fires eviction too early.

@@ -315,6 +315,13 @@ class SemanticCache:
             max_workers=1, thread_name_prefix="semantic-cache-io"
         )
         self._storage._io_executor = self._io_executor
+        # Also replace simplevecdb's own executor so ALL operations (add_texts,
+        # similarity_search, delete_by_ids, etc.) serialize on the same thread.
+        # Without this, simplevecdb's 4-thread pool runs usearch/SQLite ops
+        # concurrently with our ONNX thread, causing hangs and segfaults.
+        self._storage._db._executor = self._io_executor
+        coll = self._storage._collection
+        coll._executor = self._io_executor
 
     @property
     def metrics(self) -> SessionMetrics:
