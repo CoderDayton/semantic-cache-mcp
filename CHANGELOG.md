@@ -9,7 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Tool hangs under concurrent access** — Two thread-safety issues caused MCP tool calls to complete their action (file written/edited) but never return a response. Root causes: (1) simplevecdb's internal 4-thread executor ran usearch/SQLite operations concurrently with ONNX on our single-thread executor, and (2) synchronous catalog reads on the event loop raced with catalog writes on the executor thread. All operations now serialize on a single shared executor, eliminating the hangs. Stress-tested with 58 concurrent tool calls (reads, writes, edits, batch ops) — zero hangs.
+- **Tool hangs under concurrent access** — Three rounds of fixes for tool calls that complete their action but never return a response, with GPU spinning continuously:
+  1. Offloaded all file I/O to `run_in_executor` so the event loop stays unblocked.
+  2. Replaced simplevecdb's internal 4-thread executor with our shared single-thread executor, and moved all synchronous catalog operations off the event loop into the executor.
+  3. Routed **all** ONNX inference through the executor. Three code paths called ONNX directly on the event loop (`embed_query` in search, `embed` in keepalive, `embed_fn` closure in semantic summarization), racing with executor-based ONNX calls from other coroutines — two threads hitting the non-thread-safe ONNX session caused the GPU to spin indefinitely. Stress-tested with 58 concurrent tool calls — zero hangs.
 
 ## [0.3.4] - 2026-03-15
 
