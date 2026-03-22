@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tool hangs under concurrent access** — Two thread-safety issues caused MCP tool calls to complete their action (file written/edited) but never return a response. Root causes: (1) simplevecdb's internal 4-thread executor ran usearch/SQLite operations concurrently with ONNX on our single-thread executor, and (2) synchronous catalog reads on the event loop raced with catalog writes on the executor thread. All operations now serialize on a single shared executor, eliminating the hangs. Stress-tested with 58 concurrent tool calls (reads, writes, edits, batch ops) — zero hangs.
+
 ## [0.3.4] - 2026-03-15
 
 ### Fixed
