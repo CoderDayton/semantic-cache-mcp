@@ -8,7 +8,7 @@ dependencies = [
     "blake3>=1.0.8",
     "fastembed>=0.5.1",
     "fastmcp>=3.0.0b1",
-    "simplevecdb>=2.3.0",
+    "simplevecdb>=2.4.0",
 ]
 
 [project.optional-dependencies]
@@ -34,9 +34,6 @@ semantic-cache-mcp = "semantic_cache_mcp.server:main"
 override-dependencies = [
     "sqlcipher3-binary>=0.5.0; sys_platform == 'linux'",
 ]
-
-[tool.uv.sources]
-simplevecdb = { path = "../simplevecdb", editable = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import array
-import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypeVar
 
 from simplevecdb import AsyncVectorDB, DistanceStrategy, Quantization
 
@@ -27,8 +24,6 @@ from ...core.tokenizer import count_tokens
 from ...types import CacheEntry, EmbeddingVector
 
 logger = logging.getLogger(__name__)
-
-_T = TypeVar("_T")
 
 VECDB_PATH = CACHE_DIR / "vecdb.db"
 
@@ -62,15 +57,6 @@ class VectorStorage:
 
     __slots__ = ("_db", "_collection", "_db_path", "_closed", "_io_executor")
 
-    async def _run_sync(self, fn: Callable[[], _T]) -> _T:
-        """Run a blocking function in the shared IO executor.
-
-        Uses the single-threaded executor set by SemanticCache to prevent
-        segfaults from ONNX/usearch allocator conflicts.
-        """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._io_executor, fn)
-
     # Quantization currently in use — stored in sidecar to detect future changes.
     _QUANTIZATION = Quantization.INT8
     _COLLECTION_NAME = "files"
@@ -93,7 +79,9 @@ class VectorStorage:
         )
         self._collection = self._db.collection(self._COLLECTION_NAME)
         self._closed = False
-        self._io_executor = self._db._executor
+        # When executor is injected, use it directly; otherwise read back
+        # the one simplevecdb created internally.
+        self._io_executor = executor if executor is not None else self._db._executor
         # Write sentinel — removed on clean shutdown by _remove_sentinel().
         STARTUP_SENTINEL.touch()
         logger.info(f"VectorStorage initialized at {db_path}")
@@ -811,7 +799,14 @@ class VectorStorage:
 
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of files removed."""
-        return await self._run_sync(self._clear_sync)
+        count = await self._collection.count()
+        if count > 0:
+            all_docs = await self._collection.get_documents()
+            doc_ids = [doc_id for doc_id, _, _ in all_docs]
+            if doc_ids:
+                await self._collection.delete_by_ids(doc_ids)
+                await self._collection.save()
+        return count
 
     # -------------------------------------------------------------------------
     # Internal helpers
