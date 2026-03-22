@@ -35,6 +35,9 @@ override-dependencies = [
     "sqlcipher3-binary>=0.5.0; sys_platform == 'linux'",
 ]
 
+[tool.uv.sources]
+simplevecdb = { path = "../simplevecdb", editable = true }
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

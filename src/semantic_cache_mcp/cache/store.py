@@ -294,10 +294,18 @@ class SemanticCache:
     _DRAIN_TIMEOUT: float = 8.0
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
-        self._storage = VectorStorage(db_path)
-        # Share the IO executor with VectorStorage so all blocking ops
-        # (file I/O, ONNX, usearch) serialize on the same thread.
-        # Keep SQLiteStorage only for session metrics persistence
+        # Single-thread executor shared by ALL blocking operations:
+        # file I/O, ONNX embedding inference, and vecdb index saves.
+        # MUST be single-threaded — ONNX Runtime and usearch use
+        # incompatible allocators that segfault under concurrent access
+        # from different threads.
+        # Passed to VectorStorage → AsyncVectorDB so simplevecdb's own
+        # operations (add_texts, similarity_search, etc.) also serialize
+        # on this thread.
+        self._io_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="semantic-cache-io"
+        )
+        self._storage = VectorStorage(db_path, executor=self._io_executor)
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
         self._metrics = SessionMetrics(self._metrics_storage._pool)
@@ -306,22 +314,6 @@ class SemanticCache:
         self._inflight = 0
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
-        # Single-thread executor shared by ALL blocking operations:
-        # file I/O, ONNX embedding inference, and vecdb index saves.
-        # MUST be single-threaded — ONNX Runtime and usearch use
-        # incompatible allocators that segfault under concurrent access
-        # from different threads.
-        self._io_executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="semantic-cache-io"
-        )
-        self._storage._io_executor = self._io_executor
-        # Also replace simplevecdb's own executor so ALL operations (add_texts,
-        # similarity_search, delete_by_ids, etc.) serialize on the same thread.
-        # Without this, simplevecdb's 4-thread pool runs usearch/SQLite ops
-        # concurrently with our ONNX thread, causing hangs and segfaults.
-        self._storage._db._executor = self._io_executor
-        coll = self._storage._collection
-        coll._executor = self._io_executor
 
     def reset_executor(self) -> None:
         """Replace the IO executor with a fresh one after a timeout/hang.
