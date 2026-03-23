@@ -85,9 +85,7 @@ def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:
     cache.reset_executor()
 
 
-async def _shielded_write(
-    cache: SemanticCache, coro: Any, *, timeout: float = _TOOL_TIMEOUT
-) -> Any:
+async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | None = None) -> Any:
     """Run a write coroutine protected from cancellation during shutdown.
 
     Uses asyncio.shield so the inner task runs to completion even when
@@ -102,6 +100,8 @@ async def _shielded_write(
     the wrapper to finish.  asyncio.timeout works because it cancels the
     *shield future* (which is immediately "done"), not the inner task.
     """
+    if timeout is None:
+        timeout = _TOOL_TIMEOUT
     if not cache.begin_operation():
         coro.close()  # prevent 'coroutine was never awaited' warning
         raise RuntimeError("Server is shutting down")
