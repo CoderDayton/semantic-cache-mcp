@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.hashing import hash_content
-from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
+from ..types import BatchEditResult, EditResult, EmbeddingVector, SingleEditOutcome, WriteResult
 from ..utils import aread_bytes, aread_text, astat, awrite_atomic
 from ..utils._async_io import (
     _atomic_write_sync as _atomic_write,  # noqa: F401 — re-exported for tests
@@ -175,9 +175,21 @@ async def smart_write(
                     diff_tokens = count_tokens(diff_content) if diff_content else 0
                     tokens_saved = max(0, tokens_written - diff_tokens)
 
-        # Update cache with final content
+        # Update cache with final content.
+        # Skip re-embedding for small edits (< 20% changed) — the old
+        # embedding is similar enough for retrieval, saving ~23ms ONNX call.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await cache.get_embedding(content, path)
+        embedding: EmbeddingVector | None = None
+        if not created and from_cache and diff_stats_result:
+            changed = diff_stats_result.get("insertions", 0) + diff_stats_result.get("deletions", 0)
+            total = diff_stats_result.get("total_lines", changed + 1)
+            if total > 0 and changed / total < 0.2:
+                cached_entry = await cache.get(str(file_path))
+                if cached_entry and cached_entry.embedding:
+                    embedding = cached_entry.embedding
+                    logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        if embedding is None:
+            embedding = await cache.get_embedding(content, path)
         await cache.put(str(file_path), content, mtime, embedding)
         action = "Created" if created else "Updated"
         if formatted:
@@ -431,9 +443,20 @@ async def smart_edit(
                 diff_stats_result = diff_stats(content, new_content)
                 diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
-        # Update cache with final content
+        # Update cache with final content.
+        # Skip re-embedding for small edits — reuse cached embedding.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await cache.get_embedding(new_content, path)
+        embedding: EmbeddingVector | None = None
+        if diff_stats_result:
+            changed = diff_stats_result.get("insertions", 0) + diff_stats_result.get("deletions", 0)
+            total = diff_stats_result.get("total_lines", changed + 1)
+            if total > 0 and changed / total < 0.2:
+                cached_entry = await cache.get(str(file_path))
+                if cached_entry and cached_entry.embedding:
+                    embedding = cached_entry.embedding
+                    logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        if embedding is None:
+            embedding = await cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
@@ -672,9 +695,19 @@ async def smart_batch_edit(
                 stats = diff_stats(original_content, new_content)
                 diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
-        # Update cache with final content
+        # Update cache with final content.
+        # Skip re-embedding for small edits — reuse cached embedding.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await cache.get_embedding(new_content, path)
+        embedding: EmbeddingVector | None = None
+        if stats:
+            changed = stats.get("insertions", 0) + stats.get("deletions", 0)
+            total = stats.get("total_lines", changed + 1)
+            if total > 0 and changed / total < 0.2:
+                cached_entry = await cache.get(str(file_path))
+                if cached_entry and cached_entry.embedding:
+                    embedding = cached_entry.embedding
+        if embedding is None:
+            embedding = await cache.get_embedding(new_content, path)
         await cache.put(str(file_path), new_content, mtime, embedding)
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
