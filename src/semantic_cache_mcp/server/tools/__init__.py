@@ -530,10 +530,12 @@ async def edit(
     - **scoped**: old_string + new_string + start_line/end_line. Shorter context suffices.
     - **line replace**: new_string + start_line/end_line only. Maximum token savings.
 
-    Timing:
-    - Use for a single targeted change. For 2+ changes, use batch_edit.
-    - When you have line numbers from read, prefer scoped or line replace mode.
-    - Use dry_run to validate match uniqueness before committing.
+    IMPORTANT — minimize old_string size:
+    - When you have line numbers from `read`, ALWAYS prefer **line replace** or
+      **scoped** mode. Do NOT send large old_string blocks for uniqueness.
+    - old_string should be the MINIMAL text needed to identify the edit target.
+      One line is usually enough. Never send surrounding unchanged lines.
+    - For 2+ changes, use batch_edit — it's more token-efficient.
 
     Multiple matches: fails with match count and hint. Add more context or
     set replace_all=true.
@@ -542,8 +544,9 @@ async def edit(
 
     Args:
         path: File path (absolute or relative)
-        old_string: Exact string to find (whitespace-sensitive).
-            Omit for line-replace mode (requires start_line/end_line).
+        old_string: Exact string to find (whitespace-sensitive). Keep as short
+            as possible — one line is ideal. Omit entirely for line-replace mode
+            (requires start_line/end_line).
         new_string: Replacement string
         replace_all: Replace all occurrences (default: false). Not valid in line-replace mode.
         dry_run: Preview without writing (default: false)
@@ -642,11 +645,11 @@ async def batch_edit(
     - **line replace**: [null, new, start_line, end_line] or
       {"old": null, "new": "...", "start_line": 10, "end_line": 15}
 
-    Timing guidance:
-    - Use when applying 2+ edits to the same file in one step.
-    - More token-efficient than repeated edit calls on the same file.
-    - Use dry_run when testing risky edit batches.
-    - Prefer line-range modes when you know exact line numbers from `read`.
+    IMPORTANT — minimize edit size:
+    - ALWAYS prefer **line replace** mode [null, new, start, end] when you have
+      line numbers. This sends zero wasted tokens.
+    - When using find/replace, keep old_string to ONE line — the minimum needed
+      to identify the target. Never include surrounding unchanged lines.
 
     Partial success: each edit is applied independently. When edits fail, the
     response includes a failures list with the old_string and error for each —
