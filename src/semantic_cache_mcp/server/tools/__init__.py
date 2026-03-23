@@ -38,8 +38,38 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
-# Tool timeout from config (env TOOL_TIMEOUT, default 12s).
+# Tool timeout from config (env TOOL_TIMEOUT, default 20s).
 _TOOL_TIMEOUT: float = TOOL_TIMEOUT
+
+# Global tool mutex: only one tool call executes at a time.
+# Prevents concurrent coroutines from interleaving executor tasks,
+# catalog reads, and ONNX calls — the root cause of hangs when
+# multiple subagents fire tool calls simultaneously.
+_tool_lock: asyncio.Lock | None = None
+
+
+def _get_tool_lock() -> asyncio.Lock:
+    """Lazy-init the lock (must be created inside a running event loop)."""
+    global _tool_lock
+    if _tool_lock is None:
+        _tool_lock = asyncio.Lock()
+    return _tool_lock
+
+
+def _serialized(fn):
+    """Decorator: acquire the global tool lock before running the handler.
+
+    Ensures only one tool call executes at a time, preventing concurrent
+    coroutines from interleaving executor tasks and causing hangs.
+    """
+    import functools  # noqa: PLC0415
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        async with _get_tool_lock():
+            return await fn(*args, **kwargs)
+
+    return wrapper
 
 
 def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:
@@ -81,6 +111,7 @@ async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
         "github": "https://github.com/CoderDayton/semantic-cache-mcp",
     }
 )
+@_serialized
 async def read(
     ctx: Context,
     path: str,
@@ -222,6 +253,7 @@ async def read(
 
 
 @mcp.tool()
+@_serialized
 async def stats(
     ctx: Context,
 ) -> str:
@@ -390,6 +422,7 @@ async def stats(
 
 
 @mcp.tool()
+@_serialized
 async def clear(
     ctx: Context,
 ) -> str:
@@ -406,6 +439,7 @@ async def clear(
 
 
 @mcp.tool()
+@_serialized
 async def write(
     ctx: Context,
     path: str,
@@ -507,6 +541,7 @@ async def write(
 
 
 @mcp.tool()
+@_serialized
 async def edit(
     ctx: Context,
     path: str,
@@ -615,6 +650,7 @@ async def edit(
 
 
 @mcp.tool()
+@_serialized
 async def batch_edit(
     ctx: Context,
     path: str,
@@ -769,6 +805,7 @@ async def batch_edit(
 
 
 @mcp.tool()
+@_serialized
 async def search(
     ctx: Context,
     query: str,
@@ -834,6 +871,7 @@ async def search(
 
 
 @mcp.tool()
+@_serialized
 async def diff(
     ctx: Context,
     path1: str,
@@ -891,6 +929,7 @@ async def diff(
 
 
 @mcp.tool()
+@_serialized
 async def batch_read(
     ctx: Context,
     paths: str,
@@ -1016,6 +1055,7 @@ async def batch_read(
 
 
 @mcp.tool()
+@_serialized
 async def similar(
     ctx: Context,
     path: str,
@@ -1074,6 +1114,7 @@ async def similar(
 
 
 @mcp.tool()
+@_serialized
 async def glob(
     ctx: Context,
     pattern: str,
@@ -1135,6 +1176,7 @@ async def glob(
 
 
 @mcp.tool()
+@_serialized
 async def grep(
     ctx: Context,
     pattern: str,
