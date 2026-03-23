@@ -151,6 +151,10 @@ async def read(
       Set diff_mode=false after context compression to get full content again.
     - Subsequent read, file modified: returns a unified diff of changes.
 
+    When response contains "unchanged":true, the file has NOT changed since
+    your last read — the full content is already in your conversation context.
+    Do NOT re-read it.
+
     For 2+ files, prefer batch_read. Use offset/limit to read specific line
     ranges without re-reading the whole file.
 
@@ -229,16 +233,25 @@ async def read(
             timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
+        # Detect unchanged files: from_cache=True + is_diff=False means
+        # the LLM already has this file's content from a prior read.
+        unchanged = result.from_cache and not result.is_diff
+
         payload = {
             "ok": True,
             "tool": "read",
             "path": path,
             "content": result.content,
         }
+        if unchanged:
+            payload["unchanged"] = True
         if mode in _MODE_NORMAL:
-            payload["is_diff"] = result.is_diff
-            payload["truncated"] = result.truncated
-            payload["semantic_match"] = result.semantic_match
+            if result.is_diff:
+                payload["is_diff"] = True
+            if result.truncated:
+                payload["truncated"] = True
+            if result.semantic_match:
+                payload["semantic_match"] = result.semantic_match
             if result.truncated:
                 # Truncated reads use semantic summarization — the returned
                 # content is non-contiguous, so line numbers don't map to the
@@ -484,7 +497,7 @@ async def write(
       write(path, chunk2, append=true)                   # appends
       write(path, chunk3, append=true, auto_format=true) # final chunk + format
 
-    Response: returns a diff for overwrites/appends, or just status for new files.
+    Response: diff of changes for overwrites, status-only for new files.
 
     Args:
         path: File path (absolute or relative)
@@ -686,7 +699,7 @@ async def batch_edit(
     IMPORTANT: prefer line replace [null, new, start, end] when you have
     line numbers. Keep old to one line when using find/replace.
 
-    Partial success: failures list included with old_string and error.
+    Partial success: response includes 'failed' count and 'failures' array.
 
     Args:
         path: Absolute path to file
@@ -897,7 +910,7 @@ async def diff(
     Use for explicit side-by-side comparison. For checking changes to a single
     file over time, use read (which returns diffs automatically).
 
-    Large diffs are auto-summarized to stay within token budget.
+    Large diffs are truncated to stay within token budget.
 
     Args:
         path1: First file path
@@ -956,7 +969,8 @@ async def batch_read(
     Prefer over repeated read calls for 2+ files. Use early to seed the cache
     before search/similar/grep. Set diff_mode=false after context compression.
 
-    Per-file status: full, diff, unchanged, or skipped (with est_tokens).
+    Per-file status: full, diff, or skipped (with est_tokens).
+    Unchanged files listed in summary.unchanged (already in your context).
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns (e.g. "src/**/*.py")

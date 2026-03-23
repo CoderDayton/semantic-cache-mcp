@@ -87,6 +87,8 @@ async def smart_read(
             # Unchanged path (either mtime match or content hash match)
             await cache.record_access(str(file_path))
             unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
+            # NOTE: do NOT add extra text here — the JSON "unchanged":true
+            # field signals the LLM that full content is already in context.
             msg_tokens = count_tokens(unchanged_msg)
 
             if msg_tokens < tokens_original:

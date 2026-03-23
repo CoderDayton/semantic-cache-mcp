@@ -225,13 +225,17 @@ class TestReadTool:
         assert "tokens_saved" in d
         assert "params" in d
 
-    async def test_normal_mode_includes_is_diff_and_truncated(
+    async def test_normal_mode_first_read_no_noise_fields(
         self, ctx: MagicMock, sample_file: Path
     ) -> None:
+        """First read of an unchanged file omits is_diff and truncated (both False)."""
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await read(ctx, str(sample_file)))
-        assert "is_diff" in d
-        assert "truncated" in d
+        # On first read, is_diff=False and truncated=False are omitted to save tokens.
+        # Their absence means False.
+        assert d.get("is_diff") is None
+        assert d.get("truncated") is None
+        assert "content" in d
 
     async def test_truncated_file_includes_hint(self, ctx: MagicMock, tmp_path: Path) -> None:
         large = tmp_path / "large.txt"
