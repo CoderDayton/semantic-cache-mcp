@@ -94,24 +94,20 @@ async def read(
 
     Behavior with diff_mode=true (default):
     - First read: returns full content and caches it.
-    - Subsequent read, file unchanged: returns a short "unchanged" marker (no content).
-      If you need the actual content again (e.g. after context compression), set diff_mode=false.
+    - Subsequent read, file unchanged: returns a short "unchanged" marker.
+      Set diff_mode=false after context compression to get full content again.
     - Subsequent read, file modified: returns a unified diff of changes.
 
-    Timing guidance:
-    - Use for single-file inspection and verification.
-    - For 2+ files, prefer batch_read instead.
-    - Keep diff_mode=true during iteration; set false after context compression.
-    - Use offset/limit to read specific line ranges without re-reading the whole file.
+    For 2+ files, prefer batch_read. Use offset/limit to read specific line
+    ranges without re-reading the whole file.
 
-    Truncated files: the response includes a hint with the offset to continue.
-    Use read(path, offset=N, limit=M) to get the next section — do NOT re-read
-    from the beginning.
+    Truncated files: use read(path, offset=N, limit=M) to continue — do NOT
+    re-read from the beginning.
 
     Args:
         path: File path (absolute or relative)
         max_size: Maximum content size to return (default: 100000)
-        diff_mode: Return diff if previously read (default: true). Set false for full content.
+        diff_mode: Return diff if previously read (default: true)
         offset: Line number to start reading from (1-based)
         limit: Number of lines to read from offset
     """
@@ -527,32 +523,23 @@ async def edit(
 
     Three modes — use line numbers from `read` to save tokens:
     - **find/replace**: old_string + new_string. Searches entire file.
-    - **scoped**: old_string + new_string + start_line/end_line. Shorter context suffices.
-    - **line replace**: new_string + start_line/end_line only. Maximum token savings.
+    - **scoped**: old_string + new_string + start_line/end_line. Shorter context.
+    - **line replace**: new_string + start_line/end_line only. Maximum savings.
 
-    IMPORTANT — minimize old_string size:
-    - When you have line numbers from `read`, ALWAYS prefer **line replace** or
-      **scoped** mode. Do NOT send large old_string blocks for uniqueness.
-    - old_string should be the MINIMAL text needed to identify the edit target.
-      One line is usually enough. Never send surrounding unchanged lines.
-    - For 2+ changes, use batch_edit — it's more token-efficient.
+    IMPORTANT: keep old_string minimal (one line). Prefer line replace when
+    you have line numbers. For 2+ changes use batch_edit.
 
-    Multiple matches: fails with match count and hint. Add more context or
-    set replace_all=true.
-
-    Response: unified diff of the change with affected line numbers.
+    Multiple matches: fails with hint. Add context or set replace_all=true.
 
     Args:
         path: File path (absolute or relative)
-        old_string: Exact string to find (whitespace-sensitive). Keep as short
-            as possible — one line is ideal. Omit entirely for line-replace mode
-            (requires start_line/end_line).
+        old_string: Exact string to find. Keep to one line. Omit for line-replace.
         new_string: Replacement string
-        replace_all: Replace all occurrences (default: false). Not valid in line-replace mode.
+        replace_all: Replace all occurrences (default: false)
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edit (default: false)
-        start_line: Start of line range, 1-based inclusive. Must pair with end_line.
-        end_line: End of line range, 1-based inclusive. Must pair with start_line.
+        start_line: Start of line range (1-based). Must pair with end_line.
+        end_line: End of line range (1-based). Must pair with start_line.
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -636,28 +623,22 @@ async def batch_edit(
     dry_run: bool = False,
     auto_format: bool = False,
 ) -> str:
-    """Apply multiple independent edits to a file in one call. Max 50 edits.
+    """Apply multiple edits to a file in one call. Max 50 edits.
 
-    Supports three edit modes per entry (same as `edit` tool):
-    - **find/replace**: [old, new] or {"old": "...", "new": "..."}
-    - **scoped find/replace**: [old, new, start_line, end_line] or
-      {"old": "...", "new": "...", "start_line": 10, "end_line": 15}
-    - **line replace**: [null, new, start_line, end_line] or
-      {"old": null, "new": "...", "start_line": 10, "end_line": 15}
+    Edit modes per entry:
+    - [old, new] — find/replace
+    - [old, new, start_line, end_line] — scoped find/replace
+    - [null, new, start_line, end_line] — line replace (preferred)
+    Also accepts {"old": ..., "new": ..., "start_line": ..., "end_line": ...}.
 
-    IMPORTANT — minimize edit size:
-    - ALWAYS prefer **line replace** mode [null, new, start, end] when you have
-      line numbers. This sends zero wasted tokens.
-    - When using find/replace, keep old_string to ONE line — the minimum needed
-      to identify the target. Never include surrounding unchanged lines.
+    IMPORTANT: prefer line replace [null, new, start, end] when you have
+    line numbers. Keep old to one line when using find/replace.
 
-    Partial success: each edit is applied independently. When edits fail, the
-    response includes a failures list with the old_string and error for each —
-    use these to retry or correct without a separate debug call.
+    Partial success: failures list included with old_string and error.
 
     Args:
         path: Absolute path to file
-        edits: JSON array of edit entries (see modes above)
+        edits: JSON array of edit entries
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edits (default: false)
     """
@@ -920,21 +901,16 @@ async def batch_read(
 ) -> str:
     """Read multiple files under a token budget. Supports glob patterns in paths.
 
-    Timing:
-    - Prefer over repeated read calls when working with 2+ files.
-    - Use early to seed the cache before search/similar/grep.
-    - After context compression, call with diff_mode=false to reload content.
-    - Start with a tight token budget; increase only if files are skipped.
+    Prefer over repeated read calls for 2+ files. Use early to seed the cache
+    before search/similar/grep. Set diff_mode=false after context compression.
 
-    Response includes per-file status: full, diff, unchanged, or skipped.
-    Skipped files include est_tokens so you can retry them individually or
-    increase the budget. Unchanged files cost ~0 tokens.
+    Per-file status: full, diff, unchanged, or skipped (with est_tokens).
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns (e.g. "src/**/*.py")
         max_total_tokens: Token budget (default: 50000, max: 200000)
-        priority: Comma-separated or JSON array of paths to read first (order preserved)
-        diff_mode: When false, always return full content (use after context compression)
+        priority: Comma-separated or JSON array of paths to read first
+        diff_mode: When false, always return full content
     """
     cache: SemanticCache = ctx.lifespan_context["cache"]
     mode = _response_mode()
