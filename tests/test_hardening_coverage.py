@@ -799,6 +799,7 @@ class TestGlobSymlinkEscape:
 
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
+        mock_cache._io_executor = None  # use default asyncio executor for astat
         result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]
@@ -820,6 +821,7 @@ class TestGlobSymlinkEscape:
 
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
+        mock_cache._io_executor = None  # use default asyncio executor for astat
         result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]

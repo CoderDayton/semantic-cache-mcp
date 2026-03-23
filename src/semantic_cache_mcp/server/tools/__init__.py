@@ -61,6 +61,10 @@ def _serialized(fn):
 
     Ensures only one tool call executes at a time, preventing concurrent
     coroutines from interleaving executor tasks and causing hangs.
+
+    Lock acquisition has NO timeout — tools always join the queue.
+    The tool *holding* the lock will release it within TOOL_TIMEOUT
+    (via asyncio.wait_for for reads, asyncio.timeout for writes).
     """
     import functools  # noqa: PLC0415
 
@@ -81,27 +85,46 @@ def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:
     cache.reset_executor()
 
 
-async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
+async def _shielded_write(
+    cache: SemanticCache, coro: Any, *, timeout: float = _TOOL_TIMEOUT
+) -> Any:
     """Run a write coroutine protected from cancellation during shutdown.
 
     Uses asyncio.shield so the inner task runs to completion even when
     the tool handler's task is cancelled (e.g. SIGTERM). end_operation()
     fires only after the write actually finishes, keeping the drain
     counter accurate for async_close().
+
+    Timeout is enforced INSIDE the shield via asyncio.timeout, NOT by
+    wrapping this function in asyncio.wait_for.  wait_for + shield is
+    broken: wait_for cancels the wrapper → shield catches CancelledError
+    and re-awaits the inner task → wait_for blocks forever waiting for
+    the wrapper to finish.  asyncio.timeout works because it cancels the
+    *shield future* (which is immediately "done"), not the inner task.
     """
     if not cache.begin_operation():
         coro.close()  # prevent 'coroutine was never awaited' warning
         raise RuntimeError("Server is shutting down")
     task = asyncio.ensure_future(coro)
     task.set_name("shielded-write")
+    timed_out = False
     try:
-        return await asyncio.shield(task)
+        async with asyncio.timeout(timeout):
+            return await asyncio.shield(task)
+    except TimeoutError:
+        timed_out = True
+        raise
     except asyncio.CancelledError:
-        # Outer task was cancelled, but the write must finish.
-        # Re-await the real task (shield kept it alive).
-        return await task
+        # Not our timeout — genuine cancellation (SIGTERM / graceful shutdown).
+        # Give the write a brief grace period to finish disk I/O before
+        # the process exits.
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except (TimeoutError, asyncio.CancelledError):
+            raise asyncio.CancelledError() from None
     finally:
-        cache.end_operation()
+        if not timed_out:
+            cache.end_operation()
 
 
 @mcp.tool(
@@ -476,20 +499,17 @@ async def write(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await asyncio.wait_for(
-            _shielded_write(
-                cache,
-                smart_write(
-                    cache=cache,
-                    path=path,
-                    content=content,
-                    create_parents=create_parents,
-                    dry_run=dry_run,
-                    auto_format=auto_format,
-                    append=append,
-                ),
+        result = await _shielded_write(
+            cache,
+            smart_write(
+                cache=cache,
+                path=path,
+                content=content,
+                create_parents=create_parents,
+                dry_run=dry_run,
+                auto_format=auto_format,
+                append=append,
             ),
-            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("write", result)
 
@@ -580,22 +600,19 @@ async def edit(
     max_response_tokens = _response_token_cap()
 
     try:
-        result = await asyncio.wait_for(
-            _shielded_write(
-                cache,
-                smart_edit(
-                    cache=cache,
-                    path=path,
-                    old_string=old_string,
-                    new_string=new_string,
-                    replace_all=replace_all,
-                    dry_run=dry_run,
-                    auto_format=auto_format,
-                    start_line=start_line,
-                    end_line=end_line,
-                ),
+        result = await _shielded_write(
+            cache,
+            smart_edit(
+                cache=cache,
+                path=path,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=replace_all,
+                dry_run=dry_run,
+                auto_format=auto_format,
+                start_line=start_line,
+                end_line=end_line,
             ),
-            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("edit", result)
 
@@ -717,18 +734,15 @@ async def batch_edit(
                     max_response_tokens,
                 )
 
-        result = await asyncio.wait_for(
-            _shielded_write(
-                cache,
-                smart_batch_edit(
-                    cache=cache,
-                    path=path,
-                    edits=edit_tuples,
-                    dry_run=dry_run,
-                    auto_format=auto_format,
-                ),
+        result = await _shielded_write(
+            cache,
+            smart_batch_edit(
+                cache=cache,
+                path=path,
+                edits=edit_tuples,
+                dry_run=dry_run,
+                auto_format=auto_format,
             ),
-            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("batch_edit", result)
 

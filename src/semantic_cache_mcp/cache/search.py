@@ -313,7 +313,7 @@ async def glob_with_cache_status(
 
         count += 1
         path_str = str(file_path)
-        mtime = file_path.stat().st_mtime
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
 
         # Check cache status
         cached = await cache.get(path_str)

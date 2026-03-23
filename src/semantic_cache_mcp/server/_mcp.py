@@ -112,9 +112,19 @@ async def app_lifespan(server: FastMCP):
             await asyncio.sleep(300)  # 5 minutes
             try:
                 # MUST go through executor — ONNX is not thread-safe.
+                # Timeout prevents a hung ONNX call from blocking the
+                # executor indefinitely (tool calls have their own 20s
+                # timeout, but keepalive had none — a hang here would
+                # silently kill the executor until a tool reset it).
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(cache._io_executor, embed, "keepalive")
+                await asyncio.wait_for(
+                    loop.run_in_executor(cache._io_executor, embed, "keepalive"),
+                    timeout=10,
+                )
                 logger.debug("Embedding keepalive ping")
+            except TimeoutError:
+                logger.warning("Keepalive embedding timed out — resetting executor")
+                cache.reset_executor()
             except Exception:
                 logger.debug("Embedding keepalive failed", exc_info=True)
 

@@ -261,19 +261,35 @@ async def batch_smart_read(
     _entries = await asyncio.gather(*(cache.get(rp) for rp in resolved_map.values()))
     _cache_map = dict(zip(resolved_map.values(), _entries, strict=True))
 
+    # Pre-fetch stat results through the executor so the estimation loop
+    # doesn't block the event loop with synchronous syscalls (matters on
+    # NFS/FUSE mounts where stat can be slow).
+    import os  # noqa: PLC0415
+
+    async def _safe_stat(p: Path) -> os.stat_result | None:
+        try:
+            return await astat(p, cache._io_executor)
+        except (OSError, ValueError):
+            return None
+
+    _stat_results = await asyncio.gather(*(_safe_stat(Path(rp)) for rp in resolved_map.values()))
+    _stat_map: dict[str, os.stat_result | None] = dict(
+        zip(resolved_map.values(), _stat_results, strict=True)
+    )
+
     # Estimate tokens for sorting and skipped-file enrichment.
     def estimate_min_tokens(p: str) -> int:
-        resolved = Path(resolved_map[p])
-        cached = _cache_map.get(resolved_map[p])
-        if cached and resolved.exists():
-            file_mtime = resolved.stat().st_mtime
-            if cached.mtime >= file_mtime:
+        rp = resolved_map[p]
+        cached = _cache_map.get(rp)
+        st = _stat_map.get(rp)
+        if st is None:
+            return 1
+        if cached:
+            if cached.mtime >= st.st_mtime:
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
             return cached.tokens
-        if not resolved.exists() or not resolved.is_file():
-            return 1
-        return max(1, int(resolved.stat().st_size / 4))
+        return max(1, int(st.st_size / 4))
 
     token_estimates = {p: estimate_min_tokens(p) for p in paths}
 
