@@ -80,11 +80,53 @@ def embed_query(text: str) -> array.array[float] | None:
 
 
 def get_embedding_dim() -> int:
-    """Return embedding dimension; 0 if model not yet warmed up."""
-    # Must re-import to read current singleton value
+    """Return embedding dimension for the configured model, even before warmup.
+
+    Priority: runtime dim (set by warmup) > model object attribute >
+    fastembed registry > HuggingFace config.json. Never hardcodes a default.
+    """
     import semantic_cache_mcp.core.embeddings._model as _m
 
-    return _m._embedding_dim
+    # 1. Already known from warmup
+    if _m._embedding_dim > 0:
+        return _m._embedding_dim
+
+    # 2. Model object loaded — query its metadata
+    if _m._embedding_model is not None:
+        size = getattr(_m._embedding_model, "embedding_size", None)
+        if size and size > 0:
+            return int(size)
+
+    # 3. Check fastembed's built-in model registry (no model loading)
+    try:
+        from fastembed import TextEmbedding  # noqa: PLC0415
+
+        for info in TextEmbedding.list_supported_models():
+            if info.get("model") == FASTEMBED_MODEL:
+                dim = info.get("dim")
+                if dim and dim > 0:
+                    return int(dim)
+
+        # 4. Custom model — read dim from HuggingFace config.json cache
+        import json  # noqa: PLC0415
+
+        from ._constants import FASTEMBED_CACHE_DIR  # noqa: PLC0415
+
+        config_path = FASTEMBED_CACHE_DIR / "config.json"
+        if not config_path.exists():
+            # Try huggingface_hub cache layout
+            for p in FASTEMBED_CACHE_DIR.rglob("config.json"):
+                config_path = p
+                break
+
+        if config_path.exists():
+            dim = json.loads(config_path.read_text()).get("hidden_size")
+            if dim and dim > 0:
+                return int(dim)
+    except Exception:
+        pass
+
+    return 0
 
 
 def get_model_info() -> dict[str, str | int]:
