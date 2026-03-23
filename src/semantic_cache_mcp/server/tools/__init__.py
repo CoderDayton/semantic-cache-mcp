@@ -23,7 +23,7 @@ from ...cache import (
     smart_read,
     smart_write,
 )
-from ...config import MAX_CONTENT_SIZE
+from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
 from .._mcp import mcp
 from ..response import (
@@ -38,9 +38,8 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
-# Maximum time (seconds) any tool call is allowed to run before returning an error.
-# Prevents indefinite hangs from executor deadlocks or slow I/O.
-_TOOL_TIMEOUT: float = 30.0
+# Tool timeout from config (env TOOL_TIMEOUT, default 12s).
+_TOOL_TIMEOUT: float = TOOL_TIMEOUT
 
 
 def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:

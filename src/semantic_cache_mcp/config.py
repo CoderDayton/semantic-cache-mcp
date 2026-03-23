@@ -65,6 +65,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 def _env_mode(name: str, default: str) -> str:
     raw = environ.get(name)
     if raw is None:
@@ -86,6 +96,7 @@ EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)
+TOOL_TIMEOUT: Final = _env_float("TOOL_TIMEOUT", 20.0)  # seconds before tool call times out
 
 # Similarity
 SIMILARITY_THRESHOLD: Final = 0.85  # Semantic similarity threshold
