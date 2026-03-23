@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import sys
@@ -12,7 +11,7 @@ from fastmcp.server.lifespan import lifespan
 
 from ..cache import SemanticCache
 from ..config import DB_PATH
-from ..core.embeddings import embed, get_model_info, warmup
+from ..core.embeddings import get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -103,40 +102,9 @@ async def app_lifespan(server: FastMCP):
     if cache is None:
         raise RuntimeError("Cache failed to initialize")
 
-    # Background keepalive: run a tiny embedding every 5 minutes to prevent
-    # the ONNX model from being paged out or GC'd during long idle periods.
-    _keepalive_task: asyncio.Task[None] | None = None
-
-    async def _embedding_keepalive() -> None:
-        while True:
-            await asyncio.sleep(300)  # 5 minutes
-            try:
-                # MUST go through executor — ONNX is not thread-safe.
-                # Timeout prevents a hung ONNX call from blocking the
-                # executor indefinitely (tool calls have their own 20s
-                # timeout, but keepalive had none — a hang here would
-                # silently kill the executor until a tool reset it).
-                loop = asyncio.get_running_loop()
-                await asyncio.wait_for(
-                    loop.run_in_executor(cache._io_executor, embed, "keepalive"),
-                    timeout=10,
-                )
-                logger.debug("Embedding keepalive ping")
-            except TimeoutError:
-                logger.warning("Keepalive embedding timed out — resetting executor")
-                cache.reset_executor()
-            except Exception:
-                logger.debug("Embedding keepalive failed", exc_info=True)
-
-    _keepalive_task = asyncio.create_task(_embedding_keepalive())
-
     try:
         yield {"cache": cache}
     finally:
-        if _keepalive_task is not None:
-            _keepalive_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await _keepalive_task
         await cache.async_close()
         # Flush streams before exit — prevents lost log output when running
         # as a subprocess (stdio transport) or in containers.
