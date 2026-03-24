@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
@@ -64,7 +64,7 @@ _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 # catalog reads, and ONNX calls — the root cause of hangs when
 # multiple subagents fire tool calls simultaneously.
 _tool_lock: asyncio.Lock | None = None
-_LOCAL_TOOL_EXECUTION = object()
+_RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,17 +101,20 @@ async def _maybe_call_remote_tool(
     kwargs: dict[str, Any],
     *,
     timeout: float,
-) -> Any | object:
+) -> _RemoteToolReturnT | None:
     if not _is_remote_runtime(state.cache):
-        return _LOCAL_TOOL_EXECUTION
+        return None
 
     try:
-        return await state.cache.call_tool(
-            tool,
-            kwargs,
-            output_mode=state.mode,
-            max_response_tokens=state.max_response_tokens,
-            timeout=timeout,
+        return cast(
+            _RemoteToolReturnT,
+            await state.cache.call_tool(
+                tool,
+                kwargs,
+                output_mode=state.mode,
+                max_response_tokens=state.max_response_tokens,
+                timeout=timeout,
+            ),
         )
     except TimeoutError:
         _raise_tool_error(tool, f"timed out after {timeout}s", state.max_response_tokens)
@@ -234,7 +237,7 @@ async def read(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "read",
         {
@@ -246,7 +249,7 @@ async def read(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     # Validate bounds
@@ -381,8 +384,10 @@ async def stats(
     state = _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
-    remote_result = await _maybe_call_remote_tool(state, "stats", {}, timeout=_TOOL_TIMEOUT)
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    remote_result: ToolResult | None = await _maybe_call_remote_tool(
+        state, "stats", {}, timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
         return remote_result
 
     cache_stats = await cache.get_stats()
@@ -596,8 +601,10 @@ async def clear(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(state, "clear", {}, timeout=_TOOL_TIMEOUT)
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "clear", {}, timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
         return remote_result
 
     count = await cache.clear()
@@ -645,7 +652,7 @@ async def write(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "write",
         {
@@ -658,7 +665,7 @@ async def write(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -766,7 +773,7 @@ async def edit(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "edit",
         {
@@ -781,7 +788,7 @@ async def edit(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -883,7 +890,7 @@ async def batch_edit(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "batch_edit",
         {
@@ -894,7 +901,7 @@ async def batch_edit(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1046,13 +1053,13 @@ async def search(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "search",
         {"query": query, "k": k, "directory": directory},
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1120,13 +1127,13 @@ async def diff(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "diff",
         {"path1": path1, "path2": path2, "context_lines": context_lines},
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1192,7 +1199,7 @@ async def batch_read(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "batch_read",
         {
@@ -1203,7 +1210,7 @@ async def batch_read(
         },
         timeout=_TOOL_TIMEOUT * 2,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1335,13 +1342,13 @@ async def similar(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "similar",
         {"path": path, "k": k},
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1407,7 +1414,7 @@ async def glob(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "glob",
         {
@@ -1417,7 +1424,7 @@ async def glob(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
@@ -1491,7 +1498,7 @@ async def grep(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result = await _maybe_call_remote_tool(
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "grep",
         {
@@ -1504,7 +1511,7 @@ async def grep(
         },
         timeout=_TOOL_TIMEOUT,
     )
-    if remote_result is not _LOCAL_TOOL_EXECUTION:
+    if remote_result is not None:
         return remote_result
 
     try:
