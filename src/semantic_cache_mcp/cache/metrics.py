@@ -14,6 +14,15 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
+from ..types import (
+    BatchEditResult,
+    BatchReadResult,
+    DiffResult,
+    EditResult,
+    ReadResult,
+    WriteResult,
+)
+
 if TYPE_CHECKING:
     from ..storage.sqlite import ConnectionPool
 
@@ -62,8 +71,10 @@ class SessionMetrics:
     def record(self, tool_name: str, result: object) -> None:
         """Record metrics from a tool result. Thread-safe.
 
-        Dispatches via ``hasattr`` on the result object — no per-type methods,
-        no decorators. ``result=None`` is safe (e.g. clear tool).
+        Metrics must stay internally coherent: any saved-token contribution must
+        carry a matching original/returned denominator. This means token-savings
+        rate metrics are derived only from read flows, where the result models
+        expose both original and returned token counts directly or derivably.
         """
         with self._lock:
             self.tool_calls[tool_name] = self.tool_calls.get(tool_name, 0) + 1
@@ -71,43 +82,66 @@ class SessionMetrics:
             if result is None:
                 return
 
-            # tokens_saved — present on ReadResult, WriteResult, EditResult,
-            # BatchReadResult, BatchEditResult, DiffResult
-            if hasattr(result, "tokens_saved"):
+            if isinstance(result, ReadResult):
                 self.tokens_saved += result.tokens_saved
-
-            # tokens_original / tokens_returned — ReadResult only
-            if hasattr(result, "tokens_original"):
                 self.tokens_original += result.tokens_original
-            if hasattr(result, "tokens_returned"):
                 self.tokens_returned += result.tokens_returned
+                if result.from_cache:
+                    self.cache_hits += 1
+                else:
+                    self.cache_misses += 1
+                if result.is_diff:
+                    self.diffs_served += 1
+                if tool_name == "read":
+                    self.files_read += 1
+                return
 
-            # Cache hit/miss — ReadResult, WriteResult, EditResult, BatchEditResult
-            if hasattr(result, "from_cache"):
-                val = result.from_cache
-                if isinstance(val, bool):
-                    if val:
+            if isinstance(result, BatchReadResult):
+                self.tokens_saved += result.tokens_saved
+                self.tokens_original += result.total_tokens + result.tokens_saved
+                self.tokens_returned += result.total_tokens
+                self.files_read += result.files_read
+                for file_result in result.files:
+                    if file_result.status == "skipped":
+                        continue
+                    if file_result.from_cache:
                         self.cache_hits += 1
                     else:
                         self.cache_misses += 1
-                elif isinstance(val, tuple):
-                    # DiffResult.from_cache is tuple[bool, bool]
-                    self.cache_hits += sum(1 for v in val if v)
-                    self.cache_misses += sum(1 for v in val if not v)
+                    if file_result.status == "diff":
+                        self.diffs_served += 1
+                return
 
-            # Diff tracking — ReadResult
-            if hasattr(result, "is_diff") and result.is_diff:
-                self.diffs_served += 1
+            if isinstance(result, DiffResult):
+                self.cache_hits += sum(1 for v in result.from_cache if v)
+                self.cache_misses += sum(1 for v in result.from_cache if not v)
+                return
 
-            # File counts by tool
-            if tool_name == "read":
-                self.files_read += 1
-            elif tool_name == "batch_read" and hasattr(result, "files_read"):
-                self.files_read += result.files_read
-            elif tool_name == "write":
-                self.files_written += 1
-            elif tool_name in ("edit", "batch_edit"):
-                self.files_edited += 1
+            if isinstance(result, WriteResult):
+                if result.from_cache:
+                    self.cache_hits += 1
+                else:
+                    self.cache_misses += 1
+                if tool_name == "write" and not result.dry_run:
+                    self.files_written += 1
+                return
+
+            if isinstance(result, EditResult):
+                if result.from_cache:
+                    self.cache_hits += 1
+                else:
+                    self.cache_misses += 1
+                if tool_name == "edit" and not result.dry_run:
+                    self.files_edited += 1
+                return
+
+            if isinstance(result, BatchEditResult):
+                if result.from_cache:
+                    self.cache_hits += 1
+                else:
+                    self.cache_misses += 1
+                if tool_name == "batch_edit" and not result.dry_run and result.succeeded > 0:
+                    self.files_edited += 1
 
     def snapshot(self) -> dict[str, object]:
         """Thread-safe snapshot of current metrics with computed uptime."""

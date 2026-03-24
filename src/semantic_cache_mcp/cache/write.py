@@ -206,6 +206,7 @@ async def smart_write(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )
 
 
@@ -473,6 +474,7 @@ async def smart_edit(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )
 
 
@@ -724,4 +726,5 @@ async def smart_batch_edit(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )
