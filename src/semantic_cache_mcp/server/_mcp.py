@@ -9,10 +9,9 @@ import sys
 from fastmcp import FastMCP
 from fastmcp.server.lifespan import lifespan
 
-from ..cache import SemanticCache
 from ..config import DB_PATH
-from ..core.embeddings import get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
+from ._tool_worker import ToolProcessSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +58,7 @@ async def app_lifespan(server: FastMCP):
     """Initialize cache and embedding model on startup."""
     logger.info("Semantic cache MCP server starting...")
 
-    cache: SemanticCache | None = None
+    cache: ToolProcessSupervisor | None = None
 
     # Redirect stdout → stderr during initialization to prevent third-party
     # libraries (fastembed, onnxruntime) from printing to stdout and corrupting
@@ -70,30 +69,12 @@ async def app_lifespan(server: FastMCP):
             logger.info("Initializing tokenizer...")
             get_tokenizer()
 
-            # Initialize VectorStorage (usearch) before onnxruntime (fastembed).
-            # Loading onnxruntime first and then usearch causes heap corruption
-            # (free(): corrupted unsorted chunks) on Linux due to allocator conflicts.
-            logger.info("Initializing cache storage...")
-            cache = SemanticCache()
             _migrate_v2_to_v3()
-
-            logger.info("Initializing embedding model...")
-            warmup()
-
-            model_info = get_model_info()
-            # Detect embedding model change and rebuild index if needed
-            if model_info.get("ready") and cache is not None:
-                cache._storage.clear_if_model_changed(
-                    str(model_info["model"]), int(model_info["dim"])
-                )
-            if not model_info.get("ready", False):
-                logger.error(
-                    "Embedding model failed to initialize. "
-                    "Semantic similarity features will be disabled. "
-                    "Check network connectivity and disk space."
-                )
-            else:
-                logger.info(f"Embedding model ready: {model_info['model']}")
+            logger.info("Starting tool worker...")
+            cache = ToolProcessSupervisor()
+            if cache is None:
+                raise RuntimeError("Cache failed to initialize")
+            await cache.start()
             logger.info("Semantic cache MCP server started")
         except Exception:
             logger.exception("Failed to initialize semantic cache")

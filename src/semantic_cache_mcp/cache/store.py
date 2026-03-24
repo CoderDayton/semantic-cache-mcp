@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +14,7 @@ from ..core import count_tokens
 from ..storage import SQLiteStorage, VectorStorage
 from ..storage.vector import VECDB_PATH
 from ..types import CacheEntry, EmbeddingVector
+from ..utils import DetachedExecutor
 from .metrics import SessionMetrics
 
 logger = logging.getLogger(__name__)
@@ -302,9 +303,7 @@ class SemanticCache:
         # Passed to VectorStorage → AsyncVectorDB so simplevecdb's own
         # operations (add_texts, similarity_search, etc.) also serialize
         # on this thread.
-        self._io_executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="semantic-cache-io"
-        )
+        self._io_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
         self._storage = VectorStorage(db_path, executor=self._io_executor)
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
@@ -324,10 +323,11 @@ class SemanticCache:
         """
         logger.warning("Resetting IO executor — previous thread may be stuck")
         old = self._io_executor
-        # Don't wait for the old executor — it's stuck.
-        old.shutdown(wait=False)
+        # Don't wait for the old executor — the current call may be wedged in
+        # a blocking C extension or a kernel I/O wait and cannot be cancelled.
+        old.shutdown(wait=False, cancel_futures=True)
 
-        new_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="semantic-cache-io")
+        new_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
         self._io_executor = new_executor
         self._storage._io_executor = new_executor
         self._storage._db._executor = new_executor

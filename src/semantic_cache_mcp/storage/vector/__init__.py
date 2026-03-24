@@ -6,7 +6,7 @@ import array
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor
 from pathlib import Path
 
 from simplevecdb import AsyncVectorDB, DistanceStrategy, Quantization
@@ -65,7 +65,7 @@ class VectorStorage:
         self,
         db_path: Path = VECDB_PATH,
         *,
-        executor: ThreadPoolExecutor | None = None,
+        executor: Executor | None = None,
     ) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path

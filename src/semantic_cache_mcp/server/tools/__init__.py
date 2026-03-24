@@ -56,6 +56,11 @@ def _get_tool_lock() -> asyncio.Lock:
     return _tool_lock
 
 
+def _is_remote_runtime(value: Any) -> bool:
+    """True when *value* is the supervisor-backed tool runtime."""
+    return getattr(value, "_is_tool_process_supervisor", False) is True
+
+
 def _serialized(fn):
     """Decorator: acquire the global tool lock before running the handler.
 
@@ -168,9 +173,27 @@ async def read(
         offset: Line number to start reading from (1-based)
         limit: Number of lines to read from offset
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "read",
+                {
+                    "path": path,
+                    "max_size": max_size,
+                    "diff_mode": diff_mode,
+                    "offset": offset,
+                    "limit": limit,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     # Validate bounds
     if offset is not None and offset < 1:
@@ -299,8 +322,22 @@ async def stats(
     info, and process memory usage. Useful for monitoring cache effectiveness
     and diagnosing performance issues.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
+    max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "stats",
+                {},
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("stats", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+
     cache_stats = await cache.get_stats()
     model_info = get_model_info()
 
@@ -463,9 +500,22 @@ async def clear(
     ctx: Context,
 ) -> str:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "clear",
+                {},
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("clear", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+
     count = await cache.clear()
     cache.metrics.record("clear", None)
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
@@ -507,9 +557,28 @@ async def write(
         auto_format: Run formatter after write (default: false)
         append: Append content to existing file instead of overwriting (default: false)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "write",
+                {
+                    "path": path,
+                    "content": content,
+                    "create_parents": create_parents,
+                    "dry_run": dry_run,
+                    "auto_format": auto_format,
+                    "append": append,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await _shielded_write(
@@ -608,9 +677,30 @@ async def edit(
         start_line: Start of line range (1-based). Must pair with end_line.
         end_line: End of line range (1-based). Must pair with start_line.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "edit",
+                {
+                    "path": path,
+                    "old_string": old_string,
+                    "new_string": new_string,
+                    "replace_all": replace_all,
+                    "dry_run": dry_run,
+                    "auto_format": auto_format,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await _shielded_write(
@@ -707,9 +797,30 @@ async def batch_edit(
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edits (default: false)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "batch_edit",
+                {
+                    "path": path,
+                    "edits": edits,
+                    "dry_run": dry_run,
+                    "auto_format": auto_format,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error(
+                "batch_edit",
+                f"timed out after {_TOOL_TIMEOUT}s",
+                max_response_tokens,
+            )
 
     try:
         # Parse edits JSON
@@ -854,9 +965,21 @@ async def search(
         k: Max results (default: 10, max: 100)
         directory: Optional directory path to limit search scope
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "search",
+                {"query": query, "k": k, "directory": directory},
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await asyncio.wait_for(
@@ -917,9 +1040,21 @@ async def diff(
         path2: Second file path
         context_lines: Lines of context in diff (default: 3)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "diff",
+                {"path1": path1, "path2": path2, "context_lines": context_lines},
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await asyncio.wait_for(
@@ -978,9 +1113,28 @@ async def batch_read(
         priority: Comma-separated or JSON array of paths to read first
         diff_mode: When false, always return full content
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "batch_read",
+                {
+                    "paths": paths,
+                    "max_total_tokens": max_total_tokens,
+                    "priority": priority,
+                    "diff_mode": diff_mode,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT * 2,
+            )
+        except TimeoutError:
+            return _render_error(
+                "batch_read", f"timed out after {_TOOL_TIMEOUT * 2}s", max_response_tokens
+            )
 
     try:
         # Parse paths (comma-separated or JSON array)
@@ -1103,9 +1257,25 @@ async def similar(
         path: Source file path (absolute or relative)
         k: Max results (default: 5, max: 50)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "similar",
+                {"path": path, "k": k},
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error(
+                "similar",
+                f"timed out after {_TOOL_TIMEOUT}s",
+                max_response_tokens,
+            )
 
     try:
         result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
@@ -1164,9 +1334,25 @@ async def glob(
         directory: Base directory (default: current)
         cached_only: Only return files already in cache (default: false)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "glob",
+                {
+                    "pattern": pattern,
+                    "directory": directory,
+                    "cached_only": cached_only,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("glob", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await glob_with_cache_status(
@@ -1233,9 +1419,28 @@ async def grep(
         max_matches: Total match limit across all files (default: 100)
         max_files: Maximum files to return (default: 50)
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
+    cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
     max_response_tokens = _response_token_cap()
+
+    if _is_remote_runtime(cache):
+        try:
+            return await cache.call_tool(
+                "grep",
+                {
+                    "pattern": pattern,
+                    "fixed_string": fixed_string,
+                    "case_sensitive": case_sensitive,
+                    "context_lines": context_lines,
+                    "max_matches": max_matches,
+                    "max_files": max_files,
+                },
+                output_mode=mode,
+                max_response_tokens=max_response_tokens,
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _render_error("grep", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         # In compact mode, context lines are dropped in the response anyway —

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from ..config import TOOL_MAX_RESPONSE_TOKENS, TOOL_OUTPUT_MODE
@@ -10,14 +12,35 @@ from ..core import count_tokens
 
 _MODE_NORMAL = {"normal", "debug"}
 _MODE_DEBUG = "debug"
+_UNSET = object()
+_response_mode_override: ContextVar[str | None] = ContextVar("response_mode_override", default=None)
+_response_token_cap_override: ContextVar[int | None | object] = ContextVar(
+    "response_token_cap_override",
+    default=_UNSET,
+)
 
 
 def _response_mode() -> str:
-    return TOOL_OUTPUT_MODE
+    override = _response_mode_override.get()
+    return override if override is not None else TOOL_OUTPUT_MODE
 
 
 def _response_token_cap() -> int | None:
+    override = _response_token_cap_override.get()
+    if override is not _UNSET:
+        return override  # type: ignore[return-value]
     return TOOL_MAX_RESPONSE_TOKENS if TOOL_MAX_RESPONSE_TOKENS > 0 else None
+
+
+@contextmanager
+def _response_overrides(mode: str, max_response_tokens: int | None):
+    mode_token = _response_mode_override.set(mode)
+    cap_token = _response_token_cap_override.set(max_response_tokens)
+    try:
+        yield
+    finally:
+        _response_mode_override.reset(mode_token)
+        _response_token_cap_override.reset(cap_token)
 
 
 def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:

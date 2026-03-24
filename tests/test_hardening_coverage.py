@@ -554,23 +554,17 @@ class TestMcpLifespan:
     async def test_lifespan_redirect_stdout(self) -> None:
         """Stdout is redirected to stderr during init."""
 
-        def mock_warmup():
-            print("warmup noise")
+        async def mock_start() -> None:
+            print("worker startup noise")
 
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup", side_effect=mock_warmup),
-            patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test", "dim": 384},
-            ),
-            patch("semantic_cache_mcp.server._mcp.SemanticCache") as mock_cache_cls,
+            patch("semantic_cache_mcp.server._mcp.ToolProcessSupervisor") as mock_supervisor_cls,
         ):
-            mock_cache = MagicMock()
-            mock_cache.metrics = MagicMock()
-            mock_cache.async_close = AsyncMock()
-            mock_cache._shutting_down = False
-            mock_cache_cls.return_value = mock_cache
+            mock_supervisor = MagicMock()
+            mock_supervisor.start = AsyncMock(side_effect=mock_start)
+            mock_supervisor.async_close = AsyncMock()
+            mock_supervisor_cls.return_value = mock_supervisor
 
             from semantic_cache_mcp.server._mcp import app_lifespan
 
@@ -597,21 +591,15 @@ class TestMcpLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_model_not_ready(self) -> None:
-        """Embedding model not ready still creates cache."""
+        """Worker supervisor startup still yields a cache context."""
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup"),
-            patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": False},
-            ),
-            patch("semantic_cache_mcp.server._mcp.SemanticCache") as mock_cache_cls,
+            patch("semantic_cache_mcp.server._mcp.ToolProcessSupervisor") as mock_supervisor_cls,
         ):
-            mock_cache = MagicMock()
-            mock_cache.metrics = MagicMock()
-            mock_cache.async_close = AsyncMock()
-            mock_cache._shutting_down = False
-            mock_cache_cls.return_value = mock_cache
+            mock_supervisor = MagicMock()
+            mock_supervisor.start = AsyncMock()
+            mock_supervisor.async_close = AsyncMock()
+            mock_supervisor_cls.return_value = mock_supervisor
 
             from semantic_cache_mcp.server._mcp import app_lifespan
 
@@ -870,13 +858,8 @@ class TestMcpCacheNoneGuard:
         """If cache is somehow None after init block, RuntimeError raised."""
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup"),
             patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test", "dim": 384},
-            ),
-            patch(
-                "semantic_cache_mcp.server._mcp.SemanticCache",
+                "semantic_cache_mcp.server._mcp.ToolProcessSupervisor",
                 return_value=None,
             ),
         ):
