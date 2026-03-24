@@ -917,6 +917,117 @@ class TestGrepTool:
 
 
 # ===========================================================================
+# relative path support
+# ===========================================================================
+
+
+class TestRelativePathSupport:
+    async def test_read_accepts_relative_path(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        Path("rel-read.txt").write_text("relative read\n")
+
+        d = _parse(await read(ctx, "rel-read.txt"))
+
+        assert "relative read" in d["content"]
+
+    async def test_write_accepts_relative_path(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        d = _parse(await write(ctx, "rel-write.txt", "written via relative path\n"))
+
+        assert d["status"] == "created"
+        assert Path("rel-write.txt").read_text() == "written via relative path\n"
+
+    async def test_edit_accepts_relative_path(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        Path("rel-edit.py").write_text("def hello():\n    return 'world'\n")
+
+        d = _parse(await edit(ctx, "rel-edit.py", old_string="hello", new_string="hi"))
+
+        assert d["status"] == "edited"
+        assert "hi" in Path("rel-edit.py").read_text()
+
+    async def test_batch_edit_accepts_relative_path(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        Path("rel-batch-edit.txt").write_text("AAA\nBBB\n")
+
+        d = _parse(
+            await batch_edit(
+                ctx, "rel-batch-edit.txt", json.dumps([["AAA", "111"], ["BBB", "222"]])
+            )
+        )
+
+        assert d["succeeded"] == 2
+        assert Path("rel-batch-edit.txt").read_text() == "111\n222\n"
+
+    async def test_diff_accepts_relative_paths(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        Path("left.txt").write_text("left\n")
+        Path("right.txt").write_text("right\n")
+
+        d = _parse(await diff(ctx, "left.txt", "right.txt"))
+
+        assert "diff" in d
+
+    async def test_batch_read_accepts_relative_paths(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        Path("one.txt").write_text("one\n")
+        Path("two.txt").write_text("two\n")
+
+        d = _parse(await batch_read(ctx, "one.txt,two.txt"))
+
+        assert d["summary"]["files_read"] == 2
+
+    async def test_search_and_similar_accept_relative_paths(
+        self,
+        ctx: MagicMock,
+        tmp_path: Path,
+        tmp_cache: SemanticCache,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        subdir = tmp_path / "pkg"
+        subdir.mkdir()
+        Path("pkg/a.py").write_text("def alpha():\n    return 'alpha'\n")
+        Path("pkg/b.py").write_text("def beta():\n    return 'alpha'\n")
+
+        await smart_read(tmp_cache, "pkg/a.py")
+        await smart_read(tmp_cache, "pkg/b.py")
+
+        search_result = _parse(await search(ctx, "alpha", directory="pkg"))
+        similar_result = _parse(await similar(ctx, "pkg/a.py"))
+
+        assert search_result["matches"]
+        assert all(str(subdir.resolve()) in match["path"] for match in search_result["matches"])
+        assert "similar_files" in similar_result
+
+    async def test_glob_accepts_relative_directory(
+        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "mod.py").write_text("x = 1\n")
+
+        d = _parse(await glob(ctx, "*.py", directory="pkg"))
+
+        assert d["total_matches"] == 1
+        assert d["matches"][0]["path"].endswith("pkg/mod.py")
+
+
+# ===========================================================================
 # stats tool
 # ===========================================================================
 

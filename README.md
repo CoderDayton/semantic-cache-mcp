@@ -308,7 +308,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `TOOL_OUTPUT_MODE` | `compact` | Response detail (`compact`, `normal`, `debug`) |
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
-| `TOOL_TIMEOUT` | `20` | Seconds before tool call times out (auto-resets executor) |
+| `TOOL_TIMEOUT` | `30` | Seconds before tool call times out (auto-resets executor) |
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
 | `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |

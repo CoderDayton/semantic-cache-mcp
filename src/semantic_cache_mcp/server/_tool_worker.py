@@ -28,6 +28,9 @@ class _WorkerContext:
     lifespan_context: dict[str, Any]
 
 
+_PROTOCOL_ERROR = "Worker protocol error"
+
+
 class ToolProcessSupervisor:
     """Owns a single tool worker subprocess and restarts it on timeout/failure."""
 
@@ -58,9 +61,12 @@ class ToolProcessSupervisor:
         self._startup_timeout = startup_timeout
         self._shutdown_timeout = shutdown_timeout
 
+    def _is_running(self) -> bool:
+        return self._process is not None and self._process.is_alive()
+
     async def start(self) -> None:
         async with self._lock:
-            if self._process is not None and self._process.is_alive():
+            if self._is_running():
                 return
             await asyncio.to_thread(self._start_blocking)
 
@@ -74,7 +80,7 @@ class ToolProcessSupervisor:
         timeout: float,
     ) -> Any:
         async with self._lock:
-            if self._process is None or not self._process.is_alive():
+            if not self._is_running():
                 await asyncio.to_thread(self._start_blocking)
 
             request = {
@@ -95,13 +101,11 @@ class ToolProcessSupervisor:
                 await asyncio.to_thread(self._restart_blocking, f"{tool} worker failure")
                 raise
 
-            if response.get("op") == "tool_error":
-                raise ToolError(str(response["error"]))
-            if response.get("op") != "result":
+            try:
+                return _worker_result(response)
+            except RuntimeError:
                 await asyncio.to_thread(self._restart_blocking, f"{tool} protocol failure")
-                raise RuntimeError(response.get("error", "Worker protocol error"))
-
-            return response["result"]
+                raise
 
     async def async_close(self) -> None:
         async with self._lock:
@@ -184,6 +188,32 @@ class ToolProcessSupervisor:
             conn.close()
 
 
+def _worker_result(response: object) -> Any:
+    """Decode a worker reply at a single validated protocol boundary."""
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{_PROTOCOL_ERROR}: expected dict response")
+
+    op = response.get("op")
+    if op == "result":
+        if "result" not in response:
+            raise RuntimeError(f"{_PROTOCOL_ERROR}: result response missing 'result'")
+        return response["result"]
+    if op == "tool_error":
+        error = response.get("error")
+        if not isinstance(error, str) or not error:
+            raise RuntimeError(f"{_PROTOCOL_ERROR}: tool_error response missing 'error'")
+        raise ToolError(error)
+
+    error = response.get("error")
+    if isinstance(error, str) and error:
+        raise RuntimeError(error)
+    raise RuntimeError(f"{_PROTOCOL_ERROR}: unsupported op {op!r}")
+
+
+async def _send_worker_message(conn: Connection, payload: dict[str, Any]) -> None:
+    await asyncio.to_thread(conn.send, payload)
+
+
 def _tool_worker_main(conn: Connection) -> None:
     asyncio.run(_tool_worker_main_async(conn))
 
@@ -203,7 +233,7 @@ async def _tool_worker_main_async(conn: Connection) -> None:
         if model_info.get("ready") and cache is not None:
             cache._storage.clear_if_model_changed(str(model_info["model"]), int(model_info["dim"]))
 
-        await asyncio.to_thread(conn.send, {"op": "ready"})
+        await _send_worker_message(conn, {"op": "ready"})
 
         while True:
             try:
@@ -215,8 +245,8 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                 break
 
             if request.get("op") != "call_tool":
-                await asyncio.to_thread(
-                    conn.send,
+                await _send_worker_message(
+                    conn,
                     {"op": "error", "error": f"Unsupported worker op: {request.get('op')}"},
                 )
                 continue
@@ -230,17 +260,11 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                     max_response_tokens=request.get("max_response_tokens"),
                 )
             except ToolError as exc:
-                await asyncio.to_thread(
-                    conn.send,
-                    {
-                        "op": "tool_error",
-                        "error": str(exc),
-                    },
-                )
+                await _send_worker_message(conn, {"op": "tool_error", "error": str(exc)})
                 continue
             except Exception as exc:
-                await asyncio.to_thread(
-                    conn.send,
+                await _send_worker_message(
+                    conn,
                     {
                         "op": "error",
                         "error": str(exc),
@@ -249,7 +273,7 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                 )
                 continue
 
-            await asyncio.to_thread(conn.send, {"op": "result", "result": result})
+            await _send_worker_message(conn, {"op": "result", "result": result})
     except Exception as exc:
         try:
             conn.send({"op": "error", "error": str(exc), "traceback": traceback.format_exc()})

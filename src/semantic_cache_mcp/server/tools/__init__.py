@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
-# Tool timeout from config (env TOOL_TIMEOUT, default 20s).
+# Tool timeout from config (env TOOL_TIMEOUT, default 30s).
 _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 
 # Global tool mutex: only one tool call executes at a time.
@@ -63,6 +64,14 @@ _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 # catalog reads, and ONNX calls — the root cause of hangs when
 # multiple subagents fire tool calls simultaneously.
 _tool_lock: asyncio.Lock | None = None
+_LOCAL_TOOL_EXECUTION = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallState:
+    cache: Any
+    mode: str
+    max_response_tokens: int | None
 
 
 def _get_tool_lock() -> asyncio.Lock:
@@ -76,6 +85,36 @@ def _get_tool_lock() -> asyncio.Lock:
 def _is_remote_runtime(value: Any) -> bool:
     """True when *value* is the supervisor-backed tool runtime."""
     return getattr(value, "_is_tool_process_supervisor", False) is True
+
+
+def _tool_call_state(ctx: Context) -> _ToolCallState:
+    return _ToolCallState(
+        cache=ctx.lifespan_context["cache"],
+        mode=_response_mode(),
+        max_response_tokens=_response_token_cap(),
+    )
+
+
+async def _maybe_call_remote_tool(
+    state: _ToolCallState,
+    tool: str,
+    kwargs: dict[str, Any],
+    *,
+    timeout: float,
+) -> Any | object:
+    if not _is_remote_runtime(state.cache):
+        return _LOCAL_TOOL_EXECUTION
+
+    try:
+        return await state.cache.call_tool(
+            tool,
+            kwargs,
+            output_mode=state.mode,
+            max_response_tokens=state.max_response_tokens,
+            timeout=timeout,
+        )
+    except TimeoutError:
+        _raise_tool_error(tool, f"timed out after {timeout}s", state.max_response_tokens)
 
 
 def _serialized(fn):
@@ -191,27 +230,24 @@ async def read(
         offset: Line number to start reading from (1-based)
         limit: Number of lines to read from offset
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "read",
-                {
-                    "path": path,
-                    "max_size": max_size,
-                    "diff_mode": diff_mode,
-                    "offset": offset,
-                    "limit": limit,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "read",
+        {
+            "path": path,
+            "max_size": max_size,
+            "diff_mode": diff_mode,
+            "offset": offset,
+            "limit": limit,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     # Validate bounds
     if offset is not None and offset < 1:
@@ -342,21 +378,12 @@ async def stats(
     info, and process memory usage. Useful for monitoring cache effectiveness
     and diagnosing performance issues.
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "stats",
-                {},
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("stats", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    remote_result = await _maybe_call_remote_tool(state, "stats", {}, timeout=_TOOL_TIMEOUT)
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     cache_stats = await cache.get_stats()
     model_info = get_model_info()
@@ -565,21 +592,13 @@ async def clear(
     ctx: Context,
 ) -> dict[str, Any]:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "clear",
-                {},
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("clear", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(state, "clear", {}, timeout=_TOOL_TIMEOUT)
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     count = await cache.clear()
     cache.metrics.record("clear", None)
@@ -622,28 +641,25 @@ async def write(
         auto_format: Run formatter after write (default: false)
         append: Append content to existing file instead of overwriting (default: false)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "write",
-                {
-                    "path": path,
-                    "content": content,
-                    "create_parents": create_parents,
-                    "dry_run": dry_run,
-                    "auto_format": auto_format,
-                    "append": append,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "write",
+        {
+            "path": path,
+            "content": content,
+            "create_parents": create_parents,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+            "append": append,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await _shielded_write(
@@ -746,30 +762,27 @@ async def edit(
         start_line: Start of line range (1-based). Must pair with end_line.
         end_line: End of line range (1-based). Must pair with start_line.
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "edit",
-                {
-                    "path": path,
-                    "old_string": old_string,
-                    "new_string": new_string,
-                    "replace_all": replace_all,
-                    "dry_run": dry_run,
-                    "auto_format": auto_format,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "edit",
+        {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await _shielded_write(
@@ -861,35 +874,28 @@ async def batch_edit(
     Partial success: response includes 'failed' count and 'failures' array.
 
     Args:
-        path: Absolute path to file
+        path: File path (absolute or relative)
         edits: JSON array of edit entries
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edits (default: false)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "batch_edit",
-                {
-                    "path": path,
-                    "edits": edits,
-                    "dry_run": dry_run,
-                    "auto_format": auto_format,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error(
-                "batch_edit",
-                f"timed out after {_TOOL_TIMEOUT}s",
-                max_response_tokens,
-            )
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "batch_edit",
+        {
+            "path": path,
+            "edits": edits,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         # Parse edits JSON
@@ -1036,21 +1042,18 @@ async def search(
         k: Max results (default: 10, max: 100)
         directory: Optional directory path to limit search scope
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "search",
-                {"query": query, "k": k, "directory": directory},
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "search",
+        {"query": query, "k": k, "directory": directory},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await asyncio.wait_for(
@@ -1113,21 +1116,18 @@ async def diff(
         path2: Second file path
         context_lines: Lines of context in diff (default: 3)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "diff",
-                {"path1": path1, "path2": path2, "context_lines": context_lines},
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "diff",
+        {"path1": path1, "path2": path2, "context_lines": context_lines},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await asyncio.wait_for(
@@ -1188,30 +1188,23 @@ async def batch_read(
         priority: Comma-separated or JSON array of paths to read first
         diff_mode: When false, always return full content
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "batch_read",
-                {
-                    "paths": paths,
-                    "max_total_tokens": max_total_tokens,
-                    "priority": priority,
-                    "diff_mode": diff_mode,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT * 2,
-            )
-        except TimeoutError:
-            _raise_tool_error(
-                "batch_read",
-                f"timed out after {_TOOL_TIMEOUT * 2}s",
-                max_response_tokens,
-            )
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "batch_read",
+        {
+            "paths": paths,
+            "max_total_tokens": max_total_tokens,
+            "priority": priority,
+            "diff_mode": diff_mode,
+        },
+        timeout=_TOOL_TIMEOUT * 2,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         # Parse paths (comma-separated or JSON array)
@@ -1338,21 +1331,18 @@ async def similar(
         path: Source file path (absolute or relative)
         k: Max results (default: 5, max: 50)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "similar",
-                {"path": path, "k": k},
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "similar",
+        {"path": path, "k": k},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
@@ -1413,25 +1403,22 @@ async def glob(
         directory: Base directory (default: current)
         cached_only: Only return files already in cache (default: false)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "glob",
-                {
-                    "pattern": pattern,
-                    "directory": directory,
-                    "cached_only": cached_only,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("glob", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "glob",
+        {
+            "pattern": pattern,
+            "directory": directory,
+            "cached_only": cached_only,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         result = await glob_with_cache_status(
@@ -1500,28 +1487,25 @@ async def grep(
         max_matches: Total match limit across all files (default: 100)
         max_files: Maximum files to return (default: 50)
     """
-    cache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
-
-    if _is_remote_runtime(cache):
-        try:
-            return await cache.call_tool(
-                "grep",
-                {
-                    "pattern": pattern,
-                    "fixed_string": fixed_string,
-                    "case_sensitive": case_sensitive,
-                    "context_lines": context_lines,
-                    "max_matches": max_matches,
-                    "max_files": max_files,
-                },
-                output_mode=mode,
-                max_response_tokens=max_response_tokens,
-                timeout=_TOOL_TIMEOUT,
-            )
-        except TimeoutError:
-            _raise_tool_error("grep", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    state = _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result = await _maybe_call_remote_tool(
+        state,
+        "grep",
+        {
+            "pattern": pattern,
+            "fixed_string": fixed_string,
+            "case_sensitive": case_sensitive,
+            "context_lines": context_lines,
+            "max_matches": max_matches,
+            "max_files": max_files,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not _LOCAL_TOOL_EXECUTION:
+        return remote_result
 
     try:
         # In compact mode, context lines are dropped in the response anyway —

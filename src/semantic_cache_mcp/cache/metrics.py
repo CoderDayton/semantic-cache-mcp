@@ -68,6 +68,31 @@ class SessionMetrics:
         self.diffs_served = 0
         self.tool_calls: dict[str, int] = {}
 
+    def _record_cache_access(self, from_cache: bool) -> None:
+        self.cache_hits += int(from_cache)
+        self.cache_misses += int(not from_cache)
+
+    def _record_cache_accesses(self, values: tuple[bool, ...]) -> None:
+        hits = sum(values)
+        self.cache_hits += hits
+        self.cache_misses += len(values) - hits
+
+    def _snapshot_data(self, *, uptime_s: float) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "uptime_s": round(uptime_s, 1),
+            "tokens_saved": self.tokens_saved,
+            "tokens_original": self.tokens_original,
+            "tokens_returned": self.tokens_returned,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "files_read": self.files_read,
+            "files_written": self.files_written,
+            "files_edited": self.files_edited,
+            "diffs_served": self.diffs_served,
+            "tool_calls": dict(self.tool_calls),
+        }
+
     def record(self, tool_name: str, result: object) -> None:
         """Record metrics from a tool result. Thread-safe.
 
@@ -86,10 +111,7 @@ class SessionMetrics:
                 self.tokens_saved += result.tokens_saved
                 self.tokens_original += result.tokens_original
                 self.tokens_returned += result.tokens_returned
-                if result.from_cache:
-                    self.cache_hits += 1
-                else:
-                    self.cache_misses += 1
+                self._record_cache_access(result.from_cache)
                 if result.is_diff:
                     self.diffs_served += 1
                 if tool_name == "read":
@@ -104,82 +126,45 @@ class SessionMetrics:
                 for file_result in result.files:
                     if file_result.status == "skipped":
                         continue
-                    if file_result.from_cache:
-                        self.cache_hits += 1
-                    else:
-                        self.cache_misses += 1
+                    self._record_cache_access(file_result.from_cache)
                     if file_result.status == "diff":
                         self.diffs_served += 1
                 return
 
             if isinstance(result, DiffResult):
-                self.cache_hits += sum(1 for v in result.from_cache if v)
-                self.cache_misses += sum(1 for v in result.from_cache if not v)
+                self._record_cache_accesses(result.from_cache)
                 return
 
             if isinstance(result, WriteResult):
-                if result.from_cache:
-                    self.cache_hits += 1
-                else:
-                    self.cache_misses += 1
+                self._record_cache_access(result.from_cache)
                 if tool_name == "write" and not result.dry_run:
                     self.files_written += 1
                 return
 
             if isinstance(result, EditResult):
-                if result.from_cache:
-                    self.cache_hits += 1
-                else:
-                    self.cache_misses += 1
+                self._record_cache_access(result.from_cache)
                 if tool_name == "edit" and not result.dry_run:
                     self.files_edited += 1
                 return
 
             if isinstance(result, BatchEditResult):
-                if result.from_cache:
-                    self.cache_hits += 1
-                else:
-                    self.cache_misses += 1
+                self._record_cache_access(result.from_cache)
                 if tool_name == "batch_edit" and not result.dry_run and result.succeeded > 0:
                     self.files_edited += 1
 
     def snapshot(self) -> dict[str, object]:
         """Thread-safe snapshot of current metrics with computed uptime."""
         with self._lock:
-            return {
-                "session_id": self.session_id,
-                "uptime_s": round(time.time() - self.started_at, 1),
-                "tokens_saved": self.tokens_saved,
-                "tokens_original": self.tokens_original,
-                "tokens_returned": self.tokens_returned,
-                "cache_hits": self.cache_hits,
-                "cache_misses": self.cache_misses,
-                "files_read": self.files_read,
-                "files_written": self.files_written,
-                "files_edited": self.files_edited,
-                "diffs_served": self.diffs_served,
-                "tool_calls": dict(self.tool_calls),
-            }
+            return self._snapshot_data(uptime_s=time.time() - self.started_at)
 
     def persist(self) -> None:
         """Flush session metrics to SQLite."""
         now = time.time()
         with self._lock:
-            data: dict[str, object] = {
-                "session_id": self.session_id,
-                "started_at": self.started_at,
-                "ended_at": now,
-                "tokens_saved": self.tokens_saved,
-                "tokens_original": self.tokens_original,
-                "tokens_returned": self.tokens_returned,
-                "cache_hits": self.cache_hits,
-                "cache_misses": self.cache_misses,
-                "files_read": self.files_read,
-                "files_written": self.files_written,
-                "files_edited": self.files_edited,
-                "diffs_served": self.diffs_served,
-                "tool_calls_json": json.dumps(self.tool_calls),
-            }
+            data = self._snapshot_data(uptime_s=now - self.started_at)
+            data["started_at"] = self.started_at
+            data["ended_at"] = now
+            data["tool_calls_json"] = json.dumps(self.tool_calls)
             total_calls = sum(self.tool_calls.values())
 
         # Use pool directly to avoid importing SQLiteStorage instance

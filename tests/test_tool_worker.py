@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastmcp.exceptions import ToolError
 
-from semantic_cache_mcp.server._tool_worker import ToolProcessSupervisor
+from semantic_cache_mcp.server._tool_worker import ToolProcessSupervisor, _worker_result
 from semantic_cache_mcp.server.tools import read
 
 
@@ -60,6 +60,23 @@ def _tool_error_worker(conn: Connection) -> None:
             conn.send({"op": "tool_error", "error": "read: synthetic failure"})
             continue
         conn.send({"op": "result", "result": "ok-after-tool-error"})
+
+
+def _malformed_protocol_worker(conn: Connection) -> None:
+    state_file = Path(os.environ["SEMANTIC_CACHE_PROTOCOL_STATE"])
+    spawn_count = int(state_file.read_text()) if state_file.exists() else 0
+    state_file.write_text(str(spawn_count + 1))
+
+    conn.send({"op": "ready"})
+    while True:
+        request = conn.recv()
+        if request.get("op") == "shutdown":
+            conn.close()
+            return
+        if spawn_count == 0:
+            conn.send({"op": "result"})
+            continue
+        conn.send({"op": "result", "result": "ok-after-protocol-restart"})
 
 
 @pytest.mark.asyncio
@@ -141,6 +158,49 @@ async def test_tool_process_supervisor_preserves_tool_errors() -> None:
         await supervisor.async_close()
 
     assert result == "ok-after-tool-error"
+
+
+@pytest.mark.asyncio
+async def test_tool_process_supervisor_restarts_after_protocol_error(tmp_path: Path) -> None:
+    state_file = tmp_path / "protocol-state.txt"
+    old = os.environ.get("SEMANTIC_CACHE_PROTOCOL_STATE")
+    os.environ["SEMANTIC_CACHE_PROTOCOL_STATE"] = str(state_file)
+
+    supervisor = ToolProcessSupervisor(
+        worker_target=_malformed_protocol_worker, startup_timeout=2.0
+    )
+    await supervisor.start()
+    try:
+        with pytest.raises(RuntimeError, match="result response missing 'result'"):
+            await supervisor.call_tool(
+                "read",
+                {"path": "/tmp/fail"},
+                output_mode="compact",
+                max_response_tokens=None,
+                timeout=1.0,
+            )
+
+        result = await supervisor.call_tool(
+            "read",
+            {"path": "/tmp/recovered"},
+            output_mode="compact",
+            max_response_tokens=None,
+            timeout=1.0,
+        )
+    finally:
+        await supervisor.async_close()
+        if old is None:
+            os.environ.pop("SEMANTIC_CACHE_PROTOCOL_STATE", None)
+        else:
+            os.environ["SEMANTIC_CACHE_PROTOCOL_STATE"] = old
+
+    assert result == "ok-after-protocol-restart"
+    assert state_file.read_text() == "2"
+
+
+def test_worker_result_rejects_non_mapping_protocol_frames() -> None:
+    with pytest.raises(RuntimeError, match="expected dict response"):
+        _worker_result("bad-frame")
 
 
 @pytest.mark.asyncio
