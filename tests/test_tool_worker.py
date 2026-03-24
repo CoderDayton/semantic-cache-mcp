@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.server._tool_worker import ToolProcessSupervisor
 from semantic_cache_mcp.server.tools import read
@@ -46,6 +47,19 @@ def _restart_probe_worker(conn: Connection) -> None:
             conn.close()
             return
         conn.send({"op": "result", "result": "ok-after-restart"})
+
+
+def _tool_error_worker(conn: Connection) -> None:
+    conn.send({"op": "ready"})
+    while True:
+        request = conn.recv()
+        if request.get("op") == "shutdown":
+            conn.close()
+            return
+        if request["kwargs"].get("fail"):
+            conn.send({"op": "tool_error", "error": "read: synthetic failure"})
+            continue
+        conn.send({"op": "result", "result": "ok-after-tool-error"})
 
 
 @pytest.mark.asyncio
@@ -103,18 +117,47 @@ async def test_tool_process_supervisor_restarts_after_timeout(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_tool_process_supervisor_preserves_tool_errors() -> None:
+    supervisor = ToolProcessSupervisor(worker_target=_tool_error_worker, startup_timeout=2.0)
+    await supervisor.start()
+    try:
+        with pytest.raises(ToolError, match="read: synthetic failure"):
+            await supervisor.call_tool(
+                "read",
+                {"path": "/tmp/fail", "fail": True},
+                output_mode="compact",
+                max_response_tokens=None,
+                timeout=1.0,
+            )
+
+        result = await supervisor.call_tool(
+            "read",
+            {"path": "/tmp/recovered"},
+            output_mode="compact",
+            max_response_tokens=None,
+            timeout=1.0,
+        )
+    finally:
+        await supervisor.async_close()
+
+    assert result == "ok-after-tool-error"
+
+
+@pytest.mark.asyncio
 @patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact")
 @patch("semantic_cache_mcp.server.tools._response_token_cap", return_value=None)
 async def test_read_uses_remote_runtime(_cap: MagicMock, _mode: MagicMock) -> None:
     remote = MagicMock()
     remote._is_tool_process_supervisor = True
-    remote.call_tool = AsyncMock(return_value="remote-response")
+    remote.call_tool = AsyncMock(
+        return_value={"path": "/tmp/demo.py", "content": "remote-response"}
+    )
     ctx = MagicMock()
     ctx.lifespan_context = {"cache": remote}
 
     result = await read(ctx, path="/tmp/demo.py")
 
-    assert result == "remote-response"
+    assert result == {"path": "/tmp/demo.py", "content": "remote-response"}
     remote.call_tool.assert_awaited_once()
 
 
@@ -128,6 +171,5 @@ async def test_read_remote_timeout_returns_error(_cap: MagicMock, _mode: MagicMo
     ctx = MagicMock()
     ctx.lifespan_context = {"cache": remote}
 
-    result = await read(ctx, path="/tmp/demo.py")
-
-    assert "timed out" in result.lower()
+    with pytest.raises(ToolError, match="read: timed out"):
+        await read(ctx, path="/tmp/demo.py")

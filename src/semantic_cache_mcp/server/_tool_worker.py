@@ -11,6 +11,8 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Any
 
+from fastmcp.exceptions import ToolError
+
 from ..cache import SemanticCache
 from ..core.embeddings import get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
@@ -70,7 +72,7 @@ class ToolProcessSupervisor:
         output_mode: str,
         max_response_tokens: int | None,
         timeout: float,
-    ) -> str:
+    ) -> Any:
         async with self._lock:
             if self._process is None or not self._process.is_alive():
                 await asyncio.to_thread(self._start_blocking)
@@ -93,11 +95,13 @@ class ToolProcessSupervisor:
                 await asyncio.to_thread(self._restart_blocking, f"{tool} worker failure")
                 raise
 
+            if response.get("op") == "tool_error":
+                raise ToolError(str(response["error"]))
             if response.get("op") != "result":
                 await asyncio.to_thread(self._restart_blocking, f"{tool} protocol failure")
                 raise RuntimeError(response.get("error", "Worker protocol error"))
 
-            return str(response["result"])
+            return response["result"]
 
     async def async_close(self) -> None:
         async with self._lock:
@@ -225,6 +229,15 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                     output_mode=str(request["output_mode"]),
                     max_response_tokens=request.get("max_response_tokens"),
                 )
+            except ToolError as exc:
+                await asyncio.to_thread(
+                    conn.send,
+                    {
+                        "op": "tool_error",
+                        "error": str(exc),
+                    },
+                )
+                continue
             except Exception as exc:
                 await asyncio.to_thread(
                     conn.send,
@@ -255,7 +268,7 @@ async def _dispatch_tool_request(
     kwargs: dict[str, Any],
     output_mode: str,
     max_response_tokens: int | None,
-) -> str:
+) -> Any:
     import semantic_cache_mcp.server.tools as tools_mod
 
     fn = getattr(tools_mod, tool, None)

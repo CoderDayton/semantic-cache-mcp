@@ -21,6 +21,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 import semantic_cache_mcp.server.tools as _tools_mod
 from semantic_cache_mcp.cache import SemanticCache
@@ -112,16 +113,16 @@ def _reset_tool_lock() -> None:
 @patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact")
 @patch("semantic_cache_mcp.server.tools._response_token_cap", return_value=None)
 async def test_read_timeout_fires(_cap: Any, _mode: Any) -> None:
-    """read() must return a timeout error within ~_TEST_TIMEOUT, not hang."""
+    """read() must raise a tool error within ~_TEST_TIMEOUT, not hang."""
     cache = _make_cache()
     ctx = _make_ctx(cache)
 
     t0 = time.monotonic()
-    result = await read(ctx, path="/tmp/nonexistent.py")
+    with pytest.raises(ToolError, match="read: timed out"):
+        await read(ctx, path="/tmp/nonexistent.py")
     elapsed = time.monotonic() - t0
 
     assert elapsed < _TEST_TIMEOUT + 0.5, f"Took {elapsed:.2f}s, expected ~{_TEST_TIMEOUT}s"
-    assert "timed out" in result.lower()
     cache.reset_executor.assert_called_once()
 
 
@@ -152,11 +153,11 @@ async def test_write_timeout_fires(_cap: Any, _mode: Any) -> None:
 
     with patch("semantic_cache_mcp.server.tools._shielded_write", _shielded_with_test_timeout):
         t0 = time.monotonic()
-        result = await write(ctx, path="/tmp/test.txt", content="hello")
+        with pytest.raises(ToolError, match="write: timed out"):
+            await write(ctx, path="/tmp/test.txt", content="hello")
         elapsed = time.monotonic() - t0
 
     assert elapsed < _TEST_TIMEOUT + 0.5, f"Took {elapsed:.2f}s, expected ~{_TEST_TIMEOUT}s"
-    assert "timed out" in result.lower()
     cache.reset_executor.assert_called_once()
 
 
@@ -187,11 +188,11 @@ async def test_edit_timeout_fires(_cap: Any, _mode: Any) -> None:
 
     with patch("semantic_cache_mcp.server.tools._shielded_write", _shielded_with_test_timeout):
         t0 = time.monotonic()
-        result = await edit(ctx, path="/tmp/test.txt", old_string="x", new_string="y")
+        with pytest.raises(ToolError, match="edit: timed out"):
+            await edit(ctx, path="/tmp/test.txt", old_string="x", new_string="y")
         elapsed = time.monotonic() - t0
 
     assert elapsed < _TEST_TIMEOUT + 0.5, f"Took {elapsed:.2f}s, expected ~{_TEST_TIMEOUT}s"
-    assert "timed out" in result.lower()
     cache.reset_executor.assert_called_once()
 
 
@@ -205,16 +206,16 @@ async def test_edit_timeout_fires(_cap: Any, _mode: Any) -> None:
 @patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact")
 @patch("semantic_cache_mcp.server.tools._response_token_cap", return_value=None)
 async def test_search_timeout_fires(_cap: Any, _mode: Any) -> None:
-    """search() must return a timeout error, not hang forever."""
+    """search() must raise a timeout tool error, not hang forever."""
     cache = _make_cache()
     ctx = _make_ctx(cache)
 
     t0 = time.monotonic()
-    result = await search(ctx, query="find something")
+    with pytest.raises(ToolError, match="search: timed out"):
+        await search(ctx, query="find something")
     elapsed = time.monotonic() - t0
 
     assert elapsed < _TEST_TIMEOUT + 0.5, f"Took {elapsed:.2f}s, expected ~{_TEST_TIMEOUT}s"
-    assert "timed out" in result.lower()
     cache.reset_executor.assert_called_once()
 
 
@@ -236,9 +237,11 @@ async def test_lock_released_after_timeout_next_tool_succeeds(_cap: Any, _mode: 
     ctx = _make_ctx(cache)
 
     # Tool A: read hangs and times out
-    with patch("semantic_cache_mcp.server.tools.smart_read", _hang_forever):
-        result_a = await read(ctx, path="/tmp/hang.py")
-    assert "timed out" in result_a.lower()
+    with (
+        patch("semantic_cache_mcp.server.tools.smart_read", _hang_forever),
+        pytest.raises(ToolError, match="read: timed out"),
+    ):
+        await read(ctx, path="/tmp/hang.py")
 
     # Tool B: read succeeds immediately (different patch)
     with patch("semantic_cache_mcp.server.tools.smart_read", _fast_result):
@@ -248,9 +251,9 @@ async def test_lock_released_after_timeout_next_tool_succeeds(_cap: Any, _mode: 
 
     # Tool B must complete fast (not blocked by the lock)
     assert elapsed_b < 1.0, f"Tool B took {elapsed_b:.2f}s — lock was not released"
-    assert "timed out" not in result_b.lower()
-    # The response should contain valid output (not an error)
-    assert "ok.py" in result_b or "hello" in result_b
+    assert isinstance(result_b, dict)
+    assert result_b["path"] == "/tmp/ok.py"
+    assert result_b["content"] == "hello"
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +294,7 @@ async def test_multiple_queued_tools_survive_timeout(_cap: Any, _mode: Any) -> N
         # Launch 3 concurrent tool calls
         tasks = [asyncio.create_task(read(ctx, path=f"/tmp/file{i}.py")) for i in range(3)]
 
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.monotonic() - t0
 
     # Should complete in roughly _TEST_TIMEOUT (for the first) + small overhead
@@ -301,8 +304,10 @@ async def test_multiple_queued_tools_survive_timeout(_cap: Any, _mode: Any) -> N
     )
 
     # First tool timed out
-    timed_out_count = sum(1 for r in results if "timed out" in r.lower())
-    succeeded_count = sum(1 for r in results if "timed out" not in r.lower())
+    timed_out_count = sum(
+        1 for r in results if isinstance(r, ToolError) and "timed out" in str(r).lower()
+    )
+    succeeded_count = sum(1 for r in results if isinstance(r, dict))
 
     assert timed_out_count >= 1, "At least one tool should have timed out"
     assert succeeded_count >= 1, "At least one tool should have succeeded after the timeout"

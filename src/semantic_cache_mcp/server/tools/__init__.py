@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import Context
+from fastmcp.exceptions import ToolError
+from fastmcp.tools.tool import ToolResult
 
 from ...cache import (
     SemanticCache,
@@ -26,11 +28,26 @@ from ...cache import (
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
 from .._mcp import mcp
+from .._tool_models import (
+    BatchEditResponse,
+    BatchReadResponse,
+    ClearResponse,
+    DiffResponse,
+    EditResponse,
+    GlobResponse,
+    GrepResponse,
+    ReadResponse,
+    SearchResponse,
+    SimilarResponse,
+    StatsResponse,
+    WriteResponse,
+    output_schema,
+)
 from ..response import (
     _MODE_DEBUG,
     _MODE_NORMAL,
-    _render_error,
-    _render_response,
+    _finalize_payload,
+    _raise_tool_error,
     _response_mode,
     _response_token_cap,
 )
@@ -133,11 +150,12 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
 
 
 @mcp.tool(
+    output_schema=output_schema(ReadResponse),
     meta={
         "version": _pkg_version("semantic-cache-mcp"),
         "author": "Dayton Dunbar",
         "github": "https://github.com/CoderDayton/semantic-cache-mcp",
-    }
+    },
 )
 @_serialized
 async def read(
@@ -147,7 +165,7 @@ async def read(
     diff_mode: bool = True,
     offset: int | None = None,
     limit: int | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Read a file with token-efficient caching and diffs.
 
     Behavior with diff_mode=true (default):
@@ -193,13 +211,13 @@ async def read(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     # Validate bounds
     if offset is not None and offset < 1:
-        return _render_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
+        _raise_tool_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
     if limit is not None and limit < 1:
-        return _render_error("read", "limit must be >= 1", max_response_tokens)
+        _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:
@@ -244,7 +262,7 @@ async def read(
                 payload["from_cache"] = result.from_cache
                 payload["tokens_saved"] = result.tokens_saved
 
-            return _render_response(payload, max_response_tokens)
+            return _finalize_payload(payload, max_response_tokens)
 
         result = await asyncio.wait_for(
             smart_read(
@@ -300,22 +318,24 @@ async def read(
                 "limit": limit,
             }
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("read", str(e), max_response_tokens)
+        _raise_tool_error("read", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "read", path)
-        return _render_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
-        return _render_error("read", f"reading failed: {e}", max_response_tokens)
+        _raise_tool_error("read", f"reading failed: {e}", max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(StatsResponse))
 @_serialized
 async def stats(
     ctx: Context,
-) -> str:
+) -> ToolResult:
     """Get cache statistics, session activity, and lifetime metrics.
 
     Returns cache occupancy, token savings, tool call counts, embedding model
@@ -336,7 +356,7 @@ async def stats(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("stats", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("stats", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     cache_stats = await cache.get_stats()
     model_info = get_model_info()
@@ -383,6 +403,48 @@ async def stats(
     ready = model_info.get("ready", False)
     provider_str = f"{provider} ✓" if ready else f"{provider} ✗"
 
+    structured_payload: dict[str, Any] = {
+        "mode": mode,
+        "storage": {
+            "files_cached": cache_stats.get("files_cached", 0),
+            "total_tokens_cached": cache_stats.get("total_tokens_cached", 0),
+            "total_documents": cache_stats.get("total_documents", 0),
+            "db_size_mb": cache_stats.get("db_size_mb", 0.0),
+        },
+        "session": {
+            "uptime_s": session.get("uptime_s", 0),
+            "tokens_saved": s_saved,
+            "tokens_original": s_original,
+            "tokens_returned": session.get("tokens_returned", 0),
+            "cache_hits": s_hits,
+            "cache_misses": s_misses,
+            "hit_rate_pct": s_hit_pct,
+            "files_read": session.get("files_read", 0),
+            "files_written": session.get("files_written", 0),
+            "files_edited": session.get("files_edited", 0),
+            "diffs_served": session.get("diffs_served", 0),
+            "tool_calls": dict(session.get("tool_calls", {})),
+        },
+        "lifetime": {
+            "total_sessions": lt_sessions,
+            "tokens_saved": lt_saved,
+            "tokens_original": lt_original,
+            "tokens_returned": lifetime.get("tokens_returned", 0),
+            "cache_hits": lt_hits,
+            "cache_misses": lt_misses,
+            "hit_rate_pct": lt_hit_pct,
+            "files_read": lifetime.get("files_read", 0),
+            "files_written": lifetime.get("files_written", 0),
+            "files_edited": lifetime.get("files_edited", 0),
+        },
+        "embedding": {
+            "model": model_name,
+            "provider": provider,
+            "ready": ready,
+            "process_rss_mb": cache_stats.get("process_rss_mb"),
+        },
+    }
+
     if mode == "compact":
         lines = [
             "## Semantic Cache",
@@ -404,7 +466,7 @@ async def stats(
                 f"{'s' if lt_sessions != 1 else ''} · {model_name} · {provider_str}*"
             ),
         ]
-        return "\n".join(lines)
+        return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
     if mode == "normal":
         uptime = _uptime(session.get("uptime_s", 0))
@@ -488,17 +550,20 @@ async def stats(
             "|---|---|---:|",
             f"| `{model_name}` | {provider_str} | {mem_str} |",
         ]
-        return "\n".join(lines)
+        return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
     # debug — full raw dump
-    return f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```"
+    return ToolResult(
+        content=f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```",
+        structured_content=structured_payload,
+    )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(ClearResponse))
 @_serialized
 async def clear(
     ctx: Context,
-) -> str:
+) -> dict[str, Any]:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
     cache = ctx.lifespan_context["cache"]
     mode = _response_mode()
@@ -514,17 +579,17 @@ async def clear(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("clear", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("clear", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     count = await cache.clear()
     cache.metrics.record("clear", None)
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
-    return _render_response(payload, max_response_tokens)
+    return _finalize_payload(payload, max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(WriteResponse))
 @_serialized
 async def write(
     ctx: Context,
@@ -534,7 +599,7 @@ async def write(
     dry_run: bool = False,
     auto_format: bool = False,
     append: bool = False,
-) -> str:
+) -> dict[str, Any]:
     """Write file content with cache integration.
 
     Timing:
@@ -578,7 +643,7 @@ async def write(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await _shielded_write(
@@ -617,32 +682,36 @@ async def write(
             payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("write", "server is shutting down", max_response_tokens)
-        return _render_error("write", str(e), max_response_tokens)
+            _raise_tool_error("write", "server is shutting down", max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("write", str(e), max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("write", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("write", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("write", str(e), max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "write", path)
-        return _render_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in write: {e}")
-        return _render_error("write", f"I/O operation failed - {e}", max_response_tokens)
+        _raise_tool_error("write", f"I/O operation failed - {e}", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in write")
-        return _render_error(
-            "write", "Internal error occurred while writing file", max_response_tokens
+        _raise_tool_error(
+            "write",
+            "Internal error occurred while writing file",
+            max_response_tokens,
         )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(EditResponse))
 @_serialized
 async def edit(
     ctx: Context,
@@ -654,7 +723,7 @@ async def edit(
     auto_format: bool = False,
     start_line: int | None = None,
     end_line: int | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Edit file using find/replace with cached reads.
 
     Three modes — use line numbers from `read` to save tokens:
@@ -700,7 +769,7 @@ async def edit(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await _shielded_write(
@@ -744,32 +813,32 @@ async def edit(
                 "auto_format": auto_format,
             }
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("edit", "server is shutting down", max_response_tokens)
-        return _render_error("edit", str(e), max_response_tokens)
+            _raise_tool_error("edit", "server is shutting down", max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("edit", str(e), max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("edit", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("edit", str(e), max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "edit", path)
-        return _render_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
-        return _render_error("edit", f"I/O operation failed - {e}", max_response_tokens)
+        _raise_tool_error("edit", f"I/O operation failed - {e}", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in edit")
-        return _render_error(
-            "edit", "Internal error occurred while editing file", max_response_tokens
-        )
+        _raise_tool_error("edit", "Internal error occurred while editing file", max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(BatchEditResponse))
 @_serialized
 async def batch_edit(
     ctx: Context,
@@ -777,7 +846,7 @@ async def batch_edit(
     edits: str,
     dry_run: bool = False,
     auto_format: bool = False,
-) -> str:
+) -> dict[str, Any]:
     """Apply multiple edits to a file in one call. Max 50 edits.
 
     Edit modes per entry:
@@ -816,7 +885,7 @@ async def batch_edit(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error(
+            _raise_tool_error(
                 "batch_edit",
                 f"timed out after {_TOOL_TIMEOUT}s",
                 max_response_tokens,
@@ -826,7 +895,7 @@ async def batch_edit(
         # Parse edits JSON
         edits_str = edits.strip()
         if not edits_str.startswith("["):
-            return _render_error(
+            _raise_tool_error(
                 "batch_edit",
                 "edits must be a JSON array of [old, new] pairs",
                 max_response_tokens,
@@ -851,7 +920,7 @@ async def batch_edit(
                 el = int(item["end_line"]) if item.get("end_line") is not None else None
                 edit_tuples.append((old, str(item["new"]), sl, el))
             else:
-                return _render_error(
+                _raise_tool_error(
                     "batch_edit",
                     "Each edit must be [old, new], [old, new, start, end], "
                     "or {old, new, start_line?, end_line?}",
@@ -916,40 +985,42 @@ async def batch_edit(
             payload["from_cache"] = result.from_cache
             payload["params"] = {"dry_run": dry_run, "auto_format": auto_format}
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("batch_edit", "server is shutting down", max_response_tokens)
-        return _render_error("batch_edit", str(e), max_response_tokens)
+            _raise_tool_error("batch_edit", "server is shutting down", max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
     except json.JSONDecodeError as e:
-        return _render_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
+        _raise_tool_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("batch_edit", str(e), max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("batch_edit", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("batch_edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("batch_edit", str(e), max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "batch_edit", path)
-        return _render_error("batch_edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("batch_edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in batch_edit")
-        return _render_error(
+        _raise_tool_error(
             "batch_edit",
             "Internal error occurred while editing file",
             max_response_tokens,
         )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(SearchResponse))
 @_serialized
 async def search(
     ctx: Context,
     query: str,
     k: int = 10,
     directory: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Search cached files by meaning and keywords (hybrid BM25 + vector RRF).
 
     Only searches files already in the cache. Seed with batch_read first.
@@ -979,7 +1050,7 @@ async def search(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await asyncio.wait_for(
@@ -1010,24 +1081,26 @@ async def search(
             payload["k"] = k
             payload["directory"] = directory
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except TimeoutError:
         _handle_timeout(cache, "search", query[:50])
-        return _render_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in search")
-        return _render_error("search", str(e), max_response_tokens)
+        _raise_tool_error("search", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(DiffResponse))
 @_serialized
 async def diff(
     ctx: Context,
     path1: str,
     path2: str,
     context_lines: int = 3,
-) -> str:
+) -> dict[str, Any]:
     """Compare two files. Returns unified diff and semantic similarity score.
 
     Use for explicit side-by-side comparison. For checking changes to a single
@@ -1054,7 +1127,7 @@ async def diff(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await asyncio.wait_for(
@@ -1078,19 +1151,21 @@ async def diff(
             payload["from_cache"] = result.from_cache
             payload["context_lines"] = context_lines
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("diff", str(e), max_response_tokens)
+        _raise_tool_error("diff", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "diff")
-        return _render_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in diff")
-        return _render_error("diff", str(e), max_response_tokens)
+        _raise_tool_error("diff", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(BatchReadResponse))
 @_serialized
 async def batch_read(
     ctx: Context,
@@ -1098,7 +1173,7 @@ async def batch_read(
     max_total_tokens: int = 50000,
     priority: str = "",
     diff_mode: bool = True,
-) -> str:
+) -> dict[str, Any]:
     """Read multiple files under a token budget. Supports glob patterns in paths.
 
     Prefer over repeated read calls for 2+ files. Use early to seed the cache
@@ -1132,8 +1207,10 @@ async def batch_read(
                 timeout=_TOOL_TIMEOUT * 2,
             )
         except TimeoutError:
-            return _render_error(
-                "batch_read", f"timed out after {_TOOL_TIMEOUT * 2}s", max_response_tokens
+            _raise_tool_error(
+                "batch_read",
+                f"timed out after {_TOOL_TIMEOUT * 2}s",
+                max_response_tokens,
             )
 
     try:
@@ -1218,31 +1295,35 @@ async def batch_read(
             payload["skipped"] = skipped_items
         payload["files"] = file_items
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except json.JSONDecodeError:
-        return _render_error(
+        _raise_tool_error(
             "batch_read",
             "Invalid paths format. Use comma-separated or JSON array.",
             max_response_tokens,
         )
     except TimeoutError:
         _handle_timeout(cache, "batch_read")
-        return _render_error(
-            "batch_read", f"timed out after {_TOOL_TIMEOUT * 2}s", max_response_tokens
+        _raise_tool_error(
+            "batch_read",
+            f"timed out after {_TOOL_TIMEOUT * 2}s",
+            max_response_tokens,
         )
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in batch_read")
-        return _render_error("batch_read", str(e), max_response_tokens)
+        _raise_tool_error("batch_read", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(SimilarResponse))
 @_serialized
 async def similar(
     ctx: Context,
     path: str,
     k: int = 5,
-) -> str:
+) -> dict[str, Any]:
     """Find files semantically similar to a given file using cached embeddings.
 
     Compares against files already in the cache. The source file is cached
@@ -1271,11 +1352,7 @@ async def similar(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error(
-                "similar",
-                f"timed out after {_TOOL_TIMEOUT}s",
-                max_response_tokens,
-            )
+            _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
@@ -1299,26 +1376,28 @@ async def similar(
         if mode == _MODE_DEBUG:
             payload["k"] = k
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("similar", str(e), max_response_tokens)
+        _raise_tool_error("similar", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "similar", path)
-        return _render_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in similar")
-        return _render_error("similar", str(e), max_response_tokens)
+        _raise_tool_error("similar", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(GlobResponse))
 @_serialized
 async def glob(
     ctx: Context,
     pattern: str,
     directory: str = ".",
     cached_only: bool = False,
-) -> str:
+) -> dict[str, Any]:
     """Find files by glob pattern with cache status. Max 1000 matches, 5s timeout.
 
     Timing:
@@ -1352,7 +1431,7 @@ async def glob(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("glob", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("glob", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         result = await glob_with_cache_status(
@@ -1382,14 +1461,16 @@ async def glob(
         if mode == _MODE_DEBUG:
             payload["total_cached_tokens"] = result.total_cached_tokens
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in glob")
-        return _render_error("glob", str(e), max_response_tokens)
+        _raise_tool_error("glob", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(GrepResponse))
 @_serialized
 async def grep(
     ctx: Context,
@@ -1399,7 +1480,7 @@ async def grep(
     context_lines: int = 0,
     max_matches: int = 100,
     max_files: int = 50,
-) -> str:
+) -> dict[str, Any]:
     """Exact pattern search across cached files with line numbers and context.
 
     Like ripgrep on the cache. For semantic/fuzzy queries, use `search` instead.
@@ -1440,7 +1521,7 @@ async def grep(
                 timeout=_TOOL_TIMEOUT,
             )
         except TimeoutError:
-            return _render_error("grep", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+            _raise_tool_error("grep", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
 
     try:
         # In compact mode, context lines are dropped in the response anyway —
@@ -1494,11 +1575,13 @@ async def grep(
             payload["case_sensitive"] = case_sensitive
             payload["context_lines"] = context_lines
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in grep")
-        return _render_error("grep", str(e), max_response_tokens)
+        _raise_tool_error("grep", str(e), max_response_tokens)
 
 
 _EXPAND_GLOBS_TIMEOUT = 5  # seconds — matches GLOB_TIMEOUT_SECONDS

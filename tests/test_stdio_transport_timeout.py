@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastmcp.client import Client
 from fastmcp.client.transports.stdio import StdioTransport
+from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.config import CACHE_DIR
 
@@ -88,6 +89,11 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
             {"paths": json.dumps(paths), "max_total_tokens": 200_000},
             raise_on_error=False,
         )
+        with pytest.raises(ToolError, match="batch_read: timed out"):
+            await client.call_tool(
+                "batch_read",
+                {"paths": json.dumps(paths), "max_total_tokens": 200_000},
+            )
         second = await client.call_tool(
             "read",
             {"path": str(ok_file)},
@@ -97,7 +103,11 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
     first_body = _flatten_tool_result(first)
     second_body = _flatten_tool_result(second)
 
-    assert '"tool":"batch_read"' in first_body
+    assert first.is_error is True
     assert "timed out" in first_body
-    assert '"tool":"read"' in second_body
+    assert second.is_error is False
+    assert second.data is not None
+    assert type(second.data).__name__ == "ReadResponse"
+    assert second.data.path == str(ok_file)
+    assert second.data.content == "recovered via stdio timeout path\n"
     assert "recovered via stdio timeout path" in second_body

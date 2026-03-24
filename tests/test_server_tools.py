@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastmcp import Context
+from fastmcp.exceptions import ToolError
+from fastmcp.tools.tool import ToolResult
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.server.response import _minimal_payload, _render_error, _render_response
@@ -45,9 +47,16 @@ def _make_ctx(cache: SemanticCache) -> MagicMock:
     return ctx
 
 
-def _parse(response: str) -> dict[str, Any]:
-    """Parse JSON tool response."""
+def _parse(response: dict[str, Any] | str) -> dict[str, Any]:
+    """Normalize direct tool responses for tests."""
+    if isinstance(response, dict):
+        return response
     return json.loads(response)
+
+
+def _tool_text(result: ToolResult) -> str:
+    """Flatten ToolResult text content for assertions."""
+    return "\n".join(getattr(item, "text", str(item)) for item in result.content)
 
 
 # ---------------------------------------------------------------------------
@@ -199,22 +208,22 @@ class TestReadTool:
         assert "\t" in d["content"]
 
     async def test_offset_zero_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
-        d = _parse(await read(ctx, str(sample_file), offset=0))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="read: offset must be >= 1"):
+            await read(ctx, str(sample_file), offset=0)
 
     async def test_limit_zero_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
-        d = _parse(await read(ctx, str(sample_file), limit=0))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="read: limit must be >= 1"):
+            await read(ctx, str(sample_file), limit=0)
 
     async def test_file_not_found_returns_error(self, ctx: MagicMock) -> None:
-        d = _parse(await read(ctx, "/nonexistent/file.txt"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="read: "):
+            await read(ctx, "/nonexistent/file.txt")
 
     async def test_binary_file_returns_error(self, ctx: MagicMock, tmp_path: Path) -> None:
         bf = tmp_path / "binary.bin"
         bf.write_bytes(b"\x00\xff\xfe\x80" * 100)
-        d = _parse(await read(ctx, str(bf)))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="read: "):
+            await read(ctx, str(bf))
 
     async def test_debug_mode_includes_extra_fields(
         self, ctx: MagicMock, sample_file: Path
@@ -289,22 +298,24 @@ class TestWriteTool:
         assert p.exists()
 
     async def test_write_permission_error(self, ctx: MagicMock, tmp_path: Path) -> None:
-        """PermissionError from the filesystem layer maps to ok=False response."""
+        """PermissionError from the filesystem layer maps to a tool error."""
         p = tmp_path / "readonly.txt"
         p.write_text("content")
-        with patch(
-            "semantic_cache_mcp.utils._async_io._atomic_write_sync",
-            side_effect=PermissionError("[Errno 13] Permission denied"),
+        with (
+            patch(
+                "semantic_cache_mcp.utils._async_io._atomic_write_sync",
+                side_effect=PermissionError("[Errno 13] Permission denied"),
+            ),
+            pytest.raises(ToolError, match="write: permission denied"),
         ):
-            d = _parse(await write(ctx, str(p), "new"))
-        assert d["ok"] is False
+            await write(ctx, str(p), "new")
 
     async def test_write_parent_not_found_without_create_parents(
         self, ctx: MagicMock, tmp_path: Path
     ) -> None:
         p = tmp_path / "missing_parent" / "file.txt"
-        d = _parse(await write(ctx, str(p), "content", create_parents=False))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="write: "):
+            await write(ctx, str(p), "content", create_parents=False)
 
     async def test_write_debug_mode_includes_hash(self, ctx: MagicMock, tmp_path: Path) -> None:
         p = tmp_path / "debug.txt"
@@ -343,8 +354,8 @@ class TestEditTool:
     async def test_find_replace_not_found_returns_error(
         self, ctx: MagicMock, py_file: Path
     ) -> None:
-        d = _parse(await edit(ctx, str(py_file), old_string="NOTEXIST", new_string="x"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="edit: "):
+            await edit(ctx, str(py_file), old_string="NOTEXIST", new_string="x")
 
     async def test_edit_line_replace_mode(self, ctx: MagicMock, py_file: Path) -> None:
         d = _parse(
@@ -359,8 +370,8 @@ class TestEditTool:
         assert py_file.read_text() == original
 
     async def test_edit_file_not_found(self, ctx: MagicMock) -> None:
-        d = _parse(await edit(ctx, "/no/such/file.py", old_string="x", new_string="y"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="edit: "):
+            await edit(ctx, "/no/such/file.py", old_string="x", new_string="y")
 
     async def test_edit_debug_mode_includes_diff_stats(self, ctx: MagicMock, py_file: Path) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
@@ -380,13 +391,15 @@ class TestEditTool:
         assert "line_numbers" in d
 
     async def test_edit_permission_error(self, ctx: MagicMock, py_file: Path) -> None:
-        """PermissionError from atomic write maps to ok=False response."""
-        with patch(
-            "semantic_cache_mcp.utils._async_io._atomic_write_sync",
-            side_effect=PermissionError("[Errno 13] Permission denied"),
+        """PermissionError from atomic write maps to a tool error."""
+        with (
+            patch(
+                "semantic_cache_mcp.utils._async_io._atomic_write_sync",
+                side_effect=PermissionError("[Errno 13] Permission denied"),
+            ),
+            pytest.raises(ToolError, match="edit: permission denied"),
         ):
-            d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))
-        assert d["ok"] is False
+            await edit(ctx, str(py_file), old_string="hello", new_string="hi")
 
     async def test_edit_replace_all(self, ctx: MagicMock, tmp_path: Path) -> None:
         p = tmp_path / "multi.txt"
@@ -424,14 +437,14 @@ class TestBatchEditTool:
     ) -> None:
         p = tmp_path / "f3.txt"
         p.write_text("content")
-        d = _parse(await batch_edit(ctx, str(p), "not json"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="batch_edit: edits must be a JSON array"):
+            await batch_edit(ctx, str(p), "not json")
 
     async def test_batch_edit_not_array_returns_error(self, ctx: MagicMock, tmp_path: Path) -> None:
         p = tmp_path / "f4.txt"
         p.write_text("content")
-        d = _parse(await batch_edit(ctx, str(p), '{"key": "val"}'))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="batch_edit: edits must be a JSON array"):
+            await batch_edit(ctx, str(p), '{"key": "val"}')
 
     async def test_batch_edit_dict_format(self, ctx: MagicMock, tmp_path: Path) -> None:
         p = tmp_path / "f5.txt"
@@ -465,8 +478,8 @@ class TestBatchEditTool:
         assert p.read_text() == original
 
     async def test_batch_edit_file_not_found(self, ctx: MagicMock) -> None:
-        d = _parse(await batch_edit(ctx, "/no/such/file.py", json.dumps([["a", "b"]])))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="batch_edit: "):
+            await batch_edit(ctx, "/no/such/file.py", json.dumps([["a", "b"]]))
 
     async def test_batch_edit_debug_mode_includes_outcomes(
         self, ctx: MagicMock, tmp_path: Path
@@ -492,8 +505,8 @@ class TestBatchEditTool:
         p.write_text("x\n")
         # Single-element list is not a valid edit entry
         edits_json = json.dumps([["only_one"]])
-        d = _parse(await batch_edit(ctx, str(p), edits_json))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="batch_edit: Each edit must be"):
+            await batch_edit(ctx, str(p), edits_json)
 
 
 # ===========================================================================
@@ -573,8 +586,8 @@ class TestDiffTool:
     async def test_diff_file_not_found(self, ctx: MagicMock, tmp_path: Path) -> None:
         a = tmp_path / "a.txt"
         a.write_text("content")
-        d = _parse(await diff(ctx, str(a), "/nonexistent.txt"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="diff: "):
+            await diff(ctx, str(a), "/nonexistent.txt")
 
     async def test_diff_normal_mode_includes_similarity(
         self, ctx: MagicMock, tmp_path: Path
@@ -634,8 +647,8 @@ class TestBatchReadTool:
         assert "summary" in d
 
     async def test_invalid_json_array_returns_error(self, ctx: MagicMock) -> None:
-        d = _parse(await batch_read(ctx, "[not valid json"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="batch_read: Invalid paths format"):
+            await batch_read(ctx, "[not valid json")
 
     async def test_token_budget_respected(self, ctx: MagicMock, tmp_path: Path) -> None:
         files = []
@@ -732,8 +745,8 @@ class TestSimilarTool:
         assert "similar_files" in d
 
     async def test_similar_file_not_found(self, ctx: MagicMock) -> None:
-        d = _parse(await similar(ctx, "/nonexistent.py"))
-        assert d["ok"] is False
+        with pytest.raises(ToolError, match="similar: "):
+            await similar(ctx, "/nonexistent.py")
 
     async def test_similar_normal_mode(self, ctx: MagicMock, py_file: Path) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
@@ -910,40 +923,51 @@ class TestGrepTool:
 
 class TestStatsTool:
     async def test_stats_empty_cache(self, ctx: MagicMock) -> None:
-        md = await stats(ctx)
-        assert isinstance(md, str)
-        assert "Semantic Cache" in md
+        result = await stats(ctx)
+        assert isinstance(result, ToolResult)
+        assert "Semantic Cache" in _tool_text(result)
+        assert result.structured_content is not None
+        assert result.structured_content["mode"] == "compact"
 
     async def test_stats_after_caching_file(
         self, ctx: MagicMock, py_file: Path, tmp_cache: SemanticCache
     ) -> None:
         await smart_read(tmp_cache, str(py_file))
-        md = await stats(ctx)
+        result = await stats(ctx)
         # Default (compact) mode returns markdown with file count
-        assert "Semantic Cache" in md
+        assert "Semantic Cache" in _tool_text(result)
+        assert result.structured_content is not None
+        assert result.structured_content["storage"]["files_cached"] >= 1
 
     async def test_stats_normal_mode_includes_full_stats(self, ctx: MagicMock) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
-            md = await stats(ctx)
+            result = await stats(ctx)
+        md = _tool_text(result)
         assert "# Semantic Cache Stats" in md
         assert "Storage" in md
         assert "Session" in md
         assert "Lifetime" in md
         assert "System" in md
         assert "MB" in md
+        assert result.structured_content is not None
+        assert result.structured_content["mode"] == "normal"
 
     async def test_stats_debug_mode_returns_raw_json(self, ctx: MagicMock) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            md = await stats(ctx)
+            result = await stats(ctx)
+        md = _tool_text(result)
         # Debug mode returns raw JSON in a fenced code block
         assert "```json" in md
         d = json.loads(md.split("```json\n")[1].split("\n```")[0])
         assert "files_cached" in d
         assert "embedding" in d
+        assert result.structured_content is not None
+        assert result.structured_content["mode"] == "debug"
 
     async def test_stats_compact_mode_minimal_fields(self, ctx: MagicMock) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact"):
-            md = await stats(ctx)
+            result = await stats(ctx)
+        md = _tool_text(result)
         assert "## Semantic Cache" in md
         assert "Session" in md
         assert "Lifetime" in md

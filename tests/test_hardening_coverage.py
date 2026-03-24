@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cache_status
 from semantic_cache_mcp.cache._helpers import _format_file
@@ -512,8 +513,8 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
-        assert "offset must be >= 1" in result
+        with pytest.raises(ToolError, match="read: offset must be >= 1"):
+            await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
 
     async def test_read_negative_limit(self, semantic_cache: SemanticCache) -> None:
         """limit < 1 returns error."""
@@ -522,8 +523,8 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = await read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
-        assert "limit must be >= 1" in result
+        with pytest.raises(ToolError, match="read: limit must be >= 1"):
+            await read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
 
     async def test_read_max_size_clamped(
         self, temp_dir: Path, semantic_cache: SemanticCache
@@ -539,7 +540,7 @@ class TestToolsBoundsValidation:
 
         # Negative max_size clamped to 1 (won't crash)
         result = await read(ctx=ctx, path=str(f), max_size=-999)
-        assert isinstance(result, str)
+        assert isinstance(result, dict)
 
 
 # ---------------------------------------------------------------------------
