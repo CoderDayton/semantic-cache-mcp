@@ -67,11 +67,48 @@ _tool_lock: asyncio.Lock | None = None
 _RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
 
 
+# Cached client root — resolved once per session via ctx.list_roots().
+_client_root: Path | None = None
+_client_root_resolved: bool = False
+
+
+async def _resolve_client_root(ctx: Context) -> Path | None:
+    """Fetch and cache the MCP client's project root (first list_roots entry)."""
+    global _client_root, _client_root_resolved
+    if not _client_root_resolved:
+        try:
+            roots = await ctx.list_roots()
+            if roots:
+                uri = str(roots[0].uri)
+                if uri.startswith("file://"):
+                    _client_root = Path(uri[7:])
+                    logger.debug(f"Client root: {_client_root}")
+        except Exception:
+            logger.debug("Could not resolve client roots", exc_info=True)
+        _client_root_resolved = True
+    return _client_root
+
+
+def _resolve_path(path: str, root: Path | None) -> str:
+    """Resolve *path* — absolute passes through, relative joins to *root*."""
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return str(p)
+    if root is not None:
+        return str(root / p)
+    return str(p.resolve())
+
+
 @dataclass(frozen=True, slots=True)
 class _ToolCallState:
     cache: Any
     mode: str
     max_response_tokens: int | None
+    client_root: Path | None
+
+    def resolve(self, path: str) -> str:
+        """Resolve a path against the client's project root."""
+        return _resolve_path(path, self.client_root)
 
 
 def _get_tool_lock() -> asyncio.Lock:
@@ -87,11 +124,12 @@ def _is_remote_runtime(value: Any) -> bool:
     return getattr(value, "_is_tool_process_supervisor", False) is True
 
 
-def _tool_call_state(ctx: Context) -> _ToolCallState:
+async def _tool_call_state(ctx: Context) -> _ToolCallState:
     return _ToolCallState(
         cache=ctx.lifespan_context["cache"],
         mode=_response_mode(),
         max_response_tokens=_response_token_cap(),
+        client_root=await _resolve_client_root(ctx),
     )
 
 
@@ -227,13 +265,15 @@ async def read(
     re-read from the beginning.
 
     Args:
-        path: File path (absolute or relative)
+        path: File path (absolute or relative to project root).
+            Use absolute paths for files outside the project directory.
         max_size: Maximum content size to return (default: 100000)
         diff_mode: Return diff if previously read (default: true)
         offset: Line number to start reading from (1-based)
         limit: Number of lines to read from offset
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -381,7 +421,7 @@ async def stats(
     info, and process memory usage. Useful for monitoring cache effectiveness
     and diagnosing performance issues.
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
     remote_result: ToolResult | None = await _maybe_call_remote_tool(
@@ -597,7 +637,7 @@ async def clear(
     ctx: Context,
 ) -> dict[str, Any]:
     """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -641,14 +681,15 @@ async def write(
     Response: diff of changes for overwrites, status-only for new files.
 
     Args:
-        path: File path (absolute or relative)
+        path: File path (absolute or relative to project root)
         content: Content to write (or content to append when append=true)
         create_parents: Create parent directories (default: true)
         dry_run: Preview changes without writing (default: false)
         auto_format: Run formatter after write (default: false)
         append: Append content to existing file instead of overwriting (default: false)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -760,7 +801,7 @@ async def edit(
     Multiple matches: fails with hint. Add context or set replace_all=true.
 
     Args:
-        path: File path (absolute or relative)
+        path: File path (absolute or relative to project root)
         old_string: Exact string to find. Keep to one line. Omit for line-replace.
         new_string: Replacement string
         replace_all: Replace all occurrences (default: false)
@@ -769,7 +810,8 @@ async def edit(
         start_line: Start of line range (1-based). Must pair with end_line.
         end_line: End of line range (1-based). Must pair with start_line.
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -881,12 +923,13 @@ async def batch_edit(
     Partial success: response includes 'failed' count and 'failures' array.
 
     Args:
-        path: File path (absolute or relative)
+        path: File path (absolute or relative to project root)
         edits: JSON array of edit entries
         dry_run: Preview without writing (default: false)
         auto_format: Run formatter after edits (default: false)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1049,7 +1092,8 @@ async def search(
         k: Max results (default: 10, max: 100)
         directory: Optional directory path to limit search scope
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    directory = state.resolve(directory) if directory else None
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1123,7 +1167,8 @@ async def diff(
         path2: Second file path
         context_lines: Lines of context in diff (default: 3)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path1, path2 = state.resolve(path1), state.resolve(path2)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1195,7 +1240,7 @@ async def batch_read(
         priority: Comma-separated or JSON array of paths to read first
         diff_mode: When false, always return full content
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1221,6 +1266,9 @@ async def batch_read(
         else:
             path_list = [p.strip() for p in paths_str.split(",") if p.strip()]
 
+        # Resolve relative paths against client root
+        path_list = [state.resolve(p) for p in path_list]
+
         # Expand glob patterns
         path_list = _expand_globs(path_list)
 
@@ -1232,6 +1280,7 @@ async def batch_read(
                 priority_list = json.loads(priority_str)
             else:
                 priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
+            priority_list = [state.resolve(p) for p in priority_list]
 
         result = await asyncio.wait_for(
             batch_smart_read(
@@ -1335,10 +1384,11 @@ async def similar(
     - Start with k=3–5.
 
     Args:
-        path: Source file path (absolute or relative)
+        path: Source file path (absolute or relative to project root)
         k: Max results (default: 5, max: 50)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1410,7 +1460,8 @@ async def glob(
         directory: Base directory (default: current)
         cached_only: Only return files already in cache (default: false)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
+    directory = state.resolve(directory)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -1494,7 +1545,7 @@ async def grep(
         max_matches: Total match limit across all files (default: 100)
         max_files: Maximum files to return (default: 50)
     """
-    state = _tool_call_state(ctx)
+    state = await _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
