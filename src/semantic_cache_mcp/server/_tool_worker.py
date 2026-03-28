@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import multiprocessing
+import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -16,6 +18,7 @@ from fastmcp.exceptions import ToolError
 from ..cache import SemanticCache
 from ..core.embeddings import get_model_info, warmup
 from ..core.tokenizer import get_tokenizer
+from ..logger import log_marker
 from .response import _response_overrides
 
 logger = logging.getLogger(__name__)
@@ -29,6 +32,7 @@ class _WorkerContext:
 
 
 _PROTOCOL_ERROR = "Worker protocol error"
+_REQUEST_SEQUENCE = itertools.count(1)
 
 
 class ToolProcessSupervisor:
@@ -83,28 +87,84 @@ class ToolProcessSupervisor:
             if not self._is_running():
                 await asyncio.to_thread(self._start_blocking)
 
+            request_id = next(_REQUEST_SEQUENCE)
             request = {
                 "op": "call_tool",
+                "request_id": request_id,
                 "tool": tool,
                 "kwargs": kwargs,
                 "output_mode": output_mode,
                 "max_response_tokens": max_response_tokens,
             }
+            started = time.perf_counter()
+            log_marker(
+                logger,
+                "tool.call.begin",
+                request_id=request_id,
+                tool=tool,
+                timeout_s=timeout,
+            )
             pending = asyncio.create_task(asyncio.to_thread(self._request_blocking, request))
             try:
                 response = await asyncio.wait_for(pending, timeout=timeout)
             except TimeoutError:
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+                log_marker(
+                    logger,
+                    "tool.call.timeout",
+                    request_id=request_id,
+                    tool=tool,
+                    timeout_s=timeout,
+                    elapsed_ms=elapsed_ms,
+                )
                 logger.warning(f"{tool} timed out after {timeout}s in worker process")
-                await asyncio.to_thread(self._restart_blocking, f"{tool} timeout")
+                # Drop the wedged worker immediately so the timeout stays bounded.
+                # Starting a replacement worker can trigger tokenizer/model init and
+                # GPU warmup, which would otherwise make a "30s" timeout take far
+                # longer before the caller sees the error.
+                await asyncio.to_thread(self._invalidate_worker_blocking, f"{tool} timeout")
                 raise
-            except Exception:
-                await asyncio.to_thread(self._restart_blocking, f"{tool} worker failure")
+            except Exception as exc:
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+                log_marker(
+                    logger,
+                    "tool.call.error",
+                    request_id=request_id,
+                    tool=tool,
+                    error=type(exc).__name__,
+                    elapsed_ms=elapsed_ms,
+                )
+                await asyncio.to_thread(
+                    self._invalidate_worker_blocking,
+                    f"{tool} worker failure",
+                )
                 raise
 
             try:
-                return _worker_result(response)
-            except RuntimeError:
-                await asyncio.to_thread(self._restart_blocking, f"{tool} protocol failure")
+                result = _worker_result(response)
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+                log_marker(
+                    logger,
+                    "tool.call.end",
+                    request_id=request_id,
+                    tool=tool,
+                    elapsed_ms=elapsed_ms,
+                )
+                return result
+            except RuntimeError as exc:
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+                log_marker(
+                    logger,
+                    "tool.call.protocol_error",
+                    request_id=request_id,
+                    tool=tool,
+                    error=type(exc).__name__,
+                    elapsed_ms=elapsed_ms,
+                )
+                await asyncio.to_thread(
+                    self._invalidate_worker_blocking,
+                    f"{tool} protocol failure",
+                )
                 raise
 
     async def async_close(self) -> None:
@@ -112,6 +172,8 @@ class ToolProcessSupervisor:
             await asyncio.to_thread(self._close_blocking)
 
     def _start_blocking(self) -> None:
+        started = time.perf_counter()
+        log_marker(logger, "worker.start.begin", startup_timeout_s=self._startup_timeout)
         self._close_blocking()
 
         parent_conn, child_conn = self._ctx.Pipe()
@@ -128,6 +190,12 @@ class ToolProcessSupervisor:
         self._conn = parent_conn
 
         if not parent_conn.poll(self._startup_timeout):
+            log_marker(
+                logger,
+                "worker.start.timeout",
+                startup_timeout_s=self._startup_timeout,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             self._close_blocking(force=True)
             raise RuntimeError(f"Tool worker startup timed out after {self._startup_timeout}s")
 
@@ -140,10 +208,22 @@ class ToolProcessSupervisor:
         if response.get("op") != "ready":
             error = response.get("error", "Tool worker failed to start")
             detail = response.get("traceback")
+            log_marker(
+                logger,
+                "worker.start.error",
+                error=error,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             self._close_blocking()
             if detail:
                 raise RuntimeError(f"{error}\n{detail}")
             raise RuntimeError(error)
+        log_marker(
+            logger,
+            "worker.start.ready",
+            pid=process.pid,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
 
     def _request_blocking(self, request: dict[str, Any]) -> dict[str, Any]:
         conn = self._conn
@@ -157,10 +237,10 @@ class ToolProcessSupervisor:
         except EOFError as exc:
             raise RuntimeError("Tool worker exited while handling a request") from exc
 
-    def _restart_blocking(self, reason: str) -> None:
-        logger.warning(f"Restarting tool worker: {reason}")
+    def _invalidate_worker_blocking(self, reason: str) -> None:
+        """Discard a bad worker. The next call will start a fresh one lazily."""
+        logger.warning(f"Discarding tool worker: {reason}")
         self._close_blocking(force=True)
-        self._start_blocking()
 
     def _close_blocking(self, *, force: bool = False) -> None:
         conn = self._conn
@@ -225,14 +305,44 @@ async def _tool_worker_main_async(conn: Connection) -> None:
 
         tools_mod._TOOL_TIMEOUT = _WORKER_TIMEOUT_SENTINEL
 
+        init_started = time.perf_counter()
+        log_marker(logger, "worker.init.begin")
+        stage_started = time.perf_counter()
+        log_marker(logger, "worker.init.tokenizer.begin")
         get_tokenizer()
+        log_marker(
+            logger,
+            "worker.init.tokenizer.end",
+            elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
+        )
+        stage_started = time.perf_counter()
+        log_marker(logger, "worker.init.cache.begin")
         cache = SemanticCache()
+        log_marker(
+            logger,
+            "worker.init.cache.end",
+            elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
+        )
+        stage_started = time.perf_counter()
+        log_marker(logger, "worker.init.warmup.begin")
         warmup()
+        log_marker(
+            logger,
+            "worker.init.warmup.end",
+            elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
+        )
 
         model_info = get_model_info()
         if model_info.get("ready") and cache is not None:
             cache._storage.clear_if_model_changed(str(model_info["model"]), int(model_info["dim"]))
 
+        log_marker(
+            logger,
+            "worker.init.end",
+            ready=model_info.get("ready"),
+            provider=model_info.get("provider"),
+            elapsed_ms=round((time.perf_counter() - init_started) * 1000, 1),
+        )
         await _send_worker_message(conn, {"op": "ready"})
 
         while True:
@@ -252,17 +362,35 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                 continue
 
             try:
+                request_id = request.get("request_id")
+                tool = str(request["tool"])
+                started = time.perf_counter()
+                log_marker(logger, "worker.exec.begin", request_id=request_id, tool=tool)
                 result = await _dispatch_tool_request(
                     cache=cache,
-                    tool=str(request["tool"]),
+                    tool=tool,
                     kwargs=dict(request["kwargs"]),
                     output_mode=str(request["output_mode"]),
                     max_response_tokens=request.get("max_response_tokens"),
                 )
             except ToolError as exc:
+                log_marker(
+                    logger,
+                    "worker.exec.tool_error",
+                    request_id=request.get("request_id"),
+                    tool=request.get("tool"),
+                    error=type(exc).__name__,
+                )
                 await _send_worker_message(conn, {"op": "tool_error", "error": str(exc)})
                 continue
             except Exception as exc:
+                log_marker(
+                    logger,
+                    "worker.exec.error",
+                    request_id=request.get("request_id"),
+                    tool=request.get("tool"),
+                    error=type(exc).__name__,
+                )
                 await _send_worker_message(
                     conn,
                     {
@@ -273,6 +401,13 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                 )
                 continue
 
+            log_marker(
+                logger,
+                "worker.exec.end",
+                request_id=request_id,
+                tool=tool,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             await _send_worker_message(conn, {"op": "result", "result": result})
     except Exception as exc:
         try:

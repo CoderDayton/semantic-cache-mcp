@@ -21,6 +21,7 @@ from ...config import (
 from ...core.chunking import get_optimal_chunker
 from ...core.hashing import hash_content
 from ...core.tokenizer import count_tokens
+from ...logger import log_marker
 from ...types import CacheEntry, EmbeddingVector
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,7 @@ class VectorStorage:
         elif close_error is not None:
             logger.warning(f"VectorStorage close error: {close_error}")
         else:
-            logger.info("VectorStorage closed cleanly")
+            logger.debug("VectorStorage closed cleanly")
 
     # -------------------------------------------------------------------------
     # File operations
@@ -294,13 +295,24 @@ class VectorStorage:
         """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
         if self._closed:
             return
+        started = time.perf_counter()
         content_hash = hash_content(content)
         tokens = count_tokens(content)
         now = time.time()
         content_bytes = content.encode("utf-8")
+        chunked = len(content_bytes) >= CHUNK_THRESHOLD
 
         emb_list = self._resolve_embedding(embedding)
         has_embedding = embedding is not None
+        log_marker(
+            logger,
+            "vector.put.begin",
+            path=path,
+            tokens=tokens,
+            bytes=len(content_bytes),
+            chunked=chunked,
+            has_embedding=has_embedding,
+        )
 
         base_meta = {
             _META_PATH: path,
@@ -313,9 +325,19 @@ class VectorStorage:
         }
 
         # Remove old entry for this path
+        delete_started = time.perf_counter()
+        log_marker(logger, "vector.put.delete.begin", path=path)
         await self._delete_by_path(path)
+        log_marker(
+            logger,
+            "vector.put.delete.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - delete_started) * 1000, 1),
+        )
 
-        if len(content_bytes) < CHUNK_THRESHOLD:
+        add_started = time.perf_counter()
+        log_marker(logger, "vector.put.add.begin", path=path, chunked=chunked)
+        if not chunked:
             # Small file: single document
             meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
             await self._collection.add_texts(
@@ -327,8 +349,29 @@ class VectorStorage:
         else:
             # Large file: parent + chunked children
             await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+        log_marker(
+            logger,
+            "vector.put.add.end",
+            path=path,
+            chunked=chunked,
+            elapsed_ms=round((time.perf_counter() - add_started) * 1000, 1),
+        )
 
+        evict_started = time.perf_counter()
+        log_marker(logger, "vector.put.evict.begin", path=path)
         await self._evict_if_needed()
+        log_marker(
+            logger,
+            "vector.put.evict.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - evict_started) * 1000, 1),
+        )
+        log_marker(
+            logger,
+            "vector.put.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
 
     async def _put_chunked(
         self,

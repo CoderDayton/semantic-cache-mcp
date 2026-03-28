@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ import numpy as np
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
+from ..logger import log_marker
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
 from ..utils import aread_bytes, aread_text, astat
 from ._helpers import _is_binary_content
@@ -29,6 +31,7 @@ async def smart_read(
     max_size: int = MAX_CONTENT_SIZE,
     diff_mode: bool = True,
     force_full: bool = False,
+    refresh_cache: bool = True,
     _embedding: EmbeddingVector | None = None,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
@@ -67,8 +70,16 @@ async def smart_read(
 
     mtime = (await astat(file_path, cache._io_executor)).st_mtime
     tokens_original = count_tokens(content)
+    computed_embedding = _embedding
 
     cached = await cache.get(str(file_path))
+    cache_is_fresh = False
+    if cached and force_full:
+        if cached.mtime >= mtime:
+            cache_is_fresh = True
+        elif hash_content(content) == cached.content_hash:
+            await cache.update_mtime(str(file_path), mtime)
+            cache_is_fresh = True
 
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:
@@ -136,12 +147,15 @@ async def smart_read(
                 result_content = (
                     f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
                 )
-                embedding = (
-                    _embedding
-                    if _embedding is not None
-                    else (await cache.get_embedding(content, path))
+                if computed_embedding is None:
+                    computed_embedding = await cache.get_embedding(content, path)
+                await cache.refresh_path(
+                    str(file_path),
+                    content,
+                    mtime,
+                    computed_embedding,
+                    embedding_path=path,
                 )
-                await cache.put(str(file_path), content, mtime, embedding)
 
                 tokens_returned = count_tokens(result_content)
                 return ReadResult(
@@ -157,11 +171,10 @@ async def smart_read(
 
     # Strategy 3: Semantic similarity
     if not cached and diff_mode and not force_full:
-        embedding = (
-            _embedding if _embedding is not None else (await cache.get_embedding(content, path))
-        )
-        if embedding:
-            similar_path = await cache.find_similar(embedding, str(file_path))
+        if computed_embedding is None:
+            computed_embedding = await cache.get_embedding(content, path)
+        if computed_embedding:
+            similar_path = await cache.find_similar(computed_embedding, str(file_path))
             if similar_path:
                 similar_entry = await cache.get(similar_path)
                 if similar_entry:
@@ -181,7 +194,13 @@ async def smart_read(
                             f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
-                        await cache.put(str(file_path), content, mtime, embedding)
+                        await cache.refresh_path(
+                            str(file_path),
+                            content,
+                            mtime,
+                            computed_embedding,
+                            embedding_path=path,
+                        )
 
                         tokens_returned = count_tokens(result_content)
                         return ReadResult(
@@ -206,6 +225,8 @@ async def smart_read(
         # MUST run in the executor — ONNX is not thread-safe and embed_fn
         # calls it synchronously.
         try:
+            started = time.perf_counter()
+            log_marker(logger, "summarize.begin", path=path, chars=len(content))
 
             def _summarize() -> str:
                 from . import embed as _sync_embed  # noqa: PLC0415
@@ -220,14 +241,28 @@ async def smart_read(
 
             loop = asyncio.get_running_loop()
             final_content = await loop.run_in_executor(cache._io_executor, _summarize)
+            log_marker(
+                logger,
+                "summarize.end",
+                path=path,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             truncated = True
         except Exception as e:
+            log_marker(logger, "summarize.fail", path=path, error=type(e).__name__)
             logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
             final_content = truncate_semantic(content, max_size)
             truncated = True
 
-    embedding = _embedding if _embedding is not None else await cache.get_embedding(content, path)
-    await cache.put(str(file_path), content, mtime, embedding)
+    should_refresh_cache = refresh_cache or not cache_is_fresh
+    if should_refresh_cache:
+        await cache.refresh_path(
+            str(file_path),
+            content,
+            mtime,
+            computed_embedding,
+            embedding_path=path,
+        )
 
     tokens_returned = count_tokens(final_content)
     return ReadResult(

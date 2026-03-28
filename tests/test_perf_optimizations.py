@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import array
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from semantic_cache_mcp.cache import SemanticCache, batch_smart_read, smart_read
 from semantic_cache_mcp.cache.search import find_similar_files
@@ -114,6 +114,32 @@ class TestSmartReadNoDuplicateFetch:
         # Only 1 cache.get call — not 2 (the re-fetch was eliminated)
         assert get_count == 1
 
+    async def test_first_read_reuses_embedding_between_similarity_check_and_cache_put(
+        self, tmp_path: Path
+    ) -> None:
+        """First uncached read should not call get_embedding twice."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "first_read.txt"
+        f.write_text("brand new file\n")
+
+        emb = _fake_embedding()
+        original_get_embedding = SemanticCache.get_embedding
+        call_count = 0
+
+        async def counting_get_embedding(self_arg, text: str, path: str = ""):
+            nonlocal call_count
+            call_count += 1
+            return await original_get_embedding(self_arg, text, path)
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(SemanticCache, "get_embedding", counting_get_embedding),
+        ):
+            result = await smart_read(cache, str(f))
+
+        assert not result.from_cache
+        assert call_count == 1
+
     async def test_diff_path_still_generates_correct_diff(self, tmp_path: Path) -> None:
         """Verify the optimization doesn't break diff content."""
         cache = _make_cache(tmp_path)
@@ -132,6 +158,33 @@ class TestSmartReadNoDuplicateFetch:
         assert result.is_diff
         assert "-line 2" in result.content
         assert "+line 2 modified" in result.content
+
+    async def test_force_full_cached_read_skips_refresh(self, tmp_path: Path) -> None:
+        """Line-range/full-force reads should not rewrite vecdb when cache is already fresh."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "range_read.txt"
+        f.write_text("alpha\nbeta\ngamma\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=None):
+            await smart_read(cache, str(f))
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=None),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await smart_read(
+                cache,
+                str(f),
+                diff_mode=False,
+                force_full=True,
+                refresh_cache=False,
+            )
+
+        assert result.content == "alpha\nbeta\ngamma\n"
 
 
 # ---------------------------------------------------------------------------

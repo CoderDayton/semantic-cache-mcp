@@ -9,13 +9,16 @@ Covers:
 
 from __future__ import annotations
 
+import array
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from semantic_cache_mcp.cache import SemanticCache
 from semantic_cache_mcp.server.tools import _serialized, _shielded_write
 
 # ---------------------------------------------------------------------------
@@ -69,6 +72,31 @@ async def test_shielded_write_timeout_is_fast() -> None:
         await _shielded_write(cache, _hang_forever(), timeout=0.1)
     elapsed = time.monotonic() - t0
     assert elapsed < 0.5, f"Timeout took {elapsed:.2f}s, expected ~0.1s"
+
+
+async def test_refresh_path_timeout_marks_stale_and_resets_executor(tmp_path: Path) -> None:
+    """Bounded cache refresh should mark the path stale and abandon the stuck IO thread."""
+    cache = SemanticCache(db_path=tmp_path / "refresh_timeout.db")
+    path = str(tmp_path / "stale.txt")
+
+    async def _hang_put(self_arg, *args, **kwargs) -> None:
+        await asyncio.sleep(3600)
+
+    with (
+        patch.object(SemanticCache, "put", _hang_put),
+        patch.object(SemanticCache, "reset_executor") as mock_reset,
+    ):
+        ok = await cache.refresh_path(
+            path,
+            "content\n",
+            1.0,
+            array.array("f", [0.1]),
+            timeout=0.01,
+        )
+
+    assert ok is False
+    assert cache.is_stale(path) is True
+    mock_reset.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +385,7 @@ async def test_batch_read_prefetches_stats_async() -> None:
         mock_cache.begin_operation.return_value = True
         mock_cache.get_embedding = AsyncMock(return_value=None)
         mock_cache.put = AsyncMock()
+        mock_cache.refresh_path = AsyncMock(return_value=True)
         mock_cache.record_access = AsyncMock()
         mock_cache.find_similar = AsyncMock(return_value=None)
         mock_cache.update_mtime = AsyncMock()

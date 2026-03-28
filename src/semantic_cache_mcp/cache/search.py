@@ -11,6 +11,7 @@ from ..core import count_tokens, diff_stats, generate_diff
 from ..core.embeddings import embed_query
 from ..core.hashing import hash_content
 from ..core.similarity import cosine_similarity
+from ..logger import log_marker
 from ..types import (
     DiffResult,
     GlobMatch,
@@ -48,7 +49,15 @@ async def semantic_search(
     # Embed query for vector component of hybrid search.
     # MUST go through executor — ONNX is not thread-safe.
     loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    log_marker(logger, "embed.query.begin", chars=len(query))
     query_embedding = await loop.run_in_executor(cache._io_executor, embed_query, query)
+    log_marker(
+        logger,
+        "embed.query.end",
+        ok=query_embedding is not None,
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+    )
 
     # Resolve directory for post-search filtering (is_relative_to is secure
     # against prefix attacks like /project vs /project_evil)
@@ -149,7 +158,7 @@ async def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
         mtime1 = (await astat(file1, cache._io_executor)).st_mtime
         emb1 = await cache.get_embedding(content1, str(file1))
-        await cache.put(str(file1), content1, mtime1, emb1)
+        await cache.refresh_path(str(file1), content1, mtime1, emb1)
 
     # File 2
     cached2 = await cache.get(str(file2))
@@ -166,7 +175,7 @@ async def compare_files(
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
         mtime2 = (await astat(file2, cache._io_executor)).st_mtime
         emb2 = await cache.get_embedding(content2, str(file2))
-        await cache.put(str(file2), content2, mtime2, emb2)
+        await cache.refresh_path(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
@@ -240,7 +249,7 @@ async def find_similar_files(
     else:
         source_tokens = count_tokens(content)
         source_embedding = await cache.get_embedding(content, str(file_path))
-        await cache.put(str(file_path), content, file_mtime, source_embedding)
+        await cache.refresh_path(str(file_path), content, file_mtime, source_embedding)
 
     if source_embedding is None:
         return SimilarFilesResult(

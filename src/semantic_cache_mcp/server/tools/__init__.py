@@ -309,6 +309,7 @@ async def read(
                     max_size=max_size,
                     diff_mode=False,  # Line ranges bypass diff mode
                     force_full=True,
+                    refresh_cache=False,
                 ),
                 timeout=_TOOL_TIMEOUT,
             )

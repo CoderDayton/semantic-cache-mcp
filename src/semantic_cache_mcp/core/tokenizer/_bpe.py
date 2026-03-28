@@ -344,7 +344,7 @@ _SPECIAL_TOKENS = {"<|endoftext|>": 199999, "<|endofprompt|>": 200018}
 
 
 def _init_tokenizer(cache_file: Path) -> BPETokenizer:
-    logger.info(f"Loading o200k_base tokenizer from {cache_file}")
+    logger.debug(f"Loading o200k_base tokenizer from {cache_file}")
     tok = BPETokenizer()
     tok.load_tiktoken_file(cache_file)
     tok.add_special_tokens(_SPECIAL_TOKENS)

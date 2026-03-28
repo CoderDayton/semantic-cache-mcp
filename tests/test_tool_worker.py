@@ -62,6 +62,33 @@ def _tool_error_worker(conn: Connection) -> None:
         conn.send({"op": "result", "result": "ok-after-tool-error"})
 
 
+def _slow_restart_startup_worker(conn: Connection) -> None:
+    state_file = Path(os.environ["SEMANTIC_CACHE_SLOW_RESTART_STATE"])
+    spawn_count = int(state_file.read_text()) if state_file.exists() else 0
+    state_file.write_text(str(spawn_count + 1))
+
+    if spawn_count > 0:
+        time.sleep(1.0)
+
+    conn.send({"op": "ready"})
+    request = conn.recv()
+    if request.get("op") == "shutdown":
+        conn.close()
+        return
+
+    if spawn_count == 0:
+        time.sleep(60)
+        return
+
+    conn.send({"op": "result", "result": "ok-after-slow-restart"})
+    while True:
+        request = conn.recv()
+        if request.get("op") == "shutdown":
+            conn.close()
+            return
+        conn.send({"op": "result", "result": "ok-after-slow-restart"})
+
+
 def _malformed_protocol_worker(conn: Connection) -> None:
     state_file = Path(os.environ["SEMANTIC_CACHE_PROTOCOL_STATE"])
     spawn_count = int(state_file.read_text()) if state_file.exists() else 0
@@ -130,6 +157,50 @@ async def test_tool_process_supervisor_restarts_after_timeout(tmp_path: Path) ->
             os.environ["SEMANTIC_CACHE_WORKER_STATE"] = old
 
     assert result == "ok-after-restart"
+    assert state_file.read_text() == "2"
+
+
+@pytest.mark.asyncio
+async def test_tool_process_supervisor_timeout_does_not_wait_for_restart_startup(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "slow-restart-state.txt"
+    old = os.environ.get("SEMANTIC_CACHE_SLOW_RESTART_STATE")
+    os.environ["SEMANTIC_CACHE_SLOW_RESTART_STATE"] = str(state_file)
+
+    supervisor = ToolProcessSupervisor(
+        worker_target=_slow_restart_startup_worker,
+        startup_timeout=2.0,
+    )
+    await supervisor.start()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await supervisor.call_tool(
+                "read",
+                {"path": "/tmp/hang"},
+                output_mode="compact",
+                max_response_tokens=None,
+                timeout=0.1,
+            )
+        elapsed = time.monotonic() - t0
+
+        result = await supervisor.call_tool(
+            "read",
+            {"path": "/tmp/recovered"},
+            output_mode="compact",
+            max_response_tokens=None,
+            timeout=2.0,
+        )
+    finally:
+        await supervisor.async_close()
+        if old is None:
+            os.environ.pop("SEMANTIC_CACHE_SLOW_RESTART_STATE", None)
+        else:
+            os.environ["SEMANTIC_CACHE_SLOW_RESTART_STATE"] = old
+
+    assert elapsed < 0.5
+    assert result == "ok-after-slow-restart"
     assert state_file.read_text() == "2"
 
 

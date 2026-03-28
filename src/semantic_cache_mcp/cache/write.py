@@ -71,7 +71,7 @@ async def smart_write(
         if create_parents:
             if not dry_run:
                 parent.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Created parent directories: {parent}")
+                logger.debug(f"Created parent directories: {parent}")
         else:
             raise FileNotFoundError(f"Parent directory does not exist: {parent}")
 
@@ -188,13 +188,17 @@ async def smart_write(
                 if cached_entry and cached_entry.embedding:
                     embedding = cached_entry.embedding
                     logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
-        if embedding is None:
-            embedding = await cache.get_embedding(content, path)
-        await cache.put(str(file_path), content, mtime, embedding)
+        await cache.refresh_path(
+            str(file_path),
+            content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = "Created" if created else "Updated"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action} and cached: {path}")
+        logger.debug(f"{action} and cached: {path}")
 
     return WriteResult(
         path=str(file_path),
@@ -456,13 +460,17 @@ async def smart_edit(
                 if cached_entry and cached_entry.embedding:
                     embedding = cached_entry.embedding
                     logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
-        if embedding is None:
-            embedding = await cache.get_embedding(new_content, path)
-        await cache.put(str(file_path), new_content, mtime, embedding)
+        await cache.refresh_path(
+            str(file_path),
+            new_content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action} and cached: {path}")
+        logger.debug(f"{action} and cached: {path}")
 
     return EditResult(
         path=str(file_path),
@@ -708,13 +716,17 @@ async def smart_batch_edit(
                 cached_entry = await cache.get(str(file_path))
                 if cached_entry and cached_entry.embedding:
                     embedding = cached_entry.embedding
-        if embedding is None:
-            embedding = await cache.get_embedding(new_content, path)
-        await cache.put(str(file_path), new_content, mtime, embedding)
+        await cache.refresh_path(
+            str(file_path),
+            new_content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action}: {path}")
+        logger.debug(f"{action}: {path}")
 
     return BatchEditResult(
         path=str(file_path),
