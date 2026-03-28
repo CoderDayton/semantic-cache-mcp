@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from semantic_cache_mcp.cache import SemanticCache, batch_smart_read, smart_read
-from semantic_cache_mcp.cache.search import find_similar_files
+from semantic_cache_mcp.cache.search import compare_files, find_similar_files
 from semantic_cache_mcp.types import EmbeddingVector
 from tests.constants import TEST_EMBEDDING_DIM
 
@@ -226,6 +226,57 @@ class TestFindSimilarEmbeddingReuse:
 
         # File was uncached, so it went through the else branch with ONNX
         assert result.source_path == str(f)
+
+    async def test_uncached_file_skips_refresh_path(self, tmp_path: Path) -> None:
+        """Similarity search should not rewrite vecdb just to use a source embedding."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        source = tmp_path / "source.txt"
+        neighbor = tmp_path / "neighbor.txt"
+        source.write_text("source content\n")
+        neighbor.write_text("neighbor content\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(neighbor))
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await find_similar_files(cache, str(source))
+
+        assert result.source_path == str(source)
+
+
+class TestCompareFilesNoRefresh:
+    """compare_files should avoid vecdb rewrite when direct computation is enough."""
+
+    async def test_uncached_compare_skips_refresh_path(self, tmp_path: Path) -> None:
+        """Comparing two uncached files should not rewrite vecdb for either side."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        file1 = tmp_path / "one.txt"
+        file2 = tmp_path / "two.txt"
+        file1.write_text("alpha\n")
+        file2.write_text("beta\n")
+
+        with (
+            patch("semantic_cache_mcp.cache.search.embed_query", return_value=emb),
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await compare_files(cache, str(file1), str(file2))
+
+        assert result.path1 == str(file1)
+        assert result.path2 == str(file2)
 
 
 # ---------------------------------------------------------------------------

@@ -140,6 +140,8 @@ async def compare_files(
     # Get content for both files (from cache or disk)
     content1: str
     content2: str
+    emb1 = None
+    emb2 = None
     from_cache1 = False
     from_cache2 = False
 
@@ -156,9 +158,7 @@ async def compare_files(
             content1 = raw_bytes1.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path1}") from exc
-        mtime1 = (await astat(file1, cache._io_executor)).st_mtime
         emb1 = await cache.get_embedding(content1, str(file1))
-        await cache.refresh_path(str(file1), content1, mtime1, emb1)
 
     # File 2
     cached2 = await cache.get(str(file2))
@@ -173,9 +173,7 @@ async def compare_files(
             content2 = raw_bytes2.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8: {path2}") from exc
-        mtime2 = (await astat(file2, cache._io_executor)).st_mtime
         emb2 = await cache.get_embedding(content2, str(file2))
-        await cache.refresh_path(str(file2), content2, mtime2, emb2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
@@ -185,11 +183,15 @@ async def compare_files(
 
     # Compute semantic similarity between embeddings (normalized)
     similarity = 0.0
-    entry1 = await cache.get(str(file1))
-    entry2 = await cache.get(str(file2))
-    if entry1 and entry1.embedding and entry2 and entry2.embedding:
+    sim_embedding1 = cached1.embedding if cached1 and cached1.embedding else None
+    sim_embedding2 = cached2.embedding if cached2 and cached2.embedding else None
+    if not sim_embedding1 and not from_cache1:
+        sim_embedding1 = emb1
+    if not sim_embedding2 and not from_cache2:
+        sim_embedding2 = emb2
+    if sim_embedding1 and sim_embedding2:
         # Normalize to proper cosine similarity in [0, 1] range
-        raw_sim = cosine_similarity(entry1.embedding, entry2.embedding)
+        raw_sim = cosine_similarity(sim_embedding1, sim_embedding2)
         # Embeddings from nomic are normalized, but clamp just in case
         similarity = max(0.0, min(1.0, float(raw_sim)))
 
@@ -237,19 +239,21 @@ async def find_similar_files(
     source_tokens = 0
 
     file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
-    if cached and cached.mtime >= file_mtime:
-        source_tokens = cached.tokens
-        # Reuse stored embedding; only call ONNX if it was never stored
-        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
-    elif cached and hash_content(content) == cached.content_hash:
-        # Content identical despite mtime change — update mtime, treat as cached
-        await cache.update_mtime(str(file_path), file_mtime)
+    cache_is_current = cached is not None and cached.mtime >= file_mtime
+    cache_matches_content = (
+        cached is not None and not cache_is_current and hash_content(content) == cached.content_hash
+    )
+
+    if cache_is_current or cache_matches_content:
+        assert cached is not None
+        if cache_matches_content:
+            # Content identical despite mtime change — update mtime, treat as cached
+            await cache.update_mtime(str(file_path), file_mtime)
         source_tokens = cached.tokens
         source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
     else:
         source_tokens = count_tokens(content)
         source_embedding = await cache.get_embedding(content, str(file_path))
-        await cache.refresh_path(str(file_path), content, file_mtime, source_embedding)
 
     if source_embedding is None:
         return SimilarFilesResult(

@@ -16,7 +16,7 @@ from typing import Any
 from fastmcp.exceptions import ToolError
 
 from ..cache import SemanticCache
-from ..core.embeddings import get_model_info, warmup
+from ..core.embeddings import get_embedding_dim, get_model_info
 from ..core.tokenizer import get_tokenizer
 from ..logger import log_marker
 from .response import _response_overrides
@@ -324,17 +324,17 @@ async def _tool_worker_main_async(conn: Connection) -> None:
             elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
         )
         stage_started = time.perf_counter()
-        log_marker(logger, "worker.init.warmup.begin")
-        warmup()
+        log_marker(logger, "worker.init.embedding_meta.begin")
+        embedding_dim = get_embedding_dim()
         log_marker(
             logger,
-            "worker.init.warmup.end",
+            "worker.init.embedding_meta.end",
+            dim=embedding_dim,
             elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
         )
-
         model_info = get_model_info()
-        if model_info.get("ready") and cache is not None:
-            cache._storage.clear_if_model_changed(str(model_info["model"]), int(model_info["dim"]))
+        if cache is not None and embedding_dim > 0:
+            cache._storage.clear_if_model_changed(str(model_info["model"]), embedding_dim)
 
         log_marker(
             logger,
