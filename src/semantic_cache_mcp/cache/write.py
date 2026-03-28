@@ -30,6 +30,27 @@ logger = logging.getLogger(__name__)
 MAX_BATCH_EDITS = 50
 
 
+async def _maybe_reuse_cached_embedding(
+    cache: SemanticCache,
+    file_path: Path,
+    stats: dict[str, int] | None,
+) -> EmbeddingVector | None:
+    """Reuse the cached embedding for small text changes when it is still representative."""
+    if not stats:
+        return None
+
+    changed = stats.get("insertions", 0) + stats.get("deletions", 0)
+    total = stats.get("total_lines", changed + 1)
+    if total <= 0 or changed / total >= 0.2:
+        return None
+
+    cached_entry = await cache.get(str(file_path))
+    if cached_entry and cached_entry.embedding:
+        logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        return cached_entry.embedding
+    return None
+
+
 async def smart_write(
     cache: SemanticCache,
     path: str,
@@ -179,15 +200,11 @@ async def smart_write(
         # Skip re-embedding for small edits (< 20% changed) — the old
         # embedding is similar enough for retrieval, saving ~23ms ONNX call.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding: EmbeddingVector | None = None
-        if not created and from_cache and diff_stats_result:
-            changed = diff_stats_result.get("insertions", 0) + diff_stats_result.get("deletions", 0)
-            total = diff_stats_result.get("total_lines", changed + 1)
-            if total > 0 and changed / total < 0.2:
-                cached_entry = await cache.get(str(file_path))
-                if cached_entry and cached_entry.embedding:
-                    embedding = cached_entry.embedding
-                    logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        embedding = await _maybe_reuse_cached_embedding(
+            cache,
+            file_path,
+            diff_stats_result if (not created and from_cache) else None,
+        )
         await cache.refresh_path(
             str(file_path),
             content,
@@ -451,15 +468,7 @@ async def smart_edit(
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding: EmbeddingVector | None = None
-        if diff_stats_result:
-            changed = diff_stats_result.get("insertions", 0) + diff_stats_result.get("deletions", 0)
-            total = diff_stats_result.get("total_lines", changed + 1)
-            if total > 0 and changed / total < 0.2:
-                cached_entry = await cache.get(str(file_path))
-                if cached_entry and cached_entry.embedding:
-                    embedding = cached_entry.embedding
-                    logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)
         await cache.refresh_path(
             str(file_path),
             new_content,
@@ -708,14 +717,7 @@ async def smart_batch_edit(
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding: EmbeddingVector | None = None
-        if stats:
-            changed = stats.get("insertions", 0) + stats.get("deletions", 0)
-            total = stats.get("total_lines", changed + 1)
-            if total > 0 and changed / total < 0.2:
-                cached_entry = await cache.get(str(file_path))
-                if cached_entry and cached_entry.embedding:
-                    embedding = cached_entry.embedding
+        embedding = await _maybe_reuse_cached_embedding(cache, file_path, stats)
         await cache.refresh_path(
             str(file_path),
             new_content,

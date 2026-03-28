@@ -69,7 +69,10 @@ def configure_logging(
         (h for h in root.handlers if getattr(h, "name", "") == _FILE_HANDLER_NAME),
         None,
     )
-    if file_handler is not None and Path(file_handler.baseFilename) != log_file_path:
+    if (
+        isinstance(file_handler, logging.FileHandler)
+        and Path(file_handler.baseFilename) != log_file_path
+    ):
         root.removeHandler(file_handler)
         file_handler.close()
         file_handler = None
