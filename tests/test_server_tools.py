@@ -915,6 +915,39 @@ class TestGrepTool:
                 assert "line_number" in m
                 assert "line" in m
 
+    async def test_grep_accepts_optional_path_filter(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        target = tmp_path / "sim" / "finetune.py"
+        other = tmp_path / "sim" / "other.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("batch_idx = 1\n")
+        other.write_text("batch_idx = 2\n")
+        await smart_read(tmp_cache, str(target))
+        await smart_read(tmp_cache, str(other))
+
+        d = _parse(await grep(ctx, "batch_idx", fixed_string=True, path="sim/finetune.py"))
+
+        assert d["total_matches"] == 1
+        assert d["files"][0]["path"].endswith("sim/finetune.py")
+
+    async def test_grep_accepts_glob_path_filter(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        sim_file = tmp_path / "sim" / "finetune.py"
+        test_file = tmp_path / "tests" / "finetune.py"
+        sim_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        sim_file.write_text("sample = 1\n")
+        test_file.write_text("sample = 2\n")
+        await smart_read(tmp_cache, str(sim_file))
+        await smart_read(tmp_cache, str(test_file))
+
+        d = _parse(await grep(ctx, "sample", fixed_string=True, path="sim/*.py"))
+
+        assert d["total_matches"] == 1
+        assert d["files"][0]["path"].endswith("sim/finetune.py")
+
 
 # ===========================================================================
 # relative path support

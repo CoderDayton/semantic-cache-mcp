@@ -1521,6 +1521,7 @@ async def glob(
 async def grep(
     ctx: Context,
     pattern: str,
+    path: str | None = None,
     fixed_string: bool = False,
     case_sensitive: bool = True,
     context_lines: int = 0,
@@ -1531,6 +1532,7 @@ async def grep(
 
     Like ripgrep on the cache. For semantic/fuzzy queries, use `search` instead.
     Only searches cached files — seed with batch_read first.
+    Use the optional `path` argument to limit matches to one file, a relative suffix, or a glob like `src/*.py`.
 
     Timing:
     - Use for exact code patterns: function names, imports, error strings.
@@ -1540,6 +1542,7 @@ async def grep(
 
     Args:
         pattern: Regex pattern (or literal string if fixed_string=true)
+        path: Optional exact path or glob filter to limit matched files
         fixed_string: Treat pattern as literal, not regex (default: false)
         case_sensitive: Case-sensitive matching (default: true)
         context_lines: Lines of context before/after each match (default: 0)
@@ -1555,6 +1558,7 @@ async def grep(
         "grep",
         {
             "pattern": pattern,
+            "path": path,
             "fixed_string": fixed_string,
             "case_sensitive": case_sensitive,
             "context_lines": context_lines,
@@ -1572,6 +1576,7 @@ async def grep(
         effective_context = context_lines if mode in _MODE_NORMAL else 0
         results = await cache._storage.grep(
             pattern,
+            path=path,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
             context_lines=effective_context,
@@ -1609,6 +1614,7 @@ async def grep(
             "ok": True,
             "tool": "grep",
             "pattern": pattern,
+            "path": path,
             "total_matches": total_matches,
             "files_matched": len(files_payload),
             "files": files_payload,

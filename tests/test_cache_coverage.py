@@ -436,6 +436,20 @@ class TestVectorStorageGrep:
         total = sum(len(r["matches"]) for r in results)
         assert total <= 5
 
+    async def test_grep_path_suffix_filter(self, tmp_path: Path) -> None:
+        vs = _make_vector_storage(tmp_path)
+        await vs.put("/repo/sim/finetune.py", "batch_idx = 1\n", mtime=1.0)
+        await vs.put("/repo/sim/other.py", "batch_idx = 2\n", mtime=1.0)
+        results = await vs.grep("batch_idx", fixed_string=True, path="sim/finetune.py")
+        assert [r["path"] for r in results] == ["/repo/sim/finetune.py"]
+
+    async def test_grep_path_glob_filter(self, tmp_path: Path) -> None:
+        vs = _make_vector_storage(tmp_path)
+        await vs.put("/repo/sim/finetune.py", "sample = 1\n", mtime=1.0)
+        await vs.put("/repo/tests/finetune.py", "sample = 2\n", mtime=1.0)
+        results = await vs.grep("sample", fixed_string=True, path="sim/*.py")
+        assert [r["path"] for r in results] == ["/repo/sim/finetune.py"]
+
 
 class TestVectorStorageGetStats:
     """Lines 387-389, 434-441 — stats and eviction."""

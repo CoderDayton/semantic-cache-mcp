@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import fnmatch
 import json
 import logging
 import time
@@ -697,6 +698,7 @@ class VectorStorage:
         self,
         pattern: str,
         *,
+        path: str | None = None,
         fixed_string: bool = False,
         case_sensitive: bool = True,
         context_lines: int = 0,
@@ -732,13 +734,13 @@ class VectorStorage:
         for _doc_id, text, meta in all_docs:
             if meta.get(_META_IS_PARENT, False):
                 continue  # Parent docs have empty content
-            path = meta.get(_META_PATH, "")
-            if not path:
+            doc_path = meta.get(_META_PATH, "")
+            if not doc_path or not self._grep_path_matches(doc_path, path_filter=path):
                 continue
             chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
-            if path not in files:
-                files[path] = []
-            files[path].append((chunk_idx, text))
+            if doc_path not in files:
+                files[doc_path] = []
+            files[doc_path].append((chunk_idx, text))
 
         # Search each file's content
         results: list[dict] = []
@@ -774,6 +776,31 @@ class VectorStorage:
                 results.append({"path": path, "matches": file_matches})
 
         return results
+
+    @staticmethod
+    def _grep_path_matches(path: str, *, path_filter: str | None) -> bool:
+        """Match exact paths, relative suffixes, basenames, and glob filters."""
+        if not path_filter:
+            return True
+
+        normalized_path = path.replace("\\", "/")
+        normalized_filter = path_filter.replace("\\", "/")
+        has_glob = any(ch in normalized_filter for ch in "*?[")
+
+        if has_glob:
+            return any(
+                fnmatch.fnmatchcase(normalized_path, candidate)
+                for candidate in (
+                    normalized_filter,
+                    f"*/{normalized_filter}",
+                )
+            )
+
+        return (
+            normalized_path == normalized_filter
+            or normalized_path.endswith(f"/{normalized_filter}")
+            or Path(normalized_path).name == normalized_filter
+        )
 
     # -------------------------------------------------------------------------
     # Statistics and management

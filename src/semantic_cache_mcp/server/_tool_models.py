@@ -272,6 +272,7 @@ class GrepFile(ToolResponseModel):
 
 class GrepResponse(ToolResponseModel):
     pattern: str | None = None
+    path: str | None = None
     total_matches: int | None = None
     files_matched: int | None = None
     files: list[GrepFile] | None = None
