@@ -150,6 +150,9 @@ def _validate_config() -> None:
     if TOOL_MAX_RESPONSE_TOKENS < 0:
         errors.append(f"TOOL_MAX_RESPONSE_TOKENS ({TOOL_MAX_RESPONSE_TOKENS}) must be >= 0")
 
+    if TOOL_TIMEOUT <= 0:
+        errors.append(f"TOOL_TIMEOUT ({TOOL_TIMEOUT}) must be > 0")
+
     if EMBEDDING_DEVICE not in {"cpu", "cuda", "auto"}:
         errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, gpu, cuda, auto")
 

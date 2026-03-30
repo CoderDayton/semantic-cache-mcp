@@ -99,6 +99,44 @@ async def test_refresh_path_timeout_marks_stale_and_resets_executor(tmp_path: Pa
     mock_reset.assert_called_once()
 
 
+async def test_refresh_path_uses_adaptive_default_timeout(tmp_path: Path) -> None:
+    """refresh_path should honor the computed timeout when no override is passed."""
+    cache = SemanticCache(db_path=tmp_path / "refresh_default_timeout.db")
+    path = str(tmp_path / "default-timeout.txt")
+
+    async def _hang_put(self_arg, *args, **kwargs) -> None:
+        await asyncio.sleep(3600)
+
+    with (
+        patch.object(SemanticCache, "_compute_refresh_timeout", return_value=0.01),
+        patch.object(SemanticCache, "put", _hang_put),
+        patch.object(SemanticCache, "reset_executor") as mock_reset,
+    ):
+        ok = await cache.refresh_path(
+            path,
+            "content\n",
+            1.0,
+            array.array("f", [0.1]),
+        )
+
+    assert ok is False
+    assert cache.is_stale(path) is True
+    mock_reset.assert_called_once()
+
+
+def test_compute_refresh_timeout_adapts_to_remaining_work(tmp_path: Path) -> None:
+    """Adaptive timeout should be shortest when embedding work is already done."""
+    cache = SemanticCache(db_path=tmp_path / "refresh_heuristic.db")
+
+    with patch("semantic_cache_mcp.core.embeddings._model._model_ready", False):
+        cold_timeout = cache._compute_refresh_timeout(has_embedding=False)
+    with patch("semantic_cache_mcp.core.embeddings._model._model_ready", True):
+        warm_timeout = cache._compute_refresh_timeout(has_embedding=False)
+    fast_timeout = cache._compute_refresh_timeout(has_embedding=True)
+
+    assert fast_timeout <= warm_timeout <= cold_timeout
+
+
 # ---------------------------------------------------------------------------
 # _shielded_write: normal completion
 # ---------------------------------------------------------------------------

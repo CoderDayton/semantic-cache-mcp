@@ -10,7 +10,7 @@ from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, cast
 
-from ..config import CACHE_DIR
+from ..config import CACHE_DIR, TOOL_TIMEOUT
 from ..core import count_tokens
 from ..logger import log_marker
 from ..storage import SQLiteStorage, VectorStorage
@@ -296,7 +296,6 @@ class SemanticCache:
 
     # Grace period for in-flight operations to finish during shutdown.
     _DRAIN_TIMEOUT: float = 8.0
-    _CACHE_REFRESH_TIMEOUT: float = 1.0
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
         # Single-thread executor shared by ALL blocking operations:
@@ -515,6 +514,18 @@ class SemanticCache:
     def is_stale(self, path: str) -> bool:
         return path in self._stale_paths
 
+    def _compute_refresh_timeout(self, *, has_embedding: bool) -> float:
+        """Choose a timeout based on the work still left in refresh_path()."""
+        if has_embedding:
+            return min(max(1.0, TOOL_TIMEOUT * 0.1), 2.0)
+
+        import semantic_cache_mcp.core.embeddings._model as _emb_model  # noqa: PLC0415
+
+        if _emb_model._model_ready:
+            return min(max(2.0, TOOL_TIMEOUT * 0.2), 6.0)
+
+        return min(max(5.0, TOOL_TIMEOUT * 0.5), 15.0)
+
     async def put(
         self,
         path: str,
@@ -550,7 +561,11 @@ class SemanticCache:
         embedding_path: str | None = None,
         timeout: float | None = None,
     ) -> bool:
-        refresh_timeout = self._CACHE_REFRESH_TIMEOUT if timeout is None else timeout
+        refresh_timeout = (
+            self._compute_refresh_timeout(has_embedding=embedding is not None)
+            if timeout is None
+            else timeout
+        )
         started = time.perf_counter()
         log_marker(
             logger,
