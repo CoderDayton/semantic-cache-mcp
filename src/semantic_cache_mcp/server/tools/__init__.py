@@ -113,6 +113,21 @@ class _ToolCallState:
         return _resolve_path(path, self.client_root)
 
 
+def _parse_path_list(raw: str) -> list[str]:
+    """Parse comma-separated or JSON-array path inputs."""
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [p.strip() for p in text.split(",") if p.strip()]
+
+
+def _resolve_path_list(raw: str, state: _ToolCallState) -> list[str]:
+    """Parse and resolve each path against the client root."""
+    return [state.resolve(path) for path in _parse_path_list(raw)]
+
+
 def _get_tool_lock() -> asyncio.Lock:
     """Lazy-init the lock (must be created inside a running event loop)."""
     global _tool_lock
@@ -1470,43 +1485,26 @@ async def batch_read(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "batch_read",
-        {
-            "paths": paths,
-            "max_total_tokens": max_total_tokens,
-            "priority": priority,
-            "diff_mode": diff_mode,
-        },
-        timeout=_TOOL_TIMEOUT * 2,
-    )
-    if remote_result is not None:
-        return remote_result
 
     try:
-        # Parse paths (comma-separated or JSON array)
-        paths_str = paths.strip()
-        if paths_str.startswith("["):
-            path_list: list[str] = json.loads(paths_str)
-        else:
-            path_list = [p.strip() for p in paths_str.split(",") if p.strip()]
-
-        # Resolve relative paths against client root
-        path_list = [state.resolve(p) for p in path_list]
+        path_list = _resolve_path_list(paths, state)
+        priority_list = _resolve_path_list(priority, state) if priority.strip() else None
+        remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+            state,
+            "batch_read",
+            {
+                "paths": json.dumps(path_list),
+                "max_total_tokens": max_total_tokens,
+                "priority": json.dumps(priority_list) if priority_list else "",
+                "diff_mode": diff_mode,
+            },
+            timeout=_TOOL_TIMEOUT * 2,
+        )
+        if remote_result is not None:
+            return remote_result
 
         # Expand glob patterns
         path_list = _expand_globs(path_list)
-
-        # Parse priority
-        priority_list: list[str] | None = None
-        priority_str = priority.strip()
-        if priority_str:
-            if priority_str.startswith("["):
-                priority_list = json.loads(priority_str)
-            else:
-                priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
-            priority_list = [state.resolve(p) for p in priority_list]
 
         if not diff_mode:
             cached_paths = await _fresh_mtime_cached_paths(cache, path_list)

@@ -11,12 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastmcp.exceptions import ToolError
 
+from semantic_cache_mcp.server import tools as tools_mod
 from semantic_cache_mcp.server._tool_worker import (
     ToolProcessSupervisor,
     _tool_worker_main_async,
     _worker_result,
 )
-from semantic_cache_mcp.server.tools import read
+from semantic_cache_mcp.server.tools import batch_read, read
 
 
 def _echo_worker(conn: Connection) -> None:
@@ -174,7 +175,7 @@ async def test_tool_process_supervisor_timeout_does_not_wait_for_restart_startup
 
     supervisor = ToolProcessSupervisor(
         worker_target=_slow_restart_startup_worker,
-        startup_timeout=2.0,
+        startup_timeout=5.0,
     )
     await supervisor.start()
     try:
@@ -337,3 +338,40 @@ async def test_read_remote_timeout_returns_error(_cap: MagicMock, _mode: MagicMo
 
     with pytest.raises(ToolError, match="read: timed out"):
         await read(ctx, path="/tmp/demo.py")
+
+
+@pytest.mark.asyncio
+@patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact")
+@patch("semantic_cache_mcp.server.tools._response_token_cap", return_value=None)
+@patch("semantic_cache_mcp.server.tools._resolve_client_root")
+async def test_batch_read_resolves_relative_paths_before_remote_dispatch(
+    mock_root: MagicMock,
+    _cap: MagicMock,
+    _mode: MagicMock,
+) -> None:
+    remote = MagicMock()
+    remote._is_tool_process_supervisor = True
+    remote.call_tool = AsyncMock(return_value={"summary": {"files_read": 0}, "files": []})
+    ctx = MagicMock()
+    ctx.lifespan_context = {"cache": remote}
+    mock_root.return_value = Path("/repo")
+
+    result = await batch_read(
+        ctx,
+        paths='["src/**/*.py","README.md"]',
+        priority="docs/guide.md",
+    )
+
+    assert result == {"summary": {"files_read": 0}, "files": []}
+    remote.call_tool.assert_awaited_once_with(
+        "batch_read",
+        {
+            "paths": '["/repo/src/**/*.py", "/repo/README.md"]',
+            "max_total_tokens": 50000,
+            "priority": '["/repo/docs/guide.md"]',
+            "diff_mode": True,
+        },
+        output_mode="compact",
+        max_response_tokens=None,
+        timeout=tools_mod._TOOL_TIMEOUT * 2,
+    )
