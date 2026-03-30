@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cache_status
 from semantic_cache_mcp.cache._helpers import _format_file
@@ -512,8 +513,8 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
-        assert "offset must be >= 1" in result
+        with pytest.raises(ToolError, match="read: offset must be >= 1"):
+            await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
 
     async def test_read_negative_limit(self, semantic_cache: SemanticCache) -> None:
         """limit < 1 returns error."""
@@ -522,8 +523,8 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        result = await read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
-        assert "limit must be >= 1" in result
+        with pytest.raises(ToolError, match="read: limit must be >= 1"):
+            await read(ctx=ctx, path="/any/file.py", limit=0, max_size=100000)
 
     async def test_read_max_size_clamped(
         self, temp_dir: Path, semantic_cache: SemanticCache
@@ -539,7 +540,7 @@ class TestToolsBoundsValidation:
 
         # Negative max_size clamped to 1 (won't crash)
         result = await read(ctx=ctx, path=str(f), max_size=-999)
-        assert isinstance(result, str)
+        assert isinstance(result, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -554,23 +555,17 @@ class TestMcpLifespan:
     async def test_lifespan_redirect_stdout(self) -> None:
         """Stdout is redirected to stderr during init."""
 
-        def mock_warmup():
-            print("warmup noise")
+        async def mock_start() -> None:
+            print("worker startup noise")
 
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup", side_effect=mock_warmup),
-            patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test", "dim": 384},
-            ),
-            patch("semantic_cache_mcp.server._mcp.SemanticCache") as mock_cache_cls,
+            patch("semantic_cache_mcp.server._mcp.ToolProcessSupervisor") as mock_supervisor_cls,
         ):
-            mock_cache = MagicMock()
-            mock_cache.metrics = MagicMock()
-            mock_cache.async_close = AsyncMock()
-            mock_cache._shutting_down = False
-            mock_cache_cls.return_value = mock_cache
+            mock_supervisor = MagicMock()
+            mock_supervisor.start = AsyncMock(side_effect=mock_start)
+            mock_supervisor.async_close = AsyncMock()
+            mock_supervisor_cls.return_value = mock_supervisor
 
             from semantic_cache_mcp.server._mcp import app_lifespan
 
@@ -597,21 +592,15 @@ class TestMcpLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_model_not_ready(self) -> None:
-        """Embedding model not ready still creates cache."""
+        """Worker supervisor startup still yields a cache context."""
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup"),
-            patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": False},
-            ),
-            patch("semantic_cache_mcp.server._mcp.SemanticCache") as mock_cache_cls,
+            patch("semantic_cache_mcp.server._mcp.ToolProcessSupervisor") as mock_supervisor_cls,
         ):
-            mock_cache = MagicMock()
-            mock_cache.metrics = MagicMock()
-            mock_cache.async_close = AsyncMock()
-            mock_cache._shutting_down = False
-            mock_cache_cls.return_value = mock_cache
+            mock_supervisor = MagicMock()
+            mock_supervisor.start = AsyncMock()
+            mock_supervisor.async_close = AsyncMock()
+            mock_supervisor_cls.return_value = mock_supervisor
 
             from semantic_cache_mcp.server._mcp import app_lifespan
 
@@ -799,6 +788,7 @@ class TestGlobSymlinkEscape:
 
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
+        mock_cache._io_executor = None  # use default asyncio executor for astat
         result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]
@@ -820,6 +810,7 @@ class TestGlobSymlinkEscape:
 
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
+        mock_cache._io_executor = None  # use default asyncio executor for astat
         result = await glob_with_cache_status(mock_cache, "*.txt", str(search_dir))
 
         paths = [m.path for m in result.matches]
@@ -831,10 +822,13 @@ class TestSemanticSearchDirectoryFilter:
 
     async def test_directory_filter_excludes_outside_files(self, tmp_path: Path) -> None:
         """Files outside the directory filter should be excluded."""
+        from concurrent.futures import ThreadPoolExecutor
+
         with patch("semantic_cache_mcp.cache.search.embed_query") as mock_embed:
             mock_embed.return_value = list(np.zeros(64, dtype=np.float32))
 
             mock_cache = MagicMock()
+            mock_cache._io_executor = ThreadPoolExecutor(max_workers=1)
             mock_storage = MagicMock()
             mock_cache._storage = mock_storage
 
@@ -865,13 +859,8 @@ class TestMcpCacheNoneGuard:
         """If cache is somehow None after init block, RuntimeError raised."""
         with (
             patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch("semantic_cache_mcp.server._mcp.warmup"),
             patch(
-                "semantic_cache_mcp.server._mcp.get_model_info",
-                return_value={"ready": True, "model": "test", "dim": 384},
-            ),
-            patch(
-                "semantic_cache_mcp.server._mcp.SemanticCache",
+                "semantic_cache_mcp.server._mcp.ToolProcessSupervisor",
                 return_value=None,
             ),
         ):

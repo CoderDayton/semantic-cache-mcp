@@ -239,3 +239,89 @@ class TestShieldedWrite:
         # Let the shielded write finish
         await asyncio.sleep(0.3)
         assert write_completed is True
+
+
+# ---------------------------------------------------------------------------
+# Crash sentinel (VectorStorage._recover_if_crashed / _remove_sentinel)
+# ---------------------------------------------------------------------------
+
+
+def test_sentinel_created_on_init(tmp_path: Path):
+    """VectorStorage.__init__ writes the crash sentinel."""
+    sentinel = tmp_path / ".startup.lock"
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        from semantic_cache_mcp.storage.vector import VectorStorage
+
+        _vs = VectorStorage(db_path=tmp_path / "vecdb.db")
+        assert sentinel.exists(), "Sentinel should be created on init"
+
+
+def test_sentinel_removed_on_clean_close(tmp_path: Path):
+    """_remove_sentinel deletes the sentinel file."""
+    sentinel = tmp_path / ".startup.lock"
+    sentinel.touch()
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        from semantic_cache_mcp.storage.vector import VectorStorage
+
+        VectorStorage._remove_sentinel()
+        assert not sentinel.exists(), "Sentinel should be removed after clean close"
+
+
+def test_sentinel_remove_idempotent(tmp_path: Path):
+    """_remove_sentinel is safe when sentinel doesn't exist."""
+    sentinel = tmp_path / ".startup.lock"
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        from semantic_cache_mcp.storage.vector import VectorStorage
+
+        VectorStorage._remove_sentinel()  # should not raise
+
+
+def test_crash_recovery_wipes_vecdb(tmp_path: Path):
+    """When sentinel exists on startup, _recover_if_crashed wipes vecdb files."""
+    sentinel = tmp_path / ".startup.lock"
+    sentinel.touch()
+
+    db_path = tmp_path / "vecdb.db"
+    # Create fake vecdb files that would be corrupted
+    db_path.touch()
+    (tmp_path / "vecdb.db.files.usearch").touch()
+    (tmp_path / "vecdb.db-wal").touch()
+    (tmp_path / "vecdb.db-shm").touch()
+    (tmp_path / "vecdb.db.meta.json").touch()
+
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        from semantic_cache_mcp.storage.vector import VectorStorage
+
+        VectorStorage._recover_if_crashed(db_path)
+
+    assert not db_path.exists(), "vecdb.db should be wiped"
+    assert not (tmp_path / "vecdb.db.files.usearch").exists()
+    assert not (tmp_path / "vecdb.db-wal").exists()
+    assert not (tmp_path / "vecdb.db-shm").exists()
+    assert not (tmp_path / "vecdb.db.meta.json").exists()
+    assert not sentinel.exists(), "Sentinel should be cleared after recovery"
+
+
+def test_no_crash_recovery_without_sentinel(tmp_path: Path):
+    """Without sentinel, _recover_if_crashed does nothing."""
+    sentinel = tmp_path / ".startup.lock"
+    db_path = tmp_path / "vecdb.db"
+    db_path.touch()
+
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        from semantic_cache_mcp.storage.vector import VectorStorage
+
+        VectorStorage._recover_if_crashed(db_path)
+
+    assert db_path.exists(), "vecdb.db should NOT be wiped without sentinel"
+
+
+async def test_async_close_removes_sentinel(tmp_path: Path):
+    """Full async_close path removes the sentinel."""
+    sentinel = tmp_path / ".startup.lock"
+    with patch("semantic_cache_mcp.storage.vector.STARTUP_SENTINEL", sentinel):
+        cache = _make_cache(tmp_path)
+        # Sentinel is created by VectorStorage.__init__ via the patched path
+        sentinel.touch()  # ensure it exists
+        await cache.async_close()
+        assert not sentinel.exists(), "async_close should remove sentinel"

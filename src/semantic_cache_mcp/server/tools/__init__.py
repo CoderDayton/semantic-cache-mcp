@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from fastmcp import Context
+from fastmcp.exceptions import ToolError
+from fastmcp.tools.tool import ToolResult
 
 from ...cache import (
     SemanticCache,
@@ -23,14 +26,31 @@ from ...cache import (
     smart_read,
     smart_write,
 )
-from ...config import MAX_CONTENT_SIZE
+from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
+from ...utils._async_io import astat, aunlink
 from .._mcp import mcp
+from .._tool_models import (
+    BatchEditResponse,
+    BatchReadResponse,
+    ClearResponse,
+    DeleteResponse,
+    DiffResponse,
+    EditResponse,
+    GlobResponse,
+    GrepResponse,
+    ReadResponse,
+    SearchResponse,
+    SimilarResponse,
+    StatsResponse,
+    WriteResponse,
+    output_schema,
+)
 from ..response import (
     _MODE_DEBUG,
     _MODE_NORMAL,
-    _render_error,
-    _render_response,
+    _finalize_payload,
+    _raise_tool_error,
     _response_mode,
     _response_token_cap,
 )
@@ -38,36 +58,258 @@ from ..response import (
 logger = logging.getLogger(__name__)
 
 
-async def _shielded_write(cache: SemanticCache, coro: Any) -> Any:
+# Tool timeout from config (env TOOL_TIMEOUT, default 30s).
+_TOOL_TIMEOUT: float = TOOL_TIMEOUT
+
+# Global tool mutex: only one tool call executes at a time.
+# Prevents concurrent coroutines from interleaving executor tasks,
+# catalog reads, and ONNX calls — the root cause of hangs when
+# multiple subagents fire tool calls simultaneously.
+_tool_lock: asyncio.Lock | None = None
+_RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
+
+
+# Cached client root — resolved once per session via ctx.list_roots().
+_client_root: Path | None = None
+_client_root_resolved: bool = False
+
+
+async def _resolve_client_root(ctx: Context) -> Path | None:
+    """Fetch and cache the MCP client's project root (first list_roots entry)."""
+    global _client_root, _client_root_resolved
+    if not _client_root_resolved:
+        try:
+            roots = await ctx.list_roots()
+            if roots:
+                uri = str(roots[0].uri)
+                if uri.startswith("file://"):
+                    _client_root = Path(uri[7:])
+                    logger.debug(f"Client root: {_client_root}")
+        except Exception:
+            logger.debug("Could not resolve client roots", exc_info=True)
+        _client_root_resolved = True
+    return _client_root
+
+
+def _resolve_path(path: str, root: Path | None) -> str:
+    """Resolve *path* — absolute passes through, relative joins to *root*."""
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return str(p)
+    if root is not None:
+        return str(root / p)
+    return str(p.resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallState:
+    cache: Any
+    mode: str
+    max_response_tokens: int | None
+    client_root: Path | None
+
+    def resolve(self, path: str) -> str:
+        """Resolve a path against the client's project root."""
+        return _resolve_path(path, self.client_root)
+
+
+def _parse_path_list(raw: str) -> list[str]:
+    """Parse comma-separated or JSON-array path inputs."""
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [p.strip() for p in text.split(",") if p.strip()]
+
+
+def _resolve_path_list(raw: str, state: _ToolCallState) -> list[str]:
+    """Parse and resolve each path against the client root."""
+    return [state.resolve(path) for path in _parse_path_list(raw)]
+
+
+def _get_tool_lock() -> asyncio.Lock:
+    """Lazy-init the lock (must be created inside a running event loop)."""
+    global _tool_lock
+    if _tool_lock is None:
+        _tool_lock = asyncio.Lock()
+    return _tool_lock
+
+
+async def _fresh_mtime_cached_paths(cache: SemanticCache, paths: list[str]) -> list[str]:
+    """Return requested paths already cached and unchanged by mtime.
+
+    This is a tool-layer preflight used to stop redundant full-file reads before
+    smart_read() loads bytes from disk.
+    """
+
+    async def _check(path: str) -> str | None:
+        resolved = Path(path).expanduser().resolve()
+        cached = await cache.get(str(resolved))
+        if cached is None:
+            return None
+        try:
+            file_mtime = (await astat(resolved, cache._io_executor)).st_mtime
+        except (OSError, ValueError):
+            return None
+        if cached.mtime >= file_mtime:
+            return path
+        return None
+
+    unique_paths = list(dict.fromkeys(paths))
+    results = await asyncio.gather(*(_check(path) for path in unique_paths))
+    return [path for path in results if path is not None]
+
+
+def _raise_cached_full_read_block(
+    tool: str, cached_paths: list[str], max_response_tokens: int | None
+) -> None:
+    """Reject diff_mode=false when it only asks for an unchanged cached file."""
+
+    shown = ", ".join(cached_paths[:3])
+    if len(cached_paths) > 3:
+        shown += f", +{len(cached_paths) - 3} more"
+    noun = "file is" if len(cached_paths) == 1 else "files are"
+    _raise_tool_error(
+        tool,
+        "diff_mode=false is blocked for unchanged cached full-file reads. "
+        f"The requested {noun} already cached and unchanged by mtime: {shown}. "
+        "Use diff_mode=true to reuse the cached version, or use read with "
+        "offset/limit for targeted recovery instead of re-requesting the full file.",
+        max_response_tokens,
+    )
+
+
+def _delete_cache_candidates(path: Path) -> list[str]:
+    """Return cache-key candidates for a filesystem delete path.
+
+    Real files are cached by resolved path. Symlinks are deleted as links, so we
+    avoid resolving them to prevent evicting the target file's cache entry.
+    """
+    if path.is_symlink():
+        return [str(path)]
+    return list(dict.fromkeys((str(path.resolve(strict=False)), str(path))))
+
+
+def _is_remote_runtime(value: Any) -> bool:
+    """True when *value* is the supervisor-backed tool runtime."""
+    return getattr(value, "_is_tool_process_supervisor", False) is True
+
+
+async def _tool_call_state(ctx: Context) -> _ToolCallState:
+    return _ToolCallState(
+        cache=ctx.lifespan_context["cache"],
+        mode=_response_mode(),
+        max_response_tokens=_response_token_cap(),
+        client_root=await _resolve_client_root(ctx),
+    )
+
+
+async def _maybe_call_remote_tool(
+    state: _ToolCallState,
+    tool: str,
+    kwargs: dict[str, Any],
+    *,
+    timeout: float,
+) -> _RemoteToolReturnT | None:
+    if not _is_remote_runtime(state.cache):
+        return None
+
+    try:
+        return cast(
+            _RemoteToolReturnT,
+            await state.cache.call_tool(
+                tool,
+                kwargs,
+                output_mode=state.mode,
+                max_response_tokens=state.max_response_tokens,
+                timeout=timeout,
+            ),
+        )
+    except TimeoutError:
+        _raise_tool_error(tool, f"timed out after {timeout}s", state.max_response_tokens)
+
+
+def _serialized(fn):
+    """Decorator: acquire the global tool lock before running the handler.
+
+    Ensures only one tool call executes at a time, preventing concurrent
+    coroutines from interleaving executor tasks and causing hangs.
+
+    Lock acquisition has NO timeout — tools always join the queue.
+    The tool *holding* the lock will release it within TOOL_TIMEOUT
+    (via asyncio.wait_for for reads, asyncio.timeout for writes).
+    """
+    import functools  # noqa: PLC0415
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        async with _get_tool_lock():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _handle_timeout(cache: SemanticCache, tool: str, detail: str = "") -> None:
+    """Reset the executor after a timeout so subsequent calls don't hang."""
+    msg = f"{tool} timed out after {_TOOL_TIMEOUT}s"
+    if detail:
+        msg += f": {detail}"
+    logger.warning(msg)
+    cache.reset_executor()
+
+
+async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | None = None) -> Any:
     """Run a write coroutine protected from cancellation during shutdown.
 
     Uses asyncio.shield so the inner task runs to completion even when
     the tool handler's task is cancelled (e.g. SIGTERM). end_operation()
     fires only after the write actually finishes, keeping the drain
     counter accurate for async_close().
+
+    Timeout is enforced INSIDE the shield via asyncio.timeout, NOT by
+    wrapping this function in asyncio.wait_for.  wait_for + shield is
+    broken: wait_for cancels the wrapper → shield catches CancelledError
+    and re-awaits the inner task → wait_for blocks forever waiting for
+    the wrapper to finish.  asyncio.timeout works because it cancels the
+    *shield future* (which is immediately "done"), not the inner task.
     """
+    if timeout is None:
+        timeout = _TOOL_TIMEOUT
     if not cache.begin_operation():
         coro.close()  # prevent 'coroutine was never awaited' warning
         raise RuntimeError("Server is shutting down")
     task = asyncio.ensure_future(coro)
     task.set_name("shielded-write")
+    timed_out = False
     try:
-        return await asyncio.shield(task)
+        async with asyncio.timeout(timeout):
+            return await asyncio.shield(task)
+    except TimeoutError:
+        timed_out = True
+        raise
     except asyncio.CancelledError:
-        # Outer task was cancelled, but the write must finish.
-        # Re-await the real task (shield kept it alive).
-        return await task
+        # Not our timeout — genuine cancellation (SIGTERM / graceful shutdown).
+        # Give the write a brief grace period to finish disk I/O before
+        # the process exits.
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except (TimeoutError, asyncio.CancelledError):
+            raise asyncio.CancelledError() from None
     finally:
-        cache.end_operation()
+        if not timed_out:
+            cache.end_operation()
 
 
 @mcp.tool(
+    output_schema=output_schema(ReadResponse),
     meta={
         "version": _pkg_version("semantic-cache-mcp"),
         "author": "Dayton Dunbar",
         "github": "https://github.com/CoderDayton/semantic-cache-mcp",
-    }
+    },
 )
+@_serialized
 async def read(
     ctx: Context,
     path: str,
@@ -75,52 +317,84 @@ async def read(
     diff_mode: bool = True,
     offset: int | None = None,
     limit: int | None = None,
-) -> str:
-    """Read a file with token-efficient caching and diffs.
+) -> dict[str, Any]:
+    """Read one file with cache-aware full, unchanged, diff, or truncated output.
 
-    Behavior with diff_mode=true (default):
-    - First read: returns full content and caches it.
-    - Subsequent read, file unchanged: returns a short "unchanged" marker (no content).
-      If you need the actual content again (e.g. after context compression), set diff_mode=false.
-    - Subsequent read, file modified: returns a unified diff of changes.
+    Use this for a single file. For 2+ files, prefer `batch_read`.
 
-    Timing guidance:
-    - Use for single-file inspection and verification.
-    - For 2+ files, prefer batch_read instead.
-    - Keep diff_mode=true during iteration; set false after context compression.
-    - Use offset/limit to read specific line ranges without re-reading the whole file.
+    Normal behavior with `diff_mode=true`:
+    - First read: returns full content and seeds the cache.
+    - Unchanged re-read: returns a short marker plus `"unchanged": true`.
+    - Modified re-read: returns a unified diff.
 
-    Truncated files: the response includes a hint with the offset to continue.
-    Use read(path, offset=N, limit=M) to get the next section — do NOT re-read
-    from the beginning.
+    Routing rules:
+    - If response contains `"unchanged": true`, do not re-read the file just
+      to get full content; the tool is telling you the prior full content is
+      already in conversation context.
+    - Use `offset` and `limit` to recover specific line ranges, especially
+      after truncation or context loss.
+    - `diff_mode=false` is only for uncached or stale files. If the file is
+      already cached and unchanged, the tool rejects the request instead of
+      doing a redundant full-file read.
+
+    Recovery rules:
+    - If output is truncated, keep using `read` with `offset`/`limit`.
+    - Do not re-read from the beginning just to continue a long file.
 
     Args:
-        path: File path (absolute or relative)
-        max_size: Maximum content size to return (default: 100000)
-        diff_mode: Return diff if previously read (default: true). Set false for full content.
-        offset: Line number to start reading from (1-based)
-        limit: Number of lines to read from offset
+        path: File path (absolute or relative to project root). Use absolute
+            paths for files outside the current project root.
+        max_size: Maximum content size to return before summarization.
+        diff_mode: Prefer cache-aware unchanged/diff behavior. Set false only
+            when you explicitly need a full read for an uncached or stale file.
+        offset: 1-based starting line number for targeted reads.
+        limit: Number of lines to return from `offset`.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "read",
+        {
+            "path": path,
+            "max_size": max_size,
+            "diff_mode": diff_mode,
+            "offset": offset,
+            "limit": limit,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     # Validate bounds
     if offset is not None and offset < 1:
-        return _render_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
+        _raise_tool_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
     if limit is not None and limit < 1:
-        return _render_error("read", "limit must be >= 1", max_response_tokens)
+        _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:
+        if not diff_mode and offset is None and limit is None:
+            cached_paths = await _fresh_mtime_cached_paths(cache, [path])
+            if cached_paths:
+                _raise_cached_full_read_block("read", cached_paths, max_response_tokens)
+
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
-            result = await smart_read(
-                cache=cache,
-                path=path,
-                max_size=max_size,
-                diff_mode=False,  # Line ranges bypass diff mode
-                force_full=True,
+            result = await asyncio.wait_for(
+                smart_read(
+                    cache=cache,
+                    path=path,
+                    max_size=max_size,
+                    diff_mode=False,  # Line ranges bypass diff mode
+                    force_full=True,
+                    refresh_cache=False,
+                ),
+                timeout=_TOOL_TIMEOUT,
             )
             cache.metrics.record("read", result)
             lines = result.content.splitlines(keepends=True)
@@ -151,25 +425,37 @@ async def read(
                 payload["from_cache"] = result.from_cache
                 payload["tokens_saved"] = result.tokens_saved
 
-            return _render_response(payload, max_response_tokens)
+            return _finalize_payload(payload, max_response_tokens)
 
-        result = await smart_read(
-            cache=cache,
-            path=path,
-            max_size=max_size,
-            diff_mode=diff_mode,
+        result = await asyncio.wait_for(
+            smart_read(
+                cache=cache,
+                path=path,
+                max_size=max_size,
+                diff_mode=diff_mode,
+            ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
+        # Detect unchanged files: from_cache=True + is_diff=False means
+        # the LLM already has this file's content from a prior read.
+        unchanged = result.from_cache and not result.is_diff
+
         payload = {
             "ok": True,
             "tool": "read",
             "path": path,
             "content": result.content,
         }
+        if unchanged:
+            payload["unchanged"] = True
         if mode in _MODE_NORMAL:
-            payload["is_diff"] = result.is_diff
-            payload["truncated"] = result.truncated
-            payload["semantic_match"] = result.semantic_match
+            if result.is_diff:
+                payload["is_diff"] = True
+            if result.truncated:
+                payload["truncated"] = True
+            if result.semantic_match:
+                payload["semantic_match"] = result.semantic_match
             if result.truncated:
                 # Truncated reads use semantic summarization — the returned
                 # content is non-contiguous, so line numbers don't map to the
@@ -195,26 +481,41 @@ async def read(
                 "limit": limit,
             }
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("read", str(e), max_response_tokens)
+        _raise_tool_error("read", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "read", path)
+        _raise_tool_error("read", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
-        return _render_error("read", f"reading failed: {e}", max_response_tokens)
+        _raise_tool_error("read", f"reading failed: {e}", max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(StatsResponse))
+@_serialized
 async def stats(
     ctx: Context,
-) -> str:
-    """Get cache statistics, session activity, and lifetime metrics.
+) -> ToolResult:
+    """Inspect cache health, token savings, and runtime diagnostics.
 
-    Returns cache occupancy, token savings, tool call counts, embedding model
-    info, and process memory usage. Useful for monitoring cache effectiveness
-    and diagnosing performance issues.
+    Use this for debugging or measurement, not as a normal step in routine
+    read/edit loops.
+
+    Returns cache occupancy, hit rates, token savings, tool-call counts,
+    embedding model info, and process memory usage.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
+    state = await _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    remote_result: ToolResult | None = await _maybe_call_remote_tool(
+        state, "stats", {}, timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
+
     cache_stats = await cache.get_stats()
     model_info = get_model_info()
 
@@ -260,6 +561,48 @@ async def stats(
     ready = model_info.get("ready", False)
     provider_str = f"{provider} ✓" if ready else f"{provider} ✗"
 
+    structured_payload: dict[str, Any] = {
+        "mode": mode,
+        "storage": {
+            "files_cached": cache_stats.get("files_cached", 0),
+            "total_tokens_cached": cache_stats.get("total_tokens_cached", 0),
+            "total_documents": cache_stats.get("total_documents", 0),
+            "db_size_mb": cache_stats.get("db_size_mb", 0.0),
+        },
+        "session": {
+            "uptime_s": session.get("uptime_s", 0),
+            "tokens_saved": s_saved,
+            "tokens_original": s_original,
+            "tokens_returned": session.get("tokens_returned", 0),
+            "cache_hits": s_hits,
+            "cache_misses": s_misses,
+            "hit_rate_pct": s_hit_pct,
+            "files_read": session.get("files_read", 0),
+            "files_written": session.get("files_written", 0),
+            "files_edited": session.get("files_edited", 0),
+            "diffs_served": session.get("diffs_served", 0),
+            "tool_calls": dict(session.get("tool_calls", {})),
+        },
+        "lifetime": {
+            "total_sessions": lt_sessions,
+            "tokens_saved": lt_saved,
+            "tokens_original": lt_original,
+            "tokens_returned": lifetime.get("tokens_returned", 0),
+            "cache_hits": lt_hits,
+            "cache_misses": lt_misses,
+            "hit_rate_pct": lt_hit_pct,
+            "files_read": lifetime.get("files_read", 0),
+            "files_written": lifetime.get("files_written", 0),
+            "files_edited": lifetime.get("files_edited", 0),
+        },
+        "embedding": {
+            "model": model_name,
+            "provider": provider,
+            "ready": ready,
+            "process_rss_mb": cache_stats.get("process_rss_mb"),
+        },
+    }
+
     if mode == "compact":
         lines = [
             "## Semantic Cache",
@@ -281,7 +624,7 @@ async def stats(
                 f"{'s' if lt_sessions != 1 else ''} · {model_name} · {provider_str}*"
             ),
         ]
-        return "\n".join(lines)
+        return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
     if mode == "normal":
         uptime = _uptime(session.get("uptime_s", 0))
@@ -365,29 +708,157 @@ async def stats(
             "|---|---|---:|",
             f"| `{model_name}` | {provider_str} | {mem_str} |",
         ]
-        return "\n".join(lines)
+        return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
     # debug — full raw dump
-    return f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```"
+    return ToolResult(
+        content=f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```",
+        structured_content=structured_payload,
+    )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(ClearResponse))
+@_serialized
 async def clear(
     ctx: Context,
-) -> str:
-    """Clear all cache entries (content, embeddings, indexes). Returns count removed."""
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+) -> dict[str, Any]:
+    """Clear the semantic cache only; does not modify project files.
+
+    Use this rarely, mainly to recover from stale cache state or to force cold
+    re-seeding. Prefer normal `read`/`batch_read` refresh behavior when
+    possible.
+
+    Returns the number of cached entries removed.
+    """
+    state = await _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "clear", {}, timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
+
     count = await cache.clear()
     cache.metrics.record("clear", None)
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
-    return _render_response(payload, max_response_tokens)
+    return _finalize_payload(payload, max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(DeleteResponse))
+@_serialized
+async def delete(
+    ctx: Context,
+    path: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Delete one file or one symlink path and evict cache entries for that path.
+
+    Use this for explicit single-path removal instead of shelling out.
+
+    Normal statuses:
+    - `deleted`: file or symlink path was removed
+    - `would_delete`: dry-run preview only
+    - `not_found`: path did not exist; this is not an error
+
+    Constraints:
+    - No globs
+    - No recursive delete
+    - No real-directory delete
+    - If `path` is a symlink, deletes the link itself, not the target
+
+    Args:
+        path: File or symlink path (absolute or relative to project root).
+        dry_run: Preview without deleting or evicting cache.
+    """
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "delete", {"path": path, "dry_run": dry_run}, timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
+
+    target = Path(path).expanduser()
+    is_symlink = target.is_symlink()
+    exists = target.exists() or is_symlink
+    if target.is_dir() and not is_symlink:
+        _raise_tool_error(
+            "delete",
+            "directory deletion is not supported; delete only removes one file or symlink path",
+            max_response_tokens,
+        )
+
+    try:
+        if dry_run:
+            payload: dict[str, Any] = {
+                "ok": True,
+                "tool": "delete",
+                "status": "would_delete" if exists else "not_found",
+                "path": path,
+                "deleted": False,
+                "dry_run": True,
+                "cache_removed": False,
+            }
+            if mode == _MODE_DEBUG:
+                payload["symlink"] = is_symlink
+            return _finalize_payload(payload, max_response_tokens)
+
+        deleted = False
+        if exists:
+            await aunlink(target, executor=cache._io_executor)
+            deleted = True
+
+        cache_removed_count = 0
+        for candidate in _delete_cache_candidates(target):
+            cache_removed_count += await cache.delete_path(candidate)
+
+        cache.metrics.record("delete", None)
+        payload = {
+            "ok": True,
+            "tool": "delete",
+            "status": "deleted" if deleted else "not_found",
+            "path": path,
+            "deleted": deleted,
+            "dry_run": False,
+            "cache_removed": cache_removed_count > 0,
+        }
+        if mode == _MODE_DEBUG:
+            payload["symlink"] = is_symlink
+        return _finalize_payload(payload, max_response_tokens)
+
+    except FileNotFoundError:
+        payload = {
+            "ok": True,
+            "tool": "delete",
+            "status": "not_found",
+            "path": path,
+            "deleted": False,
+            "dry_run": False,
+            "cache_removed": False,
+        }
+        if mode == _MODE_DEBUG:
+            payload["symlink"] = is_symlink
+        return _finalize_payload(payload, max_response_tokens)
+    except PermissionError as e:
+        _raise_tool_error("delete", f"permission denied - {e}", max_response_tokens)
+    except OSError as e:
+        _raise_tool_error("delete", f"I/O operation failed - {e}", max_response_tokens)
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error in delete")
+        _raise_tool_error("delete", str(e), max_response_tokens)
+
+
+@mcp.tool(output_schema=output_schema(WriteResponse))
+@_serialized
 async def write(
     ctx: Context,
     path: str,
@@ -396,32 +867,53 @@ async def write(
     dry_run: bool = False,
     auto_format: bool = False,
     append: bool = False,
-) -> str:
-    """Write file content with cache integration.
+) -> dict[str, Any]:
+    """Create or replace a file, with cache refresh and overwrite diffs.
 
-    Timing:
-    - Use when creating files or replacing most/all content.
-    - For targeted substitutions, prefer edit or batch_edit.
-    - Use auto_format=true at stabilization points, not during rapid iteration.
+    Use this when you already know the full new file content. For targeted
+    changes inside an existing file, prefer `edit` or `batch_edit`.
 
-    Large files: use append=true to write in chunks:
-      write(path, chunk1)                               # creates file
-      write(path, chunk2, append=true)                   # appends
-      write(path, chunk3, append=true, auto_format=true) # final chunk + format
+    Routing rules:
+    - New file or full replacement: use `write`.
+    - Small localized change: use `edit`.
+    - Multiple localized changes in one file: use `batch_edit`.
 
-    Response: returns a diff for overwrites/appends, or just status for new files.
+    Behavior:
+    - Overwrites return a diff when useful.
+    - New files return creation status.
+    - `append=true` supports chunked construction for large files.
+    - `dry_run=true` previews without writing.
+    - `auto_format=true` is best used near the end of an edit cycle.
 
     Args:
-        path: File path (absolute or relative)
-        content: Content to write (or content to append when append=true)
-        create_parents: Create parent directories (default: true)
-        dry_run: Preview changes without writing (default: false)
-        auto_format: Run formatter after write (default: false)
-        append: Append content to existing file instead of overwriting (default: false)
+        path: File path to create or replace.
+        content: Full content to write, or appended content when
+            `append=true`.
+        create_parents: Create missing parent directories when needed.
+        dry_run: Preview without writing.
+        auto_format: Run formatter after write.
+        append: Append instead of overwrite.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "write",
+        {
+            "path": path,
+            "content": content,
+            "create_parents": create_parents,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+            "append": append,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
         result = await _shielded_write(
@@ -460,29 +952,37 @@ async def write(
             payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("write", "server is shutting down", max_response_tokens)
-        return _render_error("write", str(e), max_response_tokens)
+            _raise_tool_error("write", "server is shutting down", max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("write", str(e), max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("write", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("write", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("write", str(e), max_response_tokens)
+        _raise_tool_error("write", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "write", path)
+        _raise_tool_error("write", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in write: {e}")
-        return _render_error("write", f"I/O operation failed - {e}", max_response_tokens)
+        _raise_tool_error("write", f"I/O operation failed - {e}", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in write")
-        return _render_error(
-            "write", "Internal error occurred while writing file", max_response_tokens
+        _raise_tool_error(
+            "write",
+            "Internal error occurred while writing file",
+            max_response_tokens,
         )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(EditResponse))
+@_serialized
 async def edit(
     ctx: Context,
     path: str,
@@ -493,38 +993,59 @@ async def edit(
     auto_format: bool = False,
     start_line: int | None = None,
     end_line: int | None = None,
-) -> str:
-    """Edit file using find/replace with cached reads.
+) -> dict[str, Any]:
+    """Edit one file using cache-aware exact replacement.
 
-    Three modes — use line numbers from `read` to save tokens:
-    - **find/replace**: old_string + new_string. Searches entire file.
-    - **scoped**: old_string + new_string + start_line/end_line. Shorter context suffices.
-    - **line replace**: new_string + start_line/end_line only. Maximum token savings.
+    Prefer this over `write` when you want to preserve the rest of the file.
+    Use line numbers from `read` whenever possible to keep the edit precise.
 
-    Timing:
-    - Use for a single targeted change. For 2+ changes, use batch_edit.
-    - When you have line numbers from read, prefer scoped or line replace mode.
-    - Use dry_run to validate match uniqueness before committing.
+    Modes:
+    - Find/replace: `old_string` + `new_string`
+    - Scoped replace: add `start_line` + `end_line`
+    - Line-range replace: omit `old_string`, provide `start_line` + `end_line`
 
-    Multiple matches: fails with match count and hint. Add more context or
-    set replace_all=true.
+    Routing rules:
+    - One localized change: use `edit`
+    - Multiple independent changes in the same file: use `batch_edit`
+    - Full-file rewrite: use `write`
 
-    Response: unified diff of the change with affected line numbers.
+    Precision rules:
+    - Keep `old_string` exact and as short as possible, ideally one line.
+    - If a match is ambiguous, add more context or line bounds.
+    - Use `replace_all=true` only when every match should change.
 
     Args:
-        path: File path (absolute or relative)
-        old_string: Exact string to find (whitespace-sensitive).
-            Omit for line-replace mode (requires start_line/end_line).
-        new_string: Replacement string
-        replace_all: Replace all occurrences (default: false). Not valid in line-replace mode.
-        dry_run: Preview without writing (default: false)
-        auto_format: Run formatter after edit (default: false)
-        start_line: Start of line range, 1-based inclusive. Must pair with end_line.
-        end_line: End of line range, 1-based inclusive. Must pair with start_line.
+        path: File path to modify.
+        old_string: Exact text to find. Omit only for line-range replacement.
+        new_string: Replacement text.
+        replace_all: Replace all matches instead of requiring uniqueness.
+        dry_run: Preview without writing.
+        auto_format: Run formatter after editing.
+        start_line: 1-based inclusive start line for scoped or line-range edit.
+        end_line: 1-based inclusive end line for scoped or line-range edit.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "edit",
+        {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
         result = await _shielded_write(
@@ -568,70 +1089,87 @@ async def edit(
                 "auto_format": auto_format,
             }
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("edit", "server is shutting down", max_response_tokens)
-        return _render_error("edit", str(e), max_response_tokens)
+            _raise_tool_error("edit", "server is shutting down", max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("edit", str(e), max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("edit", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("edit", str(e), max_response_tokens)
+        _raise_tool_error("edit", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "edit", path)
+        _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
-        return _render_error("edit", f"I/O operation failed - {e}", max_response_tokens)
+        _raise_tool_error("edit", f"I/O operation failed - {e}", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in edit")
-        return _render_error(
-            "edit", "Internal error occurred while editing file", max_response_tokens
-        )
+        _raise_tool_error("edit", "Internal error occurred while editing file", max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(BatchEditResponse))
+@_serialized
 async def batch_edit(
     ctx: Context,
     path: str,
     edits: str,
     dry_run: bool = False,
     auto_format: bool = False,
-) -> str:
-    """Apply multiple independent edits to a file in one call. Max 50 edits.
+) -> dict[str, Any]:
+    """Apply multiple exact edits to one file in a single call.
 
-    Supports three edit modes per entry (same as `edit` tool):
-    - **find/replace**: [old, new] or {"old": "...", "new": "..."}
-    - **scoped find/replace**: [old, new, start_line, end_line] or
-      {"old": "...", "new": "...", "start_line": 10, "end_line": 15}
-    - **line replace**: [null, new, start_line, end_line] or
-      {"old": null, "new": "...", "start_line": 10, "end_line": 15}
+    Use this when several independent edits belong in the same file. For one
+    change, prefer `edit`. For cross-file work, call the relevant tools per
+    file instead of trying to batch across files.
 
-    Timing guidance:
-    - Use when applying 2+ edits to the same file in one step.
-    - More token-efficient than repeated edit calls on the same file.
-    - Use dry_run when testing risky edit batches.
-    - Prefer line-range modes when you know exact line numbers from `read`.
+    Supported entry forms:
+    - `[old, new]` for full-file exact replacement
+    - `[old, new, start_line, end_line]` for scoped replacement
+    - `[null, new, start_line, end_line]` for line-range replacement
+    - `{"old": ..., "new": ..., "start_line": ..., "end_line": ...}`
 
-    Partial success: each edit is applied independently. When edits fail, the
-    response includes a failures list with the old_string and error for each —
-    use these to retry or correct without a separate debug call.
+    Behavior:
+    - Partial success is allowed.
+    - Failed edits are returned so you can retry only the misses.
+    - Prefer line-range entries when you already have line numbers from `read`.
 
     Args:
-        path: Absolute path to file
-        edits: JSON array of edit entries (see modes above)
-        dry_run: Preview without writing (default: false)
-        auto_format: Run formatter after edits (default: false)
+        path: File path to modify.
+        edits: JSON array of edit entries for that file.
+        dry_run: Preview without writing.
+        auto_format: Run formatter after edits.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "batch_edit",
+        {
+            "path": path,
+            "edits": edits,
+            "dry_run": dry_run,
+            "auto_format": auto_format,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
         # Parse edits JSON
         edits_str = edits.strip()
         if not edits_str.startswith("["):
-            return _render_error(
+            _raise_tool_error(
                 "batch_edit",
                 "edits must be a JSON array of [old, new] pairs",
                 max_response_tokens,
@@ -656,7 +1194,7 @@ async def batch_edit(
                 el = int(item["end_line"]) if item.get("end_line") is not None else None
                 edit_tuples.append((old, str(item["new"]), sl, el))
             else:
-                return _render_error(
+                _raise_tool_error(
                     "batch_edit",
                     "Each edit must be [old, new], [old, new, start, end], "
                     "or {old, new, start_line?, end_line?}",
@@ -721,57 +1259,83 @@ async def batch_edit(
             payload["from_cache"] = result.from_cache
             payload["params"] = {"dry_run": dry_run, "auto_format": auto_format}
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except RuntimeError as e:
         if "shutting down" in str(e):
-            return _render_error("batch_edit", "server is shutting down", max_response_tokens)
-        return _render_error("batch_edit", str(e), max_response_tokens)
+            _raise_tool_error("batch_edit", "server is shutting down", max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
     except json.JSONDecodeError as e:
-        return _render_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
+        _raise_tool_error("batch_edit", f"Invalid JSON in edits - {e}", max_response_tokens)
     except FileNotFoundError as e:
-        return _render_error("batch_edit", str(e), max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
     except PermissionError as e:
-        return _render_error("batch_edit", f"permission denied - {e}", max_response_tokens)
+        _raise_tool_error("batch_edit", f"permission denied - {e}", max_response_tokens)
     except ValueError as e:
-        return _render_error("batch_edit", str(e), max_response_tokens)
+        _raise_tool_error("batch_edit", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "batch_edit", path)
+        _raise_tool_error("batch_edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception:
         logger.exception("Unexpected error in batch_edit")
-        return _render_error(
+        _raise_tool_error(
             "batch_edit",
             "Internal error occurred while editing file",
             max_response_tokens,
         )
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(SearchResponse))
+@_serialized
 async def search(
     ctx: Context,
     query: str,
     k: int = 10,
     directory: str | None = None,
-) -> str:
-    """Search cached files by meaning and keywords (hybrid BM25 + vector RRF).
+) -> dict[str, Any]:
+    """Search cached files by meaning or mixed keyword intent.
 
-    Only searches files already in the cache. Seed with batch_read first.
-    Use `glob cached_only=true` to check what's cached.
+    This is a cache-only semantic search. If results are empty, the likely
+    cause is that the relevant files were never seeded with `read` or
+    `batch_read`.
 
-    Timing:
-    - batch_read target files first, then search across them.
-    - Start with k=3–5; increase only if recall is insufficient.
-    - Use directory to limit scope on large codebases.
+    Routing rules:
+    - Use `search` for meaning-based queries such as concepts, behavior, or
+      intent.
+    - Use `grep` for exact symbols, strings, or regex patterns.
+    - Use `glob` to discover candidate files before seeding the cache.
+
+    Usage guidance:
+    - Seed likely files with `batch_read` first.
+    - Start with small `k` such as 3–5.
+    - Use `directory` to keep large codebases focused.
 
     Args:
-        query: Natural language or keyword search (both work — results are fused)
-        k: Max results (default: 10, max: 100)
-        directory: Optional directory path to limit search scope
+        query: Natural-language query, keywords, or a mixture of both.
+        k: Maximum number of matches to return.
+        directory: Optional directory filter applied after retrieval.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    directory = state.resolve(directory) if directory else None
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "search",
+        {"query": query, "k": k, "directory": directory},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
-        result = await semantic_search(cache, query, k=k, directory=directory)
+        result = await asyncio.wait_for(
+            semantic_search(cache, query, k=k, directory=directory),
+            timeout=_TOOL_TIMEOUT,
+        )
         cache.metrics.record("search", result)
 
         match_payload: list[dict[str, Any]] = []
@@ -796,38 +1360,60 @@ async def search(
             payload["k"] = k
             payload["directory"] = directory
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
+    except TimeoutError:
+        _handle_timeout(cache, "search", query[:50])
+        _raise_tool_error("search", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in search")
-        return _render_error("search", str(e), max_response_tokens)
+        _raise_tool_error("search", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(DiffResponse))
+@_serialized
 async def diff(
     ctx: Context,
     path1: str,
     path2: str,
     context_lines: int = 3,
-) -> str:
-    """Compare two files. Returns unified diff and semantic similarity score.
+) -> dict[str, Any]:
+    """Compare two files side by side and return a unified diff.
 
-    Use for explicit side-by-side comparison. For checking changes to a single
-    file over time, use read (which returns diffs automatically).
+    Use this for explicit file-to-file comparison. For "what changed since I
+    last read this file?", use `read` instead of `diff`.
 
-    Large diffs are auto-summarized to stay within token budget.
+    Behavior:
+    - Returns unified diff plus semantic similarity score.
+    - Reuses cached content when possible.
+    - Large diffs may be suppressed to stay within token budget.
 
     Args:
-        path1: First file path
-        path2: Second file path
-        context_lines: Lines of context in diff (default: 3)
+        path1: First file path.
+        path2: Second file path.
+        context_lines: Number of context lines to include around changes.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path1, path2 = state.resolve(path1), state.resolve(path2)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "diff",
+        {"path1": path1, "path2": path2, "context_lines": context_lines},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
-        result = await compare_files(cache, path1, path2, context_lines=context_lines)
+        result = await asyncio.wait_for(
+            compare_files(cache, path1, path2, context_lines=context_lines),
+            timeout=_TOOL_TIMEOUT,
+        )
         cache.metrics.record("diff", result)
 
         payload: dict[str, Any] = {
@@ -845,72 +1431,96 @@ async def diff(
             payload["from_cache"] = result.from_cache
             payload["context_lines"] = context_lines
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("diff", str(e), max_response_tokens)
+        _raise_tool_error("diff", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "diff")
+        _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in diff")
-        return _render_error("diff", str(e), max_response_tokens)
+        _raise_tool_error("diff", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(BatchReadResponse))
+@_serialized
 async def batch_read(
     ctx: Context,
     paths: str,
     max_total_tokens: int = 50000,
     priority: str = "",
     diff_mode: bool = True,
-) -> str:
-    """Read multiple files under a token budget. Supports glob patterns in paths.
+) -> dict[str, Any]:
+    """Read multiple files under a token budget, with cache-aware suppression.
 
-    Timing:
-    - Prefer over repeated read calls when working with 2+ files.
-    - Use early to seed the cache before search/similar/grep.
-    - After context compression, call with diff_mode=false to reload content.
-    - Start with a tight token budget; increase only if files are skipped.
+    Use this to seed the cache, gather several files at once, or expand globs
+    before `search`, `similar`, or `grep`. Prefer it over many single-file
+    `read` calls.
 
-    Response includes per-file status: full, diff, unchanged, or skipped.
-    Skipped files include est_tokens so you can retry them individually or
-    increase the budget. Unchanged files cost ~0 tokens.
+    Behavior:
+    - Unchanged files are omitted from per-file content and listed in
+      `summary.unchanged`.
+    - Modified files may return diffs.
+    - Large files may be skipped once the token budget is exhausted.
+    - `diff_mode=false` is only for uncached or stale files; unchanged cached
+      full-file requests are rejected.
+
+    Recovery rules:
+    - If a file is skipped for budget, use `read` with `offset`/`limit` or
+      raise the budget.
+    - If a file is listed in `summary.unchanged`, do not immediately re-read it
+      just to fetch the same cached full content again.
 
     Args:
-        paths: Comma-separated paths, JSON array, or glob patterns (e.g. "src/**/*.py")
-        max_total_tokens: Token budget (default: 50000, max: 200000)
-        priority: Comma-separated or JSON array of paths to read first (order preserved)
-        diff_mode: When false, always return full content (use after context compression)
+        paths: Comma-separated paths, JSON array, or glob patterns.
+        max_total_tokens: Token budget across the batch.
+        priority: Optional paths to read first before the remaining files.
+        diff_mode: Prefer cache-aware unchanged/diff behavior unless you
+            explicitly need full reads for uncached or stale files.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
 
     try:
-        # Parse paths (comma-separated or JSON array)
-        paths_str = paths.strip()
-        if paths_str.startswith("["):
-            path_list: list[str] = json.loads(paths_str)
-        else:
-            path_list = [p.strip() for p in paths_str.split(",") if p.strip()]
+        path_list = _resolve_path_list(paths, state)
+        priority_list = _resolve_path_list(priority, state) if priority.strip() else None
+        remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+            state,
+            "batch_read",
+            {
+                "paths": json.dumps(path_list),
+                "max_total_tokens": max_total_tokens,
+                "priority": json.dumps(priority_list) if priority_list else "",
+                "diff_mode": diff_mode,
+            },
+            timeout=_TOOL_TIMEOUT * 2,
+        )
+        if remote_result is not None:
+            return remote_result
 
         # Expand glob patterns
         path_list = _expand_globs(path_list)
 
-        # Parse priority
-        priority_list: list[str] | None = None
-        priority_str = priority.strip()
-        if priority_str:
-            if priority_str.startswith("["):
-                priority_list = json.loads(priority_str)
-            else:
-                priority_list = [p.strip() for p in priority_str.split(",") if p.strip()]
+        if not diff_mode:
+            cached_paths = await _fresh_mtime_cached_paths(cache, path_list)
+            if cached_paths:
+                _raise_cached_full_read_block("batch_read", cached_paths, max_response_tokens)
 
-        result = await batch_smart_read(
-            cache,
-            path_list,
-            max_total_tokens=max_total_tokens,
-            priority=priority_list,
-            diff_mode=diff_mode,
-        )
+        result = await asyncio.wait_for(
+            batch_smart_read(
+                cache,
+                path_list,
+                max_total_tokens=max_total_tokens,
+                priority=priority_list,
+                diff_mode=diff_mode,
+            ),
+            timeout=_TOOL_TIMEOUT * 2,
+        )  # batch gets double timeout
         cache.metrics.record("batch_read", result)
 
         # Build restructured response — separate unchanged, skipped, and content files
@@ -963,45 +1573,71 @@ async def batch_read(
             payload["skipped"] = skipped_items
         payload["files"] = file_items
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except json.JSONDecodeError:
-        return _render_error(
+        _raise_tool_error(
             "batch_read",
             "Invalid paths format. Use comma-separated or JSON array.",
             max_response_tokens,
         )
+    except TimeoutError:
+        _handle_timeout(cache, "batch_read")
+        _raise_tool_error(
+            "batch_read",
+            f"timed out after {_TOOL_TIMEOUT * 2}s",
+            max_response_tokens,
+        )
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in batch_read")
-        return _render_error("batch_read", str(e), max_response_tokens)
+        _raise_tool_error("batch_read", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(SimilarResponse))
+@_serialized
 async def similar(
     ctx: Context,
     path: str,
     k: int = 5,
-) -> str:
-    """Find files semantically similar to a given file using cached embeddings.
+) -> dict[str, Any]:
+    """Find cached files semantically similar to one source file.
 
-    Compares against files already in the cache. The source file is cached
-    automatically, but neighbors must be cached first (via batch_read) to appear.
+    Use this to discover related implementations, tests, or configs after the
+    surrounding code has already been seeded into the cache.
 
-    Timing:
-    - Use to discover related implementations, tests, or config files.
-    - batch_read a directory first, then use similar to find connections.
-    - Start with k=3–5.
+    Important constraint:
+    - The source file is handled automatically.
+    - Candidate neighbor files must already be cached, typically via
+      `batch_read`, or they will not appear.
+
+    Usage guidance:
+    - Seed a directory with `batch_read` first.
+    - Start with `k=3` to `k=5`.
+    - Empty results usually mean either only the source file is cached or the
+      relevant neighbors were never seeded.
 
     Args:
-        path: Source file path (absolute or relative)
-        k: Max results (default: 5, max: 50)
+        path: Source file path.
+        k: Maximum number of similar files to return.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "similar",
+        {"path": path, "k": k},
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
-        result = await find_similar_files(cache, path, k=k)
+        result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
         cache.metrics.record("similar", result)
 
         similar_payload = [
@@ -1022,40 +1658,66 @@ async def similar(
         if mode == _MODE_DEBUG:
             payload["k"] = k
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
     except FileNotFoundError as e:
-        return _render_error("similar", str(e), max_response_tokens)
+        _raise_tool_error("similar", str(e), max_response_tokens)
+    except TimeoutError:
+        _handle_timeout(cache, "similar", path)
+        _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in similar")
-        return _render_error("similar", str(e), max_response_tokens)
+        _raise_tool_error("similar", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(GlobResponse))
+@_serialized
 async def glob(
     ctx: Context,
     pattern: str,
     directory: str = ".",
     cached_only: bool = False,
-) -> str:
-    """Find files by glob pattern with cache status. Max 1000 matches, 5s timeout.
+) -> dict[str, Any]:
+    """Discover files by glob and show whether each one is already cached.
 
-    Timing:
-    - Use first to discover files, then batch_read the results.
-    - Keep patterns specific (e.g. "src/**/*.py" not "**/*").
-    - Use cached_only=true to see what's already cached before search/grep.
+    Use this before `batch_read`, `search`, `similar`, or `grep` when you need
+    candidate files or want to inspect cache coverage.
 
-    Each match shows: path, cached (bool), tokens, mtime. Pipe results
-    directly into batch_read paths.
+    Routing rules:
+    - Use `glob` to discover paths.
+    - Use `batch_read` to seed or read them.
+    - Use `cached_only=true` when you want to know what search/grep can already
+      see without more reads.
+
+    Usage guidance:
+    - Keep patterns specific.
+    - Avoid broad patterns like `**/*` unless truly necessary.
+    - Matches can be fed directly into `batch_read`.
 
     Args:
-        pattern: Glob pattern (e.g., "**/*.py")
-        directory: Base directory (default: current)
-        cached_only: Only return files already in cache (default: false)
+        pattern: Glob pattern to expand.
+        directory: Base directory for the glob.
+        cached_only: Restrict results to already cached files.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    directory = state.resolve(directory)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "glob",
+        {
+            "pattern": pattern,
+            "directory": directory,
+            "cached_only": cached_only,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
         result = await glob_with_cache_status(
@@ -1085,45 +1747,72 @@ async def glob(
         if mode == _MODE_DEBUG:
             payload["total_cached_tokens"] = result.total_cached_tokens
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in glob")
-        return _render_error("glob", str(e), max_response_tokens)
+        _raise_tool_error("glob", str(e), max_response_tokens)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=output_schema(GrepResponse))
+@_serialized
 async def grep(
     ctx: Context,
     pattern: str,
+    path: str | None = None,
     fixed_string: bool = False,
     case_sensitive: bool = True,
     context_lines: int = 0,
     max_matches: int = 100,
     max_files: int = 50,
-) -> str:
-    """Exact pattern search across cached files with line numbers and context.
+) -> dict[str, Any]:
+    """Search cached files for an exact string or regex, with line numbers.
 
-    Like ripgrep on the cache. For semantic/fuzzy queries, use `search` instead.
-    Only searches cached files — seed with batch_read first.
+    This is the cache-only exact-search tool. It is intentionally closer to
+    "ripgrep on cached content" than to live filesystem search.
 
-    Timing:
-    - Use for exact code patterns: function names, imports, error strings.
-    - Use `search` for meaning-based queries like "error handling logic".
-    - Set fixed_string=true for literals with regex chars (e.g. "foo.bar()").
-    - Add context_lines=2–3 to see surrounding code.
+    Routing rules:
+    - Use `grep` for exact symbols, literals, imports, error strings, or regex.
+    - Use `search` for semantic or fuzzy intent.
+    - Seed candidate files with `batch_read` first; empty results may simply
+      mean the relevant files are not cached yet.
+
+    Usage guidance:
+    - Set `fixed_string=true` for literals containing regex metacharacters.
+    - Add `path` to limit scope to one file, a suffix, or a glob.
+    - Add `context_lines=2` or `3` when surrounding code matters.
 
     Args:
-        pattern: Regex pattern (or literal string if fixed_string=true)
-        fixed_string: Treat pattern as literal, not regex (default: false)
-        case_sensitive: Case-sensitive matching (default: true)
-        context_lines: Lines of context before/after each match (default: 0)
-        max_matches: Total match limit across all files (default: 100)
-        max_files: Maximum files to return (default: 50)
+        pattern: Regex pattern, or a literal if `fixed_string=true`.
+        path: Optional exact path, suffix, or glob filter.
+        fixed_string: Treat `pattern` as a literal instead of regex.
+        case_sensitive: Whether matching is case-sensitive.
+        context_lines: Number of context lines to include around matches.
+        max_matches: Maximum total matches across all files.
+        max_files: Maximum number of files to return.
     """
-    cache: SemanticCache = ctx.lifespan_context["cache"]
-    mode = _response_mode()
-    max_response_tokens = _response_token_cap()
+    state = await _tool_call_state(ctx)
+    cache = state.cache
+    mode = state.mode
+    max_response_tokens = state.max_response_tokens
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "grep",
+        {
+            "pattern": pattern,
+            "path": path,
+            "fixed_string": fixed_string,
+            "case_sensitive": case_sensitive,
+            "context_lines": context_lines,
+            "max_matches": max_matches,
+            "max_files": max_files,
+        },
+        timeout=_TOOL_TIMEOUT,
+    )
+    if remote_result is not None:
+        return remote_result
 
     try:
         # In compact mode, context lines are dropped in the response anyway —
@@ -1131,6 +1820,7 @@ async def grep(
         effective_context = context_lines if mode in _MODE_NORMAL else 0
         results = await cache._storage.grep(
             pattern,
+            path=path,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
             context_lines=effective_context,
@@ -1168,6 +1858,7 @@ async def grep(
             "ok": True,
             "tool": "grep",
             "pattern": pattern,
+            "path": path,
             "total_matches": total_matches,
             "files_matched": len(files_payload),
             "files": files_payload,
@@ -1177,11 +1868,13 @@ async def grep(
             payload["case_sensitive"] = case_sensitive
             payload["context_lines"] = context_lines
 
-        return _render_response(payload, max_response_tokens)
+        return _finalize_payload(payload, max_response_tokens)
 
+    except ToolError:
+        raise
     except Exception as e:
         logger.exception("Error in grep")
-        return _render_error("grep", str(e), max_response_tokens)
+        _raise_tool_error("grep", str(e), max_response_tokens)
 
 
 _EXPAND_GLOBS_TIMEOUT = 5  # seconds — matches GLOB_TIMEOUT_SECONDS

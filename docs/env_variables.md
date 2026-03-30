@@ -55,6 +55,7 @@ Any HuggingFace sentence-transformer model with an ONNX export will work — if 
 |----------|---------|-------------|
 | `TOOL_OUTPUT_MODE` | `compact` | Response detail level. Options: `compact` (minimal metadata, best for token savings), `normal` (includes context lines in grep, extra diagnostics), `debug` (full diagnostics including timing and internal state). |
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global cap on response tokens per tool call. `0` disables the cap. Useful for constraining token budget on large operations. |
+| `TOOL_TIMEOUT` | `30` | Seconds before a tool call times out and returns an error. On timeout, the executor is automatically reset so subsequent calls work without restarting. Lower for fast machines, raise for slow I/O or large files. |
 
 ## Example: MCP Server Config with Custom Env
 

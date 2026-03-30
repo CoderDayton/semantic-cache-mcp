@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
+from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, cast
 
-from ..config import CACHE_DIR
+from ..config import CACHE_DIR, TOOL_TIMEOUT
 from ..core import count_tokens
+from ..logger import log_marker
 from ..storage import SQLiteStorage, VectorStorage
 from ..storage.vector import VECDB_PATH
 from ..types import CacheEntry, EmbeddingVector
+from ..utils import DetachedExecutor
 from .metrics import SessionMetrics
 
 logger = logging.getLogger(__name__)
@@ -286,14 +290,24 @@ class SemanticCache:
         "_shutting_down",
         "_inflight",
         "_drained",
+        "_io_executor",
+        "_stale_paths",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
     _DRAIN_TIMEOUT: float = 8.0
 
     def __init__(self, db_path: Path = VECDB_PATH) -> None:
-        self._storage = VectorStorage(db_path)
-        # Keep SQLiteStorage only for session metrics persistence
+        # Single-thread executor shared by ALL blocking operations:
+        # file I/O, ONNX embedding inference, and vecdb index saves.
+        # MUST be single-threaded — ONNX Runtime and usearch use
+        # incompatible allocators that segfault under concurrent access
+        # from different threads.
+        # Passed to VectorStorage → AsyncVectorDB so simplevecdb's own
+        # operations (add_texts, similarity_search, etc.) also serialize
+        # on this thread.
+        self._io_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
+        self._storage = VectorStorage(db_path, executor=self._io_executor)
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
         self._metrics = SessionMetrics(self._metrics_storage._pool)
@@ -302,9 +316,27 @@ class SemanticCache:
         self._inflight = 0
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
-        # Dedicated single-thread executor for ONNX embedding calls.
-        # ONNX Runtime serializes inference internally, so >1 thread just
-        # wastes default-pool slots waiting on its session lock.
+        self._stale_paths: set[str] = set()
+
+    def reset_executor(self) -> None:
+        """Replace the IO executor with a fresh one after a timeout/hang.
+
+        Abandons the stuck thread (it will be GC'd when its task completes or
+        the process exits) and creates a new single-threaded executor. All
+        references on VectorStorage and simplevecdb are updated atomically.
+        """
+        logger.warning("Resetting IO executor — previous thread may be stuck")
+        old = self._io_executor
+        # Don't wait for the old executor — the current call may be wedged in
+        # a blocking C extension or a kernel I/O wait and cannot be cancelled.
+        old.shutdown(wait=False, cancel_futures=True)
+
+        new_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
+        self._io_executor = new_executor
+        self._storage._io_executor = new_executor
+        self._storage._db._executor = new_executor
+        self._storage._collection._executor = new_executor
+        logger.debug("IO executor replaced with fresh instance")
 
     @property
     def metrics(self) -> SessionMetrics:
@@ -349,10 +381,10 @@ class SemanticCache:
         # Catch CancelledError so cleanup proceeds even if our task is cancelled
         # during asyncio.run()'s shutdown (after loop.stop from signal handler).
         if self._inflight > 0:
-            logger.info(f"Waiting for {self._inflight} in-flight operation(s) to finish...")
+            logger.debug(f"Waiting for {self._inflight} in-flight operation(s) to finish...")
             try:
                 await asyncio.wait_for(self._drained.wait(), timeout=self._DRAIN_TIMEOUT)
-                logger.info("All in-flight operations drained")
+                logger.debug("All in-flight operations drained")
             except TimeoutError:
                 logger.warning(
                     f"Drain timeout ({self._DRAIN_TIMEOUT}s) expired with "
@@ -381,6 +413,11 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._io_executor.shutdown(wait=False)
+
+        # Remove crash sentinel — signals clean shutdown.
+        VectorStorage._remove_sentinel()
+
     def close(self) -> None:
         """Synchronous close fallback (no drain wait).
 
@@ -407,14 +444,21 @@ class SemanticCache:
         except Exception as e:
             logger.warning(f"Failed to close metrics pool: {e}")
 
+        self._io_executor.shutdown(wait=False)
+
+        # Remove crash sentinel — signals clean shutdown.
+        VectorStorage._remove_sentinel()
+
     # -------------------------------------------------------------------------
     # Embedding
     # -------------------------------------------------------------------------
 
-    def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
+    async def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
         """Embed text using FastEmbed. When path is given, prepends a file-type label
         (e.g. "Python source code: ...") so the model gets intent-rich context instead
         of raw syntactic noise — improves retrieval for JSON, YAML, and config files.
+
+        Runs ONNX inference in a thread executor to avoid blocking the event loop.
         """
         try:
             # Late import from package so patch("semantic_cache_mcp.cache.embed") in tests works.
@@ -424,11 +468,27 @@ class SemanticCache:
             if path:
                 text = f"{_file_label(path)}: {text}"
 
-            result = _embed(text)
+            loop = asyncio.get_running_loop()
+            started = time.perf_counter()
+            log_marker(
+                logger,
+                "embed.single.begin",
+                path=path or None,
+                chars=min(len(text), 8000),
+            )
+            result = await loop.run_in_executor(self._io_executor, _embed, text)
+            log_marker(
+                logger,
+                "embed.single.end",
+                path=path or None,
+                ok=result is not None,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
             if result:
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result
         except Exception as e:
+            log_marker(logger, "embed.single.fail", path=path or None, error=type(e).__name__)
             logger.warning(f"Failed to get embedding: {e}")
             return None
 
@@ -437,10 +497,34 @@ class SemanticCache:
     # -------------------------------------------------------------------------
 
     async def get(self, path: str) -> CacheEntry | None:
+        if path in self._stale_paths:
+            logger.debug(f"Treating stale cache entry as miss: {path}")
+            return None
         entry = await self._storage.get(path)
         if entry:
             logger.debug(f"Cache hit: {path}")
         return entry
+
+    def mark_stale(self, path: str) -> None:
+        self._stale_paths.add(path)
+
+    def clear_stale(self, path: str) -> None:
+        self._stale_paths.discard(path)
+
+    def is_stale(self, path: str) -> bool:
+        return path in self._stale_paths
+
+    def _compute_refresh_timeout(self, *, has_embedding: bool) -> float:
+        """Choose a timeout based on the work still left in refresh_path()."""
+        if has_embedding:
+            return min(max(1.0, TOOL_TIMEOUT * 0.1), 2.0)
+
+        import semantic_cache_mcp.core.embeddings._model as _emb_model  # noqa: PLC0415
+
+        if _emb_model._model_ready:
+            return min(max(2.0, TOOL_TIMEOUT * 0.2), 6.0)
+
+        return min(max(5.0, TOOL_TIMEOUT * 0.5), 15.0)
 
     async def put(
         self,
@@ -450,8 +534,87 @@ class SemanticCache:
         embedding: EmbeddingVector | None = None,
     ) -> None:
         tokens = count_tokens(content)
+        started = time.perf_counter()
+        log_marker(
+            logger,
+            "cache.put.begin",
+            path=path,
+            tokens=tokens,
+            has_embedding=embedding is not None,
+        )
         await self._storage.put(path, content, mtime, embedding)
-        logger.info(f"Cached file: {path} ({tokens} tokens)")
+        log_marker(
+            logger,
+            "cache.put.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        logger.debug(f"Cached file: {path} ({tokens} tokens)")
+
+    async def refresh_path(
+        self,
+        path: str,
+        content: str,
+        mtime: float,
+        embedding: EmbeddingVector | None = None,
+        *,
+        embedding_path: str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        refresh_timeout = (
+            self._compute_refresh_timeout(has_embedding=embedding is not None)
+            if timeout is None
+            else timeout
+        )
+        started = time.perf_counter()
+        log_marker(
+            logger,
+            "cache.refresh.begin",
+            path=path,
+            timeout_s=refresh_timeout,
+            has_embedding=embedding is not None,
+        )
+
+        async def _refresh() -> None:
+            actual_embedding = embedding
+            if actual_embedding is None:
+                actual_embedding = await self.get_embedding(content, embedding_path or path)
+            await self.put(path, content, mtime, actual_embedding)
+
+        try:
+            await asyncio.wait_for(_refresh(), timeout=refresh_timeout)
+        except TimeoutError:
+            self.mark_stale(path)
+            log_marker(
+                logger,
+                "cache.refresh.timeout",
+                path=path,
+                timeout_s=refresh_timeout,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+            logger.warning(f"Cache refresh timed out for {path}; marking stale and resetting IO")
+            self.reset_executor()
+            return False
+        except Exception as e:
+            self.mark_stale(path)
+            log_marker(
+                logger,
+                "cache.refresh.fail",
+                path=path,
+                error=type(e).__name__,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+            logger.warning(f"Cache refresh failed for {path}: {e}")
+            return False
+
+        self.clear_stale(path)
+        log_marker(
+            logger,
+            "cache.refresh.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        return True
 
     async def get_content(self, entry: CacheEntry) -> str:
         return await self._storage.get_content(entry)
@@ -511,7 +674,33 @@ class SemanticCache:
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
-        return cast(list[EmbeddingVector | None], _embed_batch(texts))
+        started = time.perf_counter()
+        log_marker(logger, "embed.batch.begin", count=len(texts))
+        try:
+            result = cast(list[EmbeddingVector | None], _embed_batch(texts))
+            log_marker(
+                logger,
+                "embed.batch.end",
+                count=len(texts),
+                ok=sum(1 for item in result if item is not None),
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+            return result
+        except Exception as exc:
+            log_marker(
+                logger,
+                "embed.batch.fail",
+                count=len(texts),
+                error=type(exc).__name__,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            )
+            raise
 
     async def clear(self) -> int:
         return await self._storage.clear()
+
+    async def delete_path(self, path: str) -> int:
+        """Delete one cached path and clear any stale marker for it."""
+        removed = await self._storage.delete_path(path)
+        self.clear_stale(path)
+        return removed

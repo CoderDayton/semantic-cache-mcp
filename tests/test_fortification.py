@@ -321,21 +321,21 @@ class TestClearSync:
 class TestVectorStorageHealthCheck:
     """is_healthy() should return True when the DB is usable, False otherwise."""
 
-    def test_healthy_after_init(self, tmp_path: Path) -> None:
+    async def test_healthy_after_init(self, tmp_path: Path) -> None:
         from semantic_cache_mcp.storage.vector import VectorStorage
 
         vs = VectorStorage(tmp_path / "vec.db")
         try:
-            assert vs.is_healthy() is True
+            assert await vs.is_healthy() is True
         finally:
             vs.close()
 
-    def test_unhealthy_after_close(self, tmp_path: Path) -> None:
+    async def test_unhealthy_after_close(self, tmp_path: Path) -> None:
         from semantic_cache_mcp.storage.vector import VectorStorage
 
         vs = VectorStorage(tmp_path / "vec.db")
         vs.close()
-        assert vs.is_healthy() is False
+        assert await vs.is_healthy() is False
 
 
 # ---------------------------------------------------------------------------

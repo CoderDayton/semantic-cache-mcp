@@ -1,20 +1,41 @@
 <p align="center">
-  <img src="assets/logo.svg" width="128" height="128" alt="Semantic Cache MCP Logo">
+  <img
+    src="https://cdn.jsdelivr.net/gh/CoderDayton/semantic-cache-mcp@f8af5804ddc7c3fed62d6901c0c7df098a76164e/assets/logo.svg"
+    width="128"
+    height="128"
+    alt="Semantic Cache MCP Logo"
+  />
 </p>
 
 <h1 align="center">Semantic Cache MCP</h1>
 
 <p align="center">
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"></a>
-  <a href="https://github.com/modelcontextprotocol/python-sdk"><img src="https://img.shields.io/badge/FastMCP-3.0-green.svg" alt="FastMCP 3.0"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://ko-fi.com/U7U01WTJF9">
+    <img
+      src="https://ko-fi.com/img/githubbutton_sm.svg"
+      alt="Support on Ko-fi"
+      height="36"
+    />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.python.org/downloads/" >
+    <img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" />
+  </a>
+  <a href="https://github.com/modelcontextprotocol/python-sdk">
+    <img src="https://img.shields.io/badge/FastMCP-3.0-00A67E?style=for-the-badge" alt="FastMCP 3.0" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" />
+  </a>
 </p>
 
 ---
 
 **Reduce Claude Code token usage by 80%+ with intelligent file caching.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that eliminates redundant token consumption when Claude reads files. Instead of sending full file contents on every request, it returns diffs for changed files, suppresses unchanged files entirely, and intelligently summarizes large files — all transparently through 12 purpose-built MCP tools.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that eliminates redundant token consumption when Claude reads files. Instead of sending full file contents on every request, it returns diffs for changed files, suppresses unchanged files entirely, and intelligently summarizes large files — all transparently through 13 purpose-built MCP tools.
 
 ---
 
@@ -133,21 +154,22 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Smart file reading with diff-mode. Three states: first read (full + cache), unchanged (99% savings), modified (diff, 80–95% savings). Use `offset`/`limit` for line ranges. |
-| `write` | Write files with cache integration. `auto_format=true` runs formatter. `append=true` enables chunked writes for large files. Returns diff on overwrite. |
-| `edit` | Find/replace using cached reads — three modes: full-file, scoped to a line range, or direct line replacement. `dry_run=true` previews. `replace_all=true` handles multiple matches. Returns unified diff. |
-| `batch_edit` | Up to 50 edits per call with partial success. Each entry can be find/replace, scoped, or line-range replacement. `auto_format=true` and `dry_run=true` supported. |
+| `read` | Single-file cache-aware read. Returns full content on first read, unchanged markers on cache hits, diffs on modifications, and supports `offset`/`limit` for targeted recovery. |
+| `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
+| `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
+| `edit` | Single-file exact edit using cached content. Best for one localized change; supports scoped and line-range replacement plus `dry_run=true`. |
+| `batch_edit` | Multiple exact edits in one file with partial success reporting. Best when several localized changes belong in the same file. |
 
 ### Discovery
 
 | Tool | Description |
 |------|-------------|
-| `search` | Semantic/embedding search across cached files by meaning — not keywords. Seed cache first with `read` or `batch_read`. |
-| `similar` | Finds semantically similar cached files to a given path. Start with `k=3–5`. Only searches cached files. |
-| `glob` | Pattern matching with cache status per file. `cached_only=true` filters to already-cached files. Max 1000 matches, 5s timeout. |
-| `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Pre-scans and batch-embeds all new/changed files in a single model call. Set `diff_mode=false` after context compression. |
-| `grep` | Regex or literal pattern search across cached files with line numbers and optional context lines. Like ripgrep for the cache. |
-| `diff` | Compare two files. Returns unified diff plus semantic similarity score. Large diffs are auto-summarized to stay within token budget. |
+| `search` | Cache-only semantic search for meaning or mixed keyword intent. Seed likely files first with `batch_read`; use `grep` for exact text. |
+| `similar` | Cache-only nearest-neighbor lookup for one source file. Best after seeding a directory with `batch_read`. |
+| `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
+| `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
+| `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
+| `diff` | Explicit side-by-side file comparison with unified diff and semantic similarity. Use `read` instead for “what changed since last read?”. |
 
 ### Management
 
@@ -166,7 +188,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```
 read path="/src/app.py"
 read path="/src/app.py" diff_mode=true         # default
-read path="/src/app.py" diff_mode=false        # full content (use after context compression)
+read path="/src/app.py" diff_mode=false        # full content only when cache is stale/missing
 read path="/src/app.py" offset=120 limit=80    # lines 120–199 only
 ```
 
@@ -284,7 +306,7 @@ batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
 - **Token budget**: stops reading new files once `max_total_tokens` reached; skipped files include `est_tokens` hint
 - **Unchanged suppression**: unchanged files appear in `summary.unchanged` with no content (zero tokens)
 - **Batch embedding**: pre-scans all new/changed files and embeds them in a single model call before reading — N model calls reduced to 1
-- **Context compression recovery**: set `diff_mode=false` when Claude needs full content after losing context
+- **Full-read guard**: `diff_mode=false` is rejected for unchanged cached files; use `diff_mode=true` to reuse cache or `read` with `offset`/`limit` for targeted recovery
 
 </details>
 
@@ -308,6 +330,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `TOOL_OUTPUT_MODE` | `compact` | Response detail (`compact`, `normal`, `debug`) |
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
+| `TOOL_TIMEOUT` | `30` | Seconds before tool call times out (auto-resets executor) |
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
 | `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from typing import TYPE_CHECKING, Any
 
 from ...config import EMBEDDING_DEVICE
+from ...logger import log_marker
 from ...utils import retry
 from ._constants import FASTEMBED_CACHE_DIR, FASTEMBED_MODEL
 from ._cuda import _cuda_provider_is_available
@@ -29,8 +31,14 @@ def _get_model() -> TextEmbedding:
     if _embedding_model is None:
         from fastembed import TextEmbedding
 
-        logger.info(f"Loading embedding model: {FASTEMBED_MODEL}")
-        logger.info(f"Model cache directory: {FASTEMBED_CACHE_DIR}")
+        started = time.perf_counter()
+        log_marker(
+            logger,
+            "embed.model.init.begin",
+            model=FASTEMBED_MODEL,
+            device=EMBEDDING_DEVICE,
+            cache_dir=FASTEMBED_CACHE_DIR,
+        )
 
         FASTEMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -116,11 +124,17 @@ def _get_model() -> TextEmbedding:
                 # 3x model size + 512MB headroom for attention spikes and kernel workspace
                 mem_limit = int(model_info["onnx_size_bytes"]) * 3 + 512 * 1024 * 1024  # type: ignore[arg-type]
                 init_kwargs["providers"][0][1]["gpu_mem_limit"] = mem_limit
-                logger.info(f"GPU memory limit set to {mem_limit / (1024**3):.1f}GB from ONNX size")
+                logger.debug(
+                    f"GPU memory limit set to {mem_limit / (1024**3):.1f}GB from ONNX size"
+                )
             _embedding_model, _execution_provider = _init_or_fallback(init_kwargs)
 
-        logger.info(f"Embedding execution provider: {_execution_provider}")
-        logger.info("Embedding model loaded")
+        log_marker(
+            logger,
+            "embed.model.init.end",
+            provider=_execution_provider,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
 
     return _embedding_model
 
@@ -138,7 +152,8 @@ def warmup() -> None:
     if _model_ready:
         return
 
-    logger.info("Warming up embedding model...")
+    started = time.perf_counter()
+    log_marker(logger, "embed.warmup.begin")
     model = _get_model()
 
     # Representative texts at different lengths to warm up ONNX kernel cache
@@ -165,4 +180,9 @@ def warmup() -> None:
         _embedding_dim = len(results[0])
 
     _model_ready = True
-    logger.info(f"Embedding model warmed up (dim={_embedding_dim})")
+    log_marker(
+        logger,
+        "embed.warmup.end",
+        dim=_embedding_dim,
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+    )

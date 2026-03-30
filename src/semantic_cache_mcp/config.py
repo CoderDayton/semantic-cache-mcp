@@ -1,22 +1,11 @@
 """Configuration constants for semantic-cache-mcp."""
 
-import logging
 import sys
 from os import environ
 from pathlib import Path
 from typing import Final
 
-# Logging configuration — explicit stderr handler to prevent stdout pollution
-# in stdio MCP transport. Default basicConfig would also use stderr, but being
-# explicit guards against accidental reconfiguration by third-party libraries.
-LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
-LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-if not logging.root.handlers:
-    _handler = logging.StreamHandler(sys.stderr)
-    _handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    logging.root.addHandler(_handler)
-logging.root.setLevel(LOG_LEVEL)
+from .logger import DEFAULT_LOG_FORMAT, configure_logging, get_log_dir, get_log_file_path
 
 
 # Paths
@@ -48,6 +37,21 @@ def _get_cache_dir() -> Path:
 
 CACHE_DIR: Final = _get_cache_dir()
 DB_PATH: Final = CACHE_DIR / "cache.db"
+LOG_DIR: Final = get_log_dir(CACHE_DIR, environ.get("LOG_DIR"))
+LOG_FILE_PATH: Final = get_log_file_path(LOG_DIR)
+
+# Crash sentinel — written on startup, removed on clean shutdown.
+# If present at next startup → previous run crashed → wipe vecdb to avoid
+# heap corruption from corrupted usearch index files.
+STARTUP_SENTINEL: Final = CACHE_DIR / ".startup.lock"
+
+
+# Logging configuration — explicit stderr handler to prevent stdout pollution
+# in stdio MCP transport, plus a dated file handler for post-mortem debugging.
+LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT: Final = DEFAULT_LOG_FORMAT
+
+configure_logging(LOG_DIR, LOG_FILE_PATH, log_level=LOG_LEVEL, log_format=LOG_FORMAT)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,6 +60,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
     except ValueError:
         return default
 
@@ -81,6 +95,7 @@ EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)
+TOOL_TIMEOUT: Final = _env_float("TOOL_TIMEOUT", 30.0)  # seconds before tool call times out
 
 # Similarity
 SIMILARITY_THRESHOLD: Final = 0.85  # Semantic similarity threshold
@@ -134,6 +149,9 @@ def _validate_config() -> None:
 
     if TOOL_MAX_RESPONSE_TOKENS < 0:
         errors.append(f"TOOL_MAX_RESPONSE_TOKENS ({TOOL_MAX_RESPONSE_TOKENS}) must be >= 0")
+
+    if TOOL_TIMEOUT <= 0:
+        errors.append(f"TOOL_TIMEOUT ({TOOL_TIMEOUT}) must be > 0")
 
     if EMBEDDING_DEVICE not in {"cpu", "cuda", "auto"}:
         errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, gpu, cuda, auto")

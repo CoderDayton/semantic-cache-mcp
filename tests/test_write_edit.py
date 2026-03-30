@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -966,3 +967,46 @@ class TestSmartBatchEditLineRange:
 
         assert result.succeeded == 2
         assert file_path.read_text() == "aaa\nXXX\nYYY\nddd\n"
+
+
+class TestBestEffortCacheRefresh:
+    """Mutation tools should still succeed when vecdb refresh degrades."""
+
+    async def test_write_succeeds_when_refresh_fails(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        file_path = temp_dir / "write_refresh_failure.txt"
+
+        with patch.object(SemanticCache, "refresh_path", new=AsyncMock(return_value=False)):
+            result = await smart_write(semantic_cache_no_embeddings, str(file_path), "hello\n")
+
+        assert result.created is True
+        assert file_path.read_text() == "hello\n"
+
+    async def test_edit_succeeds_when_refresh_fails(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        file_path = temp_dir / "edit_refresh_failure.txt"
+        file_path.write_text("hello world\n")
+
+        with patch.object(SemanticCache, "refresh_path", new=AsyncMock(return_value=False)):
+            result = await smart_edit(semantic_cache_no_embeddings, str(file_path), "world", "mars")
+
+        assert result.replacements_made == 1
+        assert file_path.read_text() == "hello mars\n"
+
+    async def test_batch_edit_succeeds_when_refresh_fails(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        file_path = temp_dir / "batch_refresh_failure.txt"
+        file_path.write_text("a\nb\nc\n")
+
+        with patch.object(SemanticCache, "refresh_path", new=AsyncMock(return_value=False)):
+            result = await smart_batch_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                [("b", "beta")],
+            )
+
+        assert result.succeeded == 1
+        assert file_path.read_text() == "a\nbeta\nc\n"

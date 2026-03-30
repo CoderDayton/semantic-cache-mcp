@@ -180,7 +180,7 @@ class TestRecordEdit:
 
         assert metrics.files_edited == 1
         assert metrics.cache_hits == 1
-        assert metrics.tokens_saved == 100
+        assert metrics.tokens_saved == 0
 
     def test_batch_edit_increments_files_edited(self, metrics: SessionMetrics) -> None:
         result = BatchEditResult(
@@ -201,7 +201,50 @@ class TestRecordEdit:
         metrics.record("batch_edit", result)
 
         assert metrics.files_edited == 1
-        assert metrics.tokens_saved == 200
+        assert metrics.tokens_saved == 0
+
+    def test_batch_edit_with_no_success_does_not_increment_files_edited(
+        self, metrics: SessionMetrics
+    ) -> None:
+        result = BatchEditResult(
+            path="/test.py",
+            outcomes=[
+                SingleEditOutcome(
+                    old_string="missing",
+                    new_string="new",
+                    success=False,
+                    line_number=None,
+                    error="not found",
+                ),
+            ],
+            succeeded=0,
+            failed=1,
+            diff_content="",
+            diff_stats={},
+            tokens_saved=0,
+            content_hash="def",
+            from_cache=False,
+        )
+        metrics.record("batch_edit", result)
+
+        assert metrics.files_edited == 0
+
+    def test_edit_dry_run_does_not_increment_files_edited(self, metrics: SessionMetrics) -> None:
+        result = EditResult(
+            path="/test.py",
+            matches_found=1,
+            replacements_made=1,
+            line_numbers=[10],
+            diff_content="@@ -10 +10 @@",
+            diff_stats={"insertions": 1, "deletions": 1},
+            tokens_saved=100,
+            content_hash="abc",
+            from_cache=True,
+            dry_run=True,
+        )
+        metrics.record("edit", result)
+
+        assert metrics.files_edited == 0
 
 
 class TestRecordDiff:
@@ -219,9 +262,39 @@ class TestRecordDiff:
         )
         metrics.record("diff", result)
 
-        assert metrics.tokens_saved == 300
+        assert metrics.tokens_saved == 0
         assert metrics.cache_hits == 1
         assert metrics.cache_misses == 1
+
+
+class TestRecordBatchReadDerivedTotals:
+    """Batch-read metrics must preserve coherent saved/original/returned totals."""
+
+    def test_batch_read_derives_original_and_cache_counts(self, metrics: SessionMetrics) -> None:
+        result = BatchReadResult(
+            files=[
+                FileReadSummary(path="/a.py", tokens=10, status="unchanged", from_cache=True),
+                FileReadSummary(path="/b.py", tokens=25, status="diff", from_cache=True),
+                FileReadSummary(path="/c.py", tokens=40, status="full", from_cache=False),
+                FileReadSummary(path="/d.py", tokens=0, status="skipped", from_cache=False),
+            ],
+            contents={"/b.py": "diff", "/c.py": "full"},
+            total_tokens=75,
+            tokens_saved=125,
+            files_read=3,
+            files_skipped=1,
+            unchanged_paths=["/a.py"],
+        )
+
+        metrics.record("batch_read", result)
+
+        assert metrics.tokens_saved == 125
+        assert metrics.tokens_original == 200
+        assert metrics.tokens_returned == 75
+        assert metrics.cache_hits == 2
+        assert metrics.cache_misses == 1
+        assert metrics.diffs_served == 1
+        assert metrics.files_read == 3
 
 
 class TestRecordNone:
@@ -366,3 +439,25 @@ class TestPersistAndLifetime:
         assert lifetime["tokens_saved"] == 100  # 50 * 2
         assert lifetime["files_read"] == 2
         assert lifetime["files_written"] == 2
+
+    def test_write_dry_run_not_persisted_as_file_write(self, storage: SQLiteStorage) -> None:
+        m = SessionMetrics(storage._pool)
+        m.record(
+            "write",
+            WriteResult(
+                path="/f.py",
+                bytes_written=10,
+                tokens_written=5,
+                created=True,
+                diff_content=None,
+                diff_stats=None,
+                tokens_saved=0,
+                content_hash="h",
+                from_cache=False,
+                dry_run=True,
+            ),
+        )
+        m.persist()
+
+        lifetime = storage.get_lifetime_stats()
+        assert lifetime["files_written"] == 0

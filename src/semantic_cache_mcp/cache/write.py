@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import tempfile
 from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.hashing import hash_content
-from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
+from ..types import BatchEditResult, EditResult, EmbeddingVector, SingleEditOutcome, WriteResult
+from ..utils import aread_bytes, aread_text, astat, awrite_atomic
+from ..utils._async_io import (
+    _atomic_write_sync as _atomic_write,  # noqa: F401 — re-exported for tests
+)
 from ._helpers import (
     MAX_EDIT_SIZE,
     MAX_MATCHES,
@@ -28,29 +30,25 @@ logger = logging.getLogger(__name__)
 MAX_BATCH_EDITS = 50
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    """Atomic write via temp-file + rename. Preserves original permissions."""
-    # Write to temp file in same directory (same filesystem for atomic rename)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with open(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        # Preserve original file permissions (mkstemp creates 0600)
-        if path.exists():
-            import os
-            import stat
+async def _maybe_reuse_cached_embedding(
+    cache: SemanticCache,
+    file_path: Path,
+    stats: dict[str, int] | None,
+) -> EmbeddingVector | None:
+    """Reuse the cached embedding for small text changes when it is still representative."""
+    if not stats:
+        return None
 
-            try:
-                original_mode = path.stat().st_mode
-                os.chmod(tmp_path, stat.S_IMODE(original_mode))
-            except OSError:
-                pass  # Best effort; new file gets default permissions
-        Path(tmp_path).replace(path)  # Atomic on POSIX, best-effort on Windows
-    except BaseException:
-        # Clean up temp file on any failure
-        with contextlib.suppress(OSError):
-            Path(tmp_path).unlink(missing_ok=True)
-        raise
+    changed = stats.get("insertions", 0) + stats.get("deletions", 0)
+    total = stats.get("total_lines", changed + 1)
+    if total <= 0 or changed / total >= 0.2:
+        return None
+
+    cached_entry = await cache.get(str(file_path))
+    if cached_entry and cached_entry.embedding:
+        logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
+        return cached_entry.embedding
+    return None
 
 
 async def smart_write(
@@ -94,7 +92,7 @@ async def smart_write(
         if create_parents:
             if not dry_run:
                 parent.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Created parent directories: {parent}")
+                logger.debug(f"Created parent directories: {parent}")
         else:
             raise FileNotFoundError(f"Parent directory does not exist: {parent}")
 
@@ -112,7 +110,7 @@ async def smart_write(
     if not created:
         # Check for binary file
         try:
-            sample = file_path.read_bytes()[:8192]
+            sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
             if _is_binary_content(sample):
                 raise ValueError(
                     f"Binary file not supported: {path}. Cannot overwrite binary with text."
@@ -123,7 +121,7 @@ async def smart_write(
         # Try to get content from cache first (saves tokens!)
         cached = await cache.get(str(file_path))
         if cached:
-            mtime = file_path.stat().st_mtime
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
             if cached.mtime >= mtime:
                 old_content = await cache.get_content(cached)
                 from_cache = True
@@ -131,7 +129,7 @@ async def smart_write(
             else:
                 # mtime changed — check content hash before falling back to disk
                 try:
-                    disk_bytes = file_path.read_bytes()
+                    disk_bytes = await aread_bytes(file_path, cache._io_executor)
                     if hash_content(disk_bytes) == cached.content_hash:
                         await cache.update_mtime(str(file_path), mtime)
                         old_content = await cache.get_content(cached)
@@ -143,9 +141,11 @@ async def smart_write(
         # Fall back to disk read
         if old_content is None:
             try:
-                old_content = file_path.read_text(encoding="utf-8")
+                old_content = await aread_text(file_path, executor=cache._io_executor)
             except UnicodeDecodeError:
-                old_content = file_path.read_text(encoding="utf-8", errors="replace")
+                old_content = await aread_text(
+                    file_path, errors="replace", executor=cache._io_executor
+                )
                 logger.warning(f"File {path} contains non-UTF-8 characters")
 
     # Append mode: concatenate new content onto existing
@@ -172,7 +172,7 @@ async def smart_write(
     # Write file (unless dry_run)
     if not dry_run:
         try:
-            _atomic_write(file_path, content)
+            await awrite_atomic(file_path, content, cache._io_executor)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
@@ -182,7 +182,7 @@ async def smart_write(
             formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
-                content = file_path.read_text(encoding="utf-8")
+                content = await aread_text(file_path, executor=cache._io_executor)
                 content_bytes = content.encode("utf-8")
                 bytes_written = len(content_bytes)
                 tokens_written = count_tokens(content)
@@ -196,14 +196,26 @@ async def smart_write(
                     diff_tokens = count_tokens(diff_content) if diff_content else 0
                     tokens_saved = max(0, tokens_written - diff_tokens)
 
-        # Update cache with final content
-        mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(content, path)
-        await cache.put(str(file_path), content, mtime, embedding)
+        # Update cache with final content.
+        # Skip re-embedding for small edits (< 20% changed) — the old
+        # embedding is similar enough for retrieval, saving ~23ms ONNX call.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        embedding = await _maybe_reuse_cached_embedding(
+            cache,
+            file_path,
+            diff_stats_result if (not created and from_cache) else None,
+        )
+        await cache.refresh_path(
+            str(file_path),
+            content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = "Created" if created else "Updated"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action} and cached: {path}")
+        logger.debug(f"{action} and cached: {path}")
 
     return WriteResult(
         path=str(file_path),
@@ -215,6 +227,7 @@ async def smart_write(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )
 
 
@@ -280,7 +293,7 @@ async def smart_edit(
 
     # Check for binary file
     try:
-        sample = file_path.read_bytes()[:8192]
+        sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
         if _is_binary_content(sample):
             raise ValueError(f"Binary file not supported: {path}. Edit only works with text files.")
     except OSError as e:
@@ -292,7 +305,7 @@ async def smart_edit(
     cached = await cache.get(str(file_path))
 
     if cached:
-        mtime = file_path.stat().st_mtime
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
         if cached.mtime >= mtime:
             content = await cache.get_content(cached)
             from_cache = True
@@ -300,9 +313,11 @@ async def smart_edit(
         else:
             # mtime changed — check content hash before falling back to disk
             try:
-                disk_content = file_path.read_text(encoding="utf-8")
+                disk_content = await aread_text(file_path, executor=cache._io_executor)
             except UnicodeDecodeError:
-                disk_content = file_path.read_text(encoding="utf-8", errors="replace")
+                disk_content = await aread_text(
+                    file_path, errors="replace", executor=cache._io_executor
+                )
             if hash_content(disk_content) == cached.content_hash:
                 await cache.update_mtime(str(file_path), mtime)
                 content = await cache.get_content(cached)
@@ -313,9 +328,9 @@ async def smart_edit(
     else:
         # No cache entry, read from disk
         try:
-            content = file_path.read_text(encoding="utf-8")
+            content = await aread_text(file_path, executor=cache._io_executor)
         except UnicodeDecodeError:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            content = await aread_text(file_path, errors="replace", executor=cache._io_executor)
 
     # Validate content size
     if len(content) > MAX_EDIT_SIZE:
@@ -432,7 +447,7 @@ async def smart_edit(
     # Write file (unless dry_run)
     if not dry_run:
         try:
-            _atomic_write(file_path, new_content)
+            await awrite_atomic(file_path, new_content, cache._io_executor)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
@@ -442,7 +457,7 @@ async def smart_edit(
             formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
-                new_content = file_path.read_text(encoding="utf-8")
+                new_content = await aread_text(file_path, executor=cache._io_executor)
                 content_hash = hash_content(new_content.encode("utf-8"))
 
                 # Re-compute diff against original (before format)
@@ -450,14 +465,21 @@ async def smart_edit(
                 diff_stats_result = diff_stats(content, new_content)
                 diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
-        # Update cache with final content
-        mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(new_content, path)
-        await cache.put(str(file_path), new_content, mtime, embedding)
+        # Update cache with final content.
+        # Skip re-embedding for small edits — reuse cached embedding.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)
+        await cache.refresh_path(
+            str(file_path),
+            new_content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action} and cached: {path}")
+        logger.debug(f"{action} and cached: {path}")
 
     return EditResult(
         path=str(file_path),
@@ -469,6 +491,7 @@ async def smart_edit(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )
 
 
@@ -511,7 +534,7 @@ async def smart_batch_edit(
 
     # Check for binary file
     try:
-        sample = file_path.read_bytes()[:8192]
+        sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
         if _is_binary_content(sample):
             raise ValueError(f"Binary file not supported: {path}")
     except OSError as e:
@@ -523,13 +546,15 @@ async def smart_batch_edit(
     cached = await cache.get(str(file_path))
 
     if cached:
-        mtime = file_path.stat().st_mtime
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
         if cached.mtime >= mtime:
             content = await cache.get_content(cached)
             from_cache = True
         else:
             # mtime changed — check content hash before falling back to disk
-            disk_content = file_path.read_text(encoding="utf-8", errors="replace")
+            disk_content = await aread_text(
+                file_path, errors="replace", executor=cache._io_executor
+            )
             if hash_content(disk_content) == cached.content_hash:
                 await cache.update_mtime(str(file_path), mtime)
                 content = await cache.get_content(cached)
@@ -537,7 +562,7 @@ async def smart_batch_edit(
             else:
                 content = disk_content
     else:
-        content = file_path.read_text(encoding="utf-8")
+        content = await aread_text(file_path, executor=cache._io_executor)
 
     original_content = content
 
@@ -671,7 +696,7 @@ async def smart_batch_edit(
     # Write file if any edits succeeded (unless dry_run)
     if succeeded > 0 and not dry_run:
         try:
-            _atomic_write(file_path, new_content)
+            await awrite_atomic(file_path, new_content, cache._io_executor)
         except OSError as e:
             raise PermissionError(f"Cannot write file: {e}") from e
 
@@ -681,7 +706,7 @@ async def smart_batch_edit(
             formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
-                new_content = file_path.read_text(encoding="utf-8")
+                new_content = await aread_text(file_path, executor=cache._io_executor)
                 content_hash = hash_content(new_content.encode("utf-8"))
 
                 # Re-compute diff against original (before format)
@@ -689,14 +714,21 @@ async def smart_batch_edit(
                 stats = diff_stats(original_content, new_content)
                 diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
-        # Update cache with final content
-        mtime = file_path.stat().st_mtime
-        embedding = cache.get_embedding(new_content, path)
-        await cache.put(str(file_path), new_content, mtime, embedding)
+        # Update cache with final content.
+        # Skip re-embedding for small edits — reuse cached embedding.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        embedding = await _maybe_reuse_cached_embedding(cache, file_path, stats)
+        await cache.refresh_path(
+            str(file_path),
+            new_content,
+            mtime,
+            embedding,
+            embedding_path=path,
+        )
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:
             action += " and formatted"
-        logger.info(f"{action}: {path}")
+        logger.debug(f"{action}: {path}")
 
     return BatchEditResult(
         path=str(file_path),
@@ -708,4 +740,5 @@ async def smart_batch_edit(
         tokens_saved=tokens_saved,
         content_hash=content_hash,
         from_cache=from_cache,
+        dry_run=dry_run,
     )

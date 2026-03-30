@@ -198,3 +198,15 @@ class TestStatisticsAndManagement:
 
         count = await storage.clear()
         assert count >= 2
+
+    async def test_delete_path_removes_one_entry(self, temp_dir: Path) -> None:
+        """delete_path should remove cached docs for only the requested path."""
+        storage = VectorStorage(temp_dir / "test.db")
+        await storage.put("/test/file1.txt", "Content 1", time.time())
+        await storage.put("/test/file2.txt", "Content 2", time.time())
+
+        removed = await storage.delete_path("/test/file1.txt")
+
+        assert removed >= 1
+        assert await storage.get("/test/file1.txt") is None
+        assert await storage.get("/test/file2.txt") is not None

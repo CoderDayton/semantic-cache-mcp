@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import array
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from semantic_cache_mcp.cache import SemanticCache, batch_smart_read, smart_read
-from semantic_cache_mcp.cache.search import find_similar_files
+from semantic_cache_mcp.cache.search import compare_files, find_similar_files
 from semantic_cache_mcp.types import EmbeddingVector
 from tests.constants import TEST_EMBEDDING_DIM
 
@@ -114,6 +114,32 @@ class TestSmartReadNoDuplicateFetch:
         # Only 1 cache.get call — not 2 (the re-fetch was eliminated)
         assert get_count == 1
 
+    async def test_first_read_reuses_embedding_between_similarity_check_and_cache_put(
+        self, tmp_path: Path
+    ) -> None:
+        """First uncached read should not call get_embedding twice."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "first_read.txt"
+        f.write_text("brand new file\n")
+
+        emb = _fake_embedding()
+        original_get_embedding = SemanticCache.get_embedding
+        call_count = 0
+
+        async def counting_get_embedding(self_arg, text: str, path: str = ""):
+            nonlocal call_count
+            call_count += 1
+            return await original_get_embedding(self_arg, text, path)
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(SemanticCache, "get_embedding", counting_get_embedding),
+        ):
+            result = await smart_read(cache, str(f))
+
+        assert not result.from_cache
+        assert call_count == 1
+
     async def test_diff_path_still_generates_correct_diff(self, tmp_path: Path) -> None:
         """Verify the optimization doesn't break diff content."""
         cache = _make_cache(tmp_path)
@@ -132,6 +158,33 @@ class TestSmartReadNoDuplicateFetch:
         assert result.is_diff
         assert "-line 2" in result.content
         assert "+line 2 modified" in result.content
+
+    async def test_force_full_cached_read_skips_refresh(self, tmp_path: Path) -> None:
+        """Line-range/full-force reads should not rewrite vecdb when cache is already fresh."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "range_read.txt"
+        f.write_text("alpha\nbeta\ngamma\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=None):
+            await smart_read(cache, str(f))
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=None),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await smart_read(
+                cache,
+                str(f),
+                diff_mode=False,
+                force_full=True,
+                refresh_cache=False,
+            )
+
+        assert result.content == "alpha\nbeta\ngamma\n"
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +226,100 @@ class TestFindSimilarEmbeddingReuse:
 
         # File was uncached, so it went through the else branch with ONNX
         assert result.source_path == str(f)
+
+    async def test_uncached_file_skips_refresh_path(self, tmp_path: Path) -> None:
+        """Similarity search should not rewrite vecdb just to use a source embedding."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        source = tmp_path / "source.txt"
+        neighbor = tmp_path / "neighbor.txt"
+        source.write_text("source content\n")
+        neighbor.write_text("neighbor content\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(neighbor))
+
+        with (
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await find_similar_files(cache, str(source))
+
+        assert result.source_path == str(source)
+
+    async def test_cached_file_skips_disk_read_when_fresh(self, tmp_path: Path) -> None:
+        """Fresh cached source file should not hit disk again."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "fresh.txt"
+        f.write_text("fresh content\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(f))
+
+        with patch(
+            "semantic_cache_mcp.cache.search.aread_bytes",
+            side_effect=AssertionError("aread_bytes should not be called"),
+        ):
+            result = await find_similar_files(cache, str(f))
+
+        assert result.source_path == str(f)
+
+
+class TestCompareFilesNoRefresh:
+    """compare_files should avoid vecdb rewrite when direct computation is enough."""
+
+    async def test_uncached_compare_skips_refresh_path(self, tmp_path: Path) -> None:
+        """Comparing two uncached files should not rewrite vecdb for either side."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        file1 = tmp_path / "one.txt"
+        file2 = tmp_path / "two.txt"
+        file1.write_text("alpha\n")
+        file2.write_text("beta\n")
+
+        with (
+            patch("semantic_cache_mcp.cache.search.embed_query", return_value=emb),
+            patch("semantic_cache_mcp.cache.embed", return_value=emb),
+            patch.object(
+                SemanticCache,
+                "refresh_path",
+                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
+            ),
+        ):
+            result = await compare_files(cache, str(file1), str(file2))
+
+        assert result.path1 == str(file1)
+        assert result.path2 == str(file2)
+
+    async def test_touched_cached_compare_reuses_cache(self, tmp_path: Path) -> None:
+        """mtime-only changes should still count as cache hits after hash check."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        file1 = tmp_path / "one.txt"
+        file2 = tmp_path / "two.txt"
+        file1.write_text("alpha\n")
+        file2.write_text("beta\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(file1))
+            await smart_read(cache, str(file2))
+
+        import os
+        import time
+
+        bumped = time.time() + 10
+        os.utime(str(file1), (bumped, bumped))
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb) as mock_embed:
+            result = await compare_files(cache, str(file1), str(file2))
+
+        mock_embed.assert_not_called()
+        assert result.from_cache == (True, True)
 
 
 # ---------------------------------------------------------------------------

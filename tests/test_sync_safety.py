@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
+import semantic_cache_mcp.config as config_mod
+from semantic_cache_mcp.logger import configure_logging, get_log_dir, get_log_file_path
 from semantic_cache_mcp.storage.vector import VectorStorage
 
 
@@ -90,6 +93,51 @@ class TestStderrLogging:
                     violations.append(f"{py_file.name}:{node.lineno}")
 
         assert not violations, f"Found print() calls in source: {violations}"
+
+
+class TestFileLogging:
+    """Tests for dated file logging configuration."""
+
+    def test_get_log_dir_defaults_to_cache_logs(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / "cache"
+        assert get_log_dir(cache_dir) == (cache_dir / "logs").resolve()
+
+    def test_get_log_file_path_uses_date(self, tmp_path: Path) -> None:
+        log_dir = (tmp_path / "logs").resolve()
+        log_path = get_log_file_path(log_dir, now=datetime(2026, 3, 27, 12, 0, 0))
+        assert log_path == log_dir / "semantic-cache-mcp-2026-03-27.log"
+
+    def test_configure_logging_creates_dated_file(self, tmp_path: Path) -> None:
+        root = logging.getLogger()
+        original_level = root.level
+
+        log_dir = (tmp_path / "logs").resolve()
+        log_path = get_log_file_path(log_dir, now=datetime(2026, 3, 27, 12, 0, 0))
+
+        try:
+            configure_logging(log_dir, log_path, log_level="INFO")
+            logging.getLogger("semantic_cache_mcp.test").warning("file-log-smoke-test")
+
+            file_handlers = [
+                h
+                for h in root.handlers
+                if isinstance(h, logging.FileHandler)
+                and getattr(h, "name", "") == "semantic-cache-mcp.file"
+            ]
+            assert len(file_handlers) == 1
+            file_handlers[0].flush()
+
+            assert log_dir.is_dir()
+            assert log_path.exists()
+            assert "file-log-smoke-test" in log_path.read_text(encoding="utf-8")
+        finally:
+            configure_logging(
+                config_mod.LOG_DIR,
+                config_mod.LOG_FILE_PATH,
+                log_level=config_mod.LOG_LEVEL,
+                log_format=config_mod.LOG_FORMAT,
+            )
+            root.setLevel(original_level)
 
 
 class TestStdoutRedirect:

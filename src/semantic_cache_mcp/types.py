@@ -51,6 +51,7 @@ class WriteResult:
     tokens_saved: int
     content_hash: ContentHash
     from_cache: bool
+    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -66,6 +67,7 @@ class EditResult:
     tokens_saved: int
     content_hash: ContentHash
     from_cache: bool
+    dry_run: bool = False
 
 
 # -----------------------------------------------------------------------------
@@ -220,3 +222,4 @@ class BatchEditResult:
     tokens_saved: int
     content_hash: ContentHash
     from_cache: bool
+    dry_run: bool = False

@@ -248,14 +248,29 @@ class TestCacheOperations:
         stats = await semantic_cache_no_embeddings.get_stats()
         assert stats["files_cached"] == 0
 
-    def test_get_embedding_without_embeddings_service(
+    async def test_delete_path_removes_cached_entry(
+        self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
+    ) -> None:
+        """delete_path should evict one cached entry without clearing others."""
+        simple = str(sample_files["simple"])
+        python = str(sample_files["python"])
+        await smart_read(semantic_cache_no_embeddings, simple)
+        await smart_read(semantic_cache_no_embeddings, python)
+
+        removed = await semantic_cache_no_embeddings.delete_path(str(Path(simple).resolve()))
+
+        assert removed >= 1
+        assert await semantic_cache_no_embeddings.get(str(Path(simple).resolve())) is None
+        assert await semantic_cache_no_embeddings.get(str(Path(python).resolve())) is not None
+
+    async def test_get_embedding_without_embeddings_service(
         self, semantic_cache_no_embeddings: SemanticCache
     ) -> None:
         """get_embedding returns None when embed returns None."""
-        result = semantic_cache_no_embeddings.get_embedding("test text")
+        result = await semantic_cache_no_embeddings.get_embedding("test text")
         assert result is None
 
-    def test_get_embedding_with_embeddings_service(
+    async def test_get_embedding_with_embeddings_service(
         self, temp_dir: Path, mock_embeddings: EmbeddingVector
     ) -> None:
         """get_embedding returns embedding when embed returns a value."""
@@ -263,7 +278,7 @@ class TestCacheOperations:
 
         with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
             cache = SemanticCache(db_path=db_path)
-            result = cache.get_embedding("test text")
+            result = await cache.get_embedding("test text")
 
             assert result is not None
             assert len(result) == len(mock_embeddings)

@@ -156,6 +156,25 @@ class TestCompareFiles:
         result = await compare_files(cache, str(sample_files["py"]), str(sample_files["py2"]))
         assert 0.0 <= result.similarity <= 1.0
 
+    async def test_diff_touched_file_still_uses_cache(self, cache: SemanticCache, temp_dir: Path):
+        """Touch-only mtime changes should not drop a cache hit."""
+        file1 = temp_dir / "a.txt"
+        file2 = temp_dir / "b.txt"
+        file1.write_text("same content\n")
+        file2.write_text("other content\n")
+
+        await smart_read(cache, str(file1))
+        await smart_read(cache, str(file2))
+
+        import os
+        import time
+
+        bumped = time.time() + 10
+        os.utime(str(file1), (bumped, bumped))
+
+        result = await compare_files(cache, str(file1), str(file2))
+        assert result.from_cache == (True, True)
+
 
 class TestBatchSmartRead:
     """Tests for batch_smart_read function."""
@@ -222,6 +241,22 @@ class TestFindSimilarFiles:
 
         for sf in result.similar_files:
             assert sf.path != source
+
+    async def test_similar_skips_disk_read_for_fresh_cached_source(
+        self, cache: SemanticCache, sample_files: dict
+    ):
+        """Fresh cached source file should reuse cache without re-reading disk."""
+        mock_emb = _make_embedding()
+        with patch("semantic_cache_mcp.cache.embed", return_value=mock_emb):
+            await smart_read(cache, str(sample_files["py"]))
+
+        with patch(
+            "semantic_cache_mcp.cache.search.aread_bytes",
+            side_effect=AssertionError("aread_bytes should not be called"),
+        ):
+            result = await find_similar_files(cache, str(sample_files["py"]))
+
+        assert result.source_path == str(sample_files["py"])
 
 
 class TestGlobWithCacheStatus:

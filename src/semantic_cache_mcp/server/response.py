@@ -3,21 +3,46 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Never
+
+from fastmcp.exceptions import ToolError
 
 from ..config import TOOL_MAX_RESPONSE_TOKENS, TOOL_OUTPUT_MODE
 from ..core import count_tokens
 
 _MODE_NORMAL = {"normal", "debug"}
 _MODE_DEBUG = "debug"
+_UNSET = object()
+_response_mode_override: ContextVar[str | None] = ContextVar("response_mode_override", default=None)
+_response_token_cap_override: ContextVar[int | None | object] = ContextVar(
+    "response_token_cap_override",
+    default=_UNSET,
+)
 
 
 def _response_mode() -> str:
-    return TOOL_OUTPUT_MODE
+    override = _response_mode_override.get()
+    return override if override is not None else TOOL_OUTPUT_MODE
 
 
 def _response_token_cap() -> int | None:
+    override = _response_token_cap_override.get()
+    if override is not _UNSET:
+        return override  # type: ignore[return-value]
     return TOOL_MAX_RESPONSE_TOKENS if TOOL_MAX_RESPONSE_TOKENS > 0 else None
+
+
+@contextmanager
+def _response_overrides(mode: str, max_response_tokens: int | None):
+    mode_token = _response_mode_override.set(mode)
+    cap_token = _response_token_cap_override.set(max_response_tokens)
+    try:
+        yield
+    finally:
+        _response_mode_override.reset(mode_token)
+        _response_token_cap_override.reset(cap_token)
 
 
 def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -48,22 +73,45 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return minimal
 
 
+def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) -> dict[str, Any]:
+    """Apply response shaping without serializing, for FastMCP structured results."""
+    body = payload.copy()
+    if _response_mode() == "compact" and body.get("ok") is True:
+        body.pop("ok", None)
+        body.pop("tool", None)
+
+    if max_response_tokens is not None and max_response_tokens > 0:
+        rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        if count_tokens(rendered) > max_response_tokens:
+            body = _minimal_payload(body)
+            rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        if count_tokens(rendered) > max_response_tokens:
+            body = {"ok": False, "truncated": True}
+
+    return body
+
+
 def _render_response(payload: dict[str, Any], max_response_tokens: int | None) -> str:
     """Serialize payload to compact JSON, truncating if it exceeds max_response_tokens."""
-    # In compact mode, strip diagnostic wrapper fields from success responses.
-    # Errors (ok=False) keep all fields so Claude can identify what failed.
-    if TOOL_OUTPUT_MODE == "compact" and payload.get("ok") is True:
-        payload.pop("ok", None)
-        payload.pop("tool", None)
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    if max_response_tokens is not None and max_response_tokens > 0:
-        if count_tokens(body) > max_response_tokens:
-            body = json.dumps(_minimal_payload(payload), separators=(",", ":"), ensure_ascii=False)
-        if count_tokens(body) > max_response_tokens:
-            body = json.dumps({"ok": False, "truncated": True}, separators=(",", ":"))
-    return body
+    body = _finalize_payload(payload, max_response_tokens)
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
 def _render_error(tool: str, message: str, max_response_tokens: int | None) -> str:
     payload = {"ok": False, "tool": tool, "error": message}
     return _render_response(payload, max_response_tokens)
+
+
+def _tool_error_message(tool: str, message: str, max_response_tokens: int | None) -> str:
+    text = f"{tool}: {message}"
+    if (
+        max_response_tokens is not None
+        and max_response_tokens > 0
+        and count_tokens(text) > max_response_tokens
+    ):
+        text = f"{tool}: error truncated by max_response_tokens"
+    return text
+
+
+def _raise_tool_error(tool: str, message: str, max_response_tokens: int | None) -> Never:
+    raise ToolError(_tool_error_message(tool, message, max_response_tokens))
