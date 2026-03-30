@@ -1,13 +1,34 @@
 <p align="center">
-  <img src="assets/logo.svg" width="128" height="128" alt="Semantic Cache MCP Logo">
+  <img
+    src="https://cdn.jsdelivr.net/gh/CoderDayton/semantic-cache-mcp@f8af5804ddc7c3fed62d6901c0c7df098a76164e/assets/logo.svg"
+    width="128"
+    height="128"
+    alt="Semantic Cache MCP Logo"
+  />
 </p>
 
 <h1 align="center">Semantic Cache MCP</h1>
 
 <p align="center">
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"></a>
-  <a href="https://github.com/modelcontextprotocol/python-sdk"><img src="https://img.shields.io/badge/FastMCP-3.0-green.svg" alt="FastMCP 3.0"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://ko-fi.com/U7U01WTJF9">
+    <img
+      src="https://ko-fi.com/img/githubbutton_sm.svg"
+      alt="Support on Ko-fi"
+      height="36"
+    />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.python.org/downloads/" >
+    <img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" />
+  </a>
+  <a href="https://github.com/modelcontextprotocol/python-sdk">
+    <img src="https://img.shields.io/badge/FastMCP-3.0-00A67E?style=for-the-badge" alt="FastMCP 3.0" />
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" />
+  </a>
 </p>
 
 ---
