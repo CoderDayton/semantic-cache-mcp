@@ -145,7 +145,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | `search` | Semantic/embedding search across cached files by meaning — not keywords. Seed cache first with `read` or `batch_read`. |
 | `similar` | Finds semantically similar cached files to a given path. Start with `k=3–5`. Only searches cached files. |
 | `glob` | Pattern matching with cache status per file. `cached_only=true` filters to already-cached files. Max 1000 matches, 5s timeout. |
-| `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Pre-scans and batch-embeds all new/changed files in a single model call. Set `diff_mode=false` after context compression. |
+| `batch_read` | Read 2+ files in one call. Supports glob expansion in paths, priority ordering, token budget, and per-file diff suppression for unchanged files. Pre-scans and batch-embeds all new/changed files in a single model call. `diff_mode=false` is only for uncached/stale files; unchanged cached full-file requests are rejected. |
 | `grep` | Regex or literal pattern search across cached files with line numbers and optional context lines. Like ripgrep for the cache. |
 | `diff` | Compare two files. Returns unified diff plus semantic similarity score. Large diffs are auto-summarized to stay within token budget. |
 
@@ -166,7 +166,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```
 read path="/src/app.py"
 read path="/src/app.py" diff_mode=true         # default
-read path="/src/app.py" diff_mode=false        # full content (use after context compression)
+read path="/src/app.py" diff_mode=false        # full content only when cache is stale/missing
 read path="/src/app.py" offset=120 limit=80    # lines 120–199 only
 ```
 
@@ -284,7 +284,7 @@ batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
 - **Token budget**: stops reading new files once `max_total_tokens` reached; skipped files include `est_tokens` hint
 - **Unchanged suppression**: unchanged files appear in `summary.unchanged` with no content (zero tokens)
 - **Batch embedding**: pre-scans all new/changed files and embeds them in a single model call before reading — N model calls reduced to 1
-- **Context compression recovery**: set `diff_mode=false` when Claude needs full content after losing context
+- **Full-read guard**: `diff_mode=false` is rejected for unchanged cached files; use `diff_mode=true` to reuse cache or `read` with `offset`/`limit` for targeted recovery
 
 </details>
 

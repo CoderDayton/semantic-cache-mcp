@@ -251,6 +251,24 @@ class TestFindSimilarEmbeddingReuse:
 
         assert result.source_path == str(source)
 
+    async def test_cached_file_skips_disk_read_when_fresh(self, tmp_path: Path) -> None:
+        """Fresh cached source file should not hit disk again."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "fresh.txt"
+        f.write_text("fresh content\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(f))
+
+        with patch(
+            "semantic_cache_mcp.cache.search.aread_bytes",
+            side_effect=AssertionError("aread_bytes should not be called"),
+        ):
+            result = await find_similar_files(cache, str(f))
+
+        assert result.source_path == str(f)
+
 
 class TestCompareFilesNoRefresh:
     """compare_files should avoid vecdb rewrite when direct computation is enough."""
@@ -277,6 +295,31 @@ class TestCompareFilesNoRefresh:
 
         assert result.path1 == str(file1)
         assert result.path2 == str(file2)
+
+    async def test_touched_cached_compare_reuses_cache(self, tmp_path: Path) -> None:
+        """mtime-only changes should still count as cache hits after hash check."""
+        emb = _fake_embedding()
+        cache = _make_cache(tmp_path)
+        file1 = tmp_path / "one.txt"
+        file2 = tmp_path / "two.txt"
+        file1.write_text("alpha\n")
+        file2.write_text("beta\n")
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
+            await smart_read(cache, str(file1))
+            await smart_read(cache, str(file2))
+
+        import os
+        import time
+
+        bumped = time.time() + 10
+        os.utime(str(file1), (bumped, bumped))
+
+        with patch("semantic_cache_mcp.cache.embed", return_value=emb) as mock_embed:
+            result = await compare_files(cache, str(file1), str(file2))
+
+        mock_embed.assert_not_called()
+        assert result.from_cache == (True, True)
 
 
 # ---------------------------------------------------------------------------

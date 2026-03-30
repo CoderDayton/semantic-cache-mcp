@@ -188,12 +188,18 @@ class TestReadTool:
         # content is returned (not suppressed in single-file read)
         assert "content" in d
 
-    async def test_diff_mode_false_always_returns_content(
+    async def test_diff_mode_false_allows_uncached_full_content(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        d = _parse(await read(ctx, str(sample_file), diff_mode=False))
+        assert "line1" in d["content"]
+
+    async def test_diff_mode_false_blocks_cached_unchanged_full_content(
         self, ctx: MagicMock, sample_file: Path
     ) -> None:
         await read(ctx, str(sample_file))
-        d = _parse(await read(ctx, str(sample_file), diff_mode=False))
-        assert "line1" in d["content"]
+        with pytest.raises(ToolError, match="diff_mode=false is blocked"):
+            await read(ctx, str(sample_file), diff_mode=False)
 
     async def test_offset_limit_returns_line_range(self, ctx: MagicMock, sample_file: Path) -> None:
         d = _parse(await read(ctx, str(sample_file), offset=2, limit=2))
@@ -675,12 +681,18 @@ class TestBatchReadTool:
         d = _parse(await batch_read(ctx, str(sample_file)))
         assert "unchanged" in d.get("summary", {})
 
-    async def test_diff_mode_false_returns_full_content(
+    async def test_diff_mode_false_allows_uncached_files(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        d = _parse(await batch_read(ctx, str(sample_file), diff_mode=False))
+        assert d["summary"]["files_read"] >= 1
+
+    async def test_diff_mode_false_blocks_cached_unchanged_files(
         self, ctx: MagicMock, sample_file: Path
     ) -> None:
         await batch_read(ctx, str(sample_file))
-        d = _parse(await batch_read(ctx, str(sample_file), diff_mode=False))
-        assert d["summary"]["files_read"] >= 1
+        with pytest.raises(ToolError, match="diff_mode=false is blocked"):
+            await batch_read(ctx, str(sample_file), diff_mode=False)
 
     async def test_priority_parameter_comma_separated(
         self, ctx: MagicMock, sample_file: Path, py_file: Path

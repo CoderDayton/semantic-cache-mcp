@@ -13,7 +13,9 @@ from ..core.hashing import hash_content
 from ..core.similarity import cosine_similarity
 from ..logger import log_marker
 from ..types import (
+    CacheEntry,
     DiffResult,
+    EmbeddingVector,
     GlobMatch,
     GlobResult,
     SearchMatch,
@@ -33,6 +35,40 @@ MAX_SEARCH_QUERY_LEN = 8000
 MAX_SIMILAR_K = 50
 MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
+
+
+async def _read_text_file(cache: SemanticCache, file_path: Path, display_path: str) -> str:
+    """Read and decode a text file with the standard binary/UTF-8 guards."""
+
+    raw_bytes = await aread_bytes(file_path, cache._io_executor)
+    if _is_binary_content(raw_bytes):
+        raise ValueError(f"File is binary and cannot be processed: {display_path}")
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"File is not valid UTF-8: {display_path}") from exc
+
+
+async def _load_diff_input(
+    cache: SemanticCache, file_path: Path, display_path: str
+) -> tuple[CacheEntry | None, str, EmbeddingVector | None, bool]:
+    """Load diff input, reusing cache on mtime or content-hash matches."""
+
+    cached = await cache.get(str(file_path))
+    if cached is not None:
+        file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if cached.mtime >= file_mtime:
+            return cached, await cache.get_content(cached), None, True
+
+    content = await _read_text_file(cache, file_path, display_path)
+    if cached is not None:
+        file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if hash_content(content) == cached.content_hash:
+            await cache.update_mtime(str(file_path), file_mtime)
+            return cached, content, None, True
+
+    embedding = await cache.get_embedding(content, str(file_path))
+    return cached, content, embedding, False
 
 
 async def semantic_search(
@@ -146,34 +182,10 @@ async def compare_files(
     from_cache2 = False
 
     # File 1
-    cached1 = await cache.get(str(file1))
-    if cached1 and cached1.mtime >= (await astat(file1, cache._io_executor)).st_mtime:
-        content1 = await cache.get_content(cached1)
-        from_cache1 = True
-    else:
-        try:
-            raw_bytes1 = await aread_bytes(file1, cache._io_executor)
-            if _is_binary_content(raw_bytes1):
-                raise ValueError(f"File is binary and cannot be diffed: {path1}")
-            content1 = raw_bytes1.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"File is not valid UTF-8: {path1}") from exc
-        emb1 = await cache.get_embedding(content1, str(file1))
+    cached1, content1, emb1, from_cache1 = await _load_diff_input(cache, file1, path1)
 
     # File 2
-    cached2 = await cache.get(str(file2))
-    if cached2 and cached2.mtime >= (await astat(file2, cache._io_executor)).st_mtime:
-        content2 = await cache.get_content(cached2)
-        from_cache2 = True
-    else:
-        try:
-            raw_bytes2 = await aread_bytes(file2, cache._io_executor)
-            if _is_binary_content(raw_bytes2):
-                raise ValueError(f"File is binary and cannot be diffed: {path2}")
-            content2 = raw_bytes2.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"File is not valid UTF-8: {path2}") from exc
-        emb2 = await cache.get_embedding(content2, str(file2))
+    cached2, content2, emb2, from_cache2 = await _load_diff_input(cache, file2, path2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
@@ -225,33 +237,32 @@ async def find_similar_files(
     if not file_path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
 
-    # Guard against binary files before read_text
-    raw = await aread_bytes(file_path, cache._io_executor)
-    if _is_binary_content(raw):
-        raise ValueError(f"Binary file not supported: {path}")
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        content = raw.decode("utf-8", errors="replace")
-
-    # Get/compute embedding for source file
     cached = await cache.get(str(file_path))
     source_tokens = 0
+    source_embedding: EmbeddingVector | None
 
-    file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
-    cache_is_current = cached is not None and cached.mtime >= file_mtime
-    cache_matches_content = (
-        cached is not None and not cache_is_current and hash_content(content) == cached.content_hash
-    )
-
-    if cache_is_current or cache_matches_content:
-        assert cached is not None
-        if cache_matches_content:
-            # Content identical despite mtime change — update mtime, treat as cached
-            await cache.update_mtime(str(file_path), file_mtime)
-        source_tokens = cached.tokens
-        source_embedding = cached.embedding or await cache.get_embedding(content, str(file_path))
+    if cached is not None:
+        file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if cached.mtime >= file_mtime:
+            source_tokens = cached.tokens
+            if cached.embedding is not None:
+                source_embedding = cached.embedding
+            else:
+                cached_content = await cache.get_content(cached)
+                source_embedding = await cache.get_embedding(cached_content, str(file_path))
+        else:
+            content = await _read_text_file(cache, file_path, path)
+            if hash_content(content) == cached.content_hash:
+                await cache.update_mtime(str(file_path), file_mtime)
+                source_tokens = cached.tokens
+                source_embedding = cached.embedding or await cache.get_embedding(
+                    content, str(file_path)
+                )
+            else:
+                source_tokens = count_tokens(content)
+                source_embedding = await cache.get_embedding(content, str(file_path))
     else:
+        content = await _read_text_file(cache, file_path, path)
         source_tokens = count_tokens(content)
         source_embedding = await cache.get_embedding(content, str(file_path))
 

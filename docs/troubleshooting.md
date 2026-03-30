@@ -43,10 +43,7 @@
 
 **All files reporting "unchanged" after model context compression**
 - **Cause:** The cache tracks filesystem state (mtime), not LLM context state. After context compression, the LLM no longer has the file content, but the cache still reports the file as unchanged.
-- **Fix:** Call `batch_read` or `read` with `diff_mode=False` to force full content return, bypassing the cache hit path.
-  ```
-  batch_read paths="src/**/*.py" diff_mode=false
-  ```
+- **Fix:** Unchanged cached full-file reads are intentionally blocked even with `diff_mode=false` to avoid redundant full rereads. Use `read` with `offset`/`limit` for targeted recovery, or clear the cache if you truly need a cold full reread.
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
