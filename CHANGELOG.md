@@ -7,12 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-30
+
+### Added
+
+- **`delete` tool** — Added a narrow cache-aware delete operation for one file or one symlink path, with `dry_run` support and immediate cache eviction.
+- **Path-filtered `grep`** — Exact cached-content search can now be scoped to one file, suffix, or glob path filter to reduce noise and token spend.
+
+### Changed
+
+- **LLM tool routing prompts** — Rewrote tool docstrings and README guidance so models choose the right cache-first tool more reliably and recover cleanly from empty or unchanged results.
+- **Relative path resolution** — Tool paths now resolve against the client project root instead of the server process cwd.
+- **FastMCP 3.1 alignment** — Normalized tool outputs and remote dispatch behavior to match current FastMCP response handling.
+
 ### Fixed
 
-- **Tool hangs under concurrent access** — Three rounds of fixes for tool calls that complete their action but never return a response, with GPU spinning continuously:
-  1. Offloaded all file I/O to `run_in_executor` so the event loop stays unblocked.
-  2. Replaced simplevecdb's internal 4-thread executor with our shared single-thread executor, and moved all synchronous catalog operations off the event loop into the executor.
-  3. Routed **all** ONNX inference through the executor. Three code paths called ONNX directly on the event loop (`embed_query` in search, `embed` in keepalive, `embed_fn` closure in semantic summarization), racing with executor-based ONNX calls from other coroutines — two threads hitting the non-thread-safe ONNX session caused the GPU to spin indefinitely. Stress-tested with 58 concurrent tool calls — zero hangs.
+- **Tool hangs under concurrent access** — Blocking file I/O, SQLite catalog work, and all ONNX inference paths are isolated from the event loop and serialized safely, eliminating the GPU-spin / no-response hang class under load.
+- **Timeout recovery** — Added a supervised tool worker that drops and restarts wedged executors after tool timeouts or worker protocol failures without stretching the caller's timeout budget.
+- **Embedding dimension detection** — Removed the hardcoded 384-dimension fallback so non-default embedding models no longer corrupt vector storage shape.
+- **Stats consistency** — Internal stats counters now stay coherent across clears, rewrites, and cache refreshes.
+
+### Performance
+
+- **Cache hit ratio** — `read` and `batch_read` now block `diff_mode=false` for unchanged cached full-file reads so callers reuse the cached version instead of forcing redundant disk I/O.
+- **Embedding reuse** — Small edits reuse cached embeddings when possible, and `similar` avoids recomputing source embeddings for fresh cached files.
+- **Freshness checks** — `diff` now uses the same mtime-plus-content-hash freshness logic as read/write paths, avoiding cache misses on touch-only changes.
+- **Adaptive refresh timeout** — Cache refreshes now choose a timeout based on remaining work, reducing unnecessary executor resets after slow but healthy write/edit refreshes.
+- **Lower startup churn** — Removed the embedding keepalive task and unnecessary cache rewrites during worker initialization.
 
 ## [0.3.4] - 2026-03-15
 

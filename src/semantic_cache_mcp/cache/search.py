@@ -42,7 +42,10 @@ async def _read_text_file(cache: SemanticCache, file_path: Path, display_path: s
 
     raw_bytes = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw_bytes):
-        raise ValueError(f"File is binary and cannot be processed: {display_path}")
+        raise ValueError(
+            "Binary file not supported: "
+            f"{display_path}. Similarity search only works with text files."
+        )
     try:
         return raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
