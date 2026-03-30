@@ -683,3 +683,9 @@ class SemanticCache:
 
     async def clear(self) -> int:
         return await self._storage.clear()
+
+    async def delete_path(self, path: str) -> int:
+        """Delete one cached path and clear any stale marker for it."""
+        removed = await self._storage.delete_path(path)
+        self.clear_stale(path)
+        return removed

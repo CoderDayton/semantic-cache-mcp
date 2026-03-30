@@ -50,6 +50,15 @@ class ClearResponse(ToolResponseModel):
     output_mode: str | None = None
 
 
+class DeleteResponse(ToolResponseModel):
+    status: str | None = None
+    path: str | None = None
+    deleted: bool | None = None
+    dry_run: bool | None = None
+    cache_removed: bool | None = None
+    symlink: bool | None = None
+
+
 class StatsStorage(ToolResponseModel):
     files_cached: int | None = None
     total_tokens_cached: int | None = None

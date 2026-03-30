@@ -70,3 +70,15 @@ async def awrite_atomic(path: Path, content: str, executor: Executor | None = No
     """Atomic write without blocking the event loop."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(executor, _atomic_write_sync, path, content)
+
+
+async def aunlink(
+    path: Path, *, missing_ok: bool = False, executor: Executor | None = None
+) -> None:
+    """Unlink a file or symlink without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+
+    def _unlink() -> None:
+        path.unlink(missing_ok=missing_ok)
+
+    await loop.run_in_executor(executor, _unlink)

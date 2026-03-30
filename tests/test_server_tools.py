@@ -24,6 +24,7 @@ from semantic_cache_mcp.server.tools import (
     batch_edit,
     batch_read,
     clear,
+    delete,
     diff,
     edit,
     glob,
@@ -266,6 +267,68 @@ class TestReadTool:
         assert "lines" in d
         assert d["lines"]["start"] == 1
         assert d["lines"]["end"] == 3
+
+
+# ===========================================================================
+# delete tool
+# ===========================================================================
+
+
+class TestDeleteTool:
+    async def test_delete_existing_file(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "delete-me.txt"
+        p.write_text("bye\n")
+
+        d = _parse(await delete(ctx, str(p)))
+
+        assert d.get("status") == "deleted"
+        assert not p.exists()
+
+    async def test_delete_dry_run_keeps_file(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "dry-delete.txt"
+        p.write_text("keep\n")
+
+        d = _parse(await delete(ctx, str(p), dry_run=True))
+
+        assert d.get("status") == "would_delete"
+        assert p.exists()
+
+    async def test_delete_missing_file_returns_not_found(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        d = _parse(await delete(ctx, str(tmp_path / "missing.txt")))
+        assert d.get("status") == "not_found"
+
+    async def test_delete_evicts_cached_file(
+        self, ctx: MagicMock, py_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(py_file))
+
+        d = _parse(await delete(ctx, str(py_file)))
+
+        assert d.get("status") == "deleted"
+        assert d.get("cache_removed") is True
+        assert (await tmp_cache.get(str(py_file.resolve()))) is None
+
+    async def test_delete_rejects_real_directory(self, ctx: MagicMock, tmp_path: Path) -> None:
+        d = tmp_path / "dir"
+        d.mkdir()
+        with pytest.raises(ToolError, match="delete: directory deletion is not supported"):
+            await delete(ctx, str(d))
+
+    async def test_delete_symlink_removes_link_not_target(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.txt"
+        link = tmp_path / "alias.txt"
+        target.write_text("keep target\n")
+        link.symlink_to(target)
+
+        d = _parse(await delete(ctx, str(link)))
+
+        assert d.get("status") == "deleted"
+        assert not link.exists()
+        assert target.exists()
 
 
 # ===========================================================================

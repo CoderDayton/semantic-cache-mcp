@@ -881,6 +881,13 @@ class VectorStorage:
                 await self._collection.save()
         return count
 
+    async def delete_path(self, path: str) -> int:
+        """Delete cached documents for one path. Returns docs removed."""
+        removed = await self._delete_by_path(path)
+        if removed > 0:
+            await self._collection.save()
+        return removed
+
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
