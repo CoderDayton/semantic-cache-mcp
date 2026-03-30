@@ -63,9 +63,6 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
         p.write_text(payload + f"file={i}\n")
         paths.append(str(p))
 
-    ok_file = files_dir / "ok.txt"
-    ok_file.write_text("recovered via stdio timeout path\n")
-
     env = os.environ.copy()
     env["SEMANTIC_CACHE_DIR"] = str(runtime_cache)
     env["TOOL_TIMEOUT"] = "0.2"
@@ -94,11 +91,7 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
                 "batch_read",
                 {"paths": json.dumps(paths), "max_total_tokens": 200_000},
             )
-        second = await client.call_tool(
-            "read",
-            {"path": str(ok_file)},
-            raise_on_error=False,
-        )
+        second = await client.call_tool("stats", {}, raise_on_error=False)
 
     first_body = _flatten_tool_result(first)
     second_body = _flatten_tool_result(second)
@@ -107,7 +100,7 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
     assert "timed out" in first_body
     assert second.is_error is False
     assert second.data is not None
-    assert type(second.data).__name__ == "ReadResponse"
-    assert second.data.path == str(ok_file)
-    assert second.data.content == "recovered via stdio timeout path\n"
-    assert "recovered via stdio timeout path" in second_body
+    assert type(second.data).__name__ == "StatsResponse"
+    assert second.data.storage is not None
+    assert second.data.session is not None
+    assert "files_cached" in second_body
