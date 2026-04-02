@@ -403,6 +403,16 @@ class VectorStorage:
         chunks_bytes = list(chunker(content_bytes))
         total_chunks = len(chunks_bytes)
 
+        # Safety cap: prevent extreme chunk counts from degrading all operations.
+        max_chunks = 500
+        if total_chunks > max_chunks:
+            logger.warning(
+                f"File {path} produced {total_chunks} chunks (max {max_chunks}); "
+                "storing truncated to cap"
+            )
+            chunks_bytes = chunks_bytes[:max_chunks]
+            total_chunks = max_chunks
+
         # Decode each chunk back to str, tracking line offsets
         chunk_texts: list[str] = []
         line_offset = 0
@@ -750,6 +760,10 @@ class VectorStorage:
         if fixed_string:
             compiled = re.compile(re.escape(pattern), flags)
         else:
+            # Cap pattern length to mitigate ReDoS from pathological regexes.
+            if len(pattern) > 1000:
+                logger.warning(f"Regex pattern too long ({len(pattern)} chars), rejecting")
+                return []
             try:
                 compiled = re.compile(pattern, flags)
             except re.error as e:
