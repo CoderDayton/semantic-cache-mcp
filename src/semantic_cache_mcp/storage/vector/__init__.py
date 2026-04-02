@@ -364,8 +364,16 @@ class VectorStorage:
             )
             logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
         else:
-            # Large file: parent + chunked children
-            await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            # Large file: try chunked storage, fall back to single-doc if too many chunks
+            stored = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            if not stored:
+                meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
+                await self._collection.add_texts(
+                    texts=[content],
+                    metadatas=[meta],
+                    embeddings=[emb_list],
+                )
+                logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
         log_marker(
             logger,
             "vector.put.add.end",
@@ -397,21 +405,26 @@ class VectorStorage:
         content_bytes: bytes,
         base_meta: dict,
         file_embedding: list[float],
-    ) -> None:
-        """Store large file as parent doc (file metadata) + CDC-chunked children (raw text)."""
+    ) -> bool:
+        """Store large file as parent doc + CDC-chunked children.
+
+        Returns False if the file produced too many chunks (caller should
+        fall back to single-doc storage to preserve full content).
+        """
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
         total_chunks = len(chunks_bytes)
 
-        # Safety cap: prevent extreme chunk counts from degrading all operations.
-        max_chunks = 500
-        if total_chunks > max_chunks:
+        # Safety cap: if CDC produces too many chunks, bail out and let
+        # the caller store the file as a single unchunked document instead
+        # of silently truncating (which would cause data loss).
+        _MAX_CHUNKS = 500  # noqa: N806
+        if total_chunks > _MAX_CHUNKS:
             logger.warning(
-                f"File {path} produced {total_chunks} chunks (max {max_chunks}); "
-                "storing truncated to cap"
+                f"File {path} produced {total_chunks} chunks (max {_MAX_CHUNKS}); "
+                "falling back to single-doc storage to preserve full content"
             )
-            chunks_bytes = chunks_bytes[:max_chunks]
-            total_chunks = max_chunks
+            return False
 
         # Decode each chunk back to str, tracking line offsets
         chunk_texts: list[str] = []
@@ -474,6 +487,7 @@ class VectorStorage:
             f"Stored {path} as {total_chunks} chunks "
             f"(parent_id={parent_id}, {base_meta[_META_TOKENS]} tokens)"
         )
+        return True
 
     def _expected_dim(self) -> int:
         """Return the expected embedding dimension, querying the model if needed."""
