@@ -42,7 +42,7 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 ## Features
 
 - **80%+ Token Reduction** — Unchanged files cost ~0 tokens; changed files return diffs only
-- **Three-State Read Model** — First read (full + cache), unchanged (message only, 99% savings), modified (diff, 80–95% savings)
+- **Automatic Three-State Reads** — First read (full + cache), unchanged (`"unchanged":true`, 99% savings), modified (diff, 80–95% savings) — fully automatic, no configuration
 - **Semantic Search** — Hybrid BM25 + HNSW vector search via local ONNX embeddings (configurable model, default BAAI/bge-small-en-v1.5), no API keys, works offline
 - **Batch Embedding** — `batch_smart_read` pre-scans all new/changed files and embeds them in a single model call (N calls → 1)
 - **Content Hash Freshness** — BLAKE3 hash detects when mtime changes but content is identical (touch, git checkout) — returns cached instead of re-reading
@@ -183,16 +183,14 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ## Tool Reference
 
 <details>
-<summary><strong>read</strong> — Single file with diff-mode</summary>
+<summary><strong>read</strong> — Single file, automatic caching</summary>
 
 ```
-read path="/src/app.py"
-read path="/src/app.py" diff_mode=true         # default
-read path="/src/app.py" diff_mode=false        # full content only when cache is stale/missing
+read path="/src/app.py"                        # automatic: full, unchanged, or diff
 read path="/src/app.py" offset=120 limit=80    # lines 120–199 only
 ```
 
-**Three states:**
+**Automatic three states:**
 
 | State | Response | Token cost |
 |-------|----------|------------|
@@ -297,8 +295,8 @@ glob pattern="**/*.py" directory="./src" cached_only=true
 
 ```
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
-batch_read paths='["/src/a.py","/src/b.py"]' diff_mode=true priority="/src/main.py"
-batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
+batch_read paths='["/src/a.py","/src/b.py"]' priority="/src/main.py"
+batch_read paths="/src/*.py" max_total_tokens=30000
 ```
 
 - **Glob expansion**: `src/*.py` expanded inline (max 50 files per glob)
@@ -306,7 +304,7 @@ batch_read paths="/src/*.py" max_total_tokens=30000 diff_mode=false
 - **Token budget**: stops reading new files once `max_total_tokens` reached; skipped files include `est_tokens` hint
 - **Unchanged suppression**: unchanged files appear in `summary.unchanged` with no content (zero tokens)
 - **Batch embedding**: pre-scans all new/changed files and embeds them in a single model call before reading — N model calls reduced to 1
-- **Full-read guard**: `diff_mode=false` is rejected for unchanged cached files; use `diff_mode=true` to reuse cache or `read` with `offset`/`limit` for targeted recovery
+- **Recovery**: use `read` with `offset`/`limit` for targeted line-range recovery after truncation or context loss
 
 </details>
 

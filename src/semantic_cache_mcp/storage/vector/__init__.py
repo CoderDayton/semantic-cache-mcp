@@ -190,6 +190,22 @@ class VectorStorage:
             self._clear_sync()
             logger.info("Cleared all cached embeddings")
 
+        # Runtime dim check: even if the sidecar matches, verify the live
+        # index dimension agrees with the current model. A stale or missing
+        # sidecar could leave a dim-mismatched index that segfaults on add.
+        index_dim = self._collection.dim
+        if index_dim is not None and index_dim > 0 and index_dim != dim:
+            logger.warning(
+                f"Index dimension {index_dim} != model dimension {dim}; "
+                "clearing index to prevent usearch segfault"
+            )
+            for suffix in (f".{self._COLLECTION_NAME}.usearch",):
+                stale = self._db_path.parent / (self._db_path.name + suffix)
+                if stale.exists():
+                    stale.unlink()
+                    logger.info(f"Deleted dim-mismatched index: {stale}")
+            self._clear_sync()
+
         meta["embedding_model"] = model_name
         meta["embedding_dim"] = dim
         meta_path.write_text(json.dumps(meta))
@@ -348,8 +364,16 @@ class VectorStorage:
             )
             logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
         else:
-            # Large file: parent + chunked children
-            await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            # Large file: try chunked storage, fall back to single-doc if too many chunks
+            stored = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            if not stored:
+                meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
+                await self._collection.add_texts(
+                    texts=[content],
+                    metadatas=[meta],
+                    embeddings=[emb_list],
+                )
+                logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
         log_marker(
             logger,
             "vector.put.add.end",
@@ -381,11 +405,26 @@ class VectorStorage:
         content_bytes: bytes,
         base_meta: dict,
         file_embedding: list[float],
-    ) -> None:
-        """Store large file as parent doc (file metadata) + CDC-chunked children (raw text)."""
+    ) -> bool:
+        """Store large file as parent doc + CDC-chunked children.
+
+        Returns False if the file produced too many chunks (caller should
+        fall back to single-doc storage to preserve full content).
+        """
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
         total_chunks = len(chunks_bytes)
+
+        # Safety cap: if CDC produces too many chunks, bail out and let
+        # the caller store the file as a single unchunked document instead
+        # of silently truncating (which would cause data loss).
+        _MAX_CHUNKS = 500  # noqa: N806
+        if total_chunks > _MAX_CHUNKS:
+            logger.warning(
+                f"File {path} produced {total_chunks} chunks (max {_MAX_CHUNKS}); "
+                "falling back to single-doc storage to preserve full content"
+            )
+            return False
 
         # Decode each chunk back to str, tracking line offsets
         chunk_texts: list[str] = []
@@ -448,21 +487,34 @@ class VectorStorage:
             f"Stored {path} as {total_chunks} chunks "
             f"(parent_id={parent_id}, {base_meta[_META_TOKENS]} tokens)"
         )
+        return True
+
+    def _expected_dim(self) -> int:
+        """Return the expected embedding dimension, querying the model if needed."""
+        dim = self._collection.dim
+        if dim is not None and dim > 0:
+            return dim
+        from ...core.embeddings import get_embedding_dim  # noqa: PLC0415
+
+        dim = get_embedding_dim()
+        if dim == 0:
+            raise RuntimeError(
+                "Cannot determine embedding dimension — model not loaded yet. "
+                "Ensure warmup() completes before storing documents."
+            )
+        return dim
 
     def _resolve_embedding(self, embedding: EmbeddingVector | None) -> list[float]:
+        expected = self._expected_dim()
         if embedding is not None:
-            return list(embedding)
-        dim = self._collection.dim
-        if dim is None:
-            from ...core.embeddings import get_embedding_dim  # noqa: PLC0415
-
-            dim = get_embedding_dim()
-            if dim == 0:
-                raise RuntimeError(
-                    "Cannot determine embedding dimension — model not loaded yet. "
-                    "Ensure warmup() completes before storing documents."
+            actual = len(embedding)
+            if actual != expected:
+                raise ValueError(
+                    f"Embedding dimension mismatch: got {actual}, expected {expected}. "
+                    "This usually means the embedding model changed mid-session."
                 )
-        return [0.0] * dim
+            return list(embedding)
+        return [0.0] * expected
 
     async def get_content(self, entry: CacheEntry) -> str:
         """Reassemble full text from simplevecdb chunks (sorted by chunk_index)."""
@@ -722,6 +774,10 @@ class VectorStorage:
         if fixed_string:
             compiled = re.compile(re.escape(pattern), flags)
         else:
+            # Cap pattern length to mitigate ReDoS from pathological regexes.
+            if len(pattern) > 1000:
+                logger.warning(f"Regex pattern too long ({len(pattern)} chars), rejecting")
+                return []
             try:
                 compiled = re.compile(pattern, flags)
             except re.error as e:
@@ -829,7 +885,10 @@ class VectorStorage:
                 "db_size_mb": 0,
             }
         count = await self._collection.count()
-        db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
+        try:
+            db_size = self._db_path.stat().st_size if self._db_path.exists() else 0
+        except OSError:
+            db_size = 0
 
         # Count unique files (not chunks)
         unique_paths: set[str] = set()
@@ -966,7 +1025,13 @@ class VectorStorage:
             logger.info(f"Cache eviction: removed {evicted} documents")
 
     def save(self) -> None:
-        """Persist index to disk."""
+        """Persist index to disk.
+
+        Guarded: if close() is already running on a daemon thread, skip
+        to avoid concurrent usearch save (not thread-safe → heap corruption).
+        """
+        if self._closed:
+            return
         self._collection._collection.save()
         sync_db = getattr(self._db, "_db", None)
         if sync_db is not None:

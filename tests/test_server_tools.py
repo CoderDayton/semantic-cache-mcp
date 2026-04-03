@@ -176,10 +176,8 @@ class TestReadTool:
         d = _parse(await read(ctx, str(sample_file)))
         assert "line1" in d["content"]
 
-    async def test_second_read_diff_mode_returns_content(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
-        """diff_mode=True on second unchanged read: content is still returned
+    async def test_second_read_returns_content(self, ctx: MagicMock, sample_file: Path) -> None:
+        """Second unchanged read: content is still returned
         (unchanged file re-reads the cached bytes; no diff marker is emitted).
         """
         await read(ctx, str(sample_file))
@@ -188,19 +186,6 @@ class TestReadTool:
         assert "path" in d
         # content is returned (not suppressed in single-file read)
         assert "content" in d
-
-    async def test_diff_mode_false_allows_uncached_full_content(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
-        d = _parse(await read(ctx, str(sample_file), diff_mode=False))
-        assert "line1" in d["content"]
-
-    async def test_diff_mode_false_blocks_cached_unchanged_full_content(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
-        await read(ctx, str(sample_file))
-        with pytest.raises(ToolError, match="diff_mode=false is blocked"):
-            await read(ctx, str(sample_file), diff_mode=False)
 
     async def test_offset_limit_returns_line_range(self, ctx: MagicMock, sample_file: Path) -> None:
         d = _parse(await read(ctx, str(sample_file), offset=2, limit=2))
@@ -743,19 +728,6 @@ class TestBatchReadTool:
         # Second read: should be unchanged
         d = _parse(await batch_read(ctx, str(sample_file)))
         assert "unchanged" in d.get("summary", {})
-
-    async def test_diff_mode_false_allows_uncached_files(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
-        d = _parse(await batch_read(ctx, str(sample_file), diff_mode=False))
-        assert d["summary"]["files_read"] >= 1
-
-    async def test_diff_mode_false_blocks_cached_unchanged_files(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
-        await batch_read(ctx, str(sample_file))
-        with pytest.raises(ToolError, match="diff_mode=false is blocked"):
-            await batch_read(ctx, str(sample_file), diff_mode=False)
 
     async def test_priority_parameter_comma_separated(
         self, ctx: MagicMock, sample_file: Path, py_file: Path

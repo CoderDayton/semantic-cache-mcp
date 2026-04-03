@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-02
+
+### Changed
+
+- **Automatic cache behavior** — Removed `diff_mode` parameter from `read` and `batch_read`. The server now automatically detects whether a file is new, unchanged, or modified and returns the optimal response (full content, `"unchanged":true` marker, or unified diff). No configuration needed.
+
+### Fixed
+
+- **Embedding dimension mismatch guard** — `_resolve_embedding` validates vector dimensions before passing to usearch, raising `ValueError` instead of segfaulting on model change mid-session.
+- **Runtime dimension check** — `clear_if_model_changed` now verifies the live index dimension matches the model, catching stale indexes even when the sidecar metadata is missing.
+- **Save race condition** — `save()` skips if `close()` is already running on the daemon thread, preventing concurrent usearch saves that caused heap corruption.
+- **Oversized file truncation** — Files producing >500 CDC chunks now fall back to single-doc storage instead of silently truncating content.
+- **ReDoS mitigation** — Grep rejects regex patterns longer than 1,000 characters.
+- **Stats crash on missing DB** — `get_stats()` handles deleted database files gracefully.
+
 ## [0.4.0] - 2026-03-30
 
 ### Added

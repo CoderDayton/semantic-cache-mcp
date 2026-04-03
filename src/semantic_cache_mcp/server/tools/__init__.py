@@ -28,7 +28,7 @@ from ...cache import (
 )
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
-from ...utils._async_io import astat, aunlink
+from ...utils._async_io import aunlink
 from .._mcp import mcp
 from .._tool_models import (
     BatchEditResponse,
@@ -134,50 +134,6 @@ def _get_tool_lock() -> asyncio.Lock:
     if _tool_lock is None:
         _tool_lock = asyncio.Lock()
     return _tool_lock
-
-
-async def _fresh_mtime_cached_paths(cache: SemanticCache, paths: list[str]) -> list[str]:
-    """Return requested paths already cached and unchanged by mtime.
-
-    This is a tool-layer preflight used to stop redundant full-file reads before
-    smart_read() loads bytes from disk.
-    """
-
-    async def _check(path: str) -> str | None:
-        resolved = Path(path).expanduser().resolve()
-        cached = await cache.get(str(resolved))
-        if cached is None:
-            return None
-        try:
-            file_mtime = (await astat(resolved, cache._io_executor)).st_mtime
-        except (OSError, ValueError):
-            return None
-        if cached.mtime >= file_mtime:
-            return path
-        return None
-
-    unique_paths = list(dict.fromkeys(paths))
-    results = await asyncio.gather(*(_check(path) for path in unique_paths))
-    return [path for path in results if path is not None]
-
-
-def _raise_cached_full_read_block(
-    tool: str, cached_paths: list[str], max_response_tokens: int | None
-) -> None:
-    """Reject diff_mode=false when it only asks for an unchanged cached file."""
-
-    shown = ", ".join(cached_paths[:3])
-    if len(cached_paths) > 3:
-        shown += f", +{len(cached_paths) - 3} more"
-    noun = "file is" if len(cached_paths) == 1 else "files are"
-    _raise_tool_error(
-        tool,
-        "diff_mode=false is blocked for unchanged cached full-file reads. "
-        f"The requested {noun} already cached and unchanged by mtime: {shown}. "
-        "Use diff_mode=true to reuse the cached version, or use read with "
-        "offset/limit for targeted recovery instead of re-requesting the full file.",
-        max_response_tokens,
-    )
 
 
 def _delete_cache_candidates(path: Path) -> list[str]:
@@ -314,39 +270,27 @@ async def read(
     ctx: Context,
     path: str,
     max_size: int = MAX_CONTENT_SIZE,
-    diff_mode: bool = True,
     offset: int | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Read one file with cache-aware full, unchanged, diff, or truncated output.
+    """Read a file. Automatically returns the most token-efficient response.
 
     Use this for a single file. For 2+ files, prefer `batch_read`.
 
-    Normal behavior with `diff_mode=true`:
+    Behavior (automatic — no configuration needed):
     - First read: returns full content and seeds the cache.
-    - Unchanged re-read: returns a short marker plus `"unchanged": true`.
-    - Modified re-read: returns a unified diff.
+    - Unchanged re-read: returns `"unchanged": true` (content already in context).
+    - Modified re-read: returns a unified diff of changes.
+    - External changes: detected automatically via mtime + content hash.
 
-    Routing rules:
-    - If response contains `"unchanged": true`, do not re-read the file just
-      to get full content; the tool is telling you the prior full content is
-      already in conversation context.
-    - Use `offset` and `limit` to recover specific line ranges, especially
-      after truncation or context loss.
-    - `diff_mode=false` is only for uncached or stale files. If the file is
-      already cached and unchanged, the tool rejects the request instead of
-      doing a redundant full-file read.
-
-    Recovery rules:
-    - If output is truncated, keep using `read` with `offset`/`limit`.
-    - Do not re-read from the beginning just to continue a long file.
+    If response contains `"unchanged": true`, do NOT re-read — you already
+    have the full content from a prior read. Use `offset`/`limit` to recover
+    specific line ranges after truncation or context loss.
 
     Args:
         path: File path (absolute or relative to project root). Use absolute
             paths for files outside the current project root.
         max_size: Maximum content size to return before summarization.
-        diff_mode: Prefer cache-aware unchanged/diff behavior. Set false only
-            when you explicitly need a full read for an uncached or stale file.
         offset: 1-based starting line number for targeted reads.
         limit: Number of lines to return from `offset`.
     """
@@ -361,7 +305,6 @@ async def read(
         {
             "path": path,
             "max_size": max_size,
-            "diff_mode": diff_mode,
             "offset": offset,
             "limit": limit,
         },
@@ -378,11 +321,6 @@ async def read(
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:
-        if not diff_mode and offset is None and limit is None:
-            cached_paths = await _fresh_mtime_cached_paths(cache, [path])
-            if cached_paths:
-                _raise_cached_full_read_block("read", cached_paths, max_response_tokens)
-
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
             result = await asyncio.wait_for(
@@ -432,7 +370,6 @@ async def read(
                 cache=cache,
                 path=path,
                 max_size=max_size,
-                diff_mode=diff_mode,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -476,7 +413,6 @@ async def read(
             payload["tokens_returned"] = result.tokens_returned
             payload["params"] = {
                 "max_size": max_size,
-                "diff_mode": diff_mode,
                 "offset": offset,
                 "limit": limit,
             }
@@ -1452,34 +1388,25 @@ async def batch_read(
     paths: str,
     max_total_tokens: int = 50000,
     priority: str = "",
-    diff_mode: bool = True,
 ) -> dict[str, Any]:
-    """Read multiple files under a token budget, with cache-aware suppression.
+    """Read multiple files under a token budget. Automatically cache-aware.
 
     Use this to seed the cache, gather several files at once, or expand globs
-    before `search`, `similar`, or `grep`. Prefer it over many single-file
-    `read` calls.
+    before `search`, `similar`, or `grep`. Prefer over repeated `read` calls.
 
-    Behavior:
-    - Unchanged files are omitted from per-file content and listed in
-      `summary.unchanged`.
-    - Modified files may return diffs.
-    - Large files may be skipped once the token budget is exhausted.
-    - `diff_mode=false` is only for uncached or stale files; unchanged cached
-      full-file requests are rejected.
+    Behavior (automatic — no configuration needed):
+    - Unchanged files listed in `summary.unchanged` (already in context).
+    - Modified files return diffs.
+    - New files return full content.
+    - Large files skipped once token budget is exhausted.
 
-    Recovery rules:
-    - If a file is skipped for budget, use `read` with `offset`/`limit` or
-      raise the budget.
-    - If a file is listed in `summary.unchanged`, do not immediately re-read it
-      just to fetch the same cached full content again.
+    If a file is skipped for budget, use `read` with `offset`/`limit` or
+    raise the budget.
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns.
         max_total_tokens: Token budget across the batch.
         priority: Optional paths to read first before the remaining files.
-        diff_mode: Prefer cache-aware unchanged/diff behavior unless you
-            explicitly need full reads for uncached or stale files.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -1496,7 +1423,6 @@ async def batch_read(
                 "paths": json.dumps(path_list),
                 "max_total_tokens": max_total_tokens,
                 "priority": json.dumps(priority_list) if priority_list else "",
-                "diff_mode": diff_mode,
             },
             timeout=_TOOL_TIMEOUT * 2,
         )
@@ -1506,18 +1432,12 @@ async def batch_read(
         # Expand glob patterns
         path_list = _expand_globs(path_list)
 
-        if not diff_mode:
-            cached_paths = await _fresh_mtime_cached_paths(cache, path_list)
-            if cached_paths:
-                _raise_cached_full_read_block("batch_read", cached_paths, max_response_tokens)
-
         result = await asyncio.wait_for(
             batch_smart_read(
                 cache,
                 path_list,
                 max_total_tokens=max_total_tokens,
                 priority=priority_list,
-                diff_mode=diff_mode,
             ),
             timeout=_TOOL_TIMEOUT * 2,
         )  # batch gets double timeout
