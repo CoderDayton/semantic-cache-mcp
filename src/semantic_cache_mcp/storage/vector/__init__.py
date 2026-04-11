@@ -139,8 +139,20 @@ class VectorStorage:
         same sync collection so the new executor takes effect on subsequent
         calls. Sync VectorDB has no executor of its own, so nothing else
         needs to be touched.
+
+        Ownership transfers OUT: the caller passing a replacement executor
+        owns its lifecycle. If we previously owned the executor (no executor
+        was injected at construction), we shut it down here so the worker
+        thread isn't leaked, and flip ``_owns_executor`` to False so a later
+        ``close()`` doesn't shut down the caller's replacement.
         """
+        if self._owns_executor and self._io_executor is not new_executor:
+            try:
+                self._io_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug(f"Old owned executor shutdown failed: {exc}")
         self._io_executor = new_executor
+        self._owns_executor = False
         # Reuse the existing sync collection — we only need a fresh async
         # wrapper bound to the new executor.
         self._collection = AsyncVectorCollection(self._sync_collection, new_executor)
