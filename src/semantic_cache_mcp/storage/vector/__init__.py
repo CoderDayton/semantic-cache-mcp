@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import fnmatch
 import json
 import logging
 import time
-from concurrent.futures import Executor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 
-from simplevecdb import AsyncVectorDB, DistanceStrategy, Quantization
+from simplevecdb import AsyncVectorCollection, DistanceStrategy, Quantization, VectorDB
 
 from ...config import (
     CACHE_DIR,
@@ -57,7 +58,15 @@ class VectorStorage:
     - LRU-K eviction via access_history metadata
     """
 
-    __slots__ = ("_db", "_collection", "_db_path", "_closed", "_io_executor")
+    __slots__ = (
+        "_db",
+        "_collection",
+        "_sync_collection",
+        "_db_path",
+        "_closed",
+        "_io_executor",
+        "_owns_executor",
+    )
 
     # Quantization currently in use — stored in sidecar to detect future changes.
     _QUANTIZATION = Quantization.INT8
@@ -73,20 +82,100 @@ class VectorStorage:
         self._db_path = db_path
         self._clear_if_quantization_changed(db_path)
         self._recover_if_crashed(db_path)
-        self._db = AsyncVectorDB(
+        # Use the sync VectorDB directly (not AsyncVectorDB) so we can pass
+        # store_embeddings=True to collection() — that parameter is missing
+        # from AsyncVectorDB.collection() in simplevecdb 2.5.0. Async behavior
+        # is provided by wrapping the sync collection in AsyncVectorCollection
+        # below, which serializes ops on our injected executor.
+        self._db = VectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
             quantization=self._QUANTIZATION,
-            executor=executor,
         )
-        self._collection = self._db.collection(self._COLLECTION_NAME)
         self._closed = False
-        # When executor is injected, use it directly; otherwise read back
-        # the one simplevecdb created internally.
-        self._io_executor = executor if executor is not None else self._db._executor
+        # Sync VectorDB has no executor, so we own one when none is injected.
+        # Single-thread by default — ONNX/usearch are not thread-safe, and
+        # SemanticCache always passes its own DetachedExecutor in production.
+        # Annotate explicitly so mypy widens to Executor — both branches must
+        # be assignable, including the rebind_executor seam below.
+        self._io_executor: Executor
+        if executor is None:
+            self._io_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vecstorage-io"
+            )
+            self._owns_executor = True
+        else:
+            self._io_executor = executor
+            self._owns_executor = False
+        self._collection = self._build_collection()
         # Write sentinel — removed on clean shutdown by _remove_sentinel().
         STARTUP_SENTINEL.touch()
         logger.info(f"VectorStorage initialized at {db_path}")
+
+    def _reset_collection_sync(self, *, reason: str) -> None:
+        """Drop and recreate the collection synchronously.
+
+        Uses simplevecdb 2.5.0's ``delete_collection`` which atomically drops
+        the SQLite tables, FTS index, and usearch file in one call. The new
+        wrapper for the recreated collection is reattached to
+        ``self._collection`` so further async ops keep working. Safe to call
+        from sync startup paths — no event loop required.
+        """
+        try:
+            self._db.delete_collection(self._COLLECTION_NAME)
+        except KeyError:
+            # Collection didn't exist yet — nothing to drop.
+            pass
+        except Exception as exc:
+            logger.warning(f"delete_collection failed during {reason}: {exc}")
+        self._collection = self._build_collection()
+        logger.info(f"Collection reset complete ({reason})")
+
+    def rebind_executor(self, new_executor: Executor) -> None:
+        """Swap the IO executor used by the async collection wrapper.
+
+        Called by ``SemanticCache.reset_executor`` after a hung worker is
+        abandoned. Re-creates the AsyncVectorCollection wrapper around the
+        same sync collection so the new executor takes effect on subsequent
+        calls. Sync VectorDB has no executor of its own, so nothing else
+        needs to be touched.
+
+        Ownership transfers OUT: the caller passing a replacement executor
+        owns its lifecycle. If we previously owned the executor (no executor
+        was injected at construction), we shut it down here so the worker
+        thread isn't leaked, and flip ``_owns_executor`` to False so a later
+        ``close()`` doesn't shut down the caller's replacement.
+        """
+        if self._owns_executor and self._io_executor is not new_executor:
+            try:
+                self._io_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug(f"Old owned executor shutdown failed: {exc}")
+        self._io_executor = new_executor
+        self._owns_executor = False
+        # Reuse the existing sync collection — we only need a fresh async
+        # wrapper bound to the new executor.
+        self._collection = AsyncVectorCollection(self._sync_collection, new_executor)
+
+    def _build_collection(self) -> AsyncVectorCollection:
+        """Open the ``files`` collection with ``store_embeddings=True`` and
+        wrap it for async use.
+
+        ``store_embeddings=True`` is required so ``get_embeddings_by_ids``
+        can return the vectors used by ``SemanticCache.get()`` /
+        ``compare_files()``. simplevecdb 2.5.0 changed the default to False.
+        Stores a direct reference to the sync collection for sync code paths
+        (``save``, ``_clear_sync``) so they don't have to reach through the
+        async wrapper.
+        """
+        sync_coll = self._db.collection(
+            self._COLLECTION_NAME,
+            distance_strategy=DistanceStrategy.COSINE,
+            quantization=self._QUANTIZATION,
+            store_embeddings=True,
+        )
+        self._sync_collection = sync_coll
+        return AsyncVectorCollection(sync_coll, self._io_executor)
 
     @staticmethod
     def _remove_sentinel() -> None:
@@ -180,15 +269,7 @@ class VectorStorage:
                 f"(dim {meta.get('embedding_dim', '?')} -> {dim}); "
                 "rebuilding vector index and clearing cached embeddings"
             )
-            # Delete usearch index files
-            for suffix in (f".{self._COLLECTION_NAME}.usearch",):
-                stale = self._db_path.parent / (self._db_path.name + suffix)
-                if stale.exists():
-                    stale.unlink()
-                    logger.info(f"Deleted stale index: {stale}")
-            # Clear all documents from SQLite so stale embeddings don't persist.
-            self._clear_sync()
-            logger.info("Cleared all cached embeddings")
+            self._reset_collection_sync(reason="embedding model change")
 
         # Runtime dim check: even if the sidecar matches, verify the live
         # index dimension agrees with the current model. A stale or missing
@@ -199,12 +280,7 @@ class VectorStorage:
                 f"Index dimension {index_dim} != model dimension {dim}; "
                 "clearing index to prevent usearch segfault"
             )
-            for suffix in (f".{self._COLLECTION_NAME}.usearch",):
-                stale = self._db_path.parent / (self._db_path.name + suffix)
-                if stale.exists():
-                    stale.unlink()
-                    logger.info(f"Deleted dim-mismatched index: {stale}")
-            self._clear_sync()
+            self._reset_collection_sync(reason="dimension mismatch")
 
         meta["embedding_model"] = model_name
         meta["embedding_dim"] = dim
@@ -228,15 +304,8 @@ class VectorStorage:
         def _do_close() -> None:
             nonlocal close_error
             try:
-                # Access the sync VectorDB via AsyncVectorDB._db.
-                # Guard with getattr so a simplevecdb API change logs a
-                # warning instead of crashing during shutdown.
-                sync_db = getattr(self._db, "_db", None)
-                if sync_db is None:
-                    logger.warning("simplevecdb internal API changed — cannot access sync VectorDB")
-                    return
-                sync_db.save()
-                sync_db.close()
+                self._db.save()
+                self._db.close()
             except Exception as exc:
                 close_error = exc
 
@@ -256,6 +325,14 @@ class VectorStorage:
             logger.warning(f"VectorStorage close error: {close_error}")
         else:
             logger.debug("VectorStorage closed cleanly")
+
+        # Shut down the executor only when we own it. SemanticCache injects
+        # its own DetachedExecutor and manages its lifecycle separately.
+        if self._owns_executor:
+            try:
+                self._io_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug(f"Owned executor shutdown failed: {exc}")
 
     # -------------------------------------------------------------------------
     # File operations
@@ -915,11 +992,11 @@ class VectorStorage:
     def _clear_sync(self) -> int:
         """Synchronous clear — safe to call without an event loop.
 
-        Used by clear_if_model_changed() which runs before the async
-        server starts. Avoids the fragile get_event_loop().run_until_complete()
-        pattern that breaks when called from within a running loop.
+        Avoids the fragile get_event_loop().run_until_complete() pattern that
+        breaks when called from within a running loop. Kept for tests and
+        callers that need to clear without dropping the collection's tables.
         """
-        sync_coll = self._collection._collection
+        sync_coll = self._sync_collection
         count = sync_coll.count()
         if count > 0:
             all_docs = sync_coll.get_documents()
@@ -930,14 +1007,25 @@ class VectorStorage:
         return count
 
     async def clear(self) -> int:
-        """Clear all cache entries. Returns count of files removed."""
+        """Clear all cache entries. Returns count of documents removed.
+
+        Uses simplevecdb 2.5.0's ``delete_collection`` to atomically drop the
+        SQLite tables, FTS index, and usearch file in one call, then rebuilds
+        an empty collection. Faster and safer than the previous per-id loop.
+        Runs the (sync) ``delete_collection`` on the shared IO executor so it
+        does not block the event loop.
+        """
+        import contextlib  # noqa: PLC0415
+
         count = await self._collection.count()
         if count > 0:
-            all_docs = await self._collection.get_documents()
-            doc_ids = [doc_id for doc_id, _, _ in all_docs]
-            if doc_ids:
-                await self._collection.delete_by_ids(doc_ids)
-                await self._collection.save()
+            loop = asyncio.get_running_loop()
+            with contextlib.suppress(KeyError):
+                await loop.run_in_executor(
+                    self._io_executor,
+                    lambda: self._db.delete_collection(self._COLLECTION_NAME),
+                )
+            self._collection = self._build_collection()
         return count
 
     async def delete_path(self, path: str) -> int:
@@ -1032,7 +1120,5 @@ class VectorStorage:
         """
         if self._closed:
             return
-        self._collection._collection.save()
-        sync_db = getattr(self._db, "_db", None)
-        if sync_db is not None:
-            sync_db.save()
+        self._sync_collection.save()
+        self._db.save()

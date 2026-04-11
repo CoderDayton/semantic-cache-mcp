@@ -471,7 +471,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks,
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and:
 
 - [FastEmbed](https://github.com/qdrant/fastembed) — local ONNX embeddings (configurable, default BAAI/bge-small-en-v1.5)
-- [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB) — HNSW vector storage with FTS5 keyword search
+- [SimpleVecDB ≥ 2.5.0](https://github.com/CoderDayton/SimpleVecDB) — HNSW vector storage with FTS5 keyword search, atomic `delete_collection`, and opt-in embedding persistence (`store_embeddings=True`)
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
 - BLAKE3 cryptographic hashing for content freshness
 - LRU-K frequency-aware cache eviction

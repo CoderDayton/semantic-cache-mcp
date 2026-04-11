@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-10
+
+### Changed
+
+- **simplevecdb 2.5.0** — Bumped minimum dependency to pick up the new
+  `delete_collection`, `store_embeddings`, and pagination APIs along with
+  fixes to delete ordering, FTS retries, and connection health probes.
+- **`store_embeddings=True`** — VectorStorage now opts into SQLite-side
+  embedding storage. simplevecdb 2.5.0 changed the default to `False` to save
+  ~2× storage; without opting in, `get_embeddings_by_ids` would return `None`
+  and break embedding-aware similarity reuse in `SemanticCache.get()`.
+- **Atomic collection reset** — `clear()` and `clear_if_model_changed()` now
+  call `delete_collection()`, which drops the SQLite tables, FTS index, and
+  usearch file in one call, replacing the previous per-id loop and manual
+  file unlinks. The new helper `_reset_collection_sync()` handles the
+  startup-path (no event loop) variant.
+- **Sync VectorDB + manual async wrapper** — Replaced `AsyncVectorDB` with a
+  direct sync `VectorDB` plus a manually-built `AsyncVectorCollection`
+  wrapper. `AsyncVectorDB.collection()` does not expose `store_embeddings`
+  in 2.5.0 (no kwargs forwarding, no setter), so we need the sync collection
+  factory anyway. Going through the public sync `VectorDB` deletes every
+  remaining `simplevecdb` private-attribute access from the project: no more
+  `_db._db`, `_db._executor`, or `_collection._collection` reach-throughs.
+  A new `VectorStorage.rebind_executor()` method gives `SemanticCache.reset_executor`
+  a public seam to swap the IO executor after a hung worker.
+
 ## [0.4.1] - 2026-04-02
 
 ### Changed

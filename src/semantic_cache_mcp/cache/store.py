@@ -303,9 +303,9 @@ class SemanticCache:
         # MUST be single-threaded — ONNX Runtime and usearch use
         # incompatible allocators that segfault under concurrent access
         # from different threads.
-        # Passed to VectorStorage → AsyncVectorDB so simplevecdb's own
-        # operations (add_texts, similarity_search, etc.) also serialize
-        # on this thread.
+        # Passed to VectorStorage so simplevecdb's own operations
+        # (add_texts, similarity_search, etc.) also serialize on this thread
+        # via the AsyncVectorCollection wrapper VectorStorage builds.
         self._io_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
         self._storage = VectorStorage(db_path, executor=self._io_executor)
         metrics_db = CACHE_DIR / "metrics.db"
@@ -333,9 +333,7 @@ class SemanticCache:
 
         new_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
         self._io_executor = new_executor
-        self._storage._io_executor = new_executor
-        self._storage._db._executor = new_executor
-        self._storage._collection._executor = new_executor
+        self._storage.rebind_executor(new_executor)
         logger.debug("IO executor replaced with fresh instance")
 
     @property
