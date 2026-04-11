@@ -225,7 +225,7 @@ class TestVectorStorageClose:
         def hang_forever() -> None:
             time.sleep(60)
 
-        with patch.object(vs._db._db, "save", side_effect=hang_forever):
+        with patch.object(vs._db, "save", side_effect=hang_forever):
             start = time.monotonic()
             vs.close(timeout=0.1)
             elapsed = time.monotonic() - start
@@ -238,7 +238,7 @@ class TestVectorStorageClose:
 
         vs = VectorStorage(tmp_path / "vec.db")
 
-        with patch.object(vs._db._db, "save", side_effect=RuntimeError("corrupt")):
+        with patch.object(vs._db, "save", side_effect=RuntimeError("corrupt")):
             vs.close()  # should not raise
 
 

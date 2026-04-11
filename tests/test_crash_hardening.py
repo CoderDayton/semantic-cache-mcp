@@ -83,7 +83,7 @@ class TestClearIfModelChangedDimMismatch:
     """Fix 5: clear_if_model_changed detects runtime dimension mismatch."""
 
     def test_clear_if_model_changed_detects_dim_mismatch(self, storage: VectorStorage) -> None:
-        """When index dim != model dim, _clear_sync must be called."""
+        """When index dim != model dim, _reset_collection_sync must be called."""
         with (
             patch.object(
                 type(storage._collection),
@@ -91,13 +91,13 @@ class TestClearIfModelChangedDimMismatch:
                 new_callable=PropertyMock,
                 return_value=TEST_EMBEDDING_DIM,
             ),
-            patch.object(VectorStorage, "_clear_sync", return_value=0) as mock_clear,
+            patch.object(VectorStorage, "_reset_collection_sync", return_value=None) as mock_reset,
         ):
             storage.clear_if_model_changed("some-model", TEST_EMBEDDING_DIM * 2)
-        mock_clear.assert_called()
+        mock_reset.assert_called()
 
     def test_clear_if_model_changed_no_clear_when_dim_matches(self, storage: VectorStorage) -> None:
-        """When dims agree, _clear_sync should not be called for dim reasons."""
+        """When dims agree, _reset_collection_sync should not be called for dim reasons."""
         with (
             patch.object(
                 type(storage._collection),
@@ -105,7 +105,7 @@ class TestClearIfModelChangedDimMismatch:
                 new_callable=PropertyMock,
                 return_value=TEST_EMBEDDING_DIM,
             ),
-            patch.object(VectorStorage, "_clear_sync", return_value=0) as mock_clear,
+            patch.object(VectorStorage, "_reset_collection_sync", return_value=None) as mock_reset,
         ):
             storage.clear_if_model_changed("some-model", TEST_EMBEDDING_DIM)
-        mock_clear.assert_not_called()
+        mock_reset.assert_not_called()

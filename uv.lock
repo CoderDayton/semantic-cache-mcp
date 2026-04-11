@@ -1950,7 +1950,7 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
@@ -1982,7 +1982,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
-    { name = "simplevecdb", specifier = ">=2.4.0" },
+    { name = "simplevecdb", specifier = ">=2.5.0" },
 ]
 provides-extras = ["gpu", "dev"]
 
@@ -1997,7 +1997,7 @@ wheels = [
 
 [[package]]
 name = "simplevecdb"
-version = "2.4.0"
+version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -2008,9 +2008,9 @@ dependencies = [
     { name = "sqlite-vec" },
     { name = "usearch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/14/ce/c1ecb6b7604296ddb101217cfe83154d2a3b0cb7225b53ec9baa9c79e343/simplevecdb-2.4.0.tar.gz", hash = "sha256:0e5ee5f923507cc8d0a2e538e348e511a76c0b3a0daf4caf6d3beb533607f0ff", size = 524631, upload-time = "2026-03-22T18:04:59.997Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/94/8f11cf79f8ee38e3f8afd5f9806743b8b072bc4ecac1928b7718bc4d68bc/simplevecdb-2.5.0.tar.gz", hash = "sha256:0f1435597e4496ee5d8ddf27b85f100e551634f8e4ce08e18661c0217de08d35", size = 540013, upload-time = "2026-04-07T10:38:55.008Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/b2/6c2850898162dac72ecbc11a5558790cfb4e4db099083fff0d962abfdd67/simplevecdb-2.4.0-py3-none-any.whl", hash = "sha256:a8735c8fa55af314907bfed0018baa6b3bb5c75739466ea00d904eaa29f83c99", size = 75129, upload-time = "2026-03-22T18:04:58.546Z" },
+    { url = "https://files.pythonhosted.org/packages/67/8a/ed8368d32f0d2ea35053d877237b3e8aad07c781c7a01f9a0a65d603eb98/simplevecdb-2.5.0-py3-none-any.whl", hash = "sha256:d23f08f6978efc7e9a6ddbf7e33123415d70186fb788e96f6ce787d79bcbca03", size = 80313, upload-time = "2026-04-07T10:38:53.905Z" },
 ]
 
 [[package]]
