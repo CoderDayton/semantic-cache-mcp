@@ -407,8 +407,9 @@ async def read(
             timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
-        # Detect unchanged files: from_cache=True + is_diff=False means
-        # the LLM already has this file's content from a prior read.
+        # Detect unchanged files: from_cache=True + is_diff=False means the
+        # cached file matches the on-disk file. This is a cache fact, not proof
+        # that the current client already has the file text in context.
         unchanged = result.from_cache and not result.is_diff
 
         payload = {
@@ -418,8 +419,7 @@ async def read(
         }
         if unchanged:
             payload["unchanged"] = True
-        if not unchanged or mode == _MODE_DEBUG:
-            payload["content"] = result.content
+        payload["content"] = result.content
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True

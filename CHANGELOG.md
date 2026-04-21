@@ -16,12 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Lean default mutation responses** — Clean deterministic `write`, `edit`, and `batch_edit` results no longer return full diffs by default. They now expose machine-readable `diff_state` metadata and reserve full diffs for partial applies, debug mode, or explicit requests.
-- **Lean unchanged reads** — Unchanged `read` responses now return `unchanged=true` without replaying cached file content by default.
 - **Compressed batch/search/glob/stats payloads** — `batch_read` now returns `unchanged_count` by default instead of full unchanged path lists, skipped-file guidance moved to a summary hint, `search` omits previews by default, `glob` omits per-match `tokens`/`mtime` outside debug, and `stats` text output is shorter while preserving structured data.
-- **Estimated token impact** — In representative local simulations, the new defaults cut response size by about **72.2%** across compact-mode edit/read/batch cases, **52.6%** across the normal-mode `search`/`glob` cases, and **61.6%** across the combined sample workload.
+- **Estimated token impact** — In representative local simulations, the new defaults cut response size by about **67.2%** across compact-mode edit/read/batch cases, **53.7%** across the normal-mode `search`/`glob` cases, and **59.9%** across the combined sample workload.
 
 ### Fixed
 
+- **Warm-cache read safety** — `read` no longer drops the `content` field on unchanged cache hits, so a first read in a new client session still receives a body even when the persistent cache is already warm.
 - **Diff contract stability** — Truncated responses now preserve diff metadata instead of silently dropping it.
 - **Diff state accuracy** — Unchanged writes no longer misreport `diff_omitted=true`, and diff-bearing tools now distinguish `full`, `unchanged`, and `omitted` states consistently.
 

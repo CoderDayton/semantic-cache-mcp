@@ -209,14 +209,20 @@ class TestReadTool:
         d = _parse(await read(ctx, str(sample_file)))
         assert "line1" in d["content"]
 
-    async def test_second_read_omits_unchanged_content(
-        self, ctx: MagicMock, sample_file: Path
-    ) -> None:
+    async def test_second_read_returns_content(self, ctx: MagicMock, sample_file: Path) -> None:
         await read(ctx, str(sample_file))
         d = _parse(await read(ctx, str(sample_file)))
         assert "path" in d
         assert d["unchanged"] is True
-        assert "content" not in d
+        assert "content" in d
+
+    async def test_warm_cache_first_read_still_returns_content(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        d = _parse(await read(ctx, str(sample_file)))
+        assert d["unchanged"] is True
+        assert "content" in d
 
     async def test_offset_limit_returns_line_range(self, ctx: MagicMock, sample_file: Path) -> None:
         d = _parse(await read(ctx, str(sample_file), offset=2, limit=2))
