@@ -15,6 +15,7 @@ the process can still exit.
 
 from __future__ import annotations
 
+import _thread
 import logging
 import queue
 import threading
@@ -38,12 +39,15 @@ class DetachedExecutor(Executor):
         self._work_queue: queue.Queue[_WorkItem | None] = queue.Queue()
         self._shutdown = False
         self._shutdown_lock = threading.Lock()
-        self._thread = threading.Thread(
-            target=self._worker,
-            name=f"{thread_name_prefix}_0",
-            daemon=True,
-        )
-        self._thread.start()
+        self._worker_ident: int | None = None
+        self._worker_stopped = threading.Event()
+        self._worker_started = threading.Event()
+        self._worker_name = f"{thread_name_prefix}_0"
+        self._worker_ident = _thread.start_new_thread(self._worker_entry, ())
+        if self._worker_ident is None:
+            raise RuntimeError("failed to start detached worker thread")
+        if not self._worker_started.wait(1.0):
+            raise RuntimeError("detached worker thread did not start")
 
     def submit(self, fn, /, *args, **kwargs):
         with self._shutdown_lock:
@@ -63,8 +67,8 @@ class DetachedExecutor(Executor):
             self._cancel_pending()
 
         self._work_queue.put(None)
-        if wait and threading.current_thread() is not self._thread:
-            self._thread.join()
+        if wait and threading.get_ident() != self._worker_ident:
+            self._worker_stopped.wait()
 
     def _cancel_pending(self) -> None:
         while True:
@@ -97,3 +101,11 @@ class DetachedExecutor(Executor):
                 logger.debug("DetachedExecutor worker raised", exc_info=exc)
             else:
                 future.set_result(result)
+
+    def _worker_entry(self) -> None:
+        threading.current_thread().name = self._worker_name
+        self._worker_started.set()
+        try:
+            self._worker()
+        finally:
+            self._worker_stopped.set()

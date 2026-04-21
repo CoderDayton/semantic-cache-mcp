@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-04-20
+
+### Fixed
+
+- **macOS process-exit hang** — `DetachedExecutor.shutdown(wait=False, cancel_futures=True)` no longer risks pinning interpreter shutdown on macOS when a worker is stuck. The executor now runs its worker on a truly detached low-level thread while preserving `wait=True` semantics via an internal stop event.
+
 ## [0.4.3] - 2026-04-20
 
 ### Added
