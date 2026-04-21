@@ -52,3 +52,28 @@ print("subprocess-exit-ok")
 
     assert result.returncode == 0, result.stderr
     assert "subprocess-exit-ok" in result.stdout
+
+
+def test_utils_import_does_not_eagerly_import_server_stack() -> None:
+    """Importing semantic_cache_mcp.utils should stay isolated and cheap."""
+    code = """
+from __future__ import annotations
+
+import sys
+
+import semantic_cache_mcp.utils  # noqa: F401
+
+assert "semantic_cache_mcp.server" not in sys.modules
+assert "semantic_cache_mcp.cache" not in sys.modules
+print("utils-import-ok")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "utils-import-ok" in result.stdout
