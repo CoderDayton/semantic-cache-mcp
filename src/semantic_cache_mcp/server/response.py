@@ -15,6 +15,8 @@ from ..core import count_tokens
 _MODE_NORMAL = {"normal", "debug"}
 _MODE_DEBUG = "debug"
 _UNSET = object()
+_NO_CHANGES_DIFF = "// No changes"
+_SUPPRESSED_DIFF_PREFIX = "[diff suppressed:"
 _response_mode_override: ContextVar[str | None] = ContextVar("response_mode_override", default=None)
 _response_token_cap_override: ContextVar[int | None | object] = ContextVar(
     "response_token_cap_override",
@@ -67,10 +69,38 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for key in keep_order:
         if key in payload:
             minimal[key] = payload[key]
+
+    diff_content = payload.get("diff")
+    diff_state = payload.get("diff_state")
+    diff_omitted = payload.get("diff_omitted")
+    if isinstance(diff_content, str):
+        if diff_state in {"unchanged", "suppressed"}:
+            minimal["diff"] = diff_content
+            minimal["diff_state"] = diff_state
+        else:
+            minimal["diff_state"] = "omitted"
+            minimal["diff_omitted"] = True
+    elif diff_omitted:
+        minimal["diff_state"] = "omitted"
+        minimal["diff_omitted"] = True
+    elif diff_state is not None:
+        minimal["diff_state"] = diff_state
+
     minimal["truncated"] = True
     if "message" not in minimal:
         minimal["message"] = "Response truncated by max_response_tokens"
     return minimal
+
+
+def _diff_state(diff_content: str | None) -> str | None:
+    """Classify a diff payload for clients without making them parse strings."""
+    if not diff_content:
+        return None
+    if diff_content == _NO_CHANGES_DIFF:
+        return "unchanged"
+    if diff_content.startswith(_SUPPRESSED_DIFF_PREFIX):
+        return "suppressed"
+    return "full"
 
 
 def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) -> dict[str, Any]:
