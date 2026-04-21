@@ -113,6 +113,7 @@ class WriteResponse(ToolResponseModel):
     status: str | None = None
     path: str | None = None
     diff: str | None = None
+    diff_state: str | None = None
     diff_omitted: bool | None = None
     created: bool | None = None
     dry_run: bool | None = None
@@ -128,6 +129,7 @@ class EditParams(ToolResponseModel):
     replace_all: bool | None = None
     dry_run: bool | None = None
     auto_format: bool | None = None
+    show_diff: bool | None = None
 
 
 class EditResponse(ToolResponseModel):
@@ -136,6 +138,7 @@ class EditResponse(ToolResponseModel):
     replaced: int | None = None
     line_numbers: list[int] | None = None
     diff: str | None = None
+    diff_state: str | None = None
     diff_omitted: bool | None = None
     tokens_saved: int | None = None
     diff_stats: dict[str, Any] | None = None
@@ -160,6 +163,7 @@ class BatchEditOutcome(ToolResponseModel):
 class BatchEditParams(ToolResponseModel):
     dry_run: bool | None = None
     auto_format: bool | None = None
+    show_diff: bool | None = None
 
 
 class BatchEditResponse(ToolResponseModel):
@@ -169,6 +173,7 @@ class BatchEditResponse(ToolResponseModel):
     failed: int | None = None
     failures: list[BatchEditFailure] | None = None
     diff: str | None = None
+    diff_state: str | None = None
     diff_omitted: bool | None = None
     tokens_saved: int | None = None
     outcomes: list[BatchEditOutcome] | None = None
@@ -193,12 +198,15 @@ class SearchResponse(ToolResponseModel):
     files_searched: int | None = None
     k: int | None = None
     directory: str | None = None
+    show_preview: bool | None = None
 
 
 class DiffResponse(ToolResponseModel):
     path1: str | None = None
     path2: str | None = None
     diff: str | None = None
+    diff_state: str | None = None
+    diff_omitted: bool | None = None
     similarity: float | None = None
     diff_stats: dict[str, Any] | None = None
     tokens_saved: int | None = None
@@ -213,6 +221,7 @@ class BatchReadSummary(ToolResponseModel):
     tokens_saved: int | None = None
     unchanged: list[str] | None = None
     unchanged_count: int | None = None
+    hint: str | None = None
 
 
 class BatchReadSkipped(ToolResponseModel):

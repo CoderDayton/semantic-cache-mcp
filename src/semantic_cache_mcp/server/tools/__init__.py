@@ -49,6 +49,7 @@ from .._tool_models import (
 from ..response import (
     _MODE_DEBUG,
     _MODE_NORMAL,
+    _diff_state,
     _finalize_payload,
     _raise_tool_error,
     _response_mode,
@@ -159,6 +160,38 @@ async def _tool_call_state(ctx: Context) -> _ToolCallState:
         max_response_tokens=_response_token_cap(),
         client_root=await _resolve_client_root(ctx),
     )
+
+
+def _show_diff_requested(mode: str, show_diff: bool) -> bool:
+    """Debug mode and explicit show_diff both count as a verbose diff request."""
+    return show_diff or mode == _MODE_DEBUG
+
+
+def _apply_mutation_diff(
+    payload: dict[str, Any],
+    *,
+    diff_content: str | None,
+    mode: str,
+    show_diff: bool,
+    partial: bool = False,
+) -> None:
+    """Attach diff fields only when they materially help the next decision."""
+    actual_state = _diff_state(diff_content) or "unchanged"
+    include_diff = partial or _show_diff_requested(mode, show_diff)
+
+    if actual_state == "unchanged":
+        payload["diff_state"] = "unchanged"
+        if include_diff and diff_content:
+            payload["diff"] = diff_content
+        return
+
+    if include_diff and diff_content:
+        payload["diff"] = diff_content
+        payload["diff_state"] = actual_state
+        return
+
+    payload["diff_state"] = "omitted"
+    payload["diff_omitted"] = True
 
 
 async def _maybe_call_remote_tool(
@@ -374,18 +407,19 @@ async def read(
             timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
-        # Detect unchanged files: from_cache=True + is_diff=False means
-        # the LLM already has this file's content from a prior read.
+        # Detect unchanged files: from_cache=True + is_diff=False means the
+        # cached file matches the on-disk file. This is a cache fact, not proof
+        # that the current client already has the file text in context.
         unchanged = result.from_cache and not result.is_diff
 
         payload = {
             "ok": True,
             "tool": "read",
             "path": path,
-            "content": result.content,
         }
         if unchanged:
             payload["unchanged"] = True
+        payload["content"] = result.content
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True
@@ -543,17 +577,12 @@ async def stats(
         lines = [
             "## Semantic Cache",
             "",
-            f"**{_n(cache_stats.get('files_cached', 0))}** files · "
-            f"**{_n(cache_stats.get('total_tokens_cached', 0))}** tokens stored · "
+            f"Storage: **{_n(cache_stats.get('files_cached', 0))}** files · "
+            f"**{_n(cache_stats.get('total_tokens_cached', 0))}** tokens · "
             f"**{_mb(cache_stats.get('db_size_mb', 0.0))}**",
             "",
-            "| | Saved | Rate | Hit Rate |",
-            "|---|---:|---:|---:|",
-            f"| **Session** | {_n(s_saved)} | **{s_pct}%** | {s_hit_pct}% ({s_hits}/{s_total}) |",
-            (
-                f"| **Lifetime** | {_n(lt_saved)} | **{lt_pct}%** "
-                f"| {lt_hit_pct}% ({lt_hits}/{lt_total}) |"
-            ),
+            f"Session: {_n(s_saved)} saved ({s_pct}%) · {s_hit_pct}% hit",
+            f"Lifetime: {_n(lt_saved)} saved ({lt_pct}%) · {lt_hit_pct}% hit",
             "",
             (
                 f"*{lt_sessions} completed session"
@@ -581,34 +610,23 @@ async def stats(
         lines = [
             "# Semantic Cache Stats",
             "",
-            "---",
-            "",
             "## Storage",
+            (
+                f"{_n(cache_stats.get('files_cached', 0))} files · "
+                f"{_n(cache_stats.get('total_tokens_cached', 0))} tokens · "
+                f"{_n(cache_stats.get('total_documents', 0))} documents · "
+                f"{_mb(cache_stats.get('db_size_mb', 0.0))}"
+            ),
             "",
-            "| Files Cached | Tokens Stored | Documents | DB Size |",
-            "|---:|---:|---:|---:|",
-            f"| **{_n(cache_stats.get('files_cached', 0))}** "
-            f"| **{_n(cache_stats.get('total_tokens_cached', 0))}** "
-            f"| {_n(cache_stats.get('total_documents', 0))} "
-            f"| {_mb(cache_stats.get('db_size_mb', 0.0))} |",
-            "",
-            "---",
-            "",
-            f"## This Session  ·  uptime {uptime}",
-            "",
-            "| Metric | Tokens | Rate |",
-            "|---|---:|---:|",
-            f"| Tokens saved | **{_n(s_saved)}** | **{s_pct}%** |",
-            f"| Tokens returned | {_n(session.get('tokens_returned', 0))} | — |",
-            "",
-            "| Cache hits | Cache misses | Hit rate |",
-            "|---:|---:|---:|",
-            f"| **{_n(s_hits)}** | {_n(s_misses)} | **{s_hit_pct}%** |",
-            "",
-            f"Files read: **{files_read}** · "
-            f"written: **{files_written}** · "
-            f"edited: **{files_edited}** · "
-            f"diffs served: **{diffs}**",
+            f"## Session  ·  uptime {uptime}",
+            (
+                f"Saved {_n(s_saved)} tokens ({s_pct}%) · returned "
+                f"{_n(session.get('tokens_returned', 0))} · hit rate {s_hit_pct}%"
+            ),
+            (
+                f"Activity: read {files_read} · written {files_written} · "
+                f"edited {files_edited} · diffs served {diffs}"
+            ),
         ]
 
         if top_tools:
@@ -619,30 +637,18 @@ async def stats(
 
         lines += [
             "",
-            "---",
-            "",
             f"## Lifetime  ·  {lt_sessions} session{'s' if lt_sessions != 1 else ''}",
-            "",
-            "| Metric | Tokens | Rate |",
-            "|---|---:|---:|",
-            f"| Tokens saved | **{_n(lt_saved)}** | **{lt_pct}%** |",
-            f"| Tokens returned | {_n(lifetime.get('tokens_returned', 0))} | — |",
-            "",
-            "| Cache hits | Cache misses | Hit rate |",
-            "|---:|---:|---:|",
-            f"| **{_n(lt_hits)}** | {_n(lt_misses)} | **{lt_hit_pct}%** |",
-            "",
-            f"Files read: **{_n(lt_files_read)}** · "
-            f"written: **{_n(lt_files_written)}** · "
-            f"edited: **{_n(lt_files_edited)}**",
-            "",
-            "---",
+            (
+                f"Saved {_n(lt_saved)} tokens ({lt_pct}%) · returned "
+                f"{_n(lifetime.get('tokens_returned', 0))} · hit rate {lt_hit_pct}%"
+            ),
+            (
+                f"Activity: read {_n(lt_files_read)} · written {_n(lt_files_written)} · "
+                f"edited {_n(lt_files_edited)}"
+            ),
             "",
             "## System",
-            "",
-            "| Model | Provider | Memory |",
-            "|---|---|---:|",
-            f"| `{model_name}` | {provider_str} | {mem_str} |",
+            f"`{model_name}` · {provider_str} · {mem_str}",
         ]
         return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
@@ -802,9 +808,10 @@ async def write(
     create_parents: bool = True,
     dry_run: bool = False,
     auto_format: bool = False,
+    show_diff: bool = False,
     append: bool = False,
 ) -> dict[str, Any]:
-    """Create or replace a file, with cache refresh and overwrite diffs.
+    """Create or replace a file, with cache refresh and optional overwrite diffs.
 
     Use this when you already know the full new file content. For targeted
     changes inside an existing file, prefer `edit` or `batch_edit`.
@@ -815,7 +822,8 @@ async def write(
     - Multiple localized changes in one file: use `batch_edit`.
 
     Behavior:
-    - Overwrites return a diff when useful.
+    - Deterministic successful overwrites omit full diffs by default.
+    - Set `show_diff=true` or use debug mode to include the diff explicitly.
     - New files return creation status.
     - `append=true` supports chunked construction for large files.
     - `dry_run=true` previews without writing.
@@ -828,6 +836,7 @@ async def write(
         create_parents: Create missing parent directories when needed.
         dry_run: Preview without writing.
         auto_format: Run formatter after write.
+        show_diff: Return the diff explicitly even for deterministic writes.
         append: Append instead of overwrite.
     """
     state = await _tool_call_state(ctx)
@@ -844,6 +853,7 @@ async def write(
             "create_parents": create_parents,
             "dry_run": dry_run,
             "auto_format": auto_format,
+            "show_diff": show_diff,
             "append": append,
         },
         timeout=_TOOL_TIMEOUT,
@@ -872,10 +882,15 @@ async def write(
             "status": "created" if result.created else "updated",
             "path": result.path,
         }
-        if result.diff_content:
-            payload["diff"] = result.diff_content
-        elif not result.created:
-            payload["diff_omitted"] = True
+        if result.created:
+            payload["diff_state"] = "none"
+        else:
+            _apply_mutation_diff(
+                payload,
+                diff_content=result.diff_content,
+                mode=mode,
+                show_diff=show_diff,
+            )
 
         if mode in _MODE_NORMAL:
             payload["created"] = result.created
@@ -927,6 +942,7 @@ async def edit(
     replace_all: bool = False,
     dry_run: bool = False,
     auto_format: bool = False,
+    show_diff: bool = False,
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> dict[str, Any]:
@@ -949,6 +965,8 @@ async def edit(
     - Keep `old_string` exact and as short as possible, ideally one line.
     - If a match is ambiguous, add more context or line bounds.
     - Use `replace_all=true` only when every match should change.
+    - Deterministic successful edits omit full diffs unless `show_diff=true`
+      or debug mode is enabled.
 
     Args:
         path: File path to modify.
@@ -957,6 +975,7 @@ async def edit(
         replace_all: Replace all matches instead of requiring uniqueness.
         dry_run: Preview without writing.
         auto_format: Run formatter after editing.
+        show_diff: Return the diff explicitly for successful deterministic edits.
         start_line: 1-based inclusive start line for scoped or line-range edit.
         end_line: 1-based inclusive end line for scoped or line-range edit.
     """
@@ -975,6 +994,7 @@ async def edit(
             "replace_all": replace_all,
             "dry_run": dry_run,
             "auto_format": auto_format,
+            "show_diff": show_diff,
             "start_line": start_line,
             "end_line": end_line,
         },
@@ -1009,10 +1029,12 @@ async def edit(
             "replaced": result.replacements_made,
             "line_numbers": result.line_numbers,
         }
-        if result.diff_content:
-            payload["diff"] = result.diff_content
-        else:
-            payload["diff_omitted"] = True
+        _apply_mutation_diff(
+            payload,
+            diff_content=result.diff_content,
+            mode=mode,
+            show_diff=show_diff,
+        )
         if mode in _MODE_NORMAL:
             payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
@@ -1023,6 +1045,7 @@ async def edit(
                 "replace_all": replace_all,
                 "dry_run": dry_run,
                 "auto_format": auto_format,
+                "show_diff": show_diff,
             }
 
         return _finalize_payload(payload, max_response_tokens)
@@ -1058,6 +1081,7 @@ async def batch_edit(
     edits: str,
     dry_run: bool = False,
     auto_format: bool = False,
+    show_diff: bool = False,
 ) -> dict[str, Any]:
     """Apply multiple exact edits to one file in a single call.
 
@@ -1075,12 +1099,15 @@ async def batch_edit(
     - Partial success is allowed.
     - Failed edits are returned so you can retry only the misses.
     - Prefer line-range entries when you already have line numbers from `read`.
+    - Deterministic all-success batches omit full diffs unless `show_diff=true`
+      or debug mode is enabled.
 
     Args:
         path: File path to modify.
         edits: JSON array of edit entries for that file.
         dry_run: Preview without writing.
         auto_format: Run formatter after edits.
+        show_diff: Return the diff explicitly for successful deterministic batches.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1095,6 +1122,7 @@ async def batch_edit(
             "edits": edits,
             "dry_run": dry_run,
             "auto_format": auto_format,
+            "show_diff": show_diff,
         },
         timeout=_TOOL_TIMEOUT,
     )
@@ -1173,10 +1201,13 @@ async def batch_edit(
                 for o in result.outcomes
                 if not o.success
             ]
-        if result.diff_content:
-            payload["diff"] = result.diff_content
-        else:
-            payload["diff_omitted"] = True
+        _apply_mutation_diff(
+            payload,
+            diff_content=result.diff_content,
+            mode=mode,
+            show_diff=show_diff,
+            partial=status == "partial",
+        )
         if mode in _MODE_NORMAL:
             payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
@@ -1193,7 +1224,11 @@ async def batch_edit(
             payload["diff_stats"] = result.diff_stats
             payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
-            payload["params"] = {"dry_run": dry_run, "auto_format": auto_format}
+            payload["params"] = {
+                "dry_run": dry_run,
+                "auto_format": auto_format,
+                "show_diff": show_diff,
+            }
 
         return _finalize_payload(payload, max_response_tokens)
 
@@ -1230,6 +1265,7 @@ async def search(
     query: str,
     k: int = 10,
     directory: str | None = None,
+    show_preview: bool = False,
 ) -> dict[str, Any]:
     """Search cached files by meaning or mixed keyword intent.
 
@@ -1247,11 +1283,13 @@ async def search(
     - Seed likely files with `batch_read` first.
     - Start with small `k` such as 3–5.
     - Use `directory` to keep large codebases focused.
+    - Set `show_preview=true` only when snippet text changes the next decision.
 
     Args:
         query: Natural-language query, keywords, or a mixture of both.
         k: Maximum number of matches to return.
         directory: Optional directory filter applied after retrieval.
+        show_preview: Include match previews explicitly.
     """
     state = await _tool_call_state(ctx)
     directory = state.resolve(directory) if directory else None
@@ -1261,7 +1299,7 @@ async def search(
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state,
         "search",
-        {"query": query, "k": k, "directory": directory},
+        {"query": query, "k": k, "directory": directory, "show_preview": show_preview},
         timeout=_TOOL_TIMEOUT,
     )
     if remote_result is not None:
@@ -1279,6 +1317,7 @@ async def search(
             item: dict[str, Any] = {"path": m.path, "similarity": round(m.similarity, 4)}
             if mode in _MODE_NORMAL:
                 item["tokens"] = m.tokens
+            if show_preview or mode == _MODE_DEBUG:
                 item["preview"] = m.preview
             match_payload.append(item)
 
@@ -1295,6 +1334,7 @@ async def search(
             payload["files_searched"] = result.files_searched
             payload["k"] = k
             payload["directory"] = directory
+            payload["show_preview"] = show_preview
 
         return _finalize_payload(payload, max_response_tokens)
 
@@ -1358,6 +1398,7 @@ async def diff(
             "path1": result.path1,
             "path2": result.path2,
             "diff": result.diff_content,
+            "diff_state": _diff_state(result.diff_content),
         }
         if mode in _MODE_NORMAL:
             payload["similarity"] = round(result.similarity, 4)
@@ -1395,7 +1436,7 @@ async def batch_read(
     before `search`, `similar`, or `grep`. Prefer over repeated `read` calls.
 
     Behavior (automatic — no configuration needed):
-    - Unchanged files listed in `summary.unchanged` (already in context).
+    - Unchanged files counted in `summary.unchanged_count` (path list in debug mode).
     - Modified files return diffs.
     - New files return full content.
     - Large files skipped once token budget is exhausted.
@@ -1452,8 +1493,9 @@ async def batch_read(
             summary["total_tokens"] = result.total_tokens
             summary["tokens_saved"] = result.tokens_saved
         if result.unchanged_paths:
-            summary["unchanged"] = result.unchanged_paths
             summary["unchanged_count"] = len(result.unchanged_paths)
+            if mode == _MODE_DEBUG:
+                summary["unchanged"] = result.unchanged_paths
 
         skipped_items: list[dict[str, Any]] = []
         file_items: list[dict[str, Any]] = []
@@ -1462,7 +1504,8 @@ async def batch_read(
                 skipped_item: dict[str, Any] = {"path": f.path}
                 if f.est_tokens is not None:
                     skipped_item["est_tokens"] = f.est_tokens
-                skipped_item["hint"] = "use read with offset/limit"
+                if mode == _MODE_DEBUG:
+                    skipped_item["hint"] = "use read with offset/limit"
                 skipped_items.append(skipped_item)
             elif f.status == "unchanged":
                 # Already captured in summary.unchanged — no per-file entry needed
@@ -1490,6 +1533,7 @@ async def batch_read(
             "summary": summary,
         }
         if skipped_items:
+            summary["hint"] = "Use read with offset/limit for skipped files."
             payload["skipped"] = skipped_items
         payload["files"] = file_items
 
@@ -1650,7 +1694,7 @@ async def glob(
         matches_payload = []
         for m in result.matches:
             item: dict[str, Any] = {"path": m.path, "cached": m.cached}
-            if mode in _MODE_NORMAL:
+            if mode == _MODE_DEBUG:
                 item["tokens"] = m.tokens
                 item["mtime"] = m.mtime
             matches_payload.append(item)

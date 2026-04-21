@@ -121,6 +121,21 @@ class TestMinimalPayload:
         assert m["path1"] == "/a"
         assert m["path2"] == "/b"
 
+    def test_marks_dropped_diff_as_omitted(self) -> None:
+        m = _minimal_payload(
+            {
+                "ok": True,
+                "tool": "diff",
+                "path1": "/a",
+                "path2": "/b",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                "diff_state": "full",
+            }
+        )
+        assert "diff" not in m
+        assert m["diff_state"] == "omitted"
+        assert m["diff_omitted"] is True
+
 
 class TestRenderResponse:
     def test_normal_mode_keeps_ok_and_tool(self) -> None:
@@ -151,6 +166,24 @@ class TestRenderResponse:
         d = json.loads(body)
         assert d.get("truncated") is True
 
+    def test_token_cap_preserves_diff_metadata(self) -> None:
+        body = _render_response(
+            {
+                "ok": True,
+                "tool": "diff",
+                "path1": "/a",
+                "path2": "/b",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n" * 200,
+                "diff_state": "full",
+            },
+            80,
+        )
+        d = json.loads(body)
+        assert d["truncated"] is True
+        assert d["diff_state"] == "omitted"
+        assert d["diff_omitted"] is True
+        assert "diff" not in d
+
     def test_no_token_cap(self) -> None:
         with patch("semantic_cache_mcp.server.response.TOOL_OUTPUT_MODE", "normal"):
             body = _render_response({"ok": True, "tool": "stats"}, None)
@@ -177,14 +210,18 @@ class TestReadTool:
         assert "line1" in d["content"]
 
     async def test_second_read_returns_content(self, ctx: MagicMock, sample_file: Path) -> None:
-        """Second unchanged read: content is still returned
-        (unchanged file re-reads the cached bytes; no diff marker is emitted).
-        """
         await read(ctx, str(sample_file))
         d = _parse(await read(ctx, str(sample_file)))
-        # path is always returned
         assert "path" in d
-        # content is returned (not suppressed in single-file read)
+        assert d["unchanged"] is True
+        assert "content" in d
+
+    async def test_warm_cache_first_read_still_returns_content(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        d = _parse(await read(ctx, str(sample_file)))
+        assert d["unchanged"] is True
         assert "content" in d
 
     async def test_offset_limit_returns_line_range(self, ctx: MagicMock, sample_file: Path) -> None:
@@ -377,13 +414,33 @@ class TestWriteTool:
             d = _parse(await write(ctx, str(p), "content"))
         assert "content_hash" in d
 
-    async def test_write_diff_shown_on_overwrite(self, ctx: MagicMock, tmp_path: Path) -> None:
+    async def test_write_overwrite_omits_diff_by_default(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
         p = tmp_path / "diff.txt"
         p.write_text("old\n")
         await smart_read(ctx.lifespan_context["cache"], str(p))
         d = _parse(await write(ctx, str(p), "new\n"))
-        # diff key should be present since file was previously cached
-        assert "diff" in d or "diff_omitted" in d
+        assert d["diff_state"] == "omitted"
+        assert d["diff_omitted"] is True
+        assert "diff" not in d
+
+    async def test_write_show_diff_returns_diff(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "show-diff.txt"
+        p.write_text("old\n")
+        d = _parse(await write(ctx, str(p), "new\n", show_diff=True))
+        assert d["diff_state"] == "full"
+        assert "diff" in d
+
+    async def test_write_unchanged_overwrite_reports_unchanged_state(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        p = tmp_path / "same.txt"
+        p.write_text("same\n")
+        d = _parse(await write(ctx, str(p), "same\n"))
+        assert d["diff_state"] == "unchanged"
+        assert "diff_omitted" not in d
+        assert "diff" not in d
 
     async def test_write_normal_mode_includes_created_flag(
         self, ctx: MagicMock, tmp_path: Path
@@ -430,6 +487,7 @@ class TestEditTool:
     async def test_edit_debug_mode_includes_diff_stats(self, ctx: MagicMock, py_file: Path) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
             d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))
+        assert "diff" in d
         assert "diff_stats" in d
         assert "content_hash" in d
 
@@ -443,6 +501,19 @@ class TestEditTool:
     async def test_edit_returns_line_numbers(self, ctx: MagicMock, py_file: Path) -> None:
         d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))
         assert "line_numbers" in d
+
+    async def test_edit_omits_diff_by_default(self, ctx: MagicMock, py_file: Path) -> None:
+        d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))
+        assert d["diff_state"] == "omitted"
+        assert d["diff_omitted"] is True
+        assert "diff" not in d
+
+    async def test_edit_show_diff_returns_diff(self, ctx: MagicMock, py_file: Path) -> None:
+        d = _parse(
+            await edit(ctx, str(py_file), old_string="hello", new_string="hi", show_diff=True)
+        )
+        assert d["diff_state"] == "full"
+        assert "diff" in d
 
     async def test_edit_permission_error(self, ctx: MagicMock, py_file: Path) -> None:
         """PermissionError from atomic write maps to a tool error."""
@@ -476,6 +547,9 @@ class TestBatchEditTool:
         d = _parse(await batch_edit(ctx, str(p), edits_json))
         assert d.get("succeeded") == 2
         assert "failed" not in d  # omitted when 0
+        assert d["diff_state"] == "omitted"
+        assert d["diff_omitted"] is True
+        assert "diff" not in d
 
     async def test_batch_edit_partial_failure(self, ctx: MagicMock, tmp_path: Path) -> None:
         p = tmp_path / "f2.txt"
@@ -485,6 +559,15 @@ class TestBatchEditTool:
         assert d.get("succeeded") == 1
         assert d.get("failed") == 1
         assert "failures" in d
+        assert "diff" in d
+
+    async def test_batch_edit_show_diff_returns_diff(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "f-show.txt"
+        p.write_text("AAA\nBBB\n")
+        edits_json = json.dumps([["AAA", "111"], ["BBB", "222"]])
+        d = _parse(await batch_edit(ctx, str(p), edits_json, show_diff=True))
+        assert d["diff_state"] == "full"
+        assert "diff" in d
 
     async def test_batch_edit_invalid_json_returns_error(
         self, ctx: MagicMock, tmp_path: Path
@@ -543,6 +626,7 @@ class TestBatchEditTool:
         edits_json = json.dumps([["x", "y"]])
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
             d = _parse(await batch_edit(ctx, str(p), edits_json))
+        assert "diff" in d
         assert "outcomes" in d
 
     async def test_batch_edit_status_no_changes(self, ctx: MagicMock, tmp_path: Path) -> None:
@@ -597,12 +681,21 @@ class TestSearchTool:
             d = _parse(await search(ctx, "hello"))
         assert "files_searched" in d
         assert "k" in d
+        assert "show_preview" in d
 
     async def test_search_normal_mode_includes_count(self, ctx: MagicMock, py_file: Path) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await search(ctx, "hello"))
         assert "count" in d
         assert "cached_files" in d
+        for match in d.get("matches", []):
+            assert "preview" not in match
+
+    async def test_search_show_preview_opt_in(self, ctx: MagicMock, py_file: Path) -> None:
+        await smart_read(ctx.lifespan_context["cache"], str(py_file))
+        d = _parse(await search(ctx, "hello", show_preview=True))
+        assert d["matches"]
+        assert "preview" in d["matches"][0]
 
     async def test_search_k_parameter(
         self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
@@ -628,6 +721,7 @@ class TestDiffTool:
         b.write_text("same\n")
         d = _parse(await diff(ctx, str(a), str(b)))
         assert "diff" in d
+        assert d["diff_state"] == "unchanged"
 
     async def test_diff_different_files(self, ctx: MagicMock, tmp_path: Path) -> None:
         a = tmp_path / "a.txt"
@@ -636,6 +730,7 @@ class TestDiffTool:
         b.write_text("new content\n")
         d = _parse(await diff(ctx, str(a), str(b)))
         assert "diff" in d
+        assert d["diff_state"] == "full"
 
     async def test_diff_file_not_found(self, ctx: MagicMock, tmp_path: Path) -> None:
         a = tmp_path / "a.txt"
@@ -727,7 +822,16 @@ class TestBatchReadTool:
         await batch_read(ctx, str(sample_file))
         # Second read: should be unchanged
         d = _parse(await batch_read(ctx, str(sample_file)))
-        assert "unchanged" in d.get("summary", {})
+        assert d["summary"]["unchanged_count"] == 1
+        assert "unchanged" not in d["summary"]
+
+    async def test_skipped_hint_moves_to_summary(self, ctx: MagicMock, tmp_path: Path) -> None:
+        big = tmp_path / "big.txt"
+        big.write_text("word " * 2000)
+        d = _parse(await batch_read(ctx, str(big), max_total_tokens=10))
+        assert d["summary"]["hint"] == "Use read with offset/limit for skipped files."
+        assert d["skipped"]
+        assert "hint" not in d["skipped"][0]
 
     async def test_priority_parameter_comma_separated(
         self, ctx: MagicMock, sample_file: Path, py_file: Path
@@ -868,13 +972,15 @@ class TestGlobTool:
         cached_matches = [m for m in d["matches"] if m["cached"]]
         assert len(cached_matches) >= 1
 
-    async def test_glob_normal_mode_includes_tokens(self, ctx: MagicMock, tmp_path: Path) -> None:
+    async def test_glob_normal_mode_omits_per_match_metadata(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
         (tmp_path / "f.py").write_text("hello")
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await glob(ctx, "*.py", directory=str(tmp_path)))
         for m in d["matches"]:
-            assert "tokens" in m
-            assert "mtime" in m
+            assert "tokens" not in m
+            assert "mtime" not in m
 
     async def test_glob_debug_mode_includes_total_cached_tokens(
         self, ctx: MagicMock, tmp_path: Path
@@ -883,6 +989,9 @@ class TestGlobTool:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
             d = _parse(await glob(ctx, "*.py", directory=str(tmp_path)))
         assert "total_cached_tokens" in d
+        for m in d["matches"]:
+            assert "tokens" in m
+            assert "mtime" in m
 
 
 # ===========================================================================
@@ -1160,6 +1269,7 @@ class TestStatsTool:
             result = await stats(ctx)
         md = _tool_text(result)
         assert "## Semantic Cache" in md
+        assert "Storage" in md
         assert "Session" in md
         assert "Lifetime" in md
         assert "MB" in md
