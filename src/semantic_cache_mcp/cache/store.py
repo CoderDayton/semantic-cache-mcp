@@ -517,6 +517,11 @@ class SemanticCache:
         if has_embedding:
             return min(max(1.0, TOOL_TIMEOUT * 0.1), 2.0)
 
+        from ..config import OPENAI_EMBEDDINGS_ENABLED  # noqa: PLC0415
+
+        if OPENAI_EMBEDDINGS_ENABLED:
+            return min(max(2.0, TOOL_TIMEOUT * 0.2), 6.0)
+
         import semantic_cache_mcp.core.embeddings._model as _emb_model  # noqa: PLC0415
 
         if _emb_model._model_ready:
@@ -646,10 +651,11 @@ class SemanticCache:
             stats["merge_cache_maxsize"] = _tokenizer._merge_cache_maxsize
 
         # Add embedding model readiness
-        import semantic_cache_mcp.core.embeddings._model as _emb_model  # noqa: PLC0415
+        from ..core.embeddings import get_model_info  # noqa: PLC0415
 
-        stats["embedding_ready"] = _emb_model._model_ready
-        stats["embedding_provider"] = _emb_model._execution_provider
+        model_info = get_model_info()
+        stats["embedding_ready"] = model_info["ready"]
+        stats["embedding_provider"] = model_info["provider"]
 
         # Session metrics
         stats["session"] = self._metrics.snapshot()

@@ -5,6 +5,11 @@ import logging
 
 import numpy as np
 
+from ...config import (
+    OPENAI_EMBEDDING_DIMENSIONS,
+    OPENAI_EMBEDDING_MODEL,
+    OPENAI_EMBEDDINGS_ENABLED,
+)
 from ._constants import FASTEMBED_CACHE_DIR
 from ._cuda import _cuda_provider_is_available
 from ._model import (
@@ -12,23 +17,31 @@ from ._model import (
     _get_model,
     warmup,
 )
+from ._openai import embed_texts as _openai_embed_texts
 from ._registry import _register_custom_model
 
 logger = logging.getLogger(__name__)
 
 
+def _numpy_to_array(embedding: np.ndarray) -> array.array[float]:
+    result = array.array("f")
+    result.frombytes(embedding.astype(np.float32).tobytes())
+    return result
+
+
 def embed(text: str) -> array.array[float] | None:
     """Generate embedding, truncated to 8000 chars."""
     try:
+        if OPENAI_EMBEDDINGS_ENABLED:
+            return _openai_embed_texts([text])[0]
+
         model = _get_model()
 
         truncated = text[:8000]
 
         embeddings = list(model.embed([truncated]))
         if embeddings:
-            result = array.array("f")
-            result.frombytes(embeddings[0].astype(np.float32).tobytes())
-            return result
+            return _numpy_to_array(embeddings[0])
         return None
 
     except Exception as e:
@@ -45,14 +58,15 @@ def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
     if not texts:
         return []
     try:
+        if OPENAI_EMBEDDINGS_ENABLED:
+            return _openai_embed_texts(texts)
+
         model = _get_model()
         truncated = [t[:8000] for t in texts]
         results = list(model.embed(truncated))
         out: list[array.array[float] | None] = []
         for r in results:
-            a = array.array("f")
-            a.frombytes(r.astype(np.float32).tobytes())
-            out.append(a)
+            out.append(_numpy_to_array(r))
         return out
     except Exception as e:
         logger.warning(f"Batch embedding failed: {e}")
@@ -62,6 +76,9 @@ def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
 def embed_query(text: str) -> array.array[float] | None:
     """Embed a search query with the bge retrieval prefix."""
     try:
+        if OPENAI_EMBEDDINGS_ENABLED:
+            return _openai_embed_texts([text])[0]
+
         model = _get_model()
 
         # Official bge query instruction for retrieval tasks
@@ -86,6 +103,9 @@ def get_embedding_dim() -> int:
     fastembed registry > HuggingFace config.json. Never hardcodes a default.
     """
     import semantic_cache_mcp.core.embeddings._model as _m
+
+    if OPENAI_EMBEDDINGS_ENABLED:
+        return OPENAI_EMBEDDING_DIMENSIONS
 
     # 1. Already known from warmup
     if _m._embedding_dim > 0:
@@ -132,6 +152,15 @@ def get_embedding_dim() -> int:
 def get_model_info() -> dict[str, str | int]:
     """Return model name, dim, provider, cache_dir, and readiness flag."""
     import semantic_cache_mcp.core.embeddings._model as _m
+
+    if OPENAI_EMBEDDINGS_ENABLED:
+        return {
+            "model": OPENAI_EMBEDDING_MODEL,
+            "dim": get_embedding_dim(),
+            "cache_dir": "",
+            "provider": "OpenAI",
+            "ready": True,
+        }
 
     return {
         "model": FASTEMBED_MODEL,

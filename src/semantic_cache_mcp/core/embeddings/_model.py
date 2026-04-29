@@ -5,7 +5,7 @@ import time
 import warnings
 from typing import TYPE_CHECKING, Any
 
-from ...config import EMBEDDING_DEVICE
+from ...config import EMBEDDING_DEVICE, OPENAI_EMBEDDING_DIMENSIONS, OPENAI_EMBEDDINGS_ENABLED
 from ...logger import log_marker
 from ...utils import retry
 from ._constants import FASTEMBED_CACHE_DIR, FASTEMBED_MODEL
@@ -147,9 +147,16 @@ def warmup() -> None:
     A single-word warmup leaves these cold, causing the first real
     request to pay a ~600ms penalty.
     """
-    global _model_ready, _embedding_dim
+    global _model_ready, _embedding_dim, _execution_provider
 
     if _model_ready:
+        return
+
+    if OPENAI_EMBEDDINGS_ENABLED:
+        _embedding_dim = OPENAI_EMBEDDING_DIMENSIONS
+        _execution_provider = "OpenAI"
+        _model_ready = True
+        log_marker(logger, "embed.warmup.skip", provider="OpenAI", dim=_embedding_dim)
         return
 
     started = time.perf_counter()
