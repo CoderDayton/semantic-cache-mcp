@@ -18,6 +18,11 @@ All environment variables are optional. Defaults are tuned for typical usage.
 |----------|---------|-------------|
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model name for semantic search/similarity. Changing this clears and rebuilds all cached embeddings on next use. See [supported models](https://qdrant.github.io/fastembed/examples/Supported_Models/). |
 | `EMBEDDING_DEVICE` | `cpu` | Hardware for embedding inference. Options: `cpu` (no GPU needed), `gpu` or `cuda` (NVIDIA GPU via ONNX Runtime), `auto` (detect available). Requires `fastembed-gpu` for GPU — see below. |
+| `OPENAI_EMBEDDINGS_ENABLED` | `false` | Route embeddings through an OpenAI-compatible API instead of loading the local FastEmbed model. |
+| `OPENAI_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible embeddings endpoint. Default targets Ollama. Use `https://api.openai.com/v1` for hosted OpenAI. |
+| `OPENAI_API_KEY` | `ollama` | API key passed to the OpenAI-compatible client. Ollama accepts any non-empty value; hosted OpenAI requires a real key. |
+| `OPENAI_EMBEDDING_MODEL` | `nomic-embed-text` | Remote embedding model name. Changing this clears and rebuilds stored embeddings on next use. |
+| `OPENAI_EMBEDDING_DIMENSIONS` | *(inferred)* | Optional requested/expected remote embedding dimension. Leave unset to infer it from the first returned vector. |
 
 ### GPU acceleration
 
@@ -42,6 +47,32 @@ The default `BAAI/bge-small-en-v1.5` (33M params, 384 dimensions) is fast on CPU
 Any HuggingFace sentence-transformer model with an ONNX export will work — if the model isn't in fastembed's built-in list, it's automatically registered from HuggingFace Hub on first use (requires network access for initial download).
 
 > **Warning**: Changing the model invalidates all cached embeddings. The cache will rebuild as files are re-read.
+
+### OpenAI-compatible embeddings
+
+Set `OPENAI_EMBEDDINGS_ENABLED=true` to skip local FastEmbed startup and send embedding requests to an OpenAI-compatible service. The defaults target Ollama:
+
+```json
+"env": {
+  "OPENAI_EMBEDDINGS_ENABLED": "true",
+  "OPENAI_BASE_URL": "http://localhost:11434/v1",
+  "OPENAI_API_KEY": "ollama",
+  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text"
+}
+```
+
+Run `ollama pull nomic-embed-text` first if the model is not installed. For hosted OpenAI, override the URL, key, and model:
+
+```json
+"env": {
+  "OPENAI_EMBEDDINGS_ENABLED": "true",
+  "OPENAI_BASE_URL": "https://api.openai.com/v1",
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small"
+}
+```
+
+`OPENAI_EMBEDDING_DIMENSIONS` is optional. If unset, semantic-cache infers and records the dimension from the first returned vector. If set, the value is sent as OpenAI's `dimensions` request parameter and the response is validated against it.
 
 ## Logging
 

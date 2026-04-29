@@ -41,14 +41,11 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 ## Features
 
-- **80%+ Token Reduction** — Unchanged files cost ~0 tokens; changed files return diffs only
-- **Automatic Three-State Reads** — First read (full + cache), unchanged (`"unchanged":true`, 99% savings), modified (diff, 80–95% savings) — fully automatic, no configuration
-- **Semantic Search** — Hybrid BM25 + HNSW vector search via local ONNX embeddings (configurable model, default BAAI/bge-small-en-v1.5), no API keys, works offline
-- **Batch Embedding** — `batch_smart_read` pre-scans all new/changed files and embeds them in a single model call (N calls → 1)
-- **Content Hash Freshness** — BLAKE3 hash detects when mtime changes but content is identical (touch, git checkout) — returns cached instead of re-reading
-- **Grep** — Regex/literal pattern search across cached files with line numbers and context
-- **Semantic Summarization** — 50–80% token savings on large files, structure preserved
-- **DoS Protection** — Write size, edit size, and match count limits enforced at every boundary
+- **Cache-aware reads** — First read returns content, unchanged re-reads return a tiny marker, changed files return compact diffs.
+- **Search without re-reading** — Semantic search, similar-file lookup, grep, and glob all operate over cached project content.
+- **Configurable embeddings** — Local FastEmbed is the default; OpenAI-compatible providers are available when explicitly enabled.
+- **Large-file discipline** — Token budgets, semantic summarization, and content hashing keep responses small without losing freshness.
+- **Bounded writes and edits** — Size limits, match limits, dry runs, formatting hooks, and cache refreshes are handled at the tool boundary.
 
 ---
 
@@ -109,6 +106,21 @@ Any HuggingFace model with an ONNX export works — set `EMBEDDING_MODEL` in you
 ```
 
 If the model isn't in fastembed's built-in list, it's automatically downloaded and registered from HuggingFace Hub on first startup (ONNX file integrity is verified via SHA256). See [env_variables.md](docs/env_variables.md) for model recommendations.
+
+### OpenAI-Compatible Embeddings
+
+Local FastEmbed remains the default. To route embeddings through an OpenAI-compatible provider instead, enable it in the MCP env block. Defaults target Ollama:
+
+```json
+"env": {
+  "OPENAI_EMBEDDINGS_ENABLED": "true",
+  "OPENAI_BASE_URL": "http://localhost:11434/v1",
+  "OPENAI_API_KEY": "ollama",
+  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text"
+}
+```
+
+Run `ollama pull nomic-embed-text` first if the model is not installed. For hosted OpenAI, set `OPENAI_BASE_URL=https://api.openai.com/v1`, use a real `OPENAI_API_KEY`, and choose an embedding model such as `text-embedding-3-small`. `OPENAI_EMBEDDING_DIMENSIONS` is optional; leave it unset to infer the returned vector size.
 
 ### Block Native File Tools (Recommended)
 
@@ -181,6 +193,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ---
 
 ## Tool Reference
+
+The table above is the authoritative tool map. This section only shows the common call shapes.
 
 <details>
 <summary><strong>read</strong> — Single file, automatic caching</summary>
@@ -261,36 +275,6 @@ batch_edit path="/src/app.py" edits='[
 </details>
 
 <details>
-<summary><strong>search</strong> — Semantic search across cached files</summary>
-
-```
-search query="authentication middleware logic" k=5
-search query="database connection pooling" k=3
-```
-
-</details>
-
-<details>
-<summary><strong>similar</strong> — Find semantically related files</summary>
-
-```
-similar path="/src/auth.py" k=3
-similar path="/tests/test_auth.py" k=5
-```
-
-</details>
-
-<details>
-<summary><strong>glob</strong> — Pattern matching with cache awareness</summary>
-
-```
-glob pattern="**/*.py" directory="./src"
-glob pattern="**/*.py" directory="./src" cached_only=true
-```
-
-</details>
-
-<details>
 <summary><strong>batch_read</strong> — Multiple files with token budget</summary>
 
 ```
@@ -299,19 +283,19 @@ batch_read paths='["/src/a.py","/src/b.py"]' priority="/src/main.py"
 batch_read paths="/src/*.py" max_total_tokens=30000
 ```
 
-- **Glob expansion**: `src/*.py` expanded inline (max 50 files per glob)
-- **Priority ordering**: `priority` paths read first, remainder sorted smallest-first
-- **Token budget**: stops reading new files once `max_total_tokens` reached; skipped files include `est_tokens` hint
-- **Unchanged suppression**: unchanged files appear in `summary.unchanged` with no content (zero tokens)
-- **Batch embedding**: pre-scans all new/changed files and embeds them in a single model call before reading — N model calls reduced to 1
-- **Recovery**: use `read` with `offset`/`limit` for targeted line-range recovery after truncation or context loss
+- Expands simple globs, honors `priority`, enforces `max_total_tokens`, and reports skipped paths with recovery hints.
+- Unchanged files are collapsed into the summary instead of repeating content.
 
 </details>
 
 <details>
-<summary><strong>diff</strong> — Compare two files</summary>
+<summary><strong>discovery</strong> — Search, similar, glob, grep, diff</summary>
 
 ```
+search query="authentication middleware logic" k=5
+similar path="/src/auth.py" k=3
+glob pattern="**/*.py" directory="./src" cached_only=true
+grep pattern="class Cache" path="src/**/*.py"
 diff path1="/src/v1.py" path2="/src/v2.py"
 ```
 
@@ -333,6 +317,11 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
 | `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model for search/similarity ([options](https://qdrant.github.io/fastembed/examples/Supported_Models/)) |
+| `OPENAI_EMBEDDINGS_ENABLED` | `false` | Use OpenAI-compatible remote embeddings instead of local FastEmbed |
+| `OPENAI_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL; default targets Ollama |
+| `OPENAI_API_KEY` | `ollama` | API key for the remote embedding provider |
+| `OPENAI_EMBEDDING_MODEL` | `nomic-embed-text` | Remote embedding model name |
+| `OPENAI_EMBEDDING_DIMENSIONS` | *(inferred)* | Optional requested/expected remote embedding dimension |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 
 See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, model selection guidance, and examples.

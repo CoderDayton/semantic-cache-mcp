@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-04-28
+
+### Added
+
+- **OpenAI-compatible embeddings** — Added an opt-in remote embedding provider controlled by `OPENAI_EMBEDDINGS_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_EMBEDDING_MODEL`. Local FastEmbed remains the default path, while the OpenAI-compatible path defaults to Ollama at `http://localhost:11434/v1`.
+
+### Changed
+
+- **Inferred remote embedding dimensions** — `OPENAI_EMBEDDING_DIMENSIONS` is now optional. When unset, semantic-cache infers and records the vector dimension from the first successful remote embedding; when set, the value is sent as the provider `dimensions` parameter and validated against the response.
+- **Embedding provider docs** — README and environment-variable docs now include Ollama/OpenAI-compatible setup examples, including `ollama pull nomic-embed-text` for the default local remote-provider path.
+
 ## [0.4.4] - 2026-04-20
 
 ### Fixed

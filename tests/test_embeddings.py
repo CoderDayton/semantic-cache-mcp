@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import sys
 import types
 
@@ -10,10 +11,14 @@ import pytest
 
 def _reset_embedding_state() -> None:
     from semantic_cache_mcp.core.embeddings import _model as _emb_model
+    from semantic_cache_mcp.core.embeddings import _openai as _openai_model
 
     _emb_model._embedding_model = None
     _emb_model._model_ready = False
+    _emb_model._embedding_dim = 0
     _emb_model._execution_provider = "unknown"
+    _openai_model._client = None
+    _openai_model._embedding_dim = 0
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +115,121 @@ class TestEmbeddingProviders:
         assert "providers" in calls[0]
         assert "providers" not in calls[1]
         assert _emb_model._execution_provider == "CPUExecutionProvider"
+
+
+class TestOpenAIEmbeddings:
+    """Validate OpenAI-compatible embedding routing."""
+
+    def test_openai_embed_skips_local_model(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core import embeddings
+
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(embeddings, "_get_model", lambda: pytest.fail("loaded local model"))
+        monkeypatch.setattr(
+            embeddings,
+            "_openai_embed_texts",
+            lambda texts: [array.array("f", [1.0, 2.0, 3.0])],
+        )
+
+        result = embeddings.embed("hello")
+
+        assert result == array.array("f", [1.0, 2.0, 3.0])
+
+    def test_openai_query_does_not_apply_bge_prefix(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core import embeddings
+
+        calls: list[list[str]] = []
+
+        def fake_embed_texts(texts: list[str]) -> list[array.array[float] | None]:
+            calls.append(texts)
+            return [array.array("f", [0.5])]
+
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(embeddings, "_openai_embed_texts", fake_embed_texts)
+
+        assert embeddings.embed_query("find cache code") == array.array("f", [0.5])
+        assert calls == [["find cache code"]]
+
+    def test_openai_model_info_uses_configured_remote_metadata(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core import embeddings
+
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDING_MODEL", "nomic-embed-text")
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDING_DIMENSIONS", 768)
+
+        assert embeddings.get_embedding_dim() == 768
+        assert embeddings.get_model_info() == {
+            "model": "nomic-embed-text",
+            "dim": 768,
+            "cache_dir": "",
+            "provider": "OpenAI",
+            "ready": True,
+        }
+
+    def test_openai_warmup_does_not_load_local_model(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core.embeddings import _model as _emb_model
+
+        monkeypatch.setattr(_emb_model, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(_emb_model, "OPENAI_EMBEDDING_DIMENSIONS", 768)
+        monkeypatch.setattr(_emb_model, "_get_model", lambda: pytest.fail("loaded local model"))
+
+        _emb_model.warmup()
+
+        assert _emb_model._model_ready is True
+        assert _emb_model._embedding_dim == 768
+        assert _emb_model._execution_provider == "OpenAI"
+
+    def test_openai_adapter_sends_dimensions_only_when_explicit(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core.embeddings import _openai
+
+        calls: list[dict] = []
+
+        class FakeEmbeddings:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                item = types.SimpleNamespace(index=0, embedding=[0.1, 0.2])
+                return types.SimpleNamespace(data=[item])
+
+        monkeypatch.setattr(_openai, "OPENAI_EMBEDDING_DIMENSIONS_RAW", None)
+        monkeypatch.setattr(
+            _openai, "_get_client", lambda: types.SimpleNamespace(embeddings=FakeEmbeddings())
+        )
+
+        assert _openai.embed_texts(["abc"]) == [array.array("f", [0.1, 0.2])]
+        assert "dimensions" not in calls[0]
+        assert _openai.get_embedding_dim() == 2
+
+    def test_openai_adapter_rejects_configured_dimension_mismatch(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core.embeddings import _openai
+
+        class FakeEmbeddings:
+            def create(self, **kwargs):
+                item = types.SimpleNamespace(index=0, embedding=[0.1, 0.2])
+                return types.SimpleNamespace(data=[item])
+
+        monkeypatch.setattr(_openai, "OPENAI_EMBEDDING_DIMENSIONS", 3)
+        monkeypatch.setattr(_openai, "OPENAI_EMBEDDING_DIMENSIONS_RAW", "3")
+        monkeypatch.setattr(
+            _openai, "_get_client", lambda: types.SimpleNamespace(embeddings=FakeEmbeddings())
+        )
+
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            _openai.embed_texts(["abc"])
+
+    def test_openai_dimension_mismatch_propagates_from_public_api(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core import embeddings
+        from semantic_cache_mcp.core.embeddings._openai import OpenAIEmbeddingDimensionError
+
+        def fail(_texts):
+            raise OpenAIEmbeddingDimensionError("OpenAI embedding dimension mismatch")
+
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(embeddings, "_openai_embed_texts", fail)
+
+        with pytest.raises(OpenAIEmbeddingDimensionError):
+            embeddings.embed("abc")
+        with pytest.raises(OpenAIEmbeddingDimensionError):
+            embeddings.embed_batch(["abc"])
 
 
 class TestCustomModelRegistration:
