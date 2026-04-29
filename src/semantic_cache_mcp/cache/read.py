@@ -16,7 +16,7 @@ from ..logger import log_marker
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
 from ..utils import aread_bytes, aread_text, astat
 from ._helpers import _is_binary_content
-from .store import SemanticCache, _file_label
+from .store import SemanticCache
 
 logger = logging.getLogger(__name__)
 
@@ -374,11 +374,8 @@ async def batch_smart_read(
     # Batch embed all candidates; fall back to per-file if anything fails
     _prefetched: dict[str, EmbeddingVector] = {}
     if _to_embed:
-        from ..core.embeddings import embed_batch as _embed_batch  # noqa: PLC0415
-
-        _texts = [(f"{_file_label(_rpath)}: {_cnt}")[:8000] for _, _rpath, _cnt in _to_embed]
-        _loop = asyncio.get_running_loop()
-        _results = await _loop.run_in_executor(cache._io_executor, _embed_batch, _texts)
+        _pairs = [(_rpath, _cnt) for _, _rpath, _cnt in _to_embed]
+        _results = cache.get_embeddings_batch(_pairs)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
             if _emb is not None:
                 _prefetched[_rpath] = _emb

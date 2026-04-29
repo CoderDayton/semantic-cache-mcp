@@ -17,6 +17,7 @@ from ._model import (
     _get_model,
     warmup,
 )
+from ._openai import OpenAIEmbeddingDimensionError
 from ._openai import embed_texts as _openai_embed_texts
 from ._openai import get_embedding_dim as _openai_get_embedding_dim
 from ._registry import _register_custom_model
@@ -45,6 +46,8 @@ def embed(text: str) -> array.array[float] | None:
             return _numpy_to_array(embeddings[0])
         return None
 
+    except OpenAIEmbeddingDimensionError:
+        raise
     except Exception as e:
         logger.warning(f"Embedding failed: {e}")
         return None
@@ -69,6 +72,8 @@ def embed_batch(texts: list[str]) -> list[array.array[float] | None]:
         for r in results:
             out.append(_numpy_to_array(r))
         return out
+    except OpenAIEmbeddingDimensionError:
+        raise
     except Exception as e:
         logger.warning(f"Batch embedding failed: {e}")
         return [None] * len(texts)
@@ -92,6 +97,8 @@ def embed_query(text: str) -> array.array[float] | None:
             return result
         return None
 
+    except OpenAIEmbeddingDimensionError:
+        raise
     except Exception as e:
         logger.warning(f"Query embedding failed: {e}")
         return None

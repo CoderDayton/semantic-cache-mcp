@@ -18,6 +18,10 @@ _client: Any | None = None
 _embedding_dim: int = OPENAI_EMBEDDING_DIMENSIONS or 0
 
 
+class OpenAIEmbeddingDimensionError(ValueError):
+    """Raised when provider vectors do not match the configured dimension."""
+
+
 def _get_client() -> Any:
     global _client
 
@@ -38,7 +42,7 @@ def _to_array(values: list[float]) -> array.array[float]:
     result = array.array("f", values)
     actual_dim = len(result)
     if OPENAI_EMBEDDING_DIMENSIONS is not None and actual_dim != OPENAI_EMBEDDING_DIMENSIONS:
-        raise ValueError(
+        raise OpenAIEmbeddingDimensionError(
             f"OpenAI embedding dimension mismatch: got {actual_dim}, "
             f"expected {OPENAI_EMBEDDING_DIMENSIONS}"
         )

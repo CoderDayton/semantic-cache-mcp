@@ -216,6 +216,21 @@ class TestOpenAIEmbeddings:
         with pytest.raises(ValueError, match="dimension mismatch"):
             _openai.embed_texts(["abc"])
 
+    def test_openai_dimension_mismatch_propagates_from_public_api(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core import embeddings
+        from semantic_cache_mcp.core.embeddings._openai import OpenAIEmbeddingDimensionError
+
+        def fail(_texts):
+            raise OpenAIEmbeddingDimensionError("OpenAI embedding dimension mismatch")
+
+        monkeypatch.setattr(embeddings, "OPENAI_EMBEDDINGS_ENABLED", True)
+        monkeypatch.setattr(embeddings, "_openai_embed_texts", fail)
+
+        with pytest.raises(OpenAIEmbeddingDimensionError):
+            embeddings.embed("abc")
+        with pytest.raises(OpenAIEmbeddingDimensionError):
+            embeddings.embed_batch(["abc"])
+
 
 class TestCustomModelRegistration:
     """Validate auto-registration of HuggingFace models not in fastembed defaults."""

@@ -74,6 +74,24 @@ class TestBatchReadGather:
         assert call_count == 2
         assert result.files_read == 1
 
+    async def test_batch_read_prefetch_syncs_embedding_metadata(self, tmp_path: Path) -> None:
+        """Prefetched batch embeddings must still reconcile model/dimension metadata."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "prefetch_metadata.txt"
+        f.write_text("prefetch metadata content\n")
+        emb = _fake_embedding()
+
+        with (
+            patch("semantic_cache_mcp.cache.embed_batch", return_value=[emb]),
+            patch.object(
+                type(cache._storage), "clear_if_model_changed", autospec=True
+            ) as mock_clear,
+        ):
+            result = await batch_smart_read(cache, [str(f)])
+
+        assert result.files_read == 1
+        mock_clear.assert_called_once_with(cache._storage, "BAAI/bge-small-en-v1.5", len(emb))
+
 
 # ---------------------------------------------------------------------------
 # Fix 2: smart_read no double cache.get on diff path
