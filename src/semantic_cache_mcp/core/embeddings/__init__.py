@@ -18,6 +18,7 @@ from ._model import (
     warmup,
 )
 from ._openai import embed_texts as _openai_embed_texts
+from ._openai import get_embedding_dim as _openai_get_embedding_dim
 from ._registry import _register_custom_model
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ def get_embedding_dim() -> int:
     import semantic_cache_mcp.core.embeddings._model as _m
 
     if OPENAI_EMBEDDINGS_ENABLED:
-        return OPENAI_EMBEDDING_DIMENSIONS
+        return OPENAI_EMBEDDING_DIMENSIONS or _openai_get_embedding_dim()
 
     # 1. Already known from warmup
     if _m._embedding_dim > 0:
@@ -154,12 +155,13 @@ def get_model_info() -> dict[str, str | int]:
     import semantic_cache_mcp.core.embeddings._model as _m
 
     if OPENAI_EMBEDDINGS_ENABLED:
+        dim = get_embedding_dim()
         return {
             "model": OPENAI_EMBEDDING_MODEL,
-            "dim": get_embedding_dim(),
+            "dim": dim,
             "cache_dir": "",
             "provider": "OpenAI",
-            "ready": True,
+            "ready": dim > 0,
         }
 
     return {

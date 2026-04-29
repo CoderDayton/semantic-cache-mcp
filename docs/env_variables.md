@@ -22,7 +22,7 @@ All environment variables are optional. Defaults are tuned for typical usage.
 | `OPENAI_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible embeddings endpoint. Default targets Ollama. Use `https://api.openai.com/v1` for hosted OpenAI. |
 | `OPENAI_API_KEY` | `ollama` | API key passed to the OpenAI-compatible client. Ollama accepts any non-empty value; hosted OpenAI requires a real key. |
 | `OPENAI_EMBEDDING_MODEL` | `nomic-embed-text` | Remote embedding model name. Changing this clears and rebuilds stored embeddings on next use. |
-| `OPENAI_EMBEDDING_DIMENSIONS` | `768` | Expected remote embedding dimension for storage safety. Only sent to the API when explicitly set in env. |
+| `OPENAI_EMBEDDING_DIMENSIONS` | *(inferred)* | Optional requested/expected remote embedding dimension. Leave unset to infer it from the first returned vector. |
 
 ### GPU acceleration
 
@@ -57,24 +57,22 @@ Set `OPENAI_EMBEDDINGS_ENABLED=true` to skip local FastEmbed startup and send em
   "OPENAI_EMBEDDINGS_ENABLED": "true",
   "OPENAI_BASE_URL": "http://localhost:11434/v1",
   "OPENAI_API_KEY": "ollama",
-  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text",
-  "OPENAI_EMBEDDING_DIMENSIONS": "768"
+  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text"
 }
 ```
 
-For hosted OpenAI, override the URL, key, model, and dimension:
+Run `ollama pull nomic-embed-text` first if the model is not installed. For hosted OpenAI, override the URL, key, and model:
 
 ```json
 "env": {
   "OPENAI_EMBEDDINGS_ENABLED": "true",
   "OPENAI_BASE_URL": "https://api.openai.com/v1",
   "OPENAI_API_KEY": "sk-...",
-  "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
-  "OPENAI_EMBEDDING_DIMENSIONS": "1536"
+  "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small"
 }
 ```
 
-`OPENAI_EMBEDDING_DIMENSIONS` must match the vectors returned by the provider. If your provider supports OpenAI's `dimensions` request parameter, setting the env var sends it; otherwise leave the default aligned to your Ollama model.
+`OPENAI_EMBEDDING_DIMENSIONS` is optional. If unset, semantic-cache infers and records the dimension from the first returned vector. If set, the value is sent as OpenAI's `dimensions` request parameter and the response is validated against it.
 
 ## Logging
 

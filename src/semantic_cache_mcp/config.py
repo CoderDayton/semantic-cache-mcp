@@ -64,6 +64,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_optional_int(name: str) -> int | None:
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
 def _env_float(name: str, default: float) -> float:
     raw = environ.get(name)
     if raw is None:
@@ -106,7 +116,7 @@ OPENAI_BASE_URL: Final = environ.get("OPENAI_BASE_URL", "http://localhost:11434/
 OPENAI_API_KEY: Final = environ.get("OPENAI_API_KEY", "ollama").strip()
 OPENAI_EMBEDDING_MODEL: Final = environ.get("OPENAI_EMBEDDING_MODEL", "nomic-embed-text").strip()
 OPENAI_EMBEDDING_DIMENSIONS_RAW: Final = environ.get("OPENAI_EMBEDDING_DIMENSIONS")
-OPENAI_EMBEDDING_DIMENSIONS: Final = _env_int("OPENAI_EMBEDDING_DIMENSIONS", 768)
+OPENAI_EMBEDDING_DIMENSIONS: Final = _env_optional_int("OPENAI_EMBEDDING_DIMENSIONS")
 
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
@@ -181,7 +191,11 @@ def _validate_config() -> None:
             errors.append(
                 "OPENAI_EMBEDDING_MODEL must not be empty when OPENAI_EMBEDDINGS_ENABLED=true"
             )
-        if OPENAI_EMBEDDING_DIMENSIONS <= 0:
+        if OPENAI_EMBEDDING_DIMENSIONS_RAW is not None and OPENAI_EMBEDDING_DIMENSIONS is None:
+            errors.append(
+                "OPENAI_EMBEDDING_DIMENSIONS must be an integer when OPENAI_EMBEDDINGS_ENABLED=true"
+            )
+        elif OPENAI_EMBEDDING_DIMENSIONS is not None and OPENAI_EMBEDDING_DIMENSIONS <= 0:
             errors.append(
                 "OPENAI_EMBEDDING_DIMENSIONS must be > 0 when OPENAI_EMBEDDINGS_ENABLED=true"
             )

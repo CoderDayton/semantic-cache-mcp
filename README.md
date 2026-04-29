@@ -116,12 +116,11 @@ Local FastEmbed remains the default. To route embeddings through an OpenAI-compa
   "OPENAI_EMBEDDINGS_ENABLED": "true",
   "OPENAI_BASE_URL": "http://localhost:11434/v1",
   "OPENAI_API_KEY": "ollama",
-  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text",
-  "OPENAI_EMBEDDING_DIMENSIONS": "768"
+  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text"
 }
 ```
 
-For hosted OpenAI, set `OPENAI_BASE_URL=https://api.openai.com/v1`, use a real `OPENAI_API_KEY`, and choose an embedding model/dimension pair such as `text-embedding-3-small` with `1536`.
+Run `ollama pull nomic-embed-text` first if the model is not installed. For hosted OpenAI, set `OPENAI_BASE_URL=https://api.openai.com/v1`, use a real `OPENAI_API_KEY`, and choose an embedding model such as `text-embedding-3-small`. `OPENAI_EMBEDDING_DIMENSIONS` is optional; leave it unset to infer the returned vector size.
 
 ### Block Native File Tools (Recommended)
 
@@ -322,7 +321,7 @@ diff path1="/src/v1.py" path2="/src/v2.py"
 | `OPENAI_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL; default targets Ollama |
 | `OPENAI_API_KEY` | `ollama` | API key for the remote embedding provider |
 | `OPENAI_EMBEDDING_MODEL` | `nomic-embed-text` | Remote embedding model name |
-| `OPENAI_EMBEDDING_DIMENSIONS` | `768` | Expected remote embedding dimension |
+| `OPENAI_EMBEDDING_DIMENSIONS` | *(inferred)* | Optional requested/expected remote embedding dimension |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 
 See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, model selection guidance, and examples.

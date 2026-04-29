@@ -153,9 +153,9 @@ def warmup() -> None:
         return
 
     if OPENAI_EMBEDDINGS_ENABLED:
-        _embedding_dim = OPENAI_EMBEDDING_DIMENSIONS
+        _embedding_dim = OPENAI_EMBEDDING_DIMENSIONS or 0
         _execution_provider = "OpenAI"
-        _model_ready = True
+        _model_ready = _embedding_dim > 0
         log_marker(logger, "embed.warmup.skip", provider="OpenAI", dim=_embedding_dim)
         return
 

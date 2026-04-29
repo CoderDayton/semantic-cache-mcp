@@ -18,6 +18,7 @@ def _reset_embedding_state() -> None:
     _emb_model._embedding_dim = 0
     _emb_model._execution_provider = "unknown"
     _openai_model._client = None
+    _openai_model._embedding_dim = 0
 
 
 @pytest.fixture(autouse=True)
@@ -196,6 +197,24 @@ class TestOpenAIEmbeddings:
 
         assert _openai.embed_texts(["abc"]) == [array.array("f", [0.1, 0.2])]
         assert "dimensions" not in calls[0]
+        assert _openai.get_embedding_dim() == 2
+
+    def test_openai_adapter_rejects_configured_dimension_mismatch(self, monkeypatch) -> None:
+        from semantic_cache_mcp.core.embeddings import _openai
+
+        class FakeEmbeddings:
+            def create(self, **kwargs):
+                item = types.SimpleNamespace(index=0, embedding=[0.1, 0.2])
+                return types.SimpleNamespace(data=[item])
+
+        monkeypatch.setattr(_openai, "OPENAI_EMBEDDING_DIMENSIONS", 3)
+        monkeypatch.setattr(_openai, "OPENAI_EMBEDDING_DIMENSIONS_RAW", "3")
+        monkeypatch.setattr(
+            _openai, "_get_client", lambda: types.SimpleNamespace(embeddings=FakeEmbeddings())
+        )
+
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            _openai.embed_texts(["abc"])
 
 
 class TestCustomModelRegistration:

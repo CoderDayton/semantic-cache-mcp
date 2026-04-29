@@ -451,6 +451,15 @@ class SemanticCache:
     # Embedding
     # -------------------------------------------------------------------------
 
+    def _sync_embedding_model_metadata(self, embedding: EmbeddingVector | None) -> None:
+        """Persist model/dimension metadata once a provider returns a real vector."""
+        if embedding is None:
+            return
+        from ..core.embeddings import get_model_info  # noqa: PLC0415
+
+        model_info = get_model_info()
+        self._storage.clear_if_model_changed(str(model_info["model"]), len(embedding))
+
     async def get_embedding(self, text: str, path: str = "") -> EmbeddingVector | None:
         """Embed text using FastEmbed. When path is given, prepends a file-type label
         (e.g. "Python source code: ...") so the model gets intent-rich context instead
@@ -483,6 +492,7 @@ class SemanticCache:
                 elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
             )
             if result:
+                self._sync_embedding_model_metadata(result)
                 logger.debug(f"Embedding generated for {text[:50]}...")
             return result
         except Exception as e:
@@ -682,6 +692,10 @@ class SemanticCache:
         log_marker(logger, "embed.batch.begin", count=len(texts))
         try:
             result = cast(list[EmbeddingVector | None], _embed_batch(texts))
+            for embedding in result:
+                if embedding is not None:
+                    self._sync_embedding_model_metadata(embedding)
+                    break
             log_marker(
                 logger,
                 "embed.batch.end",
