@@ -376,7 +376,7 @@ async def batch_smart_read(
     if _to_embed:
         _pairs = [(_rpath, _cnt) for _, _rpath, _cnt in _to_embed]
         _results = cache.get_embeddings_batch(_pairs)
-        for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=True):
+        for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=False):
             if _emb is not None:
                 _prefetched[_rpath] = _emb
 
