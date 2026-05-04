@@ -28,6 +28,12 @@ def _get_model() -> TextEmbedding:
     """Lazy-init the embedding model singleton."""
     global _embedding_model, _execution_provider
 
+    if OPENAI_EMBEDDINGS_ENABLED:
+        raise RuntimeError(
+            "_get_model() called with OPENAI_EMBEDDINGS_ENABLED=true; "
+            "fastembed should not be initialized when using OpenAI provider"
+        )
+
     if _embedding_model is None:
         from fastembed import TextEmbedding
 
@@ -56,6 +62,8 @@ def _get_model() -> TextEmbedding:
                 "Falling back to CPU."
             )
         use_cuda = cuda_available and EMBEDDING_DEVICE in ("cuda", "auto")
+        if not use_cuda:
+            init_kwargs["providers"] = ["CPUExecutionProvider"]
         if use_cuda:
             # Configure CUDA provider to limit VRAM arena growth:
             # - kSameAsRequested: allocate exact size needed (default kNextPowerOfTwo
@@ -105,11 +113,17 @@ def _get_model() -> TextEmbedding:
                 return _try_init(kwargs), "CPUExecutionProvider"
             except ValueError:
                 raise  # Custom model registration handled by caller
+            except TypeError as e:
+                if "providers" not in kwargs:
+                    raise
+                logger.warning(f"{e} — providers unsupported, retrying without")
+                kwargs.pop("providers")
+                return _try_init(kwargs), "CPUExecutionProvider"
             except Exception as e:
                 if "providers" not in kwargs:
                     raise
                 logger.warning(f"{e} — falling back to CPU")
-                kwargs.pop("providers", None)
+                kwargs["providers"] = ["CPUExecutionProvider"]
                 return _try_init(kwargs), "CPUExecutionProvider"
 
         try:

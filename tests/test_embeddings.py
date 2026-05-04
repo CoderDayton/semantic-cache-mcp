@@ -84,7 +84,7 @@ class TestEmbeddingProviders:
         embeddings._get_model()
 
         assert len(calls) == 1
-        assert "providers" not in calls[0]
+        assert calls[0]["providers"] == ["CPUExecutionProvider"]
         assert _emb_model._execution_provider == "CPUExecutionProvider"
 
     def test_falls_back_if_providers_argument_unsupported(self, monkeypatch) -> None:

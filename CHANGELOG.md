@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-05-04
+
+### Fixed
+
+- **GPU VRAM leak with `EMBEDDING_DEVICE=cpu`** — When `onnxruntime-gpu` is installed but `EMBEDDING_DEVICE=cpu`, fastembed no longer auto-selects CUDA. The ONNX session now receives an explicit `providers=["CPUExecutionProvider"]`, preventing ~2GB of phantom VRAM allocation.
+- **Guard fastembed init when OpenAI provider is active** — `_get_model()` now raises immediately if called with `OPENAI_EMBEDDINGS_ENABLED=true`, making it impossible to accidentally load the local ONNX model when embeddings are routed through Ollama/OpenAI.
+- **CUDA fallback preserves CPU constraint** — When CUDA initialization fails at runtime, the retry path now explicitly sets `CPUExecutionProvider` instead of removing the `providers` kwarg (which let ONNX Runtime auto-select CUDA again).
+
 ## [0.4.5] - 2026-04-28
 
 ### Added
