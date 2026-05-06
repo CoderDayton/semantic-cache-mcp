@@ -42,6 +42,8 @@ _META_CREATED_AT = "created_at"
 _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
 _META_HAS_EMBEDDING = "has_embedding"
+_META_PREVIEW = "preview"
+_PREVIEW_CHARS = 200
 
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
 # each stored as a child document with its own vector. Smaller files are stored
@@ -414,6 +416,9 @@ class VectorStorage:
             has_embedding=has_embedding,
         )
 
+        # Pre-compute a stable preview from the start of the file so that
+        # search results don't re-slice chunk content at query time (which
+        # may yield partial-word or mid-comment slices for chunked docs).
         base_meta = {
             _META_PATH: path,
             _META_CONTENT_HASH: content_hash,
@@ -422,6 +427,7 @@ class VectorStorage:
             _META_CREATED_AT: now,
             _META_ACCESS_HISTORY: json.dumps([now]),
             _META_HAS_EMBEDDING: has_embedding,
+            _META_PREVIEW: content[:_PREVIEW_CHARS],
         }
 
         # Remove old entry for this path
@@ -813,7 +819,7 @@ class VectorStorage:
             if not path or path in seen_paths:
                 continue
             seen_paths.add(path)
-            preview = doc.page_content[:200]
+            preview = doc.metadata.get(_META_PREVIEW) or doc.page_content[:_PREVIEW_CHARS]
             matches.append((path, preview, float(score)))
             if len(matches) >= k:
                 break

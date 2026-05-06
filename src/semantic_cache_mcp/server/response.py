@@ -112,11 +112,14 @@ def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) 
 
     if max_response_tokens is not None and max_response_tokens > 0:
         rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-        if count_tokens(rendered) > max_response_tokens:
+        # Char/4 lower-bounds tokens for English/code; skip BPE encode when
+        # safely under budget to avoid the double-encode cost on small payloads.
+        char_budget = max_response_tokens * 4
+        if len(rendered) > char_budget and count_tokens(rendered) > max_response_tokens:
             body = _minimal_payload(body)
             rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-        if count_tokens(rendered) > max_response_tokens:
-            body = {"ok": False, "truncated": True}
+            if len(rendered) > char_budget and count_tokens(rendered) > max_response_tokens:
+                body = {"ok": False, "truncated": True}
 
     return body
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from ..config import MAX_CONTENT_SIZE
-from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
+from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
 from ..logger import log_marker
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
@@ -57,7 +57,39 @@ async def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Single read: binary check + decode in one I/O operation
+    # Fast path: cached + mtime match — never touch disk.
+    # stat() is ~1000x cheaper than reading file bytes, so check cache first.
+    mtime = (await astat(file_path, cache._io_executor)).st_mtime
+    cached = await cache.get(str(file_path))
+
+    if cached and diff_mode and not force_full and cached.mtime >= mtime:
+        await cache.record_access(str(file_path))
+        unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
+        msg_tokens = count_tokens(unchanged_msg)
+        if msg_tokens < cached.tokens:
+            return ReadResult(
+                content=unchanged_msg,
+                from_cache=True,
+                is_diff=False,
+                tokens_original=cached.tokens,
+                tokens_returned=msg_tokens,
+                tokens_saved=cached.tokens - msg_tokens,
+                truncated=False,
+                compression_ratio=msg_tokens / cached.tokens if cached.tokens else 1.0,
+            )
+        cached_content = await cache.get_content(cached)
+        return ReadResult(
+            content=cached_content,
+            from_cache=True,
+            is_diff=False,
+            tokens_original=cached.tokens,
+            tokens_returned=cached.tokens,
+            tokens_saved=0,
+            truncated=False,
+            compression_ratio=1.0,
+        )
+
+    # Slow path: file changed, missing from cache, or force_full requested.
     raw = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw):
         raise ValueError(
@@ -69,11 +101,9 @@ async def smart_read(
         content = raw.decode("utf-8", errors="replace")
         logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
 
-    mtime = (await astat(file_path, cache._io_executor)).st_mtime
     tokens_original = count_tokens(content)
     computed_embedding = _embedding
 
-    cached = await cache.get(str(file_path))
     cache_is_fresh = False
     if cached and force_full:
         if cached.mtime >= mtime:
@@ -136,18 +166,10 @@ async def smart_read(
         if cached is not None:
             old_content = await cache.get_content(cached)
             diff_content = generate_diff(old_content, content)
-            stats = diff_stats(old_content, content)
             diff_tokens = count_tokens(diff_content)
 
             if diff_tokens < tokens_original * 0.6:
-                stats_msg = (
-                    f"// Stats: +{stats['insertions']} -{stats['deletions']} "
-                    f"~{stats['modifications']} lines, "
-                    f"{stats['compression_ratio']:.1%} size\n"
-                )
-                result_content = (
-                    f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
-                )
+                result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
                 if computed_embedding is None:
                     computed_embedding = await cache.get_embedding(content, path)
                 await cache.refresh_path(
@@ -181,18 +203,11 @@ async def smart_read(
                 if similar_entry:
                     similar_content = await cache.get_content(similar_entry)
                     diff_content = generate_diff(similar_content, content)
-                    stats = diff_stats(similar_content, content)
                     diff_tokens = count_tokens(diff_content)
 
                     if diff_tokens < tokens_original * 0.7:
-                        stats_msg = (
-                            f"// Stats: +{stats['insertions']} -{stats['deletions']} "
-                            f"~{stats['modifications']} lines, "
-                            f"{stats['compression_ratio']:.1%} size\n"
-                        )
                         result_content = (
                             f"// Similar to cached: {similar_path}\n"
-                            f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
                         await cache.refresh_path(

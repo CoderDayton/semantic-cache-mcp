@@ -191,9 +191,9 @@ class TestSmartReadLargeFile:
             max_size=5000,
         )
         assert "Line 0" in result.content
-        # Semantic summarization uses "omitted" or "TRUNCATED" markers
-        content_lower = result.content.lower()
-        assert any(marker in content_lower for marker in ["truncated", "omitted", "lines omitted"])
+        # Truncation is signalled via the result flag; markers are no longer
+        # emitted by default to avoid wasting tokens.
+        assert result.truncated is True
 
 
 class TestSmartReadDiffModeDisabled:

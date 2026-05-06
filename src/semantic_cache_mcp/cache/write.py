@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 # DoS limit for batch_edit
 MAX_BATCH_EDITS = 50
 
+# Embedding reuse threshold: when an edit changes less than this fraction
+# of the file's lines, skip re-embedding and reuse the cached vector. The
+# old embedding remains representative for retrieval purposes, saving the
+# ~23ms ONNX inference call. Values: [0.0, 1.0]; 0 = always re-embed.
+EMBED_REUSE_THRESHOLD = 0.20
+
 
 async def _maybe_reuse_cached_embedding(
     cache: SemanticCache,
@@ -41,7 +47,7 @@ async def _maybe_reuse_cached_embedding(
 
     changed = stats.get("insertions", 0) + stats.get("deletions", 0)
     total = stats.get("total_lines", changed + 1)
-    if total <= 0 or changed / total >= 0.2:
+    if total <= 0 or changed / total >= EMBED_REUSE_THRESHOLD:
         return None
 
     cached_entry = await cache.get(str(file_path))

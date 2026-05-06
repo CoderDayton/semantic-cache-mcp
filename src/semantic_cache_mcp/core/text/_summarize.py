@@ -40,7 +40,10 @@ class SummarizationConfig:
     diversity_weight: float = 0.3  # Penalize redundancy
 
     # Output
-    include_markers: bool = True  # Include "[X lines omitted]" markers
+    # NOTE: markers are counted against the token budget but add no
+    # content value to the LLM, so default off. Enable explicitly when
+    # a human-readable preview is wanted.
+    include_markers: bool = False  # Include "[X lines omitted]" markers
     preserve_structure: bool = True  # Keep class/function headers
 
 

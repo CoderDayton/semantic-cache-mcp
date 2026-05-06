@@ -318,19 +318,12 @@ async def read(
     offset: int | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Read a file. Automatically returns the most token-efficient response.
+    """Read a file with token-efficient caching. For 2+ files, use `batch_read`.
 
-    Use this for a single file. For 2+ files, prefer `batch_read`.
-
-    Behavior (automatic — no configuration needed):
-    - First read: returns full content and seeds the cache.
-    - Unchanged re-read: returns `"unchanged": true` (content already in context).
-    - Modified re-read: returns a unified diff of changes.
-    - External changes: detected automatically via mtime + content hash.
-
-    If response contains `"unchanged": true`, do NOT re-read — you already
-    have the full content from a prior read. Use `offset`/`limit` to recover
-    specific line ranges after truncation or context loss.
+    Returns full content on first read, `"unchanged": true` on re-read of an
+    unchanged file (content already in your context — do NOT re-read), or a
+    unified diff when modified. Use `offset`/`limit` to recover line ranges
+    after truncation.
 
     Args:
         path: File path (absolute or relative to project root). Use absolute
@@ -823,23 +816,7 @@ async def write(
     show_diff: bool = False,
     append: bool = False,
 ) -> dict[str, Any]:
-    """Create or replace a file, with cache refresh and optional overwrite diffs.
-
-    Use this when you already know the full new file content. For targeted
-    changes inside an existing file, prefer `edit` or `batch_edit`.
-
-    Routing rules:
-    - New file or full replacement: use `write`.
-    - Small localized change: use `edit`.
-    - Multiple localized changes in one file: use `batch_edit`.
-
-    Behavior:
-    - Deterministic successful overwrites omit full diffs by default.
-    - Set `show_diff=true` or use debug mode to include the diff explicitly.
-    - New files return creation status.
-    - `append=true` supports chunked construction for large files.
-    - `dry_run=true` previews without writing.
-    - `auto_format=true` is best used near the end of an edit cycle.
+    """Create or replace a file. Prefer `edit`/`batch_edit` for localized changes.
 
     Args:
         path: File path to create or replace.
@@ -958,27 +935,11 @@ async def edit(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> dict[str, Any]:
-    """Edit one file using cache-aware exact replacement.
+    """Edit one file via exact replacement. Use `batch_edit` for multiple changes, `write` for full rewrites.
 
-    Prefer this over `write` when you want to preserve the rest of the file.
-    Use line numbers from `read` whenever possible to keep the edit precise.
-
-    Modes:
-    - Find/replace: `old_string` + `new_string`
-    - Scoped replace: add `start_line` + `end_line`
-    - Line-range replace: omit `old_string`, provide `start_line` + `end_line`
-
-    Routing rules:
-    - One localized change: use `edit`
-    - Multiple independent changes in the same file: use `batch_edit`
-    - Full-file rewrite: use `write`
-
-    Precision rules:
-    - Keep `old_string` exact and as short as possible, ideally one line.
-    - If a match is ambiguous, add more context or line bounds.
-    - Use `replace_all=true` only when every match should change.
-    - Deterministic successful edits omit full diffs unless `show_diff=true`
-      or debug mode is enabled.
+    Modes: find/replace (`old_string`+`new_string`), scoped (add `start_line`/`end_line`),
+    or line-range (omit `old_string`, provide both lines). Keep `old_string` short
+    and unique; add line bounds when ambiguous.
 
     Args:
         path: File path to modify.
@@ -1279,23 +1240,7 @@ async def search(
     directory: str | None = None,
     show_preview: bool = False,
 ) -> dict[str, Any]:
-    """Search cached files by meaning or mixed keyword intent.
-
-    This is a cache-only semantic search. If results are empty, the likely
-    cause is that the relevant files were never seeded with `read` or
-    `batch_read`.
-
-    Routing rules:
-    - Use `search` for meaning-based queries such as concepts, behavior, or
-      intent.
-    - Use `grep` for exact symbols, strings, or regex patterns.
-    - Use `glob` to discover candidate files before seeding the cache.
-
-    Usage guidance:
-    - Seed likely files with `batch_read` first.
-    - Start with small `k` such as 3–5.
-    - Use `directory` to keep large codebases focused.
-    - Set `show_preview=true` only when snippet text changes the next decision.
+    """Cache-only semantic search by meaning. Use `grep` for exact strings, `glob` to discover files. Empty results usually mean files weren't seeded via `read`/`batch_read`.
 
     Args:
         query: Natural-language query, keywords, or a mixture of both.
@@ -1336,13 +1281,15 @@ async def search(
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "search",
-            "query": query,
             "matches": match_payload,
         }
+        # Echoing `query` back is wasteful — the caller just sent it.
+        # Only include it in debug mode for traceability.
         if mode in _MODE_NORMAL:
             payload["count"] = len(match_payload)
             payload["cached_files"] = result.cached_files
         if mode == _MODE_DEBUG:
+            payload["query"] = query
             payload["files_searched"] = result.files_searched
             payload["k"] = k
             payload["directory"] = directory
@@ -1442,19 +1389,7 @@ async def batch_read(
     max_total_tokens: int = 50000,
     priority: str = "",
 ) -> dict[str, Any]:
-    """Read multiple files under a token budget. Automatically cache-aware.
-
-    Use this to seed the cache, gather several files at once, or expand globs
-    before `search`, `similar`, or `grep`. Prefer over repeated `read` calls.
-
-    Behavior (automatic — no configuration needed):
-    - Unchanged files counted in `summary.unchanged_count` (path list in debug mode).
-    - Modified files return diffs.
-    - New files return full content.
-    - Large files skipped once token budget is exhausted.
-
-    If a file is skipped for budget, use `read` with `offset`/`limit` or
-    raise the budget.
+    """Read multiple files under a token budget. Use to seed cache before `search`/`grep`. Prefer over repeated `read` calls. Returns diffs for modified files, full content for new ones; large files skipped when budget exhausted (use `read` with `offset`/`limit` to recover).
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns.
@@ -1578,21 +1513,7 @@ async def similar(
     path: str,
     k: int = 5,
 ) -> dict[str, Any]:
-    """Find cached files semantically similar to one source file.
-
-    Use this to discover related implementations, tests, or configs after the
-    surrounding code has already been seeded into the cache.
-
-    Important constraint:
-    - The source file is handled automatically.
-    - Candidate neighbor files must already be cached, typically via
-      `batch_read`, or they will not appear.
-
-    Usage guidance:
-    - Seed a directory with `batch_read` first.
-    - Start with `k=3` to `k=5`.
-    - Empty results usually mean either only the source file is cached or the
-      relevant neighbors were never seeded.
+    """Find cached files semantically similar to one source file. Neighbors must already be cached (seed with `batch_read` first).
 
     Args:
         path: Source file path.
@@ -1656,21 +1577,7 @@ async def glob(
     directory: str = ".",
     cached_only: bool = False,
 ) -> dict[str, Any]:
-    """Discover files by glob and show whether each one is already cached.
-
-    Use this before `batch_read`, `search`, `similar`, or `grep` when you need
-    candidate files or want to inspect cache coverage.
-
-    Routing rules:
-    - Use `glob` to discover paths.
-    - Use `batch_read` to seed or read them.
-    - Use `cached_only=true` when you want to know what search/grep can already
-      see without more reads.
-
-    Usage guidance:
-    - Keep patterns specific.
-    - Avoid broad patterns like `**/*` unless truly necessary.
-    - Matches can be fed directly into `batch_read`.
+    """Discover files by glob and show which are already cached. Use before `batch_read`/`search`/`grep`. `cached_only=true` shows what search/grep can see without more reads.
 
     Args:
         pattern: Glob pattern to expand.
@@ -1703,9 +1610,14 @@ async def glob(
             cached_only=cached_only,
         )
         cache.metrics.record("glob", result)
-        matches_payload = []
+        matches_payload: list[dict[str, Any]] = []
+        # When all matches are uncached and we're not in debug mode, drop the
+        # redundant `cached: false` field — saves ~13 chars per match.
+        all_uncached = result.cached_count == 0 and mode != _MODE_DEBUG
         for m in result.matches:
-            item: dict[str, Any] = {"path": m.path, "cached": m.cached}
+            item: dict[str, Any] = {"path": m.path}
+            if not all_uncached:
+                item["cached"] = m.cached
             if mode == _MODE_DEBUG:
                 item["tokens"] = m.tokens
                 item["mtime"] = m.mtime
@@ -1714,12 +1626,15 @@ async def glob(
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "glob",
-            "pattern": pattern,
-            "directory": result.directory,
             "matches": matches_payload,
             "total_matches": result.total_matches,
             "cached_count": result.cached_count,
         }
+        # Echoing pattern/directory back is wasteful in compact mode; the
+        # caller already knows what they sent.
+        if mode in _MODE_NORMAL:
+            payload["pattern"] = pattern
+            payload["directory"] = result.directory
         if mode == _MODE_DEBUG:
             payload["total_cached_tokens"] = result.total_cached_tokens
 
@@ -1744,21 +1659,7 @@ async def grep(
     max_matches: int = 100,
     max_files: int = 50,
 ) -> dict[str, Any]:
-    """Search cached files for an exact string or regex, with line numbers.
-
-    This is the cache-only exact-search tool. It is intentionally closer to
-    "ripgrep on cached content" than to live filesystem search.
-
-    Routing rules:
-    - Use `grep` for exact symbols, literals, imports, error strings, or regex.
-    - Use `search` for semantic or fuzzy intent.
-    - Seed candidate files with `batch_read` first; empty results may simply
-      mean the relevant files are not cached yet.
-
-    Usage guidance:
-    - Set `fixed_string=true` for literals containing regex metacharacters.
-    - Add `path` to limit scope to one file, a suffix, or a glob.
-    - Add `context_lines=2` or `3` when surrounding code matters.
+    """Cache-only ripgrep: exact string/regex with line numbers. Use `search` for semantic intent. Seed files with `batch_read` first; empty results often mean files not cached.
 
     Args:
         pattern: Regex pattern, or a literal if `fixed_string=true`.
@@ -1807,9 +1708,25 @@ async def grep(
 
         total_matches = sum(len(r["matches"]) for r in results)
 
+        # Apply a soft char budget so a wide regex on a large repo doesn't
+        # spend the entire response token cap on match lines. The hard
+        # token cap in _finalize_payload still applies as a backstop.
+        char_budget: int | None = None
+        if max_response_tokens is not None and max_response_tokens > 0:
+            # Leave ~512 tokens for the response envelope/metadata.
+            char_budget = max(1024, (max_response_tokens - 512) * 4)
+
         # Build response
         files_payload: list[dict[str, Any]] = []
+        truncated_matches = 0
+        truncated_files = 0
+        running_chars = 0
+        budget_exceeded = False
         for file_result in results:
+            if budget_exceeded:
+                truncated_files += 1
+                truncated_matches += len(file_result["matches"])
+                continue
             match_items: list[dict[str, Any]] = []
             for m in file_result["matches"]:
                 item: dict[str, Any] = {
@@ -1822,6 +1739,22 @@ async def grep(
                     if "after" in m:
                         item["after"] = m["after"]
                 match_items.append(item)
+                if char_budget is not None:
+                    # ~32 chars JSON envelope per match (line_number, line keys
+                    # + braces + commas + quotes). Add context-line bytes when
+                    # present so the soft budget accounts for them.
+                    running_chars += len(m["line"]) + 32
+                    if effective_context > 0:
+                        for ctx_line in m.get("before", ()):
+                            running_chars += len(ctx_line) + 4
+                        for ctx_line in m.get("after", ()):
+                            running_chars += len(ctx_line) + 4
+                    if running_chars > char_budget:
+                        budget_exceeded = True
+                        # Count remaining matches in this file as truncated
+                        remaining = file_result["matches"][len(match_items) :]
+                        truncated_matches += len(remaining)
+                        break
             files_payload.append(
                 {
                     "path": file_result["path"],
@@ -1839,6 +1772,10 @@ async def grep(
             "files_matched": len(files_payload),
             "files": files_payload,
         }
+        if truncated_matches > 0 or truncated_files > 0:
+            payload["truncated_matches"] = truncated_matches
+            if truncated_files > 0:
+                payload["truncated_files"] = truncated_files
         if mode == _MODE_DEBUG:
             payload["fixed_string"] = fixed_string
             payload["case_sensitive"] = case_sensitive

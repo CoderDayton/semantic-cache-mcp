@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import OrderedDict
 from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, cast
@@ -292,6 +293,8 @@ class SemanticCache:
         "_drained",
         "_io_executor",
         "_stale_paths",
+        "_search_cache",
+        "_search_cache_version",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -317,6 +320,11 @@ class SemanticCache:
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
         self._stale_paths: set[str] = set()
+        # In-session search-result cache. Bounded LRU keyed on
+        # (query, k, directory). Bumped on every write so callers see fresh
+        # results once any file changes.
+        self._search_cache: OrderedDict[tuple[str, int, str | None], Any] = OrderedDict()
+        self._search_cache_version: int = 0
 
     def reset_executor(self) -> None:
         """Replace the IO executor with a fresh one after a timeout/hang.
@@ -556,6 +564,7 @@ class SemanticCache:
             has_embedding=embedding is not None,
         )
         await self._storage.put(path, content, mtime, embedding)
+        self._bump_search_cache()
         log_marker(
             logger,
             "cache.put.end",
@@ -563,6 +572,15 @@ class SemanticCache:
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         logger.debug(f"Cached file: {path} ({tokens} tokens)")
+
+    def _bump_search_cache(self) -> None:
+        """Invalidate the in-session search-result cache.
+
+        Called on every cache mutation so semantic_search never returns
+        results that predate a write.
+        """
+        self._search_cache_version += 1
+        self._search_cache.clear()
 
     async def refresh_path(
         self,
@@ -638,6 +656,11 @@ class SemanticCache:
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding."""
         await self._storage.update_mtime(path, new_mtime)
+        # Bump the search cache: the mtime change reflects an external write
+        # whose content matched the cached hash. Even though the indexed
+        # content didn't change, the invariant "every mtime write clears the
+        # search cache" keeps result freshness simple to reason about.
+        self._bump_search_cache()
 
     async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
@@ -724,10 +747,14 @@ class SemanticCache:
             raise
 
     async def clear(self) -> int:
-        return await self._storage.clear()
+        result = await self._storage.clear()
+        self._bump_search_cache()
+        return result
 
     async def delete_path(self, path: str) -> int:
         """Delete one cached path and clear any stale marker for it."""
         removed = await self._storage.delete_path(path)
         self.clear_stale(path)
+        if removed:
+            self._bump_search_cache()
         return removed

@@ -74,6 +74,9 @@ async def _load_diff_input(
     return cached, content, embedding, False
 
 
+_SEARCH_CACHE_MAX_ENTRIES = 32
+
+
 async def semantic_search(
     cache: SemanticCache,
     query: str,
@@ -84,6 +87,16 @@ async def semantic_search(
     # DoS protection
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
+
+    # In-session result cache: identical (query, k, directory) tuples in
+    # the same session skip the full embed + BM25 + vector round-trip.
+    # Invalidated on every cache mutation via SemanticCache._bump_search_cache.
+    cache_key = (query, k, directory)
+    cached_result = cache._search_cache.get(cache_key)
+    if cached_result is not None:
+        cache._search_cache.move_to_end(cache_key)
+        cache.metrics.record("search_cache_hit", None)
+        return cached_result
 
     # Embed query for vector component of hybrid search.
     # MUST go through executor — ONNX is not thread-safe.
@@ -117,7 +130,9 @@ async def semantic_search(
     if not results:
         stats = await storage.get_stats()
         total = stats.get("files_cached", 0)
-        return SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
+        empty = SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
+        _store_search_result(cache, cache_key, empty)
+        return empty
 
     # Build matches with directory filtering
     filtered: list[tuple[str, str, float]] = []
@@ -149,12 +164,26 @@ async def semantic_search(
     stats = await storage.get_stats()
     total = stats.get("files_cached", 0)
 
-    return SearchResult(
+    result = SearchResult(
         query=query,
         matches=matches,
         files_searched=int(total),
         cached_files=int(total),
     )
+    _store_search_result(cache, cache_key, result)
+    return result
+
+
+def _store_search_result(
+    cache: SemanticCache,
+    key: tuple[str, int, str | None],
+    result: SearchResult,
+) -> None:
+    sc = cache._search_cache
+    sc[key] = result
+    sc.move_to_end(key)
+    while len(sc) > _SEARCH_CACHE_MAX_ENTRIES:
+        sc.popitem(last=False)
 
 
 async def compare_files(
