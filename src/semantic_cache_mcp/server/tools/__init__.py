@@ -66,7 +66,14 @@ _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 # Prevents concurrent coroutines from interleaving executor tasks,
 # catalog reads, and ONNX calls — the root cause of hangs when
 # multiple subagents fire tool calls simultaneously.
+#
+# We bind the lock to the running event loop so that test runners which
+# create a fresh loop per test (pytest-asyncio function scope) get a fresh
+# lock too — a stale Lock from a closed loop would deadlock or raise on
+# acquire. Production runs see a single loop, so the rebind path is dead
+# code in normal operation.
 _tool_lock: asyncio.Lock | None = None
+_tool_lock_loop: asyncio.AbstractEventLoop | None = None
 _RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
 
 
@@ -130,10 +137,16 @@ def _resolve_path_list(raw: str, state: _ToolCallState) -> list[str]:
 
 
 def _get_tool_lock() -> asyncio.Lock:
-    """Lazy-init the lock (must be created inside a running event loop)."""
-    global _tool_lock
-    if _tool_lock is None:
+    """Return the per-event-loop tool lock, creating it lazily on first use.
+
+    Re-creates the lock if the running event loop has changed (which only
+    happens in test scenarios that spin up a fresh loop per test).
+    """
+    global _tool_lock, _tool_lock_loop
+    loop = asyncio.get_running_loop()
+    if _tool_lock is None or _tool_lock_loop is not loop:
         _tool_lock = asyncio.Lock()
+        _tool_lock_loop = loop
     return _tool_lock
 
 
@@ -270,13 +283,15 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
         raise RuntimeError("Server is shutting down")
     task = asyncio.ensure_future(coro)
     task.set_name("shielded-write")
-    timed_out = False
+    # Pair begin_operation() with end_operation() that fires exactly once
+    # when the underlying write actually finishes — success, error, or
+    # cancellation. Wiring it as a done_callback (instead of a finally
+    # branch) is what makes the drain counter accurate when the awaiter
+    # gives up on a timeout while the shielded task keeps running.
+    task.add_done_callback(lambda _t: cache.end_operation())
     try:
         async with asyncio.timeout(timeout):
             return await asyncio.shield(task)
-    except TimeoutError:
-        timed_out = True
-        raise
     except asyncio.CancelledError:
         # Not our timeout — genuine cancellation (SIGTERM / graceful shutdown).
         # Give the write a brief grace period to finish disk I/O before
@@ -285,9 +300,6 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
             return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
         except (TimeoutError, asyncio.CancelledError):
             raise asyncio.CancelledError() from None
-    finally:
-        if not timed_out:
-            cache.end_operation()
 
 
 @mcp.tool(

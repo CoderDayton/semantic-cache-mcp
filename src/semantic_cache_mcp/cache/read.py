@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import stat as stat_module
 import time
 from pathlib import Path
 
@@ -347,20 +348,24 @@ async def batch_smart_read(
     _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
     for _path in paths_sorted:
         _resolved = Path(_path).expanduser().resolve()
-        _cached = _cache_map.get(str(_resolved))
-        if _cached and _resolved.exists():
-            _file_mtime = _resolved.stat().st_mtime
+        _resolved_str = str(_resolved)
+        _cached = _cache_map.get(_resolved_str)
+        # Reuse the stat result from the prefetch gather above instead of
+        # making a fresh blocking stat() call in the event loop.
+        _stat = _stat_map.get(_resolved_str)
+        if _cached and _stat is not None:
+            _file_mtime = _stat.st_mtime
             if _cached.mtime >= _file_mtime:
                 continue  # unchanged — no embedding needed
             # Check content hash before assuming changed
             try:
                 _raw_text = await aread_text(_resolved, executor=cache._io_executor)
                 if hash_content(_raw_text) == _cached.content_hash:
-                    await cache.update_mtime(str(_resolved), _file_mtime)
+                    await cache.update_mtime(_resolved_str, _file_mtime)
                     continue  # content unchanged — no embedding needed
             except Exception:  # nosec B110
                 pass
-        if not _resolved.exists() or not _resolved.is_file():
+        if _stat is None or not stat_module.S_ISREG(_stat.st_mode):
             continue  # will error in smart_read, skip pre-scan
         try:
             _raw = await aread_bytes(_resolved, cache._io_executor)
@@ -375,7 +380,7 @@ async def batch_smart_read(
     _prefetched: dict[str, EmbeddingVector] = {}
     if _to_embed:
         _pairs = [(_rpath, _cnt) for _, _rpath, _cnt in _to_embed]
-        _results = cache.get_embeddings_batch(_pairs)
+        _results = await cache.get_embeddings_batch(_pairs)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=False):
             if _emb is not None:
                 _prefetched[_rpath] = _emb

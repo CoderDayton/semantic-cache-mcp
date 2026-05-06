@@ -7,6 +7,7 @@ import asyncio
 import fnmatch
 import json
 import logging
+import threading
 import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
@@ -66,6 +67,7 @@ class VectorStorage:
         "_closed",
         "_io_executor",
         "_owns_executor",
+        "_save_lock",
     )
 
     # Quantization currently in use — stored in sidecar to detect future changes.
@@ -94,6 +96,10 @@ class VectorStorage:
             quantization=self._QUANTIZATION,
         )
         self._closed = False
+        # Mutex between save() (called from the IO executor during eviction)
+        # and the close() daemon thread's final save. usearch's save is not
+        # thread-safe, so the two cannot run concurrently.
+        self._save_lock = threading.Lock()
         # Sync VectorDB has no executor, so we own one when none is injected.
         # Single-thread by default — ONNX/usearch are not thread-safe, and
         # SemanticCache always passes its own DetachedExecutor in production.
@@ -297,18 +303,17 @@ class VectorStorage:
         if self._closed:
             return
 
-        import threading  # noqa: PLC0415
-
         self._closed = True
         close_error: BaseException | None = None
 
         def _do_close() -> None:
             nonlocal close_error
-            try:
-                self._db.save()
-                self._db.close()
-            except Exception as exc:
-                close_error = exc
+            with self._save_lock:
+                try:
+                    self._db.save()
+                    self._db.close()
+                except Exception as exc:
+                    close_error = exc
 
         # Use a daemon thread so a hung save doesn't prevent process exit.
         # ThreadPoolExecutor.__exit__ calls shutdown(wait=True) which would
@@ -1064,7 +1069,14 @@ class VectorStorage:
 
     async def _evict_if_needed(self) -> None:
         """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
-        # Get all docs once — used for both the file-count check and LRU scoring.
+        # Cheap pre-check: unique_file_count <= total document count, so if the
+        # doc count fits within the cap there is nothing to evict and we can
+        # skip the (expensive) full collection scan. _evict_if_needed runs on
+        # every put, so this gate eliminates the O(N) scan on the hot path.
+        doc_count = await self._collection.count()
+        if doc_count <= MAX_CACHE_ENTRIES:
+            return
+
         all_docs = await self._collection.get_documents()
 
         # Count unique files, not documents. Chunked files span multiple
@@ -1116,10 +1128,14 @@ class VectorStorage:
     def save(self) -> None:
         """Persist index to disk.
 
-        Guarded: if close() is already running on a daemon thread, skip
-        to avoid concurrent usearch save (not thread-safe → heap corruption).
+        Guarded by `_save_lock` against the close() daemon thread's final
+        save: usearch's save is not thread-safe, and a concurrent save from
+        eviction (running on the IO executor) racing with close() would
+        corrupt the heap. The lock also covers a re-check of `_closed` so
+        we never write after close() has begun tearing down the DB.
         """
-        if self._closed:
-            return
-        self._sync_collection.save()
-        self._db.save()
+        with self._save_lock:
+            if self._closed:
+                return
+            self._sync_collection.save()
+            self._db.save()

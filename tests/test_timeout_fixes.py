@@ -199,16 +199,23 @@ async def test_shielded_write_calls_end_operation_on_success() -> None:
     cache.end_operation.assert_called_once()
 
 
-async def test_shielded_write_skips_end_operation_on_timeout() -> None:
-    """end_operation() must NOT be called when the write times out.
-
-    The timed_out flag prevents end_operation from firing, because the
-    inner task may still be running (shielded) and will finish later.
+async def test_shielded_write_defers_end_operation_until_inner_finishes() -> None:
+    """When a timeout fires, end_operation() must NOT be called immediately
+    (the shielded task is still running) but MUST be called once the inner
+    task eventually completes. Otherwise the drain counter leaks and every
+    post-timeout shutdown blocks for the full drain window.
     """
     cache = _make_cache()
+    inner = _slow_finish(delay=0.15, value="late")
     with pytest.raises(TimeoutError):
-        await _shielded_write(cache, _hang_forever(), timeout=0.05)
+        await _shielded_write(cache, inner, timeout=0.05)
+    # Right after the timeout, the inner task is still running — the counter
+    # must remain held so async_close() blocks until the write durably lands.
     cache.end_operation.assert_not_called()
+    # Once the shielded task actually finishes, the done_callback fires and
+    # end_operation() is invoked exactly once.
+    await asyncio.sleep(0.25)
+    cache.end_operation.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +429,7 @@ async def test_batch_read_prefetches_stats_async() -> None:
         mock_cache._io_executor = None
         mock_cache.begin_operation.return_value = True
         mock_cache.get_embedding = AsyncMock(return_value=None)
+        mock_cache.get_embeddings_batch = AsyncMock(return_value=[])
         mock_cache.put = AsyncMock()
         mock_cache.refresh_path = AsyncMock(return_value=True)
         mock_cache.record_access = AsyncMock()
@@ -484,3 +492,105 @@ async def test_shielded_write_propagates_inner_exception() -> None:
 
     # end_operation should still be called (not a timeout)
     cache.end_operation.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Iteration-0 regression tests: each test fails on the original bug and
+# passes on the fix. They guard the audit's three Critical findings against
+# future regressions.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_embeddings_batch_dispatches_to_io_executor(tmp_path: Path) -> None:
+    """The batch embed path must run on the SemanticCache IO executor.
+
+    Original bug: get_embeddings_batch was a sync def that ran ONNX inference
+    on whatever thread called it. That broke the single-thread ONNX/usearch
+    invariant whenever the caller was the asyncio event-loop thread.
+
+    Regression check: capture the thread that runs `_embed_batch`. It must
+    not be the calling (event-loop) thread.
+    """
+    import threading as _threading
+
+    cache = SemanticCache(db_path=tmp_path / "exec_dispatch.db")
+    try:
+        calling_thread = _threading.get_ident()
+        seen_thread: list[int] = []
+
+        def _capture(texts: list[str]) -> list[None]:
+            seen_thread.append(_threading.get_ident())
+            return [None] * len(texts)
+
+        with patch("semantic_cache_mcp.cache.embed_batch", _capture):
+            await cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
+
+        assert len(seen_thread) == 1
+        assert seen_thread[0] != calling_thread, (
+            "embed_batch ran on the event-loop thread; the executor dispatch was bypassed"
+        )
+    finally:
+        await cache.async_close()
+
+
+async def test_shielded_write_inflight_zero_after_post_timeout_completion() -> None:
+    """After a write times out and the inner task later finishes, the
+    drain counter must return to zero. Original bug: end_operation() was
+    skipped on TimeoutError so _inflight stayed pinned forever.
+    """
+    cache = _make_cache()
+    inner = _slow_finish(delay=0.15, value="late")
+    with pytest.raises(TimeoutError):
+        await _shielded_write(cache, inner, timeout=0.05)
+    cache.end_operation.assert_not_called()
+    # Wait long enough that the shielded task definitely completed even on
+    # a slow runner. The done_callback fires synchronously on the loop.
+    await asyncio.sleep(0.5)
+    cache.end_operation.assert_called_once()
+
+
+async def test_glob_path_walk_does_not_block_event_loop() -> None:
+    """glob_with_cache_status must not block the event loop while walking
+    the filesystem. Original bug: dir_path.glob() ran on the event loop, so
+    a slow filesystem stalled every concurrent MCP call.
+
+    Regression check: while a glob walk is in progress, an unrelated short
+    sleep must complete on schedule. Patches Path.glob to inject a 0.3s
+    blocking sleep — that delay belongs in the executor, not the loop.
+    """
+    import tempfile
+    import time as _time
+    from pathlib import Path as _Path
+
+    from semantic_cache_mcp.cache.search import glob_with_cache_status
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = _Path(tmpdir).resolve()
+        (tmp / "a.txt").write_text("hello")
+
+        mock_cache = MagicMock()
+        mock_cache.get = AsyncMock(return_value=None)
+        mock_cache._io_executor = None  # default loop executor
+
+        real_glob = _Path.glob
+
+        def slow_glob(self, pattern):  # noqa: ANN001
+            _time.sleep(0.3)  # blocking — must happen off the event loop
+            return real_glob(self, pattern)
+
+        loop_responsive = asyncio.Event()
+
+        async def loop_pulse() -> None:
+            await asyncio.sleep(0.05)
+            loop_responsive.set()
+
+        with patch.object(_Path, "glob", slow_glob):
+            pulse_task = asyncio.create_task(loop_pulse())
+            t0 = _time.monotonic()
+            await glob_with_cache_status(mock_cache, "*.txt", directory=str(tmp))
+            elapsed = _time.monotonic() - t0
+            # Pulse must have fired well before the glob finished — proves
+            # the loop kept ticking while the executor handled the walk.
+            assert loop_responsive.is_set(), "event loop was blocked during glob"
+            await pulse_task
+            assert elapsed >= 0.3, f"glob completed in {elapsed:.3f}s, blocking sleep missed"

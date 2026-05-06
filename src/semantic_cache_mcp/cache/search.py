@@ -326,8 +326,30 @@ async def glob_with_cache_status(
 
     deadline = time.monotonic() + GLOB_TIMEOUT_SECONDS
 
+    def _collect_paths() -> tuple[list[Path], bool]:
+        """Walk the glob synchronously up to MAX_GLOB_MATCHES or the deadline.
+
+        Path.glob() does blocking stat() calls under the hood, so the entire
+        walk runs on the IO executor instead of the event loop. Returns the
+        (bounded) match list and a flag indicating whether the deadline cut
+        the walk short.
+        """
+        out: list[Path] = []
+        for entry in dir_path.glob(pattern):
+            if len(out) >= MAX_GLOB_MATCHES:
+                break
+            if time.monotonic() > deadline:
+                return out, True
+            out.append(entry)
+        return out, False
+
+    loop = asyncio.get_running_loop()
+    candidates, deadline_hit = await loop.run_in_executor(cache._io_executor, _collect_paths)
+    if deadline_hit:
+        logger.warning(f"Glob timed out after {GLOB_TIMEOUT_SECONDS}s")
+
     count = 0
-    for file_path in dir_path.glob(pattern):
+    for file_path in candidates:
         if count >= MAX_GLOB_MATCHES:
             break
         if time.monotonic() > deadline:

@@ -678,20 +678,29 @@ class SemanticCache:
 
         return stats
 
-    def get_embeddings_batch(
+    async def get_embeddings_batch(
         self, path_content_pairs: list[tuple[str, str]]
     ) -> list[EmbeddingVector | None]:
-        """Batch-embed files in one model call. Prepends file-type labels like get_embedding."""
+        """Batch-embed files in one model call. Prepends file-type labels like get_embedding.
+
+        Runs ONNX inference on the shared single-threaded executor to keep
+        the event loop responsive and to honor the ONNX/usearch single-thread
+        invariant (concurrent ONNX calls from multiple threads can segfault).
+        """
         from . import embed_batch as _embed_batch  # noqa: PLC0415
 
         texts = [
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
+        loop = asyncio.get_running_loop()
         started = time.perf_counter()
         log_marker(logger, "embed.batch.begin", count=len(texts))
         try:
-            result = cast(list[EmbeddingVector | None], _embed_batch(texts))
+            result = cast(
+                list[EmbeddingVector | None],
+                await loop.run_in_executor(self._io_executor, _embed_batch, texts),
+            )
             for embedding in result:
                 if embedding is not None:
                     self._sync_embedding_model_metadata(embedding)
