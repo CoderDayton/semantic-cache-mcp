@@ -48,7 +48,6 @@ from semantic_cache_mcp.cache import (  # noqa: E402, I001
 )
 from semantic_cache_mcp.core.tokenizer import count_tokens  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -315,7 +314,9 @@ async def run_benchmark(
         if not quiet:
             print("\nPhase 7: In-session Search Cache")
             print(f"  {'5 queries cold (miss)':<32s}  {cold_s * 1000:>7.1f} ms")
-            print(f"  {'5 queries warm (hit)':<32s}  {warm_s * 1000:>7.1f} ms  ({speedup:>5.1f}× faster)")  # noqa: E501
+            label = f"{'5 queries warm (hit)':<32s}"
+            timing = f"{warm_s * 1000:>7.1f} ms  ({speedup:>5.1f}× faster)"
+            print(f"  {label}  {timing}")
 
         elapsed = time.perf_counter() - t_total
 
@@ -377,9 +378,7 @@ async def run_benchmark(
 def _main() -> int:
     ap = common_argparser("Semantic Cache — Token Savings Benchmark")
     args = ap.parse_args()
-    results = asyncio.run(
-        run_benchmark(quiet=args.quiet, json_path=args.json)
-    )
+    results = asyncio.run(run_benchmark(quiet=args.quiet, json_path=args.json))
     if results["overall"] < 0.80:
         if not args.quiet:
             print(f"\nFAIL: Overall savings {results['overall']:.1%} < 80% target")

@@ -941,7 +941,9 @@ async def edit(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> dict[str, Any]:
-    """Edit one file via exact replacement. Use `batch_edit` for multiple changes, `write` for full rewrites.
+    """Edit one file via exact replacement.
+
+    Use `batch_edit` for multiple changes, `write` for full rewrites.
 
     Modes: find/replace (`old_string`+`new_string`), scoped (add `start_line`/`end_line`),
     or line-range (omit `old_string`, provide both lines). Keep `old_string` short
@@ -1246,7 +1248,10 @@ async def search(
     directory: str | None = None,
     show_preview: bool = False,
 ) -> dict[str, Any]:
-    """Cache-only semantic search by meaning. Use `grep` for exact strings, `glob` to discover files. Empty results usually mean files weren't seeded via `read`/`batch_read`.
+    """Cache-only semantic search by meaning.
+
+    Use `grep` for exact strings, `glob` to discover files. Empty results
+    usually mean files weren't seeded via `read`/`batch_read`.
 
     Args:
         query: Natural-language query, keywords, or a mixture of both.
@@ -1395,7 +1400,12 @@ async def batch_read(
     max_total_tokens: int = 50000,
     priority: str = "",
 ) -> dict[str, Any]:
-    """Read multiple files under a token budget. Use to seed cache before `search`/`grep`. Prefer over repeated `read` calls. Returns diffs for modified files, full content for new ones; large files skipped when budget exhausted (use `read` with `offset`/`limit` to recover).
+    """Read multiple files under a token budget.
+
+    Use to seed cache before `search`/`grep`; prefer over repeated `read`
+    calls. Returns diffs for modified files, full content for new ones;
+    large files skipped when budget exhausted (use `read` with
+    `offset`/`limit` to recover).
 
     Args:
         paths: Comma-separated paths, JSON array, or glob patterns.
@@ -1519,7 +1529,9 @@ async def similar(
     path: str,
     k: int = 5,
 ) -> dict[str, Any]:
-    """Find cached files semantically similar to one source file. Neighbors must already be cached (seed with `batch_read` first).
+    """Find cached files semantically similar to one source file.
+
+    Neighbors must already be cached (seed with `batch_read` first).
 
     Args:
         path: Source file path.
@@ -1583,7 +1595,10 @@ async def glob(
     directory: str = ".",
     cached_only: bool = False,
 ) -> dict[str, Any]:
-    """Discover files by glob and show which are already cached. Use before `batch_read`/`search`/`grep`. `cached_only=true` shows what search/grep can see without more reads.
+    """Discover files by glob and show which are already cached.
+
+    Use before `batch_read`/`search`/`grep`. `cached_only=true` shows what
+    search/grep can see without more reads.
 
     Args:
         pattern: Glob pattern to expand.
@@ -1665,7 +1680,10 @@ async def grep(
     max_matches: int = 100,
     max_files: int = 50,
 ) -> dict[str, Any]:
-    """Cache-only ripgrep: exact string/regex with line numbers. Use `search` for semantic intent. Seed files with `batch_read` first; empty results often mean files not cached.
+    """Cache-only ripgrep: exact string/regex with line numbers.
+
+    Use `search` for semantic intent. Seed files with `batch_read` first;
+    empty results often mean files not cached.
 
     Args:
         pattern: Regex pattern, or a literal if `fixed_string=true`.
