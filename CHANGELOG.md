@@ -5,8 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.4.6] - 2026-05-06
 
 ### Changed
@@ -15,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`batch_read` no longer stalls the event loop** — `SemanticCache.get_embeddings_batch` was a sync method that ran ONNX inference on the calling thread. For `batch_smart_read` that thread was the asyncio event loop, freezing every concurrent MCP call for the duration of the batch embed and bypassing the dedicated single-thread ONNX executor (which can segfault under concurrent inference). The method is now async and dispatches through `cache._io_executor`. Programmatic callers must add `await`.
+- **Write timeouts no longer pin the shutdown drain** — `_shielded_write` previously skipped `end_operation()` whenever `asyncio.timeout` fired, leaking the inflight counter forever because the shielded task kept running in the background. After the first write timeout, every subsequent shutdown blocked the full 8-second drain window for nothing. `end_operation()` is now wired as a `Task.add_done_callback`, so it fires exactly once when the inner task actually finishes — success, error, cancellation, or post-timeout completion.
+- **`glob` no longer blocks the event loop** — `glob_with_cache_status` walked the filesystem with `Path.glob()` directly on the loop. On NFS, FUSE, or large repos that walk could stall every concurrent MCP call for seconds. The walk now runs on the IO executor with the existing deadline guard applied inside the worker.
+- **Eviction no longer scans the full collection on every write** — `_evict_if_needed` (called on every `put`) now short-circuits via a cheap `count()` check before doing the LRU-K scan. Drops the per-write O(N) scan that touched 50K+ rows on chunked-file workloads.
+- **Pre-fetched stats reused in `batch_read`** — the pre-scan loop in `batch_smart_read` now reuses the `_stat_map` collected via the prefetch gather instead of issuing a second sync `stat()` / `is_file()` per file on the event loop.
+- **`save()` ↔ `close()` race window closed** — `VectorStorage.save()` and the `close()` daemon thread now share a `threading.Lock`, eliminating the narrow race where eviction-driven save and the final close save could call usearch's not-thread-safe save concurrently.
+- **`_format_file` bounded after SIGKILL** — the post-kill `proc.wait()` now has a 2-second timeout so a wedged formatter child cannot hang the call indefinitely.
+- **Per-event-loop tool lock** — `_tool_lock` rebinds when the running event loop changes, removing a stale-lock failure mode under pytest-asyncio function-scoped loops.
 - **GPU VRAM leak with `EMBEDDING_DEVICE=cpu`** — When `onnxruntime-gpu` is installed but `EMBEDDING_DEVICE=cpu`, fastembed no longer auto-selects CUDA. The ONNX session now receives an explicit `providers=["CPUExecutionProvider"]`, preventing ~2GB of phantom VRAM allocation.
 - **Guard fastembed init when OpenAI provider is active** — `_get_model()` now raises immediately if called with `OPENAI_EMBEDDINGS_ENABLED=true`, making it impossible to accidentally load the local ONNX model when embeddings are routed through Ollama/OpenAI.
 - **CUDA fallback preserves CPU constraint** — When CUDA initialization fails at runtime, the retry path now explicitly sets `CPUExecutionProvider` instead of removing the `providers` kwarg (which let ONNX Runtime auto-select CUDA again).
