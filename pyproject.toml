@@ -9,7 +9,7 @@ dependencies = [
     "fastembed>=0.5.1",
     "fastmcp>=3.0.0b1",
     "openai>=2.33.0",
-    "simplevecdb>=2.5.0",
+    "simplevecdb>=2.6.0",
 ]
 
 [project.optional-dependencies]

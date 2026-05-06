@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.6] - 2026-05-04
+## [0.4.6] - 2026-05-06
+
+### Changed
+
+- **simplevecdb 2.6.0** — Bumped minimum dependency from 2.5.0. Inherits upstream review-pass-3 fixes: hybrid-search RRF rank symmetry under metadata filters, RRF deduplication keyed by document ID instead of text (no more silent merge of distinct docs sharing text), per-connection lock on every catalog read path (`get_documents_by_ids`, `keyword_search`, `count`, …) closing a known sqlite3 thread-safety gap, atomic `UsearchIndex.save` via sibling `.tmp` + `os.replace` + parent-dir fsync, atomic `delete_collection` with a tightened TOCTOU window, NaN/Inf rejection at insert before the catalog row commits, and softened INT8 quantization range checks (clip + one-shot `DeprecationWarning` instead of `ValueError`) so embeddings drifting marginally outside [-1, 1] no longer crash inserts.
 
 ### Fixed
 

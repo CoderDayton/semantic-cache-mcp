@@ -82,11 +82,12 @@ class VectorStorage:
         self._db_path = db_path
         self._clear_if_quantization_changed(db_path)
         self._recover_if_crashed(db_path)
-        # Use the sync VectorDB directly (not AsyncVectorDB) so we can pass
-        # store_embeddings=True to collection() — that parameter is missing
-        # from AsyncVectorDB.collection() in simplevecdb 2.5.0. Async behavior
-        # is provided by wrapping the sync collection in AsyncVectorCollection
-        # below, which serializes ops on our injected executor.
+        # Use the sync VectorDB directly (not AsyncVectorDB) so we own the
+        # executor: ONNX/usearch require a single-threaded executor to avoid
+        # segfaults, and SemanticCache needs rebind_executor() to swap the
+        # IO executor after a hung worker. AsyncVectorDB manages its own
+        # internal pool and exposes neither hook. Async behavior is provided
+        # by wrapping the sync collection in AsyncVectorCollection below.
         self._db = VectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
@@ -115,9 +116,9 @@ class VectorStorage:
     def _reset_collection_sync(self, *, reason: str) -> None:
         """Drop and recreate the collection synchronously.
 
-        Uses simplevecdb 2.5.0's ``delete_collection`` which atomically drops
-        the SQLite tables, FTS index, and usearch file in one call. The new
-        wrapper for the recreated collection is reattached to
+        Uses ``delete_collection`` which atomically drops the SQLite tables,
+        FTS index, and usearch file in one call. The new wrapper for the
+        recreated collection is reattached to
         ``self._collection`` so further async ops keep working. Safe to call
         from sync startup paths — no event loop required.
         """
@@ -163,7 +164,7 @@ class VectorStorage:
 
         ``store_embeddings=True`` is required so ``get_embeddings_by_ids``
         can return the vectors used by ``SemanticCache.get()`` /
-        ``compare_files()``. simplevecdb 2.5.0 changed the default to False.
+        ``compare_files()``. simplevecdb defaults this to False.
         Stores a direct reference to the sync collection for sync code paths
         (``save``, ``_clear_sync``) so they don't have to reach through the
         async wrapper.
@@ -1009,8 +1010,8 @@ class VectorStorage:
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of documents removed.
 
-        Uses simplevecdb 2.5.0's ``delete_collection`` to atomically drop the
-        SQLite tables, FTS index, and usearch file in one call, then rebuilds
+        Uses ``delete_collection`` to atomically drop the SQLite tables, FTS
+        index, and usearch file in one call, then rebuilds
         an empty collection. Faster and safer than the previous per-id loop.
         Runs the (sync) ``delete_collection`` on the shared IO executor so it
         does not block the event loop.

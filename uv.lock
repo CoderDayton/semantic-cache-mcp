@@ -2050,7 +2050,7 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.4.5"
+version = "0.4.6"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
@@ -2084,7 +2084,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
-    { name = "simplevecdb", specifier = ">=2.5.0" },
+    { name = "simplevecdb", specifier = ">=2.6.0" },
 ]
 provides-extras = ["gpu", "dev"]
 
@@ -2099,20 +2099,21 @@ wheels = [
 
 [[package]]
 name = "simplevecdb"
-version = "2.5.0"
+version = "2.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "hdbscan" },
     { name = "numpy" },
+    { name = "python-dotenv" },
     { name = "scikit-learn" },
     { name = "sqlcipher3-binary", marker = "sys_platform == 'linux'" },
     { name = "sqlite-vec" },
     { name = "usearch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/31/94/8f11cf79f8ee38e3f8afd5f9806743b8b072bc4ecac1928b7718bc4d68bc/simplevecdb-2.5.0.tar.gz", hash = "sha256:0f1435597e4496ee5d8ddf27b85f100e551634f8e4ce08e18661c0217de08d35", size = 540013, upload-time = "2026-04-07T10:38:55.008Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/5e/0da24a312ddfd5d53aa9fed977f65a1889f8d00422e2d30c4d2d5494dc97/simplevecdb-2.6.0.tar.gz", hash = "sha256:5912a02e87a4bbe7e00f428b4beef5976f2918b90e3ff340b285c0830cfd8282", size = 596661, upload-time = "2026-05-06T09:09:31.837Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/67/8a/ed8368d32f0d2ea35053d877237b3e8aad07c781c7a01f9a0a65d603eb98/simplevecdb-2.5.0-py3-none-any.whl", hash = "sha256:d23f08f6978efc7e9a6ddbf7e33123415d70186fb788e96f6ce787d79bcbca03", size = 80313, upload-time = "2026-04-07T10:38:53.905Z" },
+    { url = "https://files.pythonhosted.org/packages/90/23/390e75765cace3e46e3c160102d77f394fccfd25d47f925f84c7d9bcd483/simplevecdb-2.6.0-py3-none-any.whl", hash = "sha256:2fa0175a5217782ea4fc7b699767b33ecb8467a0044f73c39e0a5551b93da149", size = 96454, upload-time = "2026-05-06T09:09:33.443Z" },
 ]
 
 [[package]]
