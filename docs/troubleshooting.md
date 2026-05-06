@@ -53,6 +53,10 @@
 - **Cause:** Only cached files are searched. New or unread files aren't in the HNSW index.
 - **Fix:** Seed the cache with `read` or `batch_read` first.
 
+**Repeated `search` queries return instantly (< 1 ms)**
+- **Cause (0.4.6+):** `SemanticCache` keeps an in-session 32-entry LRU of search results, keyed on `(query, k, directory)`. Identical queries skip the embed + BM25 + HNSW round-trip entirely.
+- **When this is wrong:** the LRU is invalidated on every cache mutation (`put`, `clear`, `delete_path`, `update_mtime`), so callers never see results that predate a write. If you suspect staleness, run `clear` to flush state.
+
 ---
 
 ## Server Hangs
@@ -90,8 +94,9 @@
 
 | Path                                         | Contents                     |
 |----------------------------------------------|------------------------------|
-| `~/.cache/semantic-cache-mcp/vecdb.db`       | VectorStorage database (raw text, HNSW vectors, FTS5 index) |
+| `~/.cache/semantic-cache-mcp/vecdb.db`       | Primary vector store (raw text, HNSW vectors, FTS5 index) |
 | `~/.cache/semantic-cache-mcp/metrics.db`     | Session metrics (token savings, tool calls, lifetime stats) |
+| `~/.cache/semantic-cache-mcp/cache.db`       | Legacy SQLite from pre-0.3.0 (only inspected at startup for migration; safe to delete) |
 | `~/.cache/semantic-cache-mcp/tokenizer/`     | o200k_base BPE tokenizer file |
 | `~/.cache/semantic-cache-mcp/models/`        | FastEmbed ONNX model (~130MB, BAAI/bge-small-en-v1.5) |
 

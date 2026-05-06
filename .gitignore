@@ -26,6 +26,9 @@ htmlcov/
 *.prof
 *.pstats
 
+# Benchmark results
+benchmarks/.results-*.json
+
 # Environment files
 .env
 .env.local

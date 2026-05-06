@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import stat as stat_module
 import time
 from pathlib import Path
 
 import numpy as np
 
 from ..config import MAX_CONTENT_SIZE
-from ..core import count_tokens, diff_stats, generate_diff, summarize_semantic, truncate_semantic
+from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
 from ..logger import log_marker
 from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
@@ -56,7 +57,42 @@ async def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Single read: binary check + decode in one I/O operation
+    # Check cache first; only stat when needed (hit comparison or cold-path
+    # refresh). Reading bytes is the dominant cost on the slow path, so the
+    # stat is folded in just before refresh_path() instead of up front.
+    cached = await cache.get(str(file_path))
+    mtime: float = 0.0
+    if cached is not None:
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+
+    if cached and diff_mode and not force_full and cached.mtime >= mtime:
+        await cache.record_access(str(file_path))
+        unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
+        msg_tokens = count_tokens(unchanged_msg)
+        if msg_tokens < cached.tokens:
+            return ReadResult(
+                content=unchanged_msg,
+                from_cache=True,
+                is_diff=False,
+                tokens_original=cached.tokens,
+                tokens_returned=msg_tokens,
+                tokens_saved=cached.tokens - msg_tokens,
+                truncated=False,
+                compression_ratio=msg_tokens / cached.tokens if cached.tokens else 1.0,
+            )
+        cached_content = await cache.get_content(cached)
+        return ReadResult(
+            content=cached_content,
+            from_cache=True,
+            is_diff=False,
+            tokens_original=cached.tokens,
+            tokens_returned=cached.tokens,
+            tokens_saved=0,
+            truncated=False,
+            compression_ratio=1.0,
+        )
+
+    # Slow path: file changed, missing from cache, or force_full requested.
     raw = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw):
         raise ValueError(
@@ -68,11 +104,9 @@ async def smart_read(
         content = raw.decode("utf-8", errors="replace")
         logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
 
-    mtime = (await astat(file_path, cache._io_executor)).st_mtime
     tokens_original = count_tokens(content)
     computed_embedding = _embedding
 
-    cached = await cache.get(str(file_path))
     cache_is_fresh = False
     if cached and force_full:
         if cached.mtime >= mtime:
@@ -135,18 +169,10 @@ async def smart_read(
         if cached is not None:
             old_content = await cache.get_content(cached)
             diff_content = generate_diff(old_content, content)
-            stats = diff_stats(old_content, content)
             diff_tokens = count_tokens(diff_content)
 
             if diff_tokens < tokens_original * 0.6:
-                stats_msg = (
-                    f"// Stats: +{stats['insertions']} -{stats['deletions']} "
-                    f"~{stats['modifications']} lines, "
-                    f"{stats['compression_ratio']:.1%} size\n"
-                )
-                result_content = (
-                    f"// Diff for {path} (changed since cache):\n{stats_msg}{diff_content}"
-                )
+                result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
                 if computed_embedding is None:
                     computed_embedding = await cache.get_embedding(content, path)
                 await cache.refresh_path(
@@ -180,18 +206,11 @@ async def smart_read(
                 if similar_entry:
                     similar_content = await cache.get_content(similar_entry)
                     diff_content = generate_diff(similar_content, content)
-                    stats = diff_stats(similar_content, content)
                     diff_tokens = count_tokens(diff_content)
 
                     if diff_tokens < tokens_original * 0.7:
-                        stats_msg = (
-                            f"// Stats: +{stats['insertions']} -{stats['deletions']} "
-                            f"~{stats['modifications']} lines, "
-                            f"{stats['compression_ratio']:.1%} size\n"
-                        )
                         result_content = (
                             f"// Similar to cached: {similar_path}\n"
-                            f"{stats_msg}"
                             f"// Diff from similar file:\n{diff_content}"
                         )
                         await cache.refresh_path(
@@ -256,6 +275,8 @@ async def smart_read(
 
     should_refresh_cache = refresh_cache or not cache_is_fresh
     if should_refresh_cache:
+        if cached is None:
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         await cache.refresh_path(
             str(file_path),
             content,
@@ -347,20 +368,24 @@ async def batch_smart_read(
     _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
     for _path in paths_sorted:
         _resolved = Path(_path).expanduser().resolve()
-        _cached = _cache_map.get(str(_resolved))
-        if _cached and _resolved.exists():
-            _file_mtime = _resolved.stat().st_mtime
+        _resolved_str = str(_resolved)
+        _cached = _cache_map.get(_resolved_str)
+        # Reuse the stat result from the prefetch gather above instead of
+        # making a fresh blocking stat() call in the event loop.
+        _stat = _stat_map.get(_resolved_str)
+        if _cached and _stat is not None:
+            _file_mtime = _stat.st_mtime
             if _cached.mtime >= _file_mtime:
                 continue  # unchanged — no embedding needed
             # Check content hash before assuming changed
             try:
                 _raw_text = await aread_text(_resolved, executor=cache._io_executor)
                 if hash_content(_raw_text) == _cached.content_hash:
-                    await cache.update_mtime(str(_resolved), _file_mtime)
+                    await cache.update_mtime(_resolved_str, _file_mtime)
                     continue  # content unchanged — no embedding needed
             except Exception:  # nosec B110
                 pass
-        if not _resolved.exists() or not _resolved.is_file():
+        if _stat is None or not stat_module.S_ISREG(_stat.st_mode):
             continue  # will error in smart_read, skip pre-scan
         try:
             _raw = await aread_bytes(_resolved, cache._io_executor)
@@ -375,7 +400,7 @@ async def batch_smart_read(
     _prefetched: dict[str, EmbeddingVector] = {}
     if _to_embed:
         _pairs = [(_rpath, _cnt) for _, _rpath, _cnt in _to_embed]
-        _results = cache.get_embeddings_batch(_pairs)
+        _results = await cache.get_embeddings_batch(_pairs)
         for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=False):
             if _emb is not None:
                 _prefetched[_rpath] = _emb

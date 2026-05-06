@@ -7,6 +7,7 @@ import asyncio
 import fnmatch
 import json
 import logging
+import threading
 import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
@@ -41,6 +42,8 @@ _META_CREATED_AT = "created_at"
 _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
 _META_HAS_EMBEDDING = "has_embedding"
+_META_PREVIEW = "preview"
+_PREVIEW_CHARS = 200
 
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
 # each stored as a child document with its own vector. Smaller files are stored
@@ -66,6 +69,7 @@ class VectorStorage:
         "_closed",
         "_io_executor",
         "_owns_executor",
+        "_save_lock",
     )
 
     # Quantization currently in use — stored in sidecar to detect future changes.
@@ -82,17 +86,22 @@ class VectorStorage:
         self._db_path = db_path
         self._clear_if_quantization_changed(db_path)
         self._recover_if_crashed(db_path)
-        # Use the sync VectorDB directly (not AsyncVectorDB) so we can pass
-        # store_embeddings=True to collection() — that parameter is missing
-        # from AsyncVectorDB.collection() in simplevecdb 2.5.0. Async behavior
-        # is provided by wrapping the sync collection in AsyncVectorCollection
-        # below, which serializes ops on our injected executor.
+        # Use the sync VectorDB directly (not AsyncVectorDB) so we own the
+        # executor: ONNX/usearch require a single-threaded executor to avoid
+        # segfaults, and SemanticCache needs rebind_executor() to swap the
+        # IO executor after a hung worker. AsyncVectorDB manages its own
+        # internal pool and exposes neither hook. Async behavior is provided
+        # by wrapping the sync collection in AsyncVectorCollection below.
         self._db = VectorDB(
             path=str(db_path),
             distance_strategy=DistanceStrategy.COSINE,
             quantization=self._QUANTIZATION,
         )
         self._closed = False
+        # Mutex between save() (called from the IO executor during eviction)
+        # and the close() daemon thread's final save. usearch's save is not
+        # thread-safe, so the two cannot run concurrently.
+        self._save_lock = threading.Lock()
         # Sync VectorDB has no executor, so we own one when none is injected.
         # Single-thread by default — ONNX/usearch are not thread-safe, and
         # SemanticCache always passes its own DetachedExecutor in production.
@@ -115,9 +124,9 @@ class VectorStorage:
     def _reset_collection_sync(self, *, reason: str) -> None:
         """Drop and recreate the collection synchronously.
 
-        Uses simplevecdb 2.5.0's ``delete_collection`` which atomically drops
-        the SQLite tables, FTS index, and usearch file in one call. The new
-        wrapper for the recreated collection is reattached to
+        Uses ``delete_collection`` which atomically drops the SQLite tables,
+        FTS index, and usearch file in one call. The new wrapper for the
+        recreated collection is reattached to
         ``self._collection`` so further async ops keep working. Safe to call
         from sync startup paths — no event loop required.
         """
@@ -163,7 +172,7 @@ class VectorStorage:
 
         ``store_embeddings=True`` is required so ``get_embeddings_by_ids``
         can return the vectors used by ``SemanticCache.get()`` /
-        ``compare_files()``. simplevecdb 2.5.0 changed the default to False.
+        ``compare_files()``. simplevecdb defaults this to False.
         Stores a direct reference to the sync collection for sync code paths
         (``save``, ``_clear_sync``) so they don't have to reach through the
         async wrapper.
@@ -296,18 +305,17 @@ class VectorStorage:
         if self._closed:
             return
 
-        import threading  # noqa: PLC0415
-
         self._closed = True
         close_error: BaseException | None = None
 
         def _do_close() -> None:
             nonlocal close_error
-            try:
-                self._db.save()
-                self._db.close()
-            except Exception as exc:
-                close_error = exc
+            with self._save_lock:
+                try:
+                    self._db.save()
+                    self._db.close()
+                except Exception as exc:
+                    close_error = exc
 
         # Use a daemon thread so a hung save doesn't prevent process exit.
         # ThreadPoolExecutor.__exit__ calls shutdown(wait=True) which would
@@ -408,6 +416,9 @@ class VectorStorage:
             has_embedding=has_embedding,
         )
 
+        # Pre-compute a stable preview from the start of the file so that
+        # search results don't re-slice chunk content at query time (which
+        # may yield partial-word or mid-comment slices for chunked docs).
         base_meta = {
             _META_PATH: path,
             _META_CONTENT_HASH: content_hash,
@@ -416,6 +427,7 @@ class VectorStorage:
             _META_CREATED_AT: now,
             _META_ACCESS_HISTORY: json.dumps([now]),
             _META_HAS_EMBEDDING: has_embedding,
+            _META_PREVIEW: content[:_PREVIEW_CHARS],
         }
 
         # Remove old entry for this path
@@ -807,7 +819,7 @@ class VectorStorage:
             if not path or path in seen_paths:
                 continue
             seen_paths.add(path)
-            preview = doc.page_content[:200]
+            preview = doc.metadata.get(_META_PREVIEW) or doc.page_content[:_PREVIEW_CHARS]
             matches.append((path, preview, float(score)))
             if len(matches) >= k:
                 break
@@ -1009,8 +1021,8 @@ class VectorStorage:
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of documents removed.
 
-        Uses simplevecdb 2.5.0's ``delete_collection`` to atomically drop the
-        SQLite tables, FTS index, and usearch file in one call, then rebuilds
+        Uses ``delete_collection`` to atomically drop the SQLite tables, FTS
+        index, and usearch file in one call, then rebuilds
         an empty collection. Faster and safer than the previous per-id loop.
         Runs the (sync) ``delete_collection`` on the shared IO executor so it
         does not block the event loop.
@@ -1063,7 +1075,14 @@ class VectorStorage:
 
     async def _evict_if_needed(self) -> None:
         """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
-        # Get all docs once — used for both the file-count check and LRU scoring.
+        # Cheap pre-check: unique_file_count <= total document count, so if the
+        # doc count fits within the cap there is nothing to evict and we can
+        # skip the (expensive) full collection scan. _evict_if_needed runs on
+        # every put, so this gate eliminates the O(N) scan on the hot path.
+        doc_count = await self._collection.count()
+        if doc_count <= MAX_CACHE_ENTRIES:
+            return
+
         all_docs = await self._collection.get_documents()
 
         # Count unique files, not documents. Chunked files span multiple
@@ -1115,10 +1134,14 @@ class VectorStorage:
     def save(self) -> None:
         """Persist index to disk.
 
-        Guarded: if close() is already running on a daemon thread, skip
-        to avoid concurrent usearch save (not thread-safe → heap corruption).
+        Guarded by `_save_lock` against the close() daemon thread's final
+        save: usearch's save is not thread-safe, and a concurrent save from
+        eviction (running on the IO executor) racing with close() would
+        corrupt the heap. The lock also covers a re-check of `_closed` so
+        we never write after close() has begun tearing down the DB.
         """
-        if self._closed:
-            return
-        self._sync_collection.save()
-        self._db.save()
+        with self._save_lock:
+            if self._closed:
+                return
+            self._sync_collection.save()
+            self._db.save()

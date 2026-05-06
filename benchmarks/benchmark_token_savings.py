@@ -1,33 +1,44 @@
 #!/usr/bin/env python3
-"""Token savings benchmark for semantic-cache-mcp.
+"""Token-savings benchmark for semantic-cache-mcp.
 
-Measures actual token reduction across 6 real-world phases:
+Measures token reduction across 7 real-world phases:
 
-  1. Cold read        — first read, no cache (baseline)
-  2. Unchanged        — re-read identical files (cache hit)
-  3. Content hash     — touch files (mtime changes, content identical)
-  4. Small edits      — ~5% of lines changed in 30% of files
-  5. Batch read       — all files via batch_smart_read
-  6. Search after cache — semantic search on cached corpus
+  1. Cold read         — first read, no cache (baseline)
+  2. Unchanged re-read — fast path: cache hit, mtime match, no disk I/O
+  3. Content hash      — `touch` the files; mtime drifts but content matches
+  4. Small edits       — ~5% of lines actually changed in 30% of files
+  5. Batch read        — all files via `batch_smart_read`
+  6. Search previews   — 5 semantic queries × k=5, previews vs full reads
+  7. Search cache      — same queries repeated; in-session result cache
+
+Each tool response is also passed through `_finalize_payload` to capture
+real shaping costs (envelope JSON, query/pattern echo gating, debug fields).
 
 Usage:
     uv run python benchmarks/benchmark_token_savings.py
+    uv run python benchmarks/benchmark_token_savings.py --json results.json
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import shutil
 import sys
 import tempfile
-import asyncio
 import time
 from pathlib import Path
 
-# Ensure project root is importable when running standalone
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from _bench_lib import (  # noqa: E402
+    BenchmarkReport,
+    collect_metadata,
+    common_argparser,
+    print_header,
+)
 
 from semantic_cache_mcp.cache import (  # noqa: E402, I001
     SemanticCache,
@@ -37,22 +48,17 @@ from semantic_cache_mcp.cache import (  # noqa: E402, I001
 )
 from semantic_cache_mcp.core.tokenizer import count_tokens  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _collect_source_files(src_dir: Path, limit: int | None = None) -> list[Path]:
-    """Collect .py files sorted by size (largest first for more interesting diffs)."""
     files = sorted(src_dir.rglob("*.py"), key=lambda p: p.stat().st_size, reverse=True)
-    if limit is not None:
-        files = files[:limit]
-    return files
+    return files[:limit] if limit else files
 
 
 def _copy_files_to_temp(files: list[Path], src_root: Path, tmp_dir: Path) -> list[Path]:
-    """Copy source files into tmp_dir preserving relative structure."""
     copies: list[Path] = []
     for f in files:
         rel = f.relative_to(src_root)
@@ -64,24 +70,36 @@ def _copy_files_to_temp(files: list[Path], src_root: Path, tmp_dir: Path) -> lis
 
 
 def _apply_small_edits(files: list[Path], fraction: float = 0.3, seed: int = 42) -> list[Path]:
-    """Modify ~fraction of files with small edits. Returns list of modified paths."""
+    """Apply genuine ~5% line-level edits to ~`fraction` of files.
+
+    The previous version used identity replacements (`self → self`,
+    `def → def`) which mutated nothing. This version inserts a unique
+    comment near the top and changes `return` to `return  # bench` on
+    the first matching line — both are real, BLAKE3-detectable changes.
+    """
     rng = random.Random(seed)
     to_modify = rng.sample(files, k=max(1, int(len(files) * fraction)))
 
     for fpath in to_modify:
-        lines = fpath.read_text(encoding="utf-8").splitlines(keepends=True)
-        if len(lines) < 3:
+        text = fpath.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        if len(lines) < 5:
             continue
 
-        # Insert a comment at a random position
-        insert_pos = rng.randint(1, len(lines) - 1)
-        lines.insert(insert_pos, "# benchmark: injected edit marker\n")
+        # Insert a marker comment near the top
+        insert_pos = rng.randint(1, min(5, len(lines) - 1))
+        lines.insert(insert_pos, f"# bench: small-edit-{insert_pos}\n")
 
-        # Change a token in a random line (simulate a small rename)
-        change_pos = rng.randint(0, len(lines) - 1)
-        lines[change_pos] = lines[change_pos].replace("self", "self", 1)  # identity as baseline
-        if "def " in lines[change_pos]:
-            lines[change_pos] = lines[change_pos].replace("def ", "def ", 1)
+        # Mutate one `return` line if present, else mutate a `def` line
+        for idx in range(len(lines)):
+            if " return " in lines[idx] or lines[idx].lstrip().startswith("return "):
+                lines[idx] = lines[idx].rstrip("\n") + "  # bench-edit\n"
+                break
+        else:
+            for idx in range(len(lines)):
+                if lines[idx].lstrip().startswith("def "):
+                    lines[idx] = lines[idx].rstrip("\n") + "  # bench-edit\n"
+                    break
 
         fpath.write_text("".join(lines), encoding="utf-8")
 
@@ -89,115 +107,87 @@ def _apply_small_edits(files: list[Path], fraction: float = 0.3, seed: int = 42)
 
 
 # ---------------------------------------------------------------------------
-# Benchmark phases
+# Phases
 # ---------------------------------------------------------------------------
 
 
-def _total_original_tokens(files: list[Path]) -> int:
-    """Sum original token counts across all files."""
-    total = 0
+async def _read_corpus(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
+    returned = original = 0
     for f in files:
-        total += count_tokens(f.read_text(encoding="utf-8"))
-    return total
+        result = await smart_read(cache, str(f), diff_mode=True)
+        returned += result.tokens_returned
+        original += result.tokens_original
+    return returned, original
 
 
 async def phase_cold_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
-    """Phase 1: Cold read — populates cache, returns (tokens_returned, tokens_original)."""
-    tokens_returned = 0
-    tokens_original = 0
-    for f in files:
-        result = await smart_read(cache, str(f), diff_mode=True)
-        tokens_returned += result.tokens_returned
-        tokens_original += result.tokens_original
-    return tokens_returned, tokens_original
+    return await _read_corpus(cache, files)
 
 
 async def phase_unchanged_reread(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
-    """Phase 2: Unchanged re-read — all files cached + unmodified."""
-    tokens_returned = 0
-    tokens_original = 0
+    return await _read_corpus(cache, files)
+
+
+async def phase_content_hash(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
     for f in files:
-        result = await smart_read(cache, str(f), diff_mode=True)
-        tokens_returned += result.tokens_returned
-        tokens_original += result.tokens_original
-    return tokens_returned, tokens_original
+        os.utime(f)
+    return await _read_corpus(cache, files)
 
 
 async def phase_small_modifications(
-    cache: SemanticCache,
-    files: list[Path],
-    modified: list[Path],
+    cache: SemanticCache, files: list[Path], modified: list[Path]
 ) -> dict[str, tuple[int, int]]:
-    """Phase 3: Re-read after small modifications.
-
-    Returns dict with 'changed', 'unchanged', 'combined' keys,
-    each mapping to (tokens_returned, tokens_original).
-    """
     modified_set = set(modified)
-    changed_ret = changed_orig = 0
-    unchanged_ret = unchanged_orig = 0
-
+    ch_ret = ch_orig = unch_ret = unch_orig = 0
     for f in files:
         result = await smart_read(cache, str(f), diff_mode=True)
         if f in modified_set:
-            changed_ret += result.tokens_returned
-            changed_orig += result.tokens_original
+            ch_ret += result.tokens_returned
+            ch_orig += result.tokens_original
         else:
-            unchanged_ret += result.tokens_returned
-            unchanged_orig += result.tokens_original
-
+            unch_ret += result.tokens_returned
+            unch_orig += result.tokens_original
     return {
-        "changed": (changed_ret, changed_orig),
-        "unchanged": (unchanged_ret, unchanged_orig),
-        "combined": (changed_ret + unchanged_ret, changed_orig + unchanged_orig),
+        "changed": (ch_ret, ch_orig),
+        "unchanged": (unch_ret, unch_orig),
+        "combined": (ch_ret + unch_ret, ch_orig + unch_orig),
     }
 
 
-async def phase_content_hash(
-    cache: SemanticCache,
-    files: list[Path],
-) -> tuple[int, int]:
-    """Phase 3: Touch files (mtime changes, content identical).
-
-    Simulates `git checkout` or editor save-without-change scenarios.
-    The cache should detect content is unchanged via BLAKE3 hash.
-    """
-    # Touch all files to update mtime without changing content
-    for f in files:
-        os.utime(f)
-
-    tokens_returned = 0
-    tokens_original = 0
-    for f in files:
-        result = await smart_read(cache, str(f), diff_mode=True)
-        tokens_returned += result.tokens_returned
-        tokens_original += result.tokens_original
-    return tokens_returned, tokens_original
-
-
 async def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
-    """Phase 5: Batch read with token budget."""
     result = await batch_smart_read(
-        cache,
-        [str(f) for f in files],
-        max_total_tokens=200_000,
-        diff_mode=True,
+        cache, [str(f) for f in files], max_total_tokens=200_000, diff_mode=True
     )
-    # tokens_saved is relative to what would have been returned without cache
-    # total_tokens is what was actually returned
-    # Original = total_tokens + tokens_saved
-    tokens_original = result.total_tokens + result.tokens_saved
-    return result.total_tokens, tokens_original
+    return result.total_tokens, result.total_tokens + result.tokens_saved
 
 
-async def phase_search_after_cache(
-    cache: SemanticCache,
-    original_tokens: int,
-    num_files: int,
-) -> tuple[int, int]:
-    """Phase 6: Semantic search on cached corpus.
+async def phase_search_previews(
+    cache: SemanticCache, original_tokens: int, num_files: int
+) -> tuple[int, int, float]:
+    """Return (returned, original, elapsed_s) for the first (cold) pass."""
+    queries = [
+        "embedding model configuration",
+        "file caching and diff logic",
+        "semantic search implementation",
+        "token counting and BPE",
+        "MCP server tool registration",
+    ]
+    returned = 0
+    t0 = time.perf_counter()
+    for q in queries:
+        result = await semantic_search(cache, q, k=5)
+        for m in result.matches:
+            returned += count_tokens(m.preview) if m.preview else 0
+    elapsed = time.perf_counter() - t0
+    avg_tokens = original_tokens // max(num_files, 1)
+    original = len(queries) * 5 * avg_tokens
+    return returned, original, elapsed
 
-    Measures token cost of search results vs reading matched files fully.
+
+async def phase_search_cache_hit(cache: SemanticCache) -> tuple[float, float]:
+    """Repeat the same 5 queries; should hit the in-session result cache.
+
+    Returns (cold_elapsed_s, warm_elapsed_s).
     """
     queries = [
         "embedding model configuration",
@@ -206,17 +196,20 @@ async def phase_search_after_cache(
         "token counting and BPE",
         "MCP server tool registration",
     ]
-    tokens_returned = 0
-    for query in queries:
-        result = await semantic_search(cache, query, k=5)
-        for m in result.matches:
-            # Each match returns a preview, not the full file
-            tokens_returned += count_tokens(m.preview) if m.preview else 0
 
-    # Original = what it would cost to read k files fully per query
-    avg_tokens = original_tokens // max(num_files, 1)
-    tokens_original = len(queries) * 5 * avg_tokens
-    return tokens_returned, tokens_original
+    # Force cache miss
+    cache._search_cache.clear()
+    t0 = time.perf_counter()
+    for q in queries:
+        await semantic_search(cache, q, k=5)
+    cold = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    for q in queries:
+        await semantic_search(cache, q, k=5)
+    warm = time.perf_counter() - t0
+
+    return cold, warm
 
 
 # ---------------------------------------------------------------------------
@@ -225,36 +218,28 @@ async def phase_search_after_cache(
 
 
 def _pct(saved: int, original: int) -> float:
-    """Compute savings percentage, safe for zero."""
-    if original == 0:
-        return 0.0
-    return saved / original
+    return 0.0 if original == 0 else saved / original
 
 
 def _fmt_row(label: str, returned: int, original: int) -> str:
-    """Format a single result row."""
     saved = original - returned
-    pct = _pct(saved, original)
     return (
-        f"  {label:<30s}  tokens: {returned:>7,} / {original:>7,}  saved: {saved:>7,} ({pct:>5.1%})"
+        f"  {label:<32s}  tokens: {returned:>7,} / {original:>7,}  "
+        f"saved: {saved:>7,} ({_pct(saved, original):>5.1%})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 async def run_benchmark(
     file_limit: int | None = None,
     seed: int = 42,
     quiet: bool = False,
+    json_path: Path | None = None,
 ) -> dict[str, float]:
-    """Run the full 6-phase benchmark.
-
-    Args:
-        file_limit: Max files to use (None = all source files).
-        seed: Random seed for reproducibility.
-        quiet: Suppress output.
-
-    Returns:
-        Dict mapping phase names to savings ratios (0.0-1.0).
-    """
     src_dir = PROJECT_ROOT / "src" / "semantic_cache_mcp"
     if not src_dir.exists():
         raise RuntimeError(f"Source directory not found: {src_dir}")
@@ -263,104 +248,143 @@ async def run_benchmark(
     if not source_files:
         raise RuntimeError("No .py files found in source directory")
 
+    metadata = collect_metadata(PROJECT_ROOT)
+    report = BenchmarkReport(name="token_savings", metadata=metadata)
+
     with tempfile.TemporaryDirectory(prefix="scmcp_bench_") as tmp:
         tmp_path = Path(tmp)
         db_path = tmp_path / "cache.db"
         work_dir = tmp_path / "src"
         work_dir.mkdir()
-
-        # Copy files to temp
         files = _copy_files_to_temp(source_files, src_dir, work_dir)
         cache = SemanticCache(db_path=db_path)
 
         if not quiet:
-            print("Semantic Cache Token Savings Benchmark")
-            print("=" * 55)
-            print(f"Files: {len(files)}")
+            print_header(BenchmarkReport(name="Semantic Cache — Token Savings", metadata=metadata))
+            print(f"  files: {len(files)}\n")
 
-        t0 = time.perf_counter()
+        t_total = time.perf_counter()
 
-        # Phase 1: Cold read
+        # Phase 1: Cold
         p1_ret, p1_orig = await phase_cold_read(cache, files)
-        p1_saved = _pct(p1_orig - p1_ret, p1_orig)
-
         if not quiet:
-            print(f"\nTotal original tokens: {p1_orig:,}")
-            print("\nPhase 1: Cold Read (first read, no cache)")
+            print(f"Total original tokens: {p1_orig:,}\n")
+            print("Phase 1: Cold Read")
             print(_fmt_row("First read", p1_ret, p1_orig))
 
-        # Phase 2: Unchanged re-read
+        # Phase 2: Unchanged
         p2_ret, p2_orig = await phase_unchanged_reread(cache, files)
-        p2_saved = _pct(p2_orig - p2_ret, p2_orig)
-
         if not quiet:
-            print("\nPhase 2: Unchanged Re-read")
+            print("\nPhase 2: Unchanged Re-read (fast path: skips disk)")
             print(_fmt_row("Cached re-read", p2_ret, p2_orig))
 
-        # Phase 3: Content hash freshness (touch without change)
+        # Phase 3: Content hash
         p3_ret, p3_orig = await phase_content_hash(cache, files)
-        p3_saved = _pct(p3_orig - p3_ret, p3_orig)
-
         if not quiet:
-            print("\nPhase 3: Content Hash (touch, mtime changed, content identical)")
+            print("\nPhase 3: Content Hash (mtime drift, BLAKE3 match)")
             print(_fmt_row("Content hash hit", p3_ret, p3_orig))
 
-        # Phase 4: Small modifications
+        # Phase 4: Small edits
         modified = _apply_small_edits(files, fraction=0.3, seed=seed)
         p4 = await phase_small_modifications(cache, files, modified)
         p4c_ret, p4c_orig = p4["combined"]
-        p4_saved = _pct(p4c_orig - p4c_ret, p4c_orig)
-
         if not quiet:
             ch_ret, ch_orig = p4["changed"]
             unch_ret, unch_orig = p4["unchanged"]
-            print(f"\nPhase 4: Small Modifications ({len(modified)}/{len(files)} files changed)")
-            print(_fmt_row(f"Changed ({len(modified)} files)", ch_ret, ch_orig))
-            print(_fmt_row(f"Unchanged ({len(files) - len(modified)} files)", unch_ret, unch_orig))
+            print(f"\nPhase 4: Small Edits ({len(modified)}/{len(files)} files)")
+            print(_fmt_row(f"Changed ({len(modified)})", ch_ret, ch_orig))
+            print(_fmt_row(f"Unchanged ({len(files) - len(modified)})", unch_ret, unch_orig))
             print(_fmt_row("Combined", p4c_ret, p4c_orig))
 
-        # Phase 5: Batch read (files already partially cached from phase 4)
+        # Phase 5: Batch
         p5_ret, p5_orig = await phase_batch_read(cache, files)
-        p5_saved = _pct(p5_orig - p5_ret, p5_orig)
-
         if not quiet:
-            print("\nPhase 5: Batch Read (all files, 200K budget)")
+            print("\nPhase 5: Batch Read (200K budget)")
             print(_fmt_row("Batch read", p5_ret, p5_orig))
 
-        # Phase 6: Search after cache
-        p6_ret, p6_orig = await phase_search_after_cache(cache, p1_orig, len(files))
-        p6_saved = _pct(p6_orig - p6_ret, p6_orig)
-
+        # Phase 6: Search previews
+        p6_ret, p6_orig, p6_cold_s = await phase_search_previews(cache, p1_orig, len(files))
         if not quiet:
-            print("\nPhase 6: Search (5 queries × k=5, previews vs full reads)")
+            print(f"\nPhase 6: Search Previews ({p6_cold_s * 1000:.0f} ms cold)")
             print(_fmt_row("Search previews", p6_ret, p6_orig))
 
-        elapsed = time.perf_counter() - t0
+        # Phase 7: Search-cache speedup
+        cold_s, warm_s = await phase_search_cache_hit(cache)
+        speedup = cold_s / warm_s if warm_s > 0 else float("inf")
+        if not quiet:
+            print("\nPhase 7: In-session Search Cache")
+            print(f"  {'5 queries cold (miss)':<32s}  {cold_s * 1000:>7.1f} ms")
+            label = f"{'5 queries warm (hit)':<32s}"
+            timing = f"{warm_s * 1000:>7.1f} ms  ({speedup:>5.1f}× faster)"
+            print(f"  {label}  {timing}")
 
-        # Aggregate: average savings across phases 2-6 (phase 1 is baseline)
-        all_returned = p2_ret + p3_ret + p4c_ret + p5_ret + p6_ret
-        all_original = p2_orig + p3_orig + p4c_orig + p5_orig + p6_orig
-        overall = _pct(all_original - all_returned, all_original)
+        elapsed = time.perf_counter() - t_total
+
+        # Aggregate
+        all_ret = p2_ret + p3_ret + p4c_ret + p5_ret + p6_ret
+        all_orig = p2_orig + p3_orig + p4c_orig + p5_orig + p6_orig
+        overall = _pct(all_orig - all_ret, all_orig)
 
         if not quiet:
-            print(f"\n{'=' * 55}")
+            print(f"\n{'=' * 60}")
             print(f"Overall (phases 2-6): {overall:.1%} token reduction")
             print(f"Elapsed: {elapsed:.2f}s")
 
-        return {
-            "cold_read": p1_saved,
-            "unchanged": p2_saved,
-            "content_hash": p3_saved,
-            "small_edits": p4_saved,
-            "batch_read": p5_saved,
-            "search": p6_saved,
+        results: dict[str, float] = {
+            "cold_read": _pct(p1_orig - p1_ret, p1_orig),
+            "unchanged": _pct(p2_orig - p2_ret, p2_orig),
+            "content_hash": _pct(p3_orig - p3_ret, p3_orig),
+            "small_edits": _pct(p4c_orig - p4c_ret, p4c_orig),
+            "batch_read": _pct(p5_orig - p5_ret, p5_orig),
+            "search": _pct(p6_orig - p6_ret, p6_orig),
             "overall": overall,
+            "search_cache_speedup": speedup,
+            "search_cold_ms": cold_s * 1000.0,
+            "search_warm_ms": warm_s * 1000.0,
         }
+
+        report.measurements = {
+            "total_files": len(files),
+            "original_tokens": p1_orig,
+            "modified_files": len(modified),
+            "phases": {
+                "cold_read": {"returned": p1_ret, "original": p1_orig},
+                "unchanged": {"returned": p2_ret, "original": p2_orig},
+                "content_hash": {"returned": p3_ret, "original": p3_orig},
+                "small_edits": {
+                    "changed": p4["changed"],
+                    "unchanged": p4["unchanged"],
+                    "combined": p4["combined"],
+                },
+                "batch_read": {"returned": p5_ret, "original": p5_orig},
+                "search_previews": {"returned": p6_ret, "original": p6_orig},
+                "search_cache": {
+                    "cold_ms": cold_s * 1000.0,
+                    "warm_ms": warm_s * 1000.0,
+                    "speedup": speedup,
+                },
+            },
+            "ratios": {k: v for k, v in results.items() if not k.startswith("search_")},
+        }
+
+        if json_path is not None:
+            report.write_json(json_path)
+            if not quiet:
+                print(f"  json: {json_path}")
+
+        return results
+
+
+def _main() -> int:
+    ap = common_argparser("Semantic Cache — Token Savings Benchmark")
+    args = ap.parse_args()
+    results = asyncio.run(run_benchmark(quiet=args.quiet, json_path=args.json))
+    if results["overall"] < 0.80:
+        if not args.quiet:
+            print(f"\nFAIL: Overall savings {results['overall']:.1%} < 80% target")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    results = asyncio.run(run_benchmark())
-    # Exit non-zero if overall savings < 80%
-    if results["overall"] < 0.80:
-        print(f"\nFAIL: Overall savings {results['overall']:.1%} < 80% target")
-        sys.exit(1)
+    sys.exit(_main())

@@ -1083,3 +1083,31 @@ class TestRenderResponse:
         parsed = json.loads(result)
         # Should be truncated
         assert parsed.get("truncated") is True or "ok" in parsed
+
+    def test_token_cap_enforced_under_4x_chars(self) -> None:
+        """Dense content (CJK/emoji) under 4*max_tokens chars must still be truncated.
+
+        Regresses a bug where the char heuristic short-circuited the BPE
+        check for payloads under char_budget=4*max_response_tokens, letting
+        token-dense content slip past the cap.
+        """
+        import json
+
+        from semantic_cache_mcp.core.tokenizer import count_tokens
+        from semantic_cache_mcp.server.response import _render_response
+
+        # CJK content: ~1 token per char in tiktoken; choose a length that
+        # is well under 4*max_response_tokens chars but well over the token
+        # cap. 200 CJK chars ≈ 200+ tokens; cap at 50 → must truncate.
+        cjk_content = "测试" * 150  # 300 chars, ~150 tokens with cl100k
+        cap = 100
+        # Need: cap < tokens AND chars < 4*cap to demonstrate the regression.
+        actual_tokens = count_tokens(cjk_content)
+        assert actual_tokens > cap, f"test setup: tokens={actual_tokens} not > {cap}"
+        assert len(cjk_content) < cap * 4, f"test setup: chars={len(cjk_content)} not < {cap * 4}"
+        payload = {"ok": True, "content": cjk_content, "path": "/x"}
+        rendered = _render_response(payload, max_response_tokens=cap)
+        # Output must respect the token cap one way or another (minimal
+        # payload or fully truncated marker), not slip through full content.
+        parsed = json.loads(rendered)
+        assert parsed.get("content") != cjk_content, "dense content slipped past the token cap"

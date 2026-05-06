@@ -294,6 +294,8 @@ class GrepResponse(ToolResponseModel):
     total_matches: int | None = None
     files_matched: int | None = None
     files: list[GrepFile] | None = None
+    truncated_matches: int | None = None
+    truncated_files: int | None = None
     fixed_string: bool | None = None
     case_sensitive: bool | None = None
     context_lines: int | None = None

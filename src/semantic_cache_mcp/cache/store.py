@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import OrderedDict
 from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any, cast
@@ -292,6 +293,7 @@ class SemanticCache:
         "_drained",
         "_io_executor",
         "_stale_paths",
+        "_search_cache",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -317,6 +319,10 @@ class SemanticCache:
         self._drained: asyncio.Event = asyncio.Event()
         self._drained.set()  # starts drained (no inflight ops)
         self._stale_paths: set[str] = set()
+        # In-session search-result cache. Bounded LRU keyed on
+        # (query, k, directory). Bumped on every write so callers see fresh
+        # results once any file changes.
+        self._search_cache: OrderedDict[tuple[str, int, str | None], Any] = OrderedDict()
 
     def reset_executor(self) -> None:
         """Replace the IO executor with a fresh one after a timeout/hang.
@@ -556,6 +562,7 @@ class SemanticCache:
             has_embedding=embedding is not None,
         )
         await self._storage.put(path, content, mtime, embedding)
+        self._bump_search_cache()
         log_marker(
             logger,
             "cache.put.end",
@@ -563,6 +570,14 @@ class SemanticCache:
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         logger.debug(f"Cached file: {path} ({tokens} tokens)")
+
+    def _bump_search_cache(self) -> None:
+        """Invalidate the in-session search-result cache.
+
+        Called on every cache mutation so semantic_search never returns
+        results that predate a write.
+        """
+        self._search_cache.clear()
 
     async def refresh_path(
         self,
@@ -638,6 +653,11 @@ class SemanticCache:
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding."""
         await self._storage.update_mtime(path, new_mtime)
+        # Bump the search cache: the mtime change reflects an external write
+        # whose content matched the cached hash. Even though the indexed
+        # content didn't change, the invariant "every mtime write clears the
+        # search cache" keeps result freshness simple to reason about.
+        self._bump_search_cache()
 
     async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
@@ -678,20 +698,29 @@ class SemanticCache:
 
         return stats
 
-    def get_embeddings_batch(
+    async def get_embeddings_batch(
         self, path_content_pairs: list[tuple[str, str]]
     ) -> list[EmbeddingVector | None]:
-        """Batch-embed files in one model call. Prepends file-type labels like get_embedding."""
+        """Batch-embed files in one model call. Prepends file-type labels like get_embedding.
+
+        Runs ONNX inference on the shared single-threaded executor to keep
+        the event loop responsive and to honor the ONNX/usearch single-thread
+        invariant (concurrent ONNX calls from multiple threads can segfault).
+        """
         from . import embed_batch as _embed_batch  # noqa: PLC0415
 
         texts = [
             (f"{_file_label(path)}: {content}" if path else content)[:8000]
             for path, content in path_content_pairs
         ]
+        loop = asyncio.get_running_loop()
         started = time.perf_counter()
         log_marker(logger, "embed.batch.begin", count=len(texts))
         try:
-            result = cast(list[EmbeddingVector | None], _embed_batch(texts))
+            result = cast(
+                list[EmbeddingVector | None],
+                await loop.run_in_executor(self._io_executor, _embed_batch, texts),
+            )
             for embedding in result:
                 if embedding is not None:
                     self._sync_embedding_model_metadata(embedding)
@@ -715,10 +744,14 @@ class SemanticCache:
             raise
 
     async def clear(self) -> int:
-        return await self._storage.clear()
+        result = await self._storage.clear()
+        self._bump_search_cache()
+        return result
 
     async def delete_path(self, path: str) -> int:
         """Delete one cached path and clear any stale marker for it."""
         removed = await self._storage.delete_path(path)
         self.clear_stale(path)
+        if removed:
+            self._bump_search_cache()
         return removed

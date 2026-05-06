@@ -76,7 +76,14 @@ async def _format_file(path: Path) -> bool:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         except TimeoutError:
             proc.kill()
-            await proc.wait()
+            # Bound the post-kill wait. SIGKILL is unstoppable so this should
+            # return almost immediately, but guarding against a wedged child
+            # (e.g. stuck in uninterruptible D-state) keeps the formatter call
+            # from blocking the caller indefinitely.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                logger.warning(f"Formatter {cmd_name} did not exit after SIGKILL on {path}")
             logger.warning(f"Formatter {cmd_name} timed out on {path}")
             return False
         if proc.returncode == 0:

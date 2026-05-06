@@ -18,7 +18,7 @@ src/semantic_cache_mcp/
 │   ├── __init__.py
 │   ├── _mcp.py             # FastMCP app instance, lifespan, startup warmup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
-│   └── tools/              # All 12 MCP tool definitions + _shielded_write helper
+│   └── tools/              # All 13 MCP tool definitions + _shielded_write helper
 ├── core/                   # Pure algorithms — stateless, zero I/O
 │   ├── __init__.py         # Flat re-exports from all sub-packages
 │   ├── chunking/           # Content-defined chunking (used for large file splitting)
@@ -94,6 +94,8 @@ Each document carries metadata for cache management:
 | `total_chunks` | `int` | Number of chunks (1 for small files) |
 | `access_history` | `JSON` | Last 5 access timestamps (LRU-K) |
 | `is_parent` | `bool` | Parent document marker (large files only) |
+| `has_embedding` | `bool` | Whether the document carries a non-zero embedding |
+| `preview` | `str` | First ~200 chars of file content, pre-stored at index time so search results don't re-slice chunked `page_content` at query time |
 
 ### LRU-K Eviction (K=2)
 
@@ -204,7 +206,9 @@ Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files 
    - **Diversity penalty**: cosine similarity to already-selected segments (avoids redundancy)
 3. Greedily select highest-scoring segments that fit the budget
 4. Always preserve the first segment (docstrings, imports, module header)
-5. Reassemble with `# ... [N lines omitted] ...` markers
+5. Reassemble selected segments in original order; `# ... [N lines omitted] ...` markers
+   are emitted only when `SummarizationConfig.include_markers=True` (default `False`
+   since 0.4.6 — markers added no LLM-visible value and consumed token budget)
 
 **Result:** 50–80% token savings on large files vs simple truncation, while preserving code skeleton and intent.
 
@@ -247,22 +251,32 @@ On SIGTERM/SIGINT:
 ```
 Client ──→ smart_read(path, diff_mode=True)
                 │
-                ▼
-         cache.get(path)
+        1. astat(path)          ◀─ cheap stat() only
+        2. cache.get(path)
                 │
-        ┌───────┴───────────────┬──────────────────┐
-        │                       │                  │
-        ▼                       ▼                  ▼
-  mtime match             content hash          not found
-  "unchanged"             match (touch)         read disk
-  (99% savings)           update mtime          embed + store
-                          "unchanged"           return full
-                          (99% savings)
-                                │
-                          hash changed
-                          compute diff
-                          (80-95% savings)
+        ┌───────┴────────────────┐
+        │                        │
+        ▼                        ▼
+  cached + mtime match    cached but mtime drifted, OR not cached
+  ── FAST PATH ──         ── SLOW PATH ──
+  return "unchanged"      aread_bytes(path) ──→ hash + decode
+  no aread_bytes call             │
+  (99% savings,           ┌───────┴────────────┐
+   ~1 ms latency)         ▼                    ▼
+                  hash matches cached    hash changed
+                  update_mtime           generate diff
+                  return "unchanged"     refresh_path + return diff
+                  (99% savings)          (80-95% savings)
+                                                │
+                                        not cached at all
+                                          read full + embed
+                                          + return full
 ```
+
+**Why the fast path matters:** the unchanged case is the most common in interactive
+sessions (the LLM re-reads files it already has). Skipping `aread_bytes`, `count_tokens`,
+and the hash compute keeps single-file unchanged reads to **~1 ms** (vs ~2 ms when
+the disk read was unconditional in pre-0.4.6 builds).
 
 After context compression, use `diff_mode=False` to force full content.
 
@@ -305,22 +319,34 @@ Client ──→ smart_write(path, content)
 ### Semantic Search
 
 ```
-query ──→ embed_query() ──→ query_vec (384D float32)
-                                    │
-                     ┌──────────────┴──────────────┐
-                     │                              │
-                     ▼                              ▼
-              BM25 keyword search           HNSW vector search
-              (FTS5 full-text)              (simplevecdb)
-                     │                              │
-                     └──────────┬───────────────────┘
-                                │
-                        Reciprocal Rank Fusion
-                        (combine + deduplicate)
-                                │
-                           top-k results
-                        (path, preview, score)
+query ──→ semantic_search(cache, query, k, directory)
+              │
+       ┌──────┴──────────────────────────┐
+       ▼                                 ▼
+ in-session result cache hit?      MISS — embed + retrieve
+ (LRU keyed on q,k,dir)                  │
+   YES → return immediately       embed_query() → query_vec (384D)
+   (< 0.01 ms — 2,000×+ faster            │
+    than a cold search)         ┌─────────┴──────────────┐
+                                ▼                        ▼
+                         BM25 keyword search      HNSW vector search
+                         (FTS5 full-text)         (simplevecdb)
+                                │                        │
+                                └────────┬───────────────┘
+                                         │
+                                  Reciprocal Rank Fusion
+                                  (combine + deduplicate)
+                                         │
+                                  store in result LRU
+                                         │
+                                  top-k results
+                                  (path, preview, score)
 ```
+
+The in-session result LRU lives on `SemanticCache._search_cache` (32-entry
+`OrderedDict`). It is invalidated on every cache mutation — `put`, `clear`,
+`delete_path`, and `update_mtime` all call `_bump_search_cache()`, which
+clears the LRU. So callers never see a result that predates a write.
 
 ---
 
