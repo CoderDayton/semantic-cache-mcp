@@ -85,8 +85,8 @@ Inference runs locally via ONNX Runtime ([FastEmbed](https://github.com/qdrant/f
 # Via MCP tool
 clear()
 
-# Via filesystem
-rm -rf ~/.cache/semantic-cache-mcp/cache.db
+# Via filesystem (drops vecdb + metrics + downloaded models)
+rm -rf ~/.cache/semantic-cache-mcp/
 ```
 
 **Cache location permissions** — The cache directory is created with user-only permissions, but depends on your umask. Verify:

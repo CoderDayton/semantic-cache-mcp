@@ -273,6 +273,14 @@ assert recovered == new_content
 
 ## Direct Cache Operations
 
+> **Search-cache invalidation:** `SemanticCache` keeps an in-session LRU of
+> recent search results (32 entries, keyed on `query`/`k`/`directory`). All
+> mutations — `put`, `clear`, `delete_path`, `update_mtime` — automatically
+> call `_bump_search_cache()` to invalidate it, so callers never see a
+> result that predates their last write. If you bypass the public API and
+> mutate underlying storage directly (rare), call `cache._bump_search_cache()`
+> manually.
+
 ```python
 # Store a file manually (pass pre-computed tokens to avoid redundant tokenization)
 cache.put(

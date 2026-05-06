@@ -33,25 +33,27 @@
 
 ---
 
-**Reduce Claude Code token usage by 80%+ with intelligent file caching.**
+**Cut your MCP client's token usage by 98% on cached reads. Respond in milliseconds.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that eliminates redundant token consumption when Claude reads files. Instead of sending full file contents on every request, it returns diffs for changed files, suppresses unchanged files entirely, and intelligently summarizes large files — all transparently through 13 purpose-built MCP tools.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, batch_read, write, edit, batch_edit, search, grep, glob, similar, diff, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
 
 ---
 
-## Features
+## Why this exists
 
-- **Cache-aware reads** — First read returns content, unchanged re-reads return a tiny marker, changed files return compact diffs.
-- **Search without re-reading** — Semantic search, similar-file lookup, grep, and glob all operate over cached project content.
-- **Configurable embeddings** — Local FastEmbed is the default; OpenAI-compatible providers are available when explicitly enabled.
-- **Large-file discipline** — Token budgets, semantic summarization, and content hashing keep responses small without losing freshness.
-- **Bounded writes and edits** — Size limits, match limits, dry runs, formatting hooks, and cache refreshes are handled at the tool boundary.
+In order of impact:
+
+**1. Reads stop costing tokens.** The first read seeds the cache. Re-reads of unchanged files return a 5-token marker (`mtime` match, no disk I/O). Modified files return a unified diff. Files larger than the budget collapse to a semantic skeleton that preserves structure rather than slicing at a byte offset.
+
+**2. Search and grep run on the cache, not the disk.** Semantic search (hybrid BM25 + HNSW), similar-file lookup, glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
+
+**3. Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, support `dry_run`, can run formatters, and refresh the cache atomically. Local FastEmbed is the default embedding provider; OpenAI-compatible endpoints are opt-in.
 
 ---
 
 ## Installation
 
-Add to Claude Code settings (`~/.claude/settings.json`):
+Add to Claude Code settings (`~/.claude.json`):
 
 **Option 1** — `uvx` (always runs latest version):
 
@@ -156,7 +158,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 ```markdown
 ## Tools
 
-- MUST use `semantic-cache-mcp` instead of native I/O tools (80%+ token savings)
+- MUST use `semantic-cache-mcp` instead of native I/O tools (98% token savings on cached reads)
 ```
 ---
 
@@ -361,56 +363,66 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
 ## How It Works
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  Claude     │────▶│  smart_read  │────▶│  Cache Lookup    │
-│  Code       │     │              │     │  (VectorStorage) │
-└─────────────┘     └──────────────┘     └──────────────────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-   ┌──────────┐     ┌──────────┐     ┌──────────────┐
-   │Unchanged │     │ Changed  │     │  New / Large │
-   │  ~0 tok  │     │  diff    │     │ summarize or │
-   │  (99%)   │     │ (80-95%) │     │ full content │
-   └──────────┘     └──────────┘     └──────────────┘
+┌──────────┐     ┌────────────┐     ┌──────────────────────────┐
+│  Claude  │────▶│ smart_read │────▶│ stat() + cache lookup    │
+│   Code   │     │            │     │ (BEFORE any disk read)   │
+└──────────┘     └────────────┘     └──────────────────────────┘
+                        │
+       ┌────────────────┼─────────────────┬──────────────────┐
+       ▼                ▼                 ▼                  ▼
+ ┌──────────┐    ┌──────────┐      ┌──────────┐      ┌────────────┐
+ │ mtime    │    │ mtime    │      │ Changed  │      │ New /      │
+ │ match    │    │ drift,   │      │ content  │      │ Large      │
+ │ FAST     │    │ hash     │      │ → diff   │      │ → summary  │
+ │ PATH     │    │ match    │      │ (80-95%) │      │  or full   │
+ │ ~5 tok   │    │ ~5 tok   │      └──────────┘      └────────────┘
+ │ (99%)    │    │ (99%)    │
+ │ ~1 ms    │    │ ~1 ms    │
+ │ no I/O   │    │ +update  │
+ └──────────┘    └──────────┘
 ```
+
+`search` works the same way. An in-session LRU keyed on `(query, k, directory)`
+returns warm hits in ~10 µs; misses fall through to embed + BM25 + HNSW. Every
+cache mutation (`put`, `clear`, `delete_path`, `update_mtime`) bumps the LRU, so
+callers never see a result that predates a write.
 
 ---
 
 ## Performance
 
-Measured on this project's 30 source files (~136K tokens). Benchmarks run on a standard dev machine (CPU embeddings).
+Measured on this project's 43 source files (**168,614 tokens**), CPU embeddings, i9-13900K, commit `5cd7100`. Reproducible via `--json` output for CI diffing.
 
-### Token Savings
+### Token savings — **98.5%** overall (phases 2–6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| Cold read | First read, no cache | 0% (baseline) |
-| Unchanged re-read | Same files, no modifications | **99.1%** |
-| Content hash | Touch files (mtime changed, content identical) | **99.1%** |
-| Small edits | ~5% of lines changed in 30% of files | **98.1%** |
-| Batch read | All files via `batch_read` | **99.1%** |
-| Search | 5 queries × k=5, previews vs full reads | **98.4%** |
-| **Overall (cached)** | **Phases 2–6 combined** | **98.8%** |
+| **Overall (cached, phases 2–6)** | **Aggregate token reduction** | **98.5%** |
+| Unchanged re-read | mtime match — fast path skips disk I/O | 98.9% |
+| Content hash | mtime drifted, BLAKE3 still matches | 98.9% |
+| Batch read | All files via `batch_read`, 200K budget | 98.9% |
+| Search previews | 5 queries × k=5, previews vs full reads | 98.3% |
+| Small edits | Real ~5% line changes in 30% of files | 97.3% |
+| Cold read | First read, no cache (baseline) | 0% |
 
-### Operation Latency
+### Latency — **unchanged reads ~1 ms; repeat searches ~10 µs**
 
-| Operation | Time |
-|-----------|-----:|
-| Unchanged read (single file) | 2 ms |
-| Unchanged re-read (29 files) | 25 ms |
-| Batch read (29 files, diff mode) | 35 ms |
-| Cold read (29 files, incl. embed) | 2,554 ms |
-| Write (200-line file) | 47 ms |
-| Edit (scoped find/replace) | 48 ms |
-| Semantic search (k=5) | 4 ms |
-| Semantic search (k=10) | 5 ms |
-| Find similar (k=3) | 49 ms |
-| Grep (literal) | 1 ms |
-| Grep (regex) | 2 ms |
-| Embedding model warmup | 206 ms |
-| Single embedding (largest file) | 47 ms |
-| Batch embedding (10 files) | 469 ms |
+| Operation | p50 | Notes |
+|-----------|----:|-------|
+| Single unchanged read (fast path) | **1.1 ms** | mtime + cache hit; no disk I/O |
+| Single diff read (changed file) | 1.0 ms | hash check + unified diff |
+| Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; **2,000×+ vs cold** |
+| Search k=5 (cache **miss**) | 5.6 ms | embed query + hybrid BM25/HNSW |
+| Edit (scoped find/replace) | 3.3 ms | uses cached content |
+| Find similar (k=3) | 2.2 ms | cached embedding reused |
+| Grep (literal `def `) | 1.4 ms | FTS5 over cached corpus |
+| Grep (regex) | 2.1 ms | regex compiled once |
+| Batch read (43 files, diff mode) | 40.2 ms | one ONNX inference for all new/changed files |
+| Unchanged re-read (43 files) | 26.9 ms | whole-corpus pass |
+| Cold read (43 files, total) | 1,990 ms | includes disk I/O, tokenisation, embedding |
+| Write (200-line file) | 49.1 ms | creates + caches + embeds |
+| Single embedding (largest file) | 47 ms | ONNX, single thread |
+| Model warmup (one-time) | 195 ms | startup only |
 
 Run benchmarks yourself:
 
