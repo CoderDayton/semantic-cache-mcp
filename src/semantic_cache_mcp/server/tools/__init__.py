@@ -299,6 +299,12 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
         except (TimeoutError, asyncio.CancelledError):
+            # Inner task is intentionally NOT cancelled — it keeps running on
+            # the IO executor until completion, at which point the
+            # done_callback fires end_operation() and unblocks async_close().
+            # async_close() waits up to _DRAIN_TIMEOUT (8s) on _drained, which
+            # is longer than the 2s grace above, so the drain counter is
+            # reliably balanced before the loop shuts down.
             raise asyncio.CancelledError() from None
 
 
@@ -1769,11 +1775,12 @@ async def grep(
             "pattern": pattern,
             "path": path,
             "total_matches": total_matches,
-            "files_matched": len(files_payload),
+            "files_matched": len(results),
             "files": files_payload,
         }
         if truncated_matches > 0 or truncated_files > 0:
             payload["truncated_matches"] = truncated_matches
+            payload["files_in_response"] = len(files_payload)
             if truncated_files > 0:
                 payload["truncated_files"] = truncated_files
         if mode == _MODE_DEBUG:

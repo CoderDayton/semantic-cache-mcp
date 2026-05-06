@@ -346,8 +346,7 @@ query ──→ semantic_search(cache, query, k, directory)
 The in-session result LRU lives on `SemanticCache._search_cache` (32-entry
 `OrderedDict`). It is invalidated on every cache mutation — `put`, `clear`,
 `delete_path`, and `update_mtime` all call `_bump_search_cache()`, which
-clears the LRU and bumps `_search_cache_version`. So callers never see a
-result that predates a write.
+clears the LRU. So callers never see a result that predates a write.
 
 ---
 

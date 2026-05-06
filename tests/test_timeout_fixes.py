@@ -570,7 +570,10 @@ async def test_glob_path_walk_does_not_block_event_loop() -> None:
 
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
-        mock_cache._io_executor = None  # default loop executor
+        # None routes run_in_executor to asyncio's default ThreadPoolExecutor
+        # — fine for filesystem ops; ONNX/usearch paths set a single-thread
+        # executor explicitly.
+        mock_cache._io_executor = None
 
         real_glob = _Path.glob
 

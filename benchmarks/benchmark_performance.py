@@ -215,7 +215,6 @@ async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int
     miss_samples: list[float] = []
     for _ in range(max(3, iters // 2)):
         cache._search_cache.clear()
-        cache._search_cache_version += 1
         t0 = time.perf_counter()
         await semantic_search(cache, query, k=5)
         miss_samples.append((time.perf_counter() - t0) * 1000.0)

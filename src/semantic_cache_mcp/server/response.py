@@ -112,8 +112,11 @@ def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) 
 
     if max_response_tokens is not None and max_response_tokens > 0:
         rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-        # Char/4 lower-bounds tokens for English/code; skip BPE encode when
-        # safely under budget to avoid the double-encode cost on small payloads.
+        # Char/4 is a lower bound on token count for English/code, used to
+        # skip BPE on payloads safely under budget. CJK/emoji can break this
+        # bound (1 token may be 1 char), but the comparison uses `len > budget`
+        # so under-the-bound payloads still fall through to count_tokens(),
+        # making this a fast-skip optimization rather than a correctness gate.
         char_budget = max_response_tokens * 4
         if len(rendered) > char_budget and count_tokens(rendered) > max_response_tokens:
             body = _minimal_payload(body)

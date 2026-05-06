@@ -200,7 +200,6 @@ async def phase_search_cache_hit(cache: SemanticCache) -> tuple[float, float]:
 
     # Force cache miss
     cache._search_cache.clear()
-    cache._search_cache_version += 1
     t0 = time.perf_counter()
     for q in queries:
         await semantic_search(cache, q, k=5)

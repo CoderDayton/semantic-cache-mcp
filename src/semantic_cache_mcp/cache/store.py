@@ -294,7 +294,6 @@ class SemanticCache:
         "_io_executor",
         "_stale_paths",
         "_search_cache",
-        "_search_cache_version",
     )
 
     # Grace period for in-flight operations to finish during shutdown.
@@ -324,7 +323,6 @@ class SemanticCache:
         # (query, k, directory). Bumped on every write so callers see fresh
         # results once any file changes.
         self._search_cache: OrderedDict[tuple[str, int, str | None], Any] = OrderedDict()
-        self._search_cache_version: int = 0
 
     def reset_executor(self) -> None:
         """Replace the IO executor with a fresh one after a timeout/hang.
@@ -579,7 +577,6 @@ class SemanticCache:
         Called on every cache mutation so semantic_search never returns
         results that predate a write.
         """
-        self._search_cache_version += 1
         self._search_cache.clear()
 
     async def refresh_path(

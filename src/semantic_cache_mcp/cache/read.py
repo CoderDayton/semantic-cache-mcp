@@ -57,10 +57,13 @@ async def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Fast path: cached + mtime match — never touch disk.
-    # stat() is ~1000x cheaper than reading file bytes, so check cache first.
-    mtime = (await astat(file_path, cache._io_executor)).st_mtime
+    # Check cache first; only stat when needed (hit comparison or cold-path
+    # refresh). Reading bytes is the dominant cost on the slow path, so the
+    # stat is folded in just before refresh_path() instead of up front.
     cached = await cache.get(str(file_path))
+    mtime: float = 0.0
+    if cached is not None:
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
 
     if cached and diff_mode and not force_full and cached.mtime >= mtime:
         await cache.record_access(str(file_path))
@@ -272,6 +275,8 @@ async def smart_read(
 
     should_refresh_cache = refresh_cache or not cache_is_fresh
     if should_refresh_cache:
+        if cached is None:
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         await cache.refresh_path(
             str(file_path),
             content,
