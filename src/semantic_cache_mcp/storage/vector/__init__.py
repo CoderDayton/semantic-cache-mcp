@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import enum
 import fnmatch
 import json
 import logging
@@ -14,7 +15,9 @@ from pathlib import Path
 
 from simplevecdb import AsyncVectorCollection, DistanceStrategy, Quantization, VectorDB
 
+from ... import config
 from ...config import (
+    ACCESS_HISTORY_SIZE,
     CACHE_DIR,
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
@@ -26,8 +29,11 @@ from ...core.hashing import hash_content
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
 from ...types import CacheEntry, EmbeddingVector
+from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["CHUNK_THRESHOLD", "StorageMode", "VECDB_PATH", "VectorStorage"]
 
 VECDB_PATH = CACHE_DIR / "vecdb.db"
 
@@ -43,7 +49,24 @@ _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
 _META_HAS_EMBEDDING = "has_embedding"
 _META_PREVIEW = "preview"
+_META_STORAGE_MODE = "storage_mode"
 _PREVIEW_CHARS = 200
+
+
+class StorageMode(enum.StrEnum):
+    """How a file's content was stored. Surfaces retrieval-quality signals.
+
+    SINGLE_DOC          — file fits in one doc, embedding represents it well.
+    CHUNKED             — file split via CDC; per-chunk text + parent embedding.
+    SINGLE_DOC_FALLBACK — chunk count exceeded the cap; whole file stored as
+                          one doc with one embedding. Embedding quality and
+                          retrieval granularity are degraded vs CHUNKED.
+    """
+
+    SINGLE_DOC = "single_doc"
+    CHUNKED = "chunked"
+    SINGLE_DOC_FALLBACK = "single_doc_fallback"
+
 
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
 # each stored as a child document with its own vector. Smaller files are stored
@@ -58,7 +81,8 @@ class VectorStorage:
     - Files stored as Documents with raw text (no compression)
     - HNSW index for O(log N) semantic similarity search
     - Metadata-based filtering for path lookups
-    - LRU-K eviction via access_history metadata
+    - TinyLFU eviction (frequency + recency) backed by an in-memory index
+      that bootstraps from access_history metadata on first need
     """
 
     __slots__ = (
@@ -70,6 +94,7 @@ class VectorStorage:
         "_io_executor",
         "_owns_executor",
         "_save_lock",
+        "_index",
     )
 
     # Quantization currently in use — stored in sidecar to detect future changes.
@@ -117,6 +142,13 @@ class VectorStorage:
             self._io_executor = executor
             self._owns_executor = False
         self._collection = self._build_collection()
+        # In-memory eviction index. Bootstraps lazily on first eviction-need
+        # so __init__ stays sync; the first scan after threshold is the only
+        # O(N) read against the collection.
+        self._index = TinyLFUIndex(
+            capacity=MAX_CACHE_ENTRIES,
+            history_size=ACCESS_HISTORY_SIZE,
+        )
         # Write sentinel — removed on clean shutdown by _remove_sentinel().
         STARTUP_SENTINEL.touch()
         logger.info(f"VectorStorage initialized at {db_path}")
@@ -138,6 +170,12 @@ class VectorStorage:
         except Exception as exc:
             logger.warning(f"delete_collection failed during {reason}: {exc}")
         self._collection = self._build_collection()
+        # Index may not be initialized yet on cold-path resets (constructor
+        # calls _reset_collection_sync before assigning _index). Tolerate
+        # that case — the constructor builds a fresh index right after.
+        index = getattr(self, "_index", None)
+        if index is not None:
+            index.clear()
         logger.info(f"Collection reset complete ({reason})")
 
     def rebind_executor(self, new_executor: Executor) -> None:
@@ -443,26 +481,47 @@ class VectorStorage:
 
         add_started = time.perf_counter()
         log_marker(logger, "vector.put.add.begin", path=path, chunked=chunked)
+        new_doc_ids: list[int] = []
         if not chunked:
             # Small file: single document
-            meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
-            await self._collection.add_texts(
+            meta = {
+                **base_meta,
+                _META_CHUNK_INDEX: 0,
+                _META_TOTAL_CHUNKS: 1,
+                _META_STORAGE_MODE: StorageMode.SINGLE_DOC.value,
+            }
+            ids = await self._collection.add_texts(
                 texts=[content],
                 metadatas=[meta],
                 embeddings=[emb_list],
             )
+            new_doc_ids = list(ids) if ids else []
             logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
         else:
             # Large file: try chunked storage, fall back to single-doc if too many chunks
-            stored = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
-            if not stored:
-                meta = {**base_meta, _META_CHUNK_INDEX: 0, _META_TOTAL_CHUNKS: 1}
-                await self._collection.add_texts(
+            stored_ids = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            if not stored_ids:
+                meta = {
+                    **base_meta,
+                    _META_CHUNK_INDEX: 0,
+                    _META_TOTAL_CHUNKS: 1,
+                    _META_STORAGE_MODE: StorageMode.SINGLE_DOC_FALLBACK.value,
+                }
+                ids = await self._collection.add_texts(
                     texts=[content],
                     metadatas=[meta],
                     embeddings=[emb_list],
                 )
+                new_doc_ids = list(ids) if ids else []
                 logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
+            else:
+                new_doc_ids = list(stored_ids)
+        # Mirror the new doc IDs into the in-memory eviction index. Only do
+        # this once the index has been bootstrapped, to keep the very first
+        # put cheap; once bootstrap fires, every subsequent put updates the
+        # index synchronously without a DB scan.
+        if self._index.loaded and new_doc_ids:
+            self._index.upsert(path, new_doc_ids, now)
         log_marker(
             logger,
             "vector.put.add.end",
@@ -494,11 +553,17 @@ class VectorStorage:
         content_bytes: bytes,
         base_meta: dict,
         file_embedding: list[float],
-    ) -> bool:
+    ) -> list[int]:
         """Store large file as parent doc + CDC-chunked children.
 
-        Returns False if the file produced too many chunks (caller should
-        fall back to single-doc storage to preserve full content).
+        Returns:
+            list[int]: Stored doc IDs in insertion order — ``[parent_id,
+            child_id_0, child_id_1, ...]`` on success. **Empty list signals
+            fallback**: CDC produced more than ``_MAX_CHUNKS`` (500) chunks,
+            so nothing was written and the caller MUST retry as single-doc
+            storage to preserve full content. Treat the empty case as a
+            silent contract — no exception is raised — so callers must not
+            interpret ``[]`` as "stored zero docs".
         """
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
@@ -513,7 +578,7 @@ class VectorStorage:
                 f"File {path} produced {total_chunks} chunks (max {_MAX_CHUNKS}); "
                 "falling back to single-doc storage to preserve full content"
             )
-            return False
+            return []
 
         # Decode each chunk back to str, tracking line offsets
         chunk_texts: list[str] = []
@@ -532,6 +597,7 @@ class VectorStorage:
             _META_IS_PARENT: True,
             _META_CHUNK_INDEX: -1,
             _META_TOTAL_CHUNKS: total_chunks,
+            _META_STORAGE_MODE: StorageMode.CHUNKED.value,
         }
         parent_ids = await self._collection.add_texts(
             texts=[""],  # Parent has no content — children hold raw text
@@ -557,6 +623,7 @@ class VectorStorage:
                 _META_TOKENS: count_tokens(text),
                 _META_CREATED_AT: base_meta[_META_CREATED_AT],
                 _META_ACCESS_HISTORY: base_meta[_META_ACCESS_HISTORY],
+                _META_STORAGE_MODE: StorageMode.CHUNKED.value,
                 "line_start": chunk_line_starts[i],
             }
             child_metas.append(child_meta)
@@ -565,7 +632,7 @@ class VectorStorage:
             # calls which is too expensive for the cache hot path.
             child_embeddings.append(zero_emb)
 
-        await self._collection.add_texts(
+        child_ids = await self._collection.add_texts(
             texts=chunk_texts,
             metadatas=child_metas,
             embeddings=child_embeddings,
@@ -576,7 +643,7 @@ class VectorStorage:
             f"Stored {path} as {total_chunks} chunks "
             f"(parent_id={parent_id}, {base_meta[_META_TOKENS]} tokens)"
         )
-        return True
+        return [parent_id, *(list(child_ids) if child_ids else [])]
 
     def _expected_dim(self) -> int:
         """Return the expected embedding dimension, querying the model if needed."""
@@ -605,8 +672,26 @@ class VectorStorage:
             return list(embedding)
         return [0.0] * expected
 
-    async def get_content(self, entry: CacheEntry) -> str:
-        """Reassemble full text from simplevecdb chunks (sorted by chunk_index)."""
+    async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
+        """Reassemble full text from simplevecdb chunks (sorted by chunk_index).
+
+        Args:
+            entry: Cache entry whose path identifies the stored content.
+            max_bytes: Optional UTF-8 byte cap. ``None`` (default) returns the
+                full reassembled text. When set, accumulation stops once the
+                next whole chunk would push the running UTF-8 byte total past
+                the cap; the partial chunk is then truncated on a UTF-8
+                code-point boundary using ``errors="ignore"``.
+
+        Notes:
+            - The cap is in **bytes**, not characters or tokens. Multi-byte
+              code points may make the returned string shorter than the cap
+              even when more content exists.
+            - Defense-in-depth for direct callers that bypass the
+              ``MAX_CONTENT_SIZE`` gate enforced by ``cache/read.py``.
+            - Parent docs (empty placeholders for chunked files) are filtered
+              out before reassembly; only child chunks contribute text.
+        """
         if self._closed:
             raise ValueError(f"Storage closed, cannot read content for {entry.path}")
         results = await self._find_docs_by_path(entry.path)
@@ -623,8 +708,23 @@ class VectorStorage:
         # Sort by chunk_index for correct reassembly
         children.sort(key=lambda r: r[1].get(_META_CHUNK_INDEX, 0))
 
-        # Concatenate raw text from all chunks
-        return "".join(r[2] for r in children)
+        if max_bytes is None:
+            return "".join(r[2] for r in children)
+
+        parts: list[str] = []
+        total = 0
+        for _, _, text in children:
+            chunk_bytes = len(text.encode("utf-8"))
+            if total + chunk_bytes > max_bytes:
+                # Truncate this chunk on a UTF-8 boundary, then stop.
+                remaining = max_bytes - total
+                if remaining > 0:
+                    encoded = text.encode("utf-8")[:remaining]
+                    parts.append(encoded.decode("utf-8", errors="ignore"))
+                break
+            parts.append(text)
+            total += chunk_bytes
+        return "".join(parts)
 
     async def record_access(self, path: str) -> None:
         if self._closed:
@@ -639,11 +739,16 @@ class VectorStorage:
         for doc_id, meta, _text in results:
             history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
             history.append(now)
-            history = history[-5:]  # Keep last 5 accesses
+            history = history[-ACCESS_HISTORY_SIZE:]
             updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
 
         if updates:
             await self._collection.update_metadata(updates)
+        # Mirror the access into the in-memory index so eviction has up-to-
+        # date frequency/recency without re-reading metadata. Skip while the
+        # index is unloaded — the bootstrap will replay history from the DB.
+        if self._index.loaded:
+            self._index.add_access(path, now)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content or re-embedding.
@@ -694,9 +799,18 @@ class VectorStorage:
             similarity = 1.0 - (distance / 2.0)
             candidate_path = doc.metadata.get(_META_PATH)
             has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
+            # Defense-in-depth: chunk children carry zero embeddings; a query
+            # with near-zero magnitude could match them as false positives if
+            # `has_embedding` is ever stale (schema migration, partial write).
+            is_chunk_child = (
+                doc.metadata.get(_META_CHUNK_INDEX, -1) >= 0
+                and not doc.metadata.get(_META_IS_PARENT, False)
+                and doc.metadata.get(_META_TOTAL_CHUNKS, 1) > 1
+            )
 
             is_match = (
                 has_emb
+                and not is_chunk_child
                 and candidate_path
                 and candidate_path != exclude_path
                 and similarity >= SIMILARITY_THRESHOLD
@@ -738,9 +852,15 @@ class VectorStorage:
             similarity = 1.0 - (distance / 2.0)
             candidate_path = doc.metadata.get(_META_PATH)
             has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
+            is_chunk_child = (
+                doc.metadata.get(_META_CHUNK_INDEX, -1) >= 0
+                and not doc.metadata.get(_META_IS_PARENT, False)
+                and doc.metadata.get(_META_TOTAL_CHUNKS, 1) > 1
+            )
 
             if (
                 has_emb
+                and not is_chunk_child
                 and candidate_path
                 and candidate_path != exclude_path
                 and candidate_path not in seen_paths
@@ -873,19 +993,43 @@ class VectorStorage:
                 logger.warning(f"Invalid regex pattern: {e}")
                 return []
 
-        # Collect all cached file content grouped by path.
-        all_docs = await self._collection.get_documents()
-        files: dict[str, list[tuple[int, str]]] = {}  # path -> [(chunk_index, text)]
-        for _doc_id, text, meta in all_docs:
-            if meta.get(_META_IS_PARENT, False):
-                continue  # Parent docs have empty content
-            doc_path = meta.get(_META_PATH, "")
-            if not doc_path or not self._grep_path_matches(doc_path, path_filter=path):
-                continue
-            chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
-            if doc_path not in files:
-                files[doc_path] = []
-            files[doc_path].append((chunk_idx, text))
+        # BM25 prefilter: avoid the full-collection scan when the pattern
+        # has usable literal tokens. Only when no tokens are extractable
+        # (e.g., regex like `[A-Z][a-z]+`) or the BM25 lookup fails do we
+        # fall back to scanning every doc. The need_full_scan flag is
+        # explicit because the prefilter has *three* terminal states
+        # (success / confidently empty / errored), and the dispatcher must
+        # not conflate "BM25 errored" with "BM25 confident no match".
+        keyword_query = self._grep_prefilter_query(pattern, fixed_string=fixed_string)
+        files: dict[str, list[tuple[int, str]]] = {}
+        need_full_scan = True
+        if keyword_query is not None:
+            candidates = await self._grep_candidate_paths(
+                keyword_query, max_files=max_files, path_filter=path
+            )
+            if candidates is not None:
+                if candidates:
+                    # Positive matches: regex post-filter on the targeted set
+                    # is exact, so no full scan is needed.
+                    need_full_scan = False
+                    files = await self._grep_load_files(candidates)
+                elif self._grep_empty_is_authoritative(pattern):
+                    # Pattern's longest token is long enough that BM25's empty
+                    # answer cannot hide a substring inside a larger document
+                    # token; trust it and short-circuit.
+                    return []
+                # Otherwise (empty + not authoritative): full scan certifies.
+            # candidates is None ⇒ BM25 errored; full scan stays armed.
+        if need_full_scan:
+            all_docs = await self._collection.get_documents()
+            for _doc_id, text, meta in all_docs:
+                if meta.get(_META_IS_PARENT, False):
+                    continue  # Parent docs have empty content
+                doc_path = meta.get(_META_PATH, "")
+                if not doc_path or not self._grep_path_matches(doc_path, path_filter=path):
+                    continue
+                chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
+                files.setdefault(doc_path, []).append((chunk_idx, text))
 
         # Search each file's content
         results: list[dict] = []
@@ -921,6 +1065,155 @@ class VectorStorage:
                 results.append({"path": path, "matches": file_matches})
 
         return results
+
+    # Two thresholds govern the BM25 prefilter, both tuned to preserve
+    # grep's substring semantics over FTS5's whole-token semantics:
+    #
+    #   _GREP_PREFILTER_MIN_TOKEN_LEN = minimum token length to *engage*
+    #     the prefilter at all. Below this, short tokens like "foo" are
+    #     too likely to be substrings of larger document tokens (e.g.,
+    #     "needlefoo") for the FTS5 query to be safely informative.
+    #
+    #   _GREP_PREFILTER_AUTHORITATIVE_LEN = the longest token in the pattern
+    #     must be ≥ this for an *empty* BM25 result to be trusted as a true
+    #     "no match anywhere". For shorter tokens BM25 returning 0 may still
+    #     hide a substring inside a longer token, so we fall back to the
+    #     full scan to certify the empty answer.
+    #
+    # Net behavior:
+    #   * pattern with tokens of length < 4 → never engage prefilter
+    #   * pattern with longest token ≥ 8 and BM25 returns candidates → use them
+    #   * pattern with longest token ≥ 8 and BM25 returns []     → return [] fast
+    #   * pattern with all tokens in [4, 7] and BM25 returns []  → full-scan to
+    #     check for substrings inside longer document tokens
+    _GREP_MIN_TOKEN_LEN = 2
+    _GREP_PREFILTER_MIN_TOKEN_LEN = 4
+    _GREP_PREFILTER_AUTHORITATIVE_LEN = 8
+
+    @staticmethod
+    def _grep_prefilter_query(pattern: str, *, fixed_string: bool) -> str | None:
+        """Build an FTS5 query from a grep pattern, or None if not feasible.
+
+        Extracts contiguous alphanumeric runs (length ≥ ``_GREP_MIN_TOKEN_LEN``)
+        from the raw pattern — works for both literal strings and regex bodies
+        because regex metacharacters are non-alphanumeric and break up the runs.
+        Each token is wrapped as an FTS5 phrase so reserved words (``NOT``,
+        ``OR``, ``AND``) and double-quote chars are not interpreted as syntax.
+
+        Returns ``None`` when:
+          * no alphanumeric run of length ≥ ``_GREP_MIN_TOKEN_LEN`` exists, or
+          * the *shortest* extracted token is below
+            ``_GREP_PREFILTER_MIN_TOKEN_LEN`` — short tokens may legitimately
+            appear as substrings inside longer document tokens that BM25
+            would not return, breaking grep's substring semantics.
+
+        In both cases the caller falls back to the full collection scan.
+        """
+        import re as _re  # noqa: PLC0415
+
+        del fixed_string  # extraction is the same: pull literal alphanumerics
+        tokens = _re.findall(rf"[A-Za-z0-9]{{{VectorStorage._GREP_MIN_TOKEN_LEN},}}", pattern)
+        if not tokens:
+            return None
+        if min(len(t) for t in tokens) < VectorStorage._GREP_PREFILTER_MIN_TOKEN_LEN:
+            return None
+        # Phrase-quote each token; FTS5 implicit AND combines them.
+        return " ".join(f'"{t}"' for t in tokens)
+
+    @staticmethod
+    def _grep_empty_is_authoritative(pattern: str) -> bool:
+        """Whether a 0-result BM25 reply can be trusted as a true 'no match'.
+
+        A long token is implausible as a substring of an even longer
+        alphanumeric run in real-world documents, so BM25 returning empty
+        is reliably "no occurrences anywhere". For shorter tokens we cannot
+        rule out a substring hidden inside a larger document token (e.g.,
+        ``"nicel"`` inside ``"mynicelongword"``) so the caller must full-scan.
+        """
+        import re as _re  # noqa: PLC0415
+
+        tokens = _re.findall(rf"[A-Za-z0-9]{{{VectorStorage._GREP_MIN_TOKEN_LEN},}}", pattern)
+        if not tokens:
+            return False
+        return max(len(t) for t in tokens) >= VectorStorage._GREP_PREFILTER_AUTHORITATIVE_LEN
+
+    # Hard cap on the BM25 over-fetch so an unusually large `max_files`
+    # (clamped at _GREP_MAX_FILES = 500) doesn't translate into a 2k-result
+    # FTS5 query. 4× headroom on max_files is plenty to absorb regex
+    # post-filter false positives.
+    _GREP_PREFILTER_FETCH_CAP = 1000
+
+    async def _grep_candidate_paths(
+        self,
+        keyword_query: str,
+        *,
+        max_files: int,
+        path_filter: str | None,
+    ) -> list[str] | None:
+        """BM25 lookup returning unique candidate paths for grep.
+
+        Returns ``None`` when the keyword search itself errors (signals the
+        caller to fall back to a full scan). Returns a possibly-empty list
+        otherwise; an empty list means BM25 is confident no file contains
+        the tokens and grep can return immediately.
+        """
+        fetch_k = min(max_files * 4, self._GREP_PREFILTER_FETCH_CAP)
+        try:
+            results = await self._collection.keyword_search(keyword_query, k=fetch_k)
+        except Exception as exc:
+            logger.debug(f"grep BM25 prefilter failed: {exc}; falling back to scan")
+            return None
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for doc, _score in results:
+            meta = doc.metadata
+            if meta.get(_META_IS_PARENT, False):
+                continue
+            doc_path = meta.get(_META_PATH, "")
+            if not doc_path or doc_path in seen:
+                continue
+            if not self._grep_path_matches(doc_path, path_filter=path_filter):
+                continue
+            seen.add(doc_path)
+            candidates.append(doc_path)
+        return candidates
+
+    async def _grep_load_files(self, paths: list[str]) -> dict[str, list[tuple[int, str]]]:
+        """Load chunk text for a set of paths in a single batched lookup.
+
+        Uses simplevecdb's list-value filter, which compiles to
+        ``json_extract(metadata, '$.path') IN (?, ?, ...)`` — one round trip
+        through the executor instead of N. Falls back to per-path lookups
+        only if the batch query itself errors.
+        """
+        files: dict[str, list[tuple[int, str]]] = {}
+        if not paths:
+            return files
+
+        try:
+            docs = await self._collection.get_documents(
+                filter_dict={_META_PATH: list(paths)},
+            )
+        except Exception as e:
+            logger.debug(f"Batched grep lookup failed ({len(paths)} paths): {e}")
+            for path in paths:
+                results = await self._find_docs_by_path(path)
+                for _doc_id, meta, text in results:
+                    if meta.get(_META_IS_PARENT, False):
+                        continue
+                    chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
+                    files.setdefault(path, []).append((chunk_idx, text))
+            return files
+
+        for _doc_id, text, meta in docs:
+            if meta.get(_META_IS_PARENT, False):
+                continue
+            doc_path = meta.get(_META_PATH)
+            if doc_path is None:
+                continue
+            chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
+            files.setdefault(doc_path, []).append((chunk_idx, text))
+        return files
 
     @staticmethod
     def _grep_path_matches(path: str, *, path_filter: str | None) -> bool:
@@ -1016,6 +1309,9 @@ class VectorStorage:
             if doc_ids:
                 sync_coll.delete_by_ids(doc_ids)
                 sync_coll.save()
+        index = getattr(self, "_index", None)
+        if index is not None:
+            index.clear()
         return count
 
     async def clear(self) -> int:
@@ -1038,6 +1334,7 @@ class VectorStorage:
                     lambda: self._db.delete_collection(self._COLLECTION_NAME),
                 )
             self._collection = self._build_collection()
+        self._index.clear()
         return count
 
     async def delete_path(self, path: str) -> int:
@@ -1067,69 +1364,83 @@ class VectorStorage:
     async def _delete_by_path(self, path: str) -> int:
         results = await self._find_docs_by_path(path)
         if not results:
+            # Index may still hold a stale entry if a prior put failed mid-way.
+            self._index.remove(path)
             return 0
 
         doc_ids = [r[0] for r in results]
-        await self._collection.delete_by_ids(doc_ids)
+        # Symmetric race-closing as in _evict_if_needed: drop from the index
+        # before the DB delete so a concurrent put on the same path cannot
+        # have its fresh entry wiped by our trailing remove. mark_dirty here
+        # is meaningful — the index has actually been mutated, and a failed
+        # DB delete leaves the two genuinely divergent.
+        self._index.remove(path)
+        try:
+            await self._collection.delete_by_ids(doc_ids)
+        except Exception:
+            self._index.mark_dirty()
+            raise
         return len(doc_ids)
 
     async def _evict_if_needed(self) -> None:
-        """Evict oldest-K-th-access files (LRU-K) when over MAX_CACHE_ENTRIES."""
-        # Cheap pre-check: unique_file_count <= total document count, so if the
-        # doc count fits within the cap there is nothing to evict and we can
-        # skip the (expensive) full collection scan. _evict_if_needed runs on
-        # every put, so this gate eliminates the O(N) scan on the hot path.
+        """Evict via TinyLFU when unique-file count exceeds MAX_CACHE_ENTRIES.
+
+        Cheap doc-count gate first (no scan when under cap). When over, the
+        in-memory `TinyLFUIndex` drives the choice — it bootstraps once from
+        the collection on first use, then every subsequent put updates it
+        synchronously with no DB scan. Frequency comes from a 4-bit Count-Min
+        sketch with periodic halving; recency comes from the OrderedDict.
+        """
+        # Read the cap via explicit module attribute access so tests can
+        # patch `config.MAX_CACHE_ENTRIES` and have it observed live (the
+        # module-top `from ...config import MAX_CACHE_ENTRIES` snapshot is
+        # only used by the constructor at instance-creation time).
+        cap = config.MAX_CACHE_ENTRIES
+
         doc_count = await self._collection.count()
-        if doc_count <= MAX_CACHE_ENTRIES:
+        if doc_count <= cap:
             return
 
-        all_docs = await self._collection.get_documents()
+        # Lazy bootstrap. Captures the executor closure here so the index
+        # module stays decoupled from AsyncVectorCollection's exact API.
+        if not self._index.loaded:
+            await self._index.ensure_loaded(self._collection.get_documents)
 
-        # Count unique files, not documents. Chunked files span multiple
-        # documents, so using doc count fires eviction too early.
-        unique_file_count = len(
-            {meta.get(_META_PATH) for _, _, meta in all_docs if meta.get(_META_PATH)}
-        )
-        if unique_file_count <= MAX_CACHE_ENTRIES:
+        if self._index.total_paths() <= cap:
             return
 
-        evict_count = max(1, unique_file_count // 10)
+        evict_count = max(1, self._index.total_paths() // 10)
+        victims = self._index.select_evictions(evict_count)
+        if not victims:
+            return
 
-        # Score each unique path by its K-th most recent access
-        path_scores: dict[str, tuple[float, list[int]]] = {}
-        for doc_id, _text, meta in all_docs:
-            path = meta.get(_META_PATH, "")
-            history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
-
-            # LRU-K score: use 2nd most recent access (or oldest if < K accesses)
-            k = 2
-            if len(history) >= k:
-                score = history[-k]
-            elif history:
-                score = history[0]
-            else:
-                score = 0.0
-
-            if path not in path_scores:
-                path_scores[path] = (score, [])
-            path_scores[path][1].append(doc_id)
-
-        # Sort by score ascending (oldest K-th access first)
-        sorted_paths = sorted(path_scores.items(), key=lambda x: x[1][0])
-
-        # Evict until we've removed enough
-        evicted = 0
         ids_to_delete: list[int] = []
-        for _path, (_, doc_ids) in sorted_paths:
-            if evicted >= evict_count:
-                break
+        for _path, doc_ids in victims:
             ids_to_delete.extend(doc_ids)
-            evicted += 1
 
-        if ids_to_delete:
+        # Remove from the index BEFORE the DB delete to close a race window:
+        # if the order were inverted, a concurrent `put(victim_path)` between
+        # the DB delete and the index removal would re-insert the path with
+        # fresh doc IDs, and the trailing index removal would then wipe the
+        # *freshly-inserted* entry. With the order below, the worst-case
+        # interleaving has a concurrent put delete the same docs we were
+        # about to delete (idempotent at the DB level) and re-insert under
+        # the new IDs — the index stays in sync with the DB.
+        for path, _ in victims:
+            self._index.remove(path)
+        try:
             await self._collection.delete_by_ids(ids_to_delete)
-            await self._collection.save()
-            logger.info(f"Cache eviction: removed {evicted} documents")
+        except Exception:
+            # Index has dropped the victim entries but the DB still holds
+            # their docs — re-bootstrap re-discovers them on the next
+            # eviction-need rather than leaking them silently.
+            self._index.mark_dirty()
+            raise
+        await self._collection.save()
+        logger.info(
+            f"Cache eviction: removed {len(victims)} files "
+            f"({len(ids_to_delete)} documents) via TinyLFU"
+        )
 
     def save(self) -> None:
         """Persist index to disk.

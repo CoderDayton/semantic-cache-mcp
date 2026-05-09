@@ -471,18 +471,18 @@ class TestVectorStorageGetStats:
     async def test_evict_if_needed_triggered(self, tmp_path: Path) -> None:
         """Patch MAX_CACHE_ENTRIES to force eviction after a few puts."""
         vs = _make_vector_storage(tmp_path)
-        from semantic_cache_mcp.storage import vector as vec_mod
+        from semantic_cache_mcp import config as cfg
 
-        original_max = vec_mod.MAX_CACHE_ENTRIES
+        original_max = cfg.MAX_CACHE_ENTRIES
         try:
-            vec_mod.MAX_CACHE_ENTRIES = 3
+            cfg.MAX_CACHE_ENTRIES = 3
             for i in range(6):
                 await vs.put(f"/evict/file{i}.txt", f"content {i}\n" * 5, mtime=float(i))
             # After eviction, count should be <= original_max * doc_count
             stats = await vs.get_stats()
             assert stats["files_cached"] >= 0  # Just verifying no crash
         finally:
-            vec_mod.MAX_CACHE_ENTRIES = original_max
+            cfg.MAX_CACHE_ENTRIES = original_max
 
 
 class TestVectorStorageSearchHybrid:
