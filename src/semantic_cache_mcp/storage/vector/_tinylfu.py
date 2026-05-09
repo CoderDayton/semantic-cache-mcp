@@ -37,15 +37,11 @@ _HASH_SALT = (
 _U64 = 0xFFFFFFFFFFFFFFFF
 
 
-# Pre-built byte translation table for CountMinSketch._halve. Each input byte
-# packs two 4-bit counters (high nibble, low nibble); we shift each nibble
-# right by 1 independently. The naive expression `(b >> 1) & 0x77` works on
-# the *byte* but cross-contaminates: bit 4 (low bit of high nibble) bleeds
-# into bit 3 (high bit of low nibble). The mask 0x77 zeros the bits that
-# crossed nibble boundaries, which happens to recover the correct independent
-# halving — bit 0 is the LSB of the low counter and is dropped, bit 4 is the
-# LSB of the high counter and is dropped. Verified against the Python loop
-# byte-for-byte in tests below.
+# Pre-built byte translation table for CountMinSketch._halve. Each byte packs
+# two 4-bit counters; `(b >> 1) & 0x77` is equivalent to halving the high and
+# low nibbles independently (the mask drops each counter's LSB, which is the
+# bit that would otherwise cross the nibble boundary). bytes.translate is a
+# single C call; verified byte-for-byte against the Python loop in tests.
 _HALVE_TABLE = bytes((b >> 1) & 0x77 for b in range(256))
 
 

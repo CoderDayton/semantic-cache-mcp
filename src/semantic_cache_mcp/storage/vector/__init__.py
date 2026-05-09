@@ -82,6 +82,8 @@ _ZERO_EMB_CACHE: dict[int, list[float]] = {}
 
 
 def _zero_embedding(dim: int) -> list[float]:
+    # Returns a shared list — callers MUST NOT mutate. simplevecdb copies via
+    # np.asarray on ingest, so the cache stays clean in practice.
     cached = _ZERO_EMB_CACHE.get(dim)
     if cached is None:
         cached = [0.0] * dim

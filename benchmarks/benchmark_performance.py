@@ -208,6 +208,65 @@ async def bench_write_edit(
     print(stats.render())
 
 
+async def bench_chunked_write(
+    report: BenchmarkReport, cache: SemanticCache, tmp: Path, iters: int
+) -> None:
+    """Files >= CHUNK_THRESHOLD (8 KB) are CDC-chunked on write.
+
+    The chunked path does N per-chunk operations (BPE token counts, JSON
+    history fan-out, zero-embedding allocations). This case exercises the
+    code paths most affected by 0.4.7's hot-path optimisations and is
+    therefore where any future regression would surface first.
+    """
+    # ~50 KB → ~25 chunks at CHUNK_MIN_SIZE=2048.
+    medium_text = "".join(f"def func_{i}():\n    return {i} * 2\n\n" for i in range(2000))
+    medium_path = tmp / "bench_chunked_medium.py"
+
+    # ~250 KB → ~125 chunks; stresses the per-chunk fan-out paths.
+    big_text = medium_text * 5
+    big_path = tmp / "bench_chunked_big.py"
+
+    medium_kb = len(medium_text.encode("utf-8")) // 1024
+    big_kb = len(big_text.encode("utf-8")) // 1024
+
+    async def _write_medium() -> None:
+        await smart_write(cache, str(medium_path), medium_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({medium_kb} KB, ~25 chunks)",
+        _write_medium,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    async def _write_big() -> None:
+        await smart_write(cache, str(big_path), big_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({big_kb} KB, ~125 chunks)",
+        _write_big,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    # Re-read of a chunked file goes through record_access, which now does
+    # one json round-trip total instead of N (one per chunk).
+    await smart_read(cache, str(medium_path))
+
+    async def _reread_chunked() -> None:
+        await smart_read(cache, str(medium_path))
+
+    _, stats = await time_async(
+        f"Chunked re-read ({medium_kb} KB, record_access fan-out)",
+        _reread_chunked,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+
 async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int) -> None:
     query = "embedding model configuration"
 
@@ -374,6 +433,10 @@ async def main() -> int:
         if not args.quiet:
             print("\n--- Write + Edit ---")
         await bench_write_edit(report, cache, tmp, iters)
+
+        if not args.quiet:
+            print("\n--- Chunked Write ---")
+        await bench_chunked_write(report, cache, tmp, iters)
 
         if not args.quiet:
             print("\n--- Search ---")
