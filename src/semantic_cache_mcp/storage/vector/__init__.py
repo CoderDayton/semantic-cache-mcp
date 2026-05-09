@@ -10,6 +10,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 
@@ -72,6 +73,20 @@ class StorageMode(enum.StrEnum):
 # each stored as a child document with its own vector. Smaller files are stored
 # as a single document. CHUNK_MIN_SIZE (2KB) is the CDC minimum chunk size.
 CHUNK_THRESHOLD = CHUNK_MIN_SIZE * 4  # 8KB — files below this stay as one doc
+
+
+# Per-dimension cached zero embeddings used by chunk children (which carry no
+# real embedding — similarity uses the parent's vector). Populating this once
+# avoids re-allocating `[0.0] * dim` on every chunked write.
+_ZERO_EMB_CACHE: dict[int, list[float]] = {}
+
+
+def _zero_embedding(dim: int) -> list[float]:
+    cached = _ZERO_EMB_CACHE.get(dim)
+    if cached is None:
+        cached = [0.0] * dim
+        _ZERO_EMB_CACHE[dim] = cached
+    return cached
 
 
 class VectorStorage:
@@ -436,10 +451,10 @@ class VectorStorage:
         if self._closed:
             return
         started = time.perf_counter()
-        content_hash = hash_content(content)
+        content_bytes = content.encode("utf-8")
+        content_hash = hash_content(content_bytes)
         tokens = count_tokens(content)
         now = time.time()
-        content_bytes = content.encode("utf-8")
         chunked = len(content_bytes) >= CHUNK_THRESHOLD
 
         emb_list = self._resolve_embedding(embedding)
@@ -552,7 +567,7 @@ class VectorStorage:
         content: str,
         content_bytes: bytes,
         base_meta: dict,
-        file_embedding: list[float],
+        file_embedding: Sequence[float],
     ) -> list[int]:
         """Store large file as parent doc + CDC-chunked children.
 
@@ -580,16 +595,37 @@ class VectorStorage:
             )
             return []
 
-        # Decode each chunk back to str, tracking line offsets
+        # Decode each chunk back to str, tracking line offsets and byte
+        # lengths (used below for proportional per-chunk token estimates).
         chunk_texts: list[str] = []
+        chunk_byte_lens: list[int] = []
         line_offset = 0
         chunk_line_starts: list[int] = []
 
         for chunk_b in chunks_bytes:
             text = chunk_b.decode("utf-8", errors="replace")
             chunk_texts.append(text)
+            chunk_byte_lens.append(len(chunk_b))
             chunk_line_starts.append(line_offset)
             line_offset += text.count("\n")
+
+        # Per-chunk token counts: estimate proportionally from the parent's
+        # exact total instead of running the BPE encoder N times serially on
+        # the single-threaded executor. The encoder dominates a chunked write
+        # for large files. We preserve the sum invariant
+        # (sum(chunk_tokens) == parent_tokens) by giving the final chunk the
+        # remainder. Estimates remain stable for display/sort heuristics.
+        parent_tokens = int(base_meta[_META_TOKENS])
+        total_bytes_sum = sum(chunk_byte_lens) or 1
+        chunk_token_estimates: list[int] = []
+        running = 0
+        for i, byte_len in enumerate(chunk_byte_lens):
+            if i == total_chunks - 1:
+                est = max(0, parent_tokens - running)
+            else:
+                est = (parent_tokens * byte_len) // total_bytes_sum
+                running += est
+            chunk_token_estimates.append(est)
 
         # Store parent document (holds file-level metadata, searchable by file embedding)
         parent_meta = {
@@ -610,17 +646,19 @@ class VectorStorage:
         # AsyncVectorCollection.add_texts does not expose parent_ids, so we call
         # the underlying sync collection directly via run_in_executor.
         child_metas: list[dict] = []
-        child_embeddings: list[list[float]] = []
+        child_embeddings: list[Sequence[float]] = []
+        # Module-level cache; same list object is shared across all child
+        # rows. add_texts does not mutate, so this is safe.
         zero_emb = self._resolve_embedding(None)
 
-        for i, text in enumerate(chunk_texts):
+        for i, _text in enumerate(chunk_texts):
             child_meta = {
                 _META_PATH: path,
                 _META_CHUNK_INDEX: i,
                 _META_TOTAL_CHUNKS: total_chunks,
                 _META_CONTENT_HASH: base_meta[_META_CONTENT_HASH],
                 _META_MTIME: base_meta[_META_MTIME],
-                _META_TOKENS: count_tokens(text),
+                _META_TOKENS: chunk_token_estimates[i],
                 _META_CREATED_AT: base_meta[_META_CREATED_AT],
                 _META_ACCESS_HISTORY: base_meta[_META_ACCESS_HISTORY],
                 _META_STORAGE_MODE: StorageMode.CHUNKED.value,
@@ -660,7 +698,16 @@ class VectorStorage:
             )
         return dim
 
-    def _resolve_embedding(self, embedding: EmbeddingVector | None) -> list[float]:
+    def _resolve_embedding(self, embedding: EmbeddingVector | None) -> Sequence[float]:
+        """Validate dim and return a Sequence[float] suitable for simplevecdb.
+
+        Skips the defensive ``list(embedding)`` copy: simplevecdb's
+        ``add_texts`` / ``similarity_search`` accept any ``Sequence[float]``,
+        and the call sites do not mutate the buffer. For the zero-vector path
+        (``embedding is None``), the result is reused from a module-level
+        per-dim cache to avoid re-allocating ``[0.0] * dim`` on every chunked
+        write or unembedded put.
+        """
         expected = self._expected_dim()
         if embedding is not None:
             actual = len(embedding)
@@ -669,8 +716,8 @@ class VectorStorage:
                     f"Embedding dimension mismatch: got {actual}, expected {expected}. "
                     "This usually means the embedding model changed mid-session."
                 )
-            return list(embedding)
-        return [0.0] * expected
+            return embedding
+        return _zero_embedding(expected)
 
     async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
         """Reassemble full text from simplevecdb chunks (sorted by chunk_index).
@@ -734,13 +781,19 @@ class VectorStorage:
             return
 
         now = time.time()
-        updates: list[tuple[int, dict]] = []
 
-        for doc_id, meta, _text in results:
-            history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
-            history.append(now)
-            history = history[-ACCESS_HISTORY_SIZE:]
-            updates.append((doc_id, {_META_ACCESS_HISTORY: json.dumps(history)}))
+        # All chunks of a single path share one access history (set together
+        # in put() and updated together here). Parse once, reserialize once,
+        # then fan the same string out to every chunk doc — avoids N×
+        # json.loads/dumps round-trips on every cached read.
+        first_meta = results[0][1]
+        history = json.loads(first_meta.get(_META_ACCESS_HISTORY, "[]"))
+        history.append(now)
+        history = history[-ACCESS_HISTORY_SIZE:]
+        history_json = json.dumps(history)
+        updates: list[tuple[int, dict]] = [
+            (doc_id, {_META_ACCESS_HISTORY: history_json}) for doc_id, _meta, _text in results
+        ]
 
         if updates:
             await self._collection.update_metadata(updates)
@@ -779,11 +832,10 @@ class VectorStorage:
         """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None."""
         if self._closed:
             return None
-        emb_list = list(embedding)
 
         try:
             results = await self._collection.similarity_search(
-                query=emb_list,
+                query=embedding,
                 k=10,  # Get candidates, then filter
             )
         except Exception as e:
@@ -834,11 +886,9 @@ class VectorStorage:
         if threshold is None:
             threshold = SIMILARITY_THRESHOLD
 
-        emb_list = list(embedding)
-
         try:
             results = await self._collection.similarity_search(
-                query=emb_list,
+                query=embedding,
                 k=k * 3,  # Over-fetch to account for filtering
             )
         except Exception as e:
@@ -908,14 +958,13 @@ class VectorStorage:
         """
         if self._closed:
             return []
-        query_vector = list(embedding) if embedding is not None else None
 
         try:
             results = await self._collection.hybrid_search(
                 query,
                 k=k * 2,
                 filter=filter,
-                query_vector=query_vector,
+                query_vector=embedding,
             )
         except Exception as e:
             logger.warning(f"Hybrid search failed: {e}")

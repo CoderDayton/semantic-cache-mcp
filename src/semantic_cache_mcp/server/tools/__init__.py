@@ -384,11 +384,12 @@ async def read(
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
 
-            # Format with line numbers like built-in Read tool
-            numbered = []
-            for i, line in enumerate(selected, start=start + 1):
-                numbered.append(f"{i:6d}\t{line.rstrip()}")
-            content = "\n".join(numbered)
+            # Format with line numbers like built-in Read tool. Generator
+            # expression avoids materializing the intermediate list — `selected`
+            # may be thousands of lines on partial reads of large files.
+            content = "\n".join(
+                f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
+            )
             line_info = {
                 "start": start + 1,
                 "end": min(end, len(lines)),

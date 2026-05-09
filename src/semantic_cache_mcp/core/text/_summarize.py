@@ -50,6 +50,33 @@ class SummarizationConfig:
 DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
 
 
+# Syntax-character set used by _information_density. Tuple of single chars so
+# str.count (a C-level scan) can be applied per char — much faster than the
+# Python-bytecode generator `sum(1 for c in content if c in "...")`.
+_SYNTAX_CHARS: tuple[str, ...] = (
+    "{",
+    "}",
+    "[",
+    "]",
+    "(",
+    ")",
+    "=",
+    ";",
+    ":",
+    ",",
+    ".",
+    "<",
+    ">",
+    "+",
+    "-",
+    "*",
+    "/",
+    "&",
+    "|",
+    "!",
+)
+
+
 # ---------------------------------------------------------------------------
 # Segment extraction
 # ---------------------------------------------------------------------------
@@ -195,12 +222,15 @@ def _information_density(segment: Segment) -> float:
 
     unique_ratio = len(set(words)) / len(words)
 
-    # Code density: presence of syntax characters
-    syntax_chars = sum(1 for c in content if c in "{}[]()=;:,.<>+-*/&|!")
+    # Code density: presence of syntax characters. str.count is a C loop;
+    # the generator form was a Python-bytecode scan over every char.
+    syntax_chars = sum(content.count(c) for c in _SYNTAX_CHARS)
     syntax_ratio = min(1.0, syntax_chars / (len(content) + 1) * 10)
 
-    # Penalize pure whitespace or comments
-    non_whitespace = len(content.replace(" ", "").replace("\n", "").replace("\t", ""))
+    # Penalize pure whitespace or comments. Compute via subtraction instead
+    # of three chained .replace() calls (each allocated an intermediate str).
+    whitespace = content.count(" ") + content.count("\n") + content.count("\t")
+    non_whitespace = len(content) - whitespace
     content_ratio = non_whitespace / (len(content) + 1)
 
     return 0.4 * unique_ratio + 0.3 * syntax_ratio + 0.3 * content_ratio
@@ -211,18 +241,31 @@ def _compute_diversity_penalty(
     embeddings: list[NDArray[np.float32]],
     selected_indices: set[int],
     threshold: float = 0.85,
+    *,
+    selected_matrix: NDArray[np.float32] | None = None,
 ) -> float:
-    """Penalty that ramps linearly when similarity to any selected segment exceeds threshold."""
+    """Penalty that ramps linearly when similarity to any selected segment exceeds threshold.
+
+    Pass ``selected_matrix`` (shape ``(k, dim)``) for the batched matmul fast
+    path used by ``summarize_semantic`` — collapses k Python-level dot products
+    into one BLAS call. The legacy per-index loop is retained as a fallback for
+    callers that don't maintain the running matrix.
+    """
     if not selected_indices:
         return 0.0
 
     seg_emb = embeddings[segment_idx]
-    max_similarity = 0.0
 
-    for idx in selected_indices:
-        if idx < len(embeddings):
-            sim = np.dot(seg_emb, embeddings[idx])
-            max_similarity = max(max_similarity, sim)
+    if selected_matrix is not None and selected_matrix.size > 0:
+        # One BLAS gemv: (k, dim) @ (dim,) → (k,); take the max similarity.
+        max_similarity = float((selected_matrix @ seg_emb).max())
+    else:
+        max_similarity = 0.0
+        for idx in selected_indices:
+            if idx < len(embeddings):
+                sim = float(np.dot(seg_emb, embeddings[idx]))
+                if sim > max_similarity:
+                    max_similarity = sim
 
     if max_similarity > threshold:
         return (max_similarity - threshold) / (1.0 - threshold)
@@ -318,10 +361,22 @@ def summarize_semantic(
     selected_indices: set[int] = set()
     current_size = 0
 
+    # Running matrix of selected embeddings — appended to as segments are
+    # accepted, then dotted in one BLAS call inside the diversity check. Pure
+    # numpy: avoids per-candidate Python loops over selected indices.
+    selected_rows: list[NDArray[np.float32]] = []
+    selected_matrix: NDArray[np.float32] | None = None
+
+    def _accept(idx: int, size: int) -> None:
+        nonlocal current_size, selected_matrix
+        selected_indices.add(idx)
+        current_size += size
+        selected_rows.append(resolved[idx])
+        selected_matrix = np.stack(selected_rows) if selected_rows else None
+
     # Always include first segment — typically contains imports, module docstring, headers
     if segments and len(segments[0].content) < content_budget:
-        selected_indices.add(0)
-        current_size += len(segments[0].content)
+        _accept(0, len(segments[0].content))
 
     for seg_idx, base_score in scored:
         if seg_idx in selected_indices:
@@ -333,14 +388,18 @@ def summarize_semantic(
         if current_size + seg_size > content_budget:
             continue
 
-        # Apply diversity penalty
-        diversity_penalty = _compute_diversity_penalty(seg_idx, resolved, selected_indices)
+        # Apply diversity penalty using the running matrix (one matmul).
+        diversity_penalty = _compute_diversity_penalty(
+            seg_idx,
+            resolved,
+            selected_indices,
+            selected_matrix=selected_matrix,
+        )
         adjusted_score = base_score * (1.0 - config.diversity_weight * diversity_penalty)
 
         # Accept if score is still reasonable
         if adjusted_score > 0.1 or (config.preserve_structure and segment.is_header):
-            selected_indices.add(seg_idx)
-            current_size += seg_size
+            _accept(seg_idx, seg_size)
 
     if not selected_indices:
         selected_indices = {0, len(segments) - 1}
