@@ -392,7 +392,7 @@ async def batch_smart_read(
             if _is_binary_content(_raw):
                 continue  # binary file — smart_read will raise ValueError
             _content = _raw.decode("utf-8")
-            _to_embed.append((_path, str(_resolved), _content))
+            _to_embed.append((_path, _resolved_str, _content))
         except Exception:  # nosec B112 — pre-scan best-effort; smart_read handles real errors
             continue
 

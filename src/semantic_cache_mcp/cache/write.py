@@ -112,6 +112,7 @@ async def smart_write(
     old_content: str | None = None
     from_cache = False
     created = not file_path.exists()
+    mtime: float | None = None
 
     if not created:
         # Check for binary file
@@ -124,10 +125,11 @@ async def smart_write(
         except OSError as e:
             raise PermissionError(f"Cannot read existing file: {e}") from e
 
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+
         # Try to get content from cache first (saves tokens!)
         cached = await cache.get(str(file_path))
         if cached:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
             if cached.mtime >= mtime:
                 old_content = await cache.get_content(cached)
                 from_cache = True
@@ -205,7 +207,8 @@ async def smart_write(
         # Update cache with final content.
         # Skip re-embedding for small edits (< 20% changed) — the old
         # embedding is similar enough for retrieval, saving ~23ms ONNX call.
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if mtime is None:
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(
             cache,
             file_path,
@@ -308,6 +311,7 @@ async def smart_edit(
     # Try to get content from cache first (huge token savings!)
     content: str
     from_cache = False
+    mtime: float | None = None
     cached = await cache.get(str(file_path))
 
     if cached:
@@ -473,7 +477,8 @@ async def smart_edit(
 
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if mtime is None:
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)
         await cache.refresh_path(
             str(file_path),
@@ -549,6 +554,7 @@ async def smart_batch_edit(
     # Get content (from cache if possible)
     content: str
     from_cache = False
+    mtime: float | None = None
     cached = await cache.get(str(file_path))
 
     if cached:
@@ -722,7 +728,8 @@ async def smart_batch_edit(
 
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        if mtime is None:
+            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(cache, file_path, stats)
         await cache.refresh_path(
             str(file_path),

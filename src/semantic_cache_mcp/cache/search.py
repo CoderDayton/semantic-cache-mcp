@@ -147,9 +147,14 @@ async def semantic_search(
     # Normalize scores to 0–1 range (best result = 1.0) so LLMs can
     # judge relevance without knowing RRF score internals.
     max_score = filtered[0][2] if filtered else 1.0
+
+    filtered_paths = [path for path, _, _ in filtered]
+    entries = await asyncio.gather(*(cache.get(p) for p in filtered_paths))
+    entry_map = dict(zip(filtered_paths, entries))
+
     matches: list[SearchMatch] = []
     for path, preview, score in filtered:
-        entry = await cache.get(path)
+        entry = entry_map[path]
         tokens = entry.tokens if entry else 0
         normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
@@ -315,8 +320,12 @@ async def find_similar_files(
     )
 
     similar_files: list[SimilarFile] = []
+    result_paths = [sim_path for sim_path, _ in results]
+    entries = await asyncio.gather(*(cache.get(p) for p in result_paths))
+    entry_map = dict(zip(result_paths, entries))
+
     for sim_path, sim_score in results:
-        entry = await cache.get(sim_path)
+        entry = entry_map[sim_path]
         tokens = entry.tokens if entry else 0
         similar_files.append(
             SimilarFile(

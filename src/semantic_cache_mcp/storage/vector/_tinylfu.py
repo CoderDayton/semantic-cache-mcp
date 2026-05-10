@@ -244,10 +244,13 @@ class TinyLFUIndex:
         if not path:
             return
         existing = self._entries.get(path)
-        history = list(existing.history) if existing is not None else []
-        history.append(ts)
-        if len(history) > self._history_size:
-            history = history[-self._history_size :]
+        if existing is not None:
+            history = existing.history
+            history.append(ts)
+            if len(history) > self._history_size:
+                del history[: len(history) - self._history_size]
+        else:
+            history = [ts]
         self._entries[path] = _Entry(
             doc_ids=list(doc_ids),
             last_access=ts,
@@ -264,7 +267,7 @@ class TinyLFUIndex:
         entry.last_access = ts
         entry.history.append(ts)
         if len(entry.history) > self._history_size:
-            entry.history = entry.history[-self._history_size :]
+            del entry.history[: len(entry.history) - self._history_size]
         self._lru.move_to_end(path)
         self._sketch.increment(self._hash(path))
 
@@ -293,18 +296,21 @@ class TinyLFUIndex:
             return []
         sample_size = min(len(self._lru), evict_count * self._TAIL_SAMPLE_FACTOR)
         sample: list[tuple[str, int, float]] = []
+        entries_get = self._entries.get
+        sketch_estimate = self._sketch.estimate
+        hash_fn = self._hash
         for path in self._lru:
-            entry = self._entries.get(path)
+            entry = entries_get(path)
             if entry is None:
                 continue
-            freq = self._sketch.estimate(self._hash(path))
+            freq = sketch_estimate(hash_fn(path))
             sample.append((path, freq, entry.last_access))
             if len(sample) >= sample_size:
                 break
         sample.sort(key=lambda t: (t[1], t[2]))
         out: list[tuple[str, list[int]]] = []
         for path, _, _ in sample[:evict_count]:
-            entry = self._entries.get(path)
+            entry = entries_get(path)
             if entry is not None:
                 out.append((path, list(entry.doc_ids)))
         return out

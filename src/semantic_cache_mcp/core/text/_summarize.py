@@ -119,15 +119,15 @@ def extract_segments(
     if n_lines == 0:
         return []
 
-    # Find boundary lines
+    # Find boundary lines (i==0 already in list; otherwise append in order).
     boundary_lines = [0]
-
+    match = _BOUNDARY_REGEX.match
     for i, line in enumerate(lines):
-        if _BOUNDARY_REGEX.match(line) and i not in boundary_lines:
+        if i > 0 and match(line):
             boundary_lines.append(i)
 
-    boundary_lines.append(n_lines)
-    boundary_lines = sorted(set(boundary_lines))
+    if boundary_lines[-1] != n_lines:
+        boundary_lines.append(n_lines)
 
     # Create segments from boundaries
     segments = []

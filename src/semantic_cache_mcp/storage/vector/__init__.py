@@ -982,15 +982,17 @@ class VectorStorage:
         """Deduplicate by path, keeping best score. Skips parent (empty) docs."""
         seen_paths: set[str] = set()
         matches: list[tuple[str, str, float]] = []
+        _preview_chars = _PREVIEW_CHARS
 
         for doc, score in results:
-            path = doc.metadata.get(_META_PATH, "")
-            if doc.metadata.get(_META_IS_PARENT, False):
-                continue  # Skip parent docs (empty content)
+            meta = doc.metadata
+            if meta.get(_META_IS_PARENT, False):
+                continue
+            path = meta.get(_META_PATH, "")
             if not path or path in seen_paths:
                 continue
             seen_paths.add(path)
-            preview = doc.metadata.get(_META_PREVIEW) or doc.page_content[:_PREVIEW_CHARS]
+            preview = meta.get(_META_PREVIEW) or doc.page_content[:_preview_chars]
             matches.append((path, preview, float(score)))
             if len(matches) >= k:
                 break
@@ -1216,6 +1218,7 @@ class VectorStorage:
             return None
         seen: set[str] = set()
         candidates: list[str] = []
+        grep_path_matches = self._grep_path_matches
         for doc, _score in results:
             meta = doc.metadata
             if meta.get(_META_IS_PARENT, False):
@@ -1223,7 +1226,7 @@ class VectorStorage:
             doc_path = meta.get(_META_PATH, "")
             if not doc_path or doc_path in seen:
                 continue
-            if not self._grep_path_matches(doc_path, path_filter=path_filter):
+            if not grep_path_matches(doc_path, path_filter=path_filter):
                 continue
             seen.add(doc_path)
             candidates.append(doc_path)
