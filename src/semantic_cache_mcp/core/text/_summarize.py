@@ -59,10 +59,10 @@ DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
 # equivalence proof against the per-char sum holds bit-exact.
 _DENSITY_TRANS: dict[int, int] = str.maketrans(
     {
-        **dict.fromkeys("{}[]()=;:,.<>+-*/&|!", "\x01"),
-        " ": "\x02",
-        "\n": "\x02",
-        "\t": "\x02",
+        **dict.fromkeys("{}[]()=;:,.<>+-*/&|!", 0x01),
+        " ": 0x02,
+        "\n": 0x02,
+        "\t": 0x02,
     }
 )
 _DENSITY_SYNTAX_MARK = "\x01"
