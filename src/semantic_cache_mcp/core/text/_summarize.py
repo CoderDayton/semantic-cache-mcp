@@ -50,31 +50,41 @@ class SummarizationConfig:
 DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
 
 
-# Syntax-character set used by _information_density. Tuple of single chars so
-# str.count (a C-level scan) can be applied per char — much faster than the
-# Python-bytecode generator `sum(1 for c in content if c in "...")`.
-_SYNTAX_CHARS: tuple[str, ...] = (
-    "{",
-    "}",
-    "[",
-    "]",
-    "(",
-    ")",
-    "=",
-    ";",
-    ":",
-    ",",
-    ".",
-    "<",
-    ">",
-    "+",
-    "-",
-    "*",
-    "/",
-    "&",
-    "|",
-    "!",
+# Translation table used by _information_density: maps every syntax char to
+# \x01 and every whitespace char to \x02. One str.translate (C call) folds
+# what was 23 separate str.count scans into a single pass over the string;
+# two str.count calls on the translated copy then recover the totals.
+# Markers are SOH/STX control codes — disjoint from the syntax/whitespace
+# sets and absent from any realistic source-code or prose input, so the
+# equivalence proof against the per-char sum holds bit-exact.
+_DENSITY_TRANS: dict[int, int] = str.maketrans(
+    {
+        **dict.fromkeys("{}[]()=;:,.<>+-*/&|!", "\x01"),
+        " ": "\x02",
+        "\n": "\x02",
+        "\t": "\x02",
+    }
 )
+_DENSITY_SYNTAX_MARK = "\x01"
+_DENSITY_WHITESPACE_MARK = "\x02"
+
+
+# ASCII word LUT used by _information_density: word chars ([A-Za-z0-9_]) map
+# to their lowercase byte; every non-word ASCII byte maps to 0x20 (space).
+# After bytes.translate the input becomes lowercase word runs separated by
+# space runs; bytes.split() (no-arg) returns the maximal word runs in one
+# C call — bit-exact vs re.findall(r"\b\w+\b", content.lower()) on ASCII,
+# which is the dominant case for code/prose. Non-ASCII falls back to regex.
+def _build_word_lut() -> bytes:
+    out = bytearray(b" " * 256)
+    for b in range(128):
+        c = chr(b)
+        if c.isalnum() or c == "_":
+            out[b] = ord(c.lower())
+    return bytes(out)
+
+
+_WORD_LUT = _build_word_lut()
 
 
 # ---------------------------------------------------------------------------
@@ -215,23 +225,29 @@ def _information_density(segment: Segment) -> float:
     if not content.strip():
         return 0.0
 
-    # Count unique words (normalized)
-    words = re.findall(r"\b\w+\b", content.lower())
+    # Count unique words (normalized). ASCII fast path swaps the regex VM
+    # for one encode + one translate + one split — three C calls instead of
+    # a Python-level regex scan + Unicode .lower() pass. Bit-exact on ASCII;
+    # non-ASCII keeps the regex so Unicode \w semantics are preserved.
+    if content.isascii():
+        words = content.encode("ascii").translate(_WORD_LUT).split()
+    else:
+        words = re.findall(r"\b\w+\b", content.lower())
     if not words:
         return 0.0
 
     unique_ratio = len(set(words)) / len(words)
 
-    # Code density: presence of syntax characters. str.count is a C loop;
-    # the generator form was a Python-bytecode scan over every char.
-    syntax_chars = sum(content.count(c) for c in _SYNTAX_CHARS)
-    syntax_ratio = min(1.0, syntax_chars / (len(content) + 1) * 10)
-
-    # Penalize pure whitespace or comments. Compute via subtraction instead
-    # of three chained .replace() calls (each allocated an intermediate str).
-    whitespace = content.count(" ") + content.count("\n") + content.count("\t")
-    non_whitespace = len(content) - whitespace
-    content_ratio = non_whitespace / (len(content) + 1)
+    # CLAW: one C-level str.translate folds the 20 syntax + 3 whitespace
+    # str.count scans into a single pass; two counts on the marker chars
+    # recover the totals. Bit-exact vs the per-char sum on any input that
+    # does not contain the SOH/STX markers (true for source code & prose).
+    n = len(content)
+    flagged = content.translate(_DENSITY_TRANS)
+    syntax_chars = flagged.count(_DENSITY_SYNTAX_MARK)
+    whitespace = flagged.count(_DENSITY_WHITESPACE_MARK)
+    syntax_ratio = min(1.0, syntax_chars / (n + 1) * 10)
+    content_ratio = (n - whitespace) / (n + 1)
 
     return 0.4 * unique_ratio + 0.3 * syntax_ratio + 0.3 * content_ratio
 

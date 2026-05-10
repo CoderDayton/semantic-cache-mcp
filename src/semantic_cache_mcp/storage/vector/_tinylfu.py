@@ -25,16 +25,15 @@ logger = logging.getLogger(__name__)
 __all__ = ["TinyLFUIndex"]
 
 
-# SplitMix64 constants — used to derive depth-independent hashes from a
-# single key hash. Avoids constructing N hash functions; one mix per row is
-# enough for Count-Min's accuracy guarantees in practice.
-_HASH_SALT = (
-    0x9E3779B97F4A7C15,
-    0xBF58476D1CE4E5B9,
-    0x94D049BB133111EB,
-    0xD6E8FEB86659FD93,
-)
+# SplitMix64 mixer used to derive 4 row indices from a single key hash.
+# PQS-CMS hashing: one mix call + 4 stratified 16-bit lane shifts replace
+# the prior 4-call _mix(key, salt[r]) scheme. SplitMix64 is designed so
+# non-overlapping bit windows pass BigCrush window-correlation tests, so
+# 4 lanes stay pairwise-independent enough for the CMS error bound.
+# Width must satisfy W ≤ 2^16; _CountMinSketch asserts this on init.
+_HASH_SALT = 0x9E3779B97F4A7C15
 _U64 = 0xFFFFFFFFFFFFFFFF
+_LANE_BITS = 16
 
 
 # Pre-built byte translation table for CountMinSketch._halve. Each byte packs
@@ -45,8 +44,9 @@ _U64 = 0xFFFFFFFFFFFFFFFF
 _HALVE_TABLE = bytes((b >> 1) & 0x77 for b in range(256))
 
 
-def _mix(key_hash: int, salt: int) -> int:
-    x = (key_hash ^ salt) & _U64
+def _splitmix64(key_hash: int) -> int:
+    """SplitMix64 finalizer; produces a uniformly mixed 64-bit value."""
+    x = (key_hash ^ _HASH_SALT) & _U64
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64
     x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64
     return x ^ (x >> 31)
@@ -60,56 +60,100 @@ class _CountMinSketch:
     is halved — the TinyLFU "freshen" pass.
     """
 
-    __slots__ = ("_width", "_mask", "_table", "_sample_size", "_events")
+    __slots__ = (
+        "_width",
+        "_mask",
+        "_table",
+        "_sample_size",
+        "_events",
+        "_phase_size",
+        "_halve_cursor",
+    )
 
     _DEPTH = 4
     _MAX = 15
 
     def __init__(self, capacity: int) -> None:
         width = 1 << max(6, max(capacity, 1).bit_length())
+        # Stratified hashing requires the per-lane bit window to cover the
+        # full slot index. With _DEPTH=4 and a 64-bit mix, 16 bits per lane
+        # caps width at 2^16 — comfortably above any realistic capacity.
+        if width > (1 << _LANE_BITS):
+            raise ValueError(
+                f"_CountMinSketch capacity yields width={width} > "
+                f"2^{_LANE_BITS}; PQS-CMS lane shifts cannot index it"
+            )
         self._width = width
         self._mask = width - 1
         self._table = [bytearray(width // 2) for _ in range(self._DEPTH)]
         # 10× capacity is the W-TinyLFU sample size used by Caffeine.
         self._sample_size = max(width, capacity) * 10
         self._events = 0
-
-    def _slot(self, key_hash: int, row: int) -> int:
-        return _mix(key_hash, _HASH_SALT[row]) & self._mask
+        # AGE-Decay: stagger halves across rows. Trigger every _phase_size
+        # events instead of _sample_size; halve exactly one row per trigger,
+        # cycling through rows. Long-run halve rate is unchanged (DEPTH
+        # triggers per sample_size events × 1 row halved = DEPTH row-halves
+        # per sample_size, same as the prior bulk halve), but per-trigger
+        # latency drops DEPTH×. The min-of-DEPTH estimator picks up a
+        # bounded uniform downward bias (≤ 2×) from the per-row age skew;
+        # this is the same factor for every key, so frequency-rank ordering
+        # used by W-TinyLFU eviction is preserved.
+        self._phase_size = max(1, self._sample_size // self._DEPTH)
+        self._halve_cursor = 0
 
     def increment(self, key_hash: int) -> None:
+        # PQS-CMS stratified hashing: one splitmix64 call yields 4 lane
+        # indices via 16-bit window shifts, replacing 4 separate _mix calls.
+        z = _splitmix64(key_hash)
+        mask = self._mask
+        table = self._table
+        max_v = self._MAX
         for row in range(self._DEPTH):
-            slot = self._slot(key_hash, row)
+            slot = (z >> (row * _LANE_BITS)) & mask
             byte_idx = slot >> 1
-            byte = self._table[row][byte_idx]
+            row_buf = table[row]
+            byte = row_buf[byte_idx]
             if slot & 1:
                 cur = byte >> 4
-                if cur < self._MAX:
-                    self._table[row][byte_idx] = (byte & 0x0F) | ((cur + 1) << 4)
+                if cur < max_v:
+                    row_buf[byte_idx] = (byte & 0x0F) | ((cur + 1) << 4)
             else:
                 cur = byte & 0x0F
-                if cur < self._MAX:
-                    self._table[row][byte_idx] = (byte & 0xF0) | (cur + 1)
+                if cur < max_v:
+                    row_buf[byte_idx] = (byte & 0xF0) | (cur + 1)
         self._events += 1
-        if self._events >= self._sample_size:
+        if self._events >= self._phase_size:
             self._halve()
 
     def estimate(self, key_hash: int) -> int:
+        z = _splitmix64(key_hash)
+        mask = self._mask
+        table = self._table
         best = self._MAX
         for row in range(self._DEPTH):
-            slot = self._slot(key_hash, row)
-            byte = self._table[row][slot >> 1]
+            slot = (z >> (row * _LANE_BITS)) & mask
+            byte = table[row][slot >> 1]
             cur = (byte >> 4) if (slot & 1) else (byte & 0x0F)
             if cur < best:
                 best = cur
         return best
 
     def _halve(self) -> None:
-        # Halve every 4-bit counter via a precomputed translation table:
-        # bytes.translate is a single C call vs. a Python-bytecode loop over
-        # every byte. Equivalent to the prior `(b >> 1) & 0x77` per-byte op.
-        for row in self._table:
-            row[:] = bytes(row).translate(_HALVE_TABLE)
+        # AGE-Decay phase halve: rotate through rows, halve one per trigger.
+        # bytearray.translate is a single C call; skipping the intermediate
+        # bytes(row) immutable copy keeps allocation pressure flat. The
+        # 4-bit counter halve is equivalent to `(b >> 1) & 0x77` per byte
+        # and was verified byte-for-byte in tests against the prior bulk
+        # path. Per-trigger work: one row of width/2 bytes (vs DEPTH rows
+        # in the bulk version).
+        cursor = self._halve_cursor
+        row = self._table[cursor]
+        row[:] = row.translate(_HALVE_TABLE)
+        self._halve_cursor = (cursor + 1) % self._DEPTH
+        # Subtract phase quantum (don't lose extra events accumulated past
+        # the trigger threshold) so the next trigger fires after exactly
+        # another _phase_size events.
+        self._events -= self._phase_size
         self._events //= 2
 
     @property
