@@ -54,7 +54,7 @@ def _tool_param_names(tool: Any) -> set[str]:
 class ParamHintsMiddleware(Middleware):
     """Rewrite alias kwargs and surface did-you-mean errors for unknown ones."""
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):  # type: ignore[override]
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
         args: dict[str, Any] | None = getattr(context.message, "arguments", None) or None
         if not args:
             return await call_next(context)
@@ -63,8 +63,11 @@ class ParamHintsMiddleware(Middleware):
         if not tool_name:
             return await call_next(context)
 
+        fastmcp_ctx = context.fastmcp_context
+        if fastmcp_ctx is None:
+            return await call_next(context)
         try:
-            tool = await context.fastmcp_context.fastmcp.get_tool(tool_name)
+            tool = await fastmcp_ctx.fastmcp.get_tool(tool_name)
         except Exception:
             return await call_next(context)
 

@@ -314,6 +314,17 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
             raise asyncio.CancelledError() from None
 
 
+def _binary_read_payload(path: str, result: Any) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "read",
+        "path": path,
+        "is_binary": True,
+        "size": result.size,
+        "mime": result.mime,
+    }
+
+
 @mcp.tool(
     output_schema=output_schema(ReadResponse),
     meta={
@@ -389,15 +400,7 @@ async def read(
             )
             cache.metrics.record("read", result)
             if result.is_binary:
-                binary_payload: dict[str, Any] = {
-                    "ok": True,
-                    "tool": "read",
-                    "path": path,
-                    "is_binary": True,
-                    "size": result.size,
-                    "mime": result.mime,
-                }
-                return _finalize_payload(binary_payload, max_response_tokens)
+                return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
             lines = result.content.splitlines(keepends=True)
             start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
@@ -442,15 +445,7 @@ async def read(
         # Binary fallback: structured metadata instead of an error so callers
         # can branch on is_binary without parsing the error string.
         if result.is_binary:
-            binary_payload: dict[str, Any] = {
-                "ok": True,
-                "tool": "read",
-                "path": path,
-                "is_binary": True,
-                "size": result.size,
-                "mime": result.mime,
-            }
-            return _finalize_payload(binary_payload, max_response_tokens)
+            return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
 
         # Detect unchanged files: from_cache=True + is_diff=False means the
         # cached file matches the on-disk file. This is a cache fact, not proof

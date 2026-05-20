@@ -141,10 +141,9 @@ class VectorStorage:
             quantization=self._QUANTIZATION,
         )
         self._closed = False
-        # TTL cache keyed by path_filter for has_cached_paths_under (see comment
-        # there). Module-attr init keeps the slot present even before the
-        # method is ever called.
-        self._has_cached_cache = {}
+        # TTL cache keyed by path_filter for has_cached_paths_under (see
+        # comment there). Initialized here so the slot is always present.
+        self._has_cached_cache: dict[str, tuple[float, bool]] = {}
         # Mutex between save() (called from the IO executor during eviction)
         # and the close() daemon thread's final save. usearch's save is not
         # thread-safe, so the two cannot run concurrently.
