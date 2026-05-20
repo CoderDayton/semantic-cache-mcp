@@ -505,7 +505,7 @@ class TestToolsBoundsValidation:
     """Cover lines 81-85: offset, limit, max_size validation."""
 
     async def test_read_negative_offset(self, semantic_cache: SemanticCache) -> None:
-        """offset < 1 returns error."""
+        """offset < 0 returns error (offset=0 is accepted as from-start)."""
         from unittest.mock import MagicMock
 
         from semantic_cache_mcp.server.tools import read
@@ -513,8 +513,8 @@ class TestToolsBoundsValidation:
         ctx = MagicMock()
         ctx.lifespan_context = {"cache": semantic_cache}
 
-        with pytest.raises(ToolError, match="read: offset must be >= 1"):
-            await read(ctx=ctx, path="/any/file.py", offset=0, max_size=100000)
+        with pytest.raises(ToolError, match="read: offset must be >= 0"):
+            await read(ctx=ctx, path="/any/file.py", offset=-1, max_size=100000)
 
     async def test_read_negative_limit(self, semantic_cache: SemanticCache) -> None:
         """limit < 1 returns error."""

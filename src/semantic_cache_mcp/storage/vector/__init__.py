@@ -112,6 +112,7 @@ class VectorStorage:
         "_owns_executor",
         "_save_lock",
         "_index",
+        "_has_cached_cache",
     )
 
     # Quantization currently in use — stored in sidecar to detect future changes.
@@ -140,6 +141,10 @@ class VectorStorage:
             quantization=self._QUANTIZATION,
         )
         self._closed = False
+        # TTL cache keyed by path_filter for has_cached_paths_under (see comment
+        # there). Module-attr init keeps the slot present even before the
+        # method is ever called.
+        self._has_cached_cache = {}
         # Mutex between save() (called from the IO executor during eviction)
         # and the close() daemon thread's final save. usearch's save is not
         # thread-safe, so the two cannot run concurrently.
@@ -1007,6 +1012,51 @@ class VectorStorage:
     _GREP_MAX_CONTEXT_LINES = 20
     _GREP_MAX_MATCHES = 10_000
     _GREP_MAX_FILES = 500
+
+    # Short TTL cache for has_cached_paths_under — the call is a fallback on
+    # empty grep results, and a wrong `path` argument from a model can fire
+    # it many times in a row. 5s is long enough to dedupe a burst, short
+    # enough that newly-cached files appear quickly.
+    _HAS_CACHED_TTL_S = 5.0
+
+    async def has_cached_paths_under(self, path_filter: str | None) -> bool:
+        """Return True if any cached document matches `path_filter`.
+
+        Used by the grep tool to distinguish "no files cached under path"
+        from "pattern produced no matches". `None`/empty filter is treated
+        as "anything cached" — short-circuits on the first non-parent doc.
+        """
+        if self._closed:
+            return False
+        import time
+
+        key = path_filter or ""
+        ttl_cache: dict[str, tuple[float, bool]] = self._has_cached_cache
+        now = time.monotonic()
+        entry = ttl_cache.get(key)
+        if entry is not None and now - entry[0] < self._HAS_CACHED_TTL_S:
+            return entry[1]
+
+        all_docs = await self._collection.get_documents()
+        if not path_filter:
+            result = any(not meta.get(_META_IS_PARENT, False) for _id, _text, meta in all_docs)
+        else:
+            matcher = self._grep_path_matches
+            result = False
+            for _doc_id, _text, meta in all_docs:
+                if meta.get(_META_IS_PARENT, False):
+                    continue
+                doc_path = meta.get(_META_PATH, "")
+                if doc_path and matcher(doc_path, path_filter=path_filter):
+                    result = True
+                    break
+        ttl_cache[key] = (now, result)
+        # Bound memory: keep the map small — bursty wrong paths typically
+        # share a small alphabet of distinct keys.
+        if len(ttl_cache) > 64:
+            oldest = min(ttl_cache, key=lambda k: ttl_cache[k][0])
+            del ttl_cache[oldest]
+        return result
 
     async def grep(
         self,

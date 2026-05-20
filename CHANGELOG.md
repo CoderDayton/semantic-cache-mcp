@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-05-20
+
+DX & feedback-loop hardening based on a 24h behavioral audit of production
+traffic. Closes the most common wasted-call shapes (silent grep empties,
+unactionable `unchanged:true`, opaque edit timeouts, alias confusion) and
+adds the `edit_preview` probe.
+
+### Added
+
+- **`edit_preview` tool** — Read-only probe returning `{found, match_count,
+  line_numbers, context}` for a given `old_string` against a file. Lets
+  callers verify an anchor is unique before committing to a 30s `edit`.
+  Response budget ≈ 200 tokens.
+- **Per-phase timing in edit timeouts** — `edit` and `batch_edit` now thread
+  a `_PhaseTimer` through `smart_edit` (input_validation, binary_check,
+  cache_lookup, anchor_search, diff_gen, atomic_write, format_subprocess,
+  cache_refresh). Timeout errors name the phase that was running and report
+  elapsed seconds.
+- **Fuzzy edit-miss hints** — When `old_string` doesn't match, the
+  ValueError now appends up to 3 nearest-line suggestions (via
+  `difflib.SequenceMatcher`). Skipped on files over 5000 lines.
+- **Grep cache-miss reason** — `grep` with a `path=` that has no cached
+  files under it now returns `reason: "no_files_cached_under_path"` and a
+  `hint` pointing at `batch_read`/`glob`, instead of returning `[]`
+  silently.
+- **Structured binary file responses** — Reading a binary file no longer
+  raises. The read tool returns `{ok: true, is_binary: true, size, mime}`
+  so callers can branch without parsing error strings. Mime is sniffed
+  from extension + a small magic-byte table.
+- **Did-you-mean for unknown parameters** — A new FastMCP middleware
+  silently rewrites common aliases (`abs_path`/`paths`/`file` → `path`,
+  `query`/`q` → `pattern`) and replaces unknown-param `-32602` errors with
+  a clean ToolError plus a `difflib` close-match suggestion.
+- **Per-session unchanged tracking** — `read` now consults a process-wide
+  LRU keyed by `(session_id, abs_path)`. The first read in a session
+  always sends full content; subsequent reads return `unchanged: true`
+  with `content_hash` and `total_lines` so the model can decide locally
+  whether a ranged re-read is warranted. Mutations (`write`, `edit`,
+  `batch_edit`, `delete`) invalidate the entry; `clear` resets the
+  tracker.
+
+### Changed
+
+- **`read.offset=0` accepted** — Previously rejected with
+  "offset must be >= 1"; now treated as from-start (equivalent to
+  omitting). Negative offsets still rejected.
+- **Formatter timeout default 10s → 15s** — Configurable via the
+  `SCMCP_FORMAT_TIMEOUT_S` environment variable.
+- **`edit`/`batch_edit` descriptions** — `edit` now leads with the
+  recommendation to use `batch_edit` for multiple changes on the same
+  file. `batch_edit` description drops the "for one change, prefer edit"
+  softener that contradicted the audit signal (270 single edits vs 35
+  batch in production).
+
 ## [0.4.6] - 2026-05-06
 
 ### Changed

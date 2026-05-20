@@ -63,10 +63,10 @@ class TestBinaryFileHandling:
     async def test_binary_file_graceful_failure(
         self, semantic_cache_no_embeddings: SemanticCache, binary_file: Path
     ) -> None:
-        """Binary files should fail gracefully with clear error."""
-        # Binary files are detected and rejected with clear error message
-        with pytest.raises(ValueError, match="Binary file not supported"):
-            await smart_read(semantic_cache_no_embeddings, str(binary_file))
+        """Binary files return a structured is_binary result (was: ValueError)."""
+        result = await smart_read(semantic_cache_no_embeddings, str(binary_file))
+        assert result.is_binary is True
+        assert result.content == ""
 
 
 class TestUnicodeContentHandling:

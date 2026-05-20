@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
+import os
 import shutil
 import stat as stat_module
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 
 from ..core import count_tokens
 
@@ -19,6 +22,43 @@ MAX_EDIT_SIZE = 10 * 1024 * 1024  # 10MB max file size for edit
 MAX_MATCHES = 10000  # Max occurrences for replace_all
 MAX_RETURN_DIFF_TOKENS = 8000  # Hard cap for emitted diff payloads
 MAX_DIFF_TO_FULL_RATIO = 0.9  # Suppress diff payloads near full-content size
+
+
+# Formatter subprocess timeout. Honor SCMCP_FORMAT_TIMEOUT_S so users with
+# slow formatters (e.g. eslint on monorepos) can extend it without recompiling.
+# Bad values must not crash import; clamp to a sane minimum so a 0/negative
+# override doesn't silently disable the timeout via asyncio.wait_for.
+def _parse_format_timeout() -> float:
+    raw = os.environ.get("SCMCP_FORMAT_TIMEOUT_S", "15")
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid SCMCP_FORMAT_TIMEOUT_S=%r; using default 15s", raw)
+        return 15.0
+    return max(1.0, value)
+
+
+FORMAT_TIMEOUT_S: float = _parse_format_timeout()
+
+
+@dataclass(slots=True)
+class _PhaseTimer:
+    """Tracks which phase a multi-step edit is currently in.
+
+    Used so that when the outer asyncio.timeout fires, the error message
+    can name the phase that was running (anchor_search, format_subprocess,
+    etc.) instead of an opaque "timed out after 30s".
+    """
+
+    current_phase: str = "init"
+    _t0: float = field(default_factory=perf_counter)
+
+    def enter(self, phase: str) -> None:
+        self.current_phase = phase
+
+    def elapsed(self) -> float:
+        return perf_counter() - self._t0
+
 
 # Auto-format configuration: extension -> (command, args...)
 # Command must accept file path as final argument
@@ -73,7 +113,7 @@ async def _format_file(path: Path) -> bool:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=FORMAT_TIMEOUT_S)
         except TimeoutError:
             proc.kill()
             # Bound the post-kill wait. SIGKILL is unstoppable so this should

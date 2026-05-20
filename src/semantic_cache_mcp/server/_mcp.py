@@ -11,6 +11,7 @@ from fastmcp.server.lifespan import lifespan
 
 from ..config import DB_PATH
 from ..core.tokenizer import get_tokenizer
+from ._param_hints import ParamHintsMiddleware
 from ._tool_worker import ToolProcessSupervisor
 
 logger = logging.getLogger(__name__)
@@ -97,3 +98,4 @@ async def app_lifespan(server: FastMCP):
 
 
 mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
+mcp.add_middleware(ParamHintsMiddleware())

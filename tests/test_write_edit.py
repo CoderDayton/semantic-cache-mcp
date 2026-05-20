@@ -260,6 +260,44 @@ class TestSmartEditErrors:
         with pytest.raises(ValueError, match="Binary file"):
             await smart_edit(semantic_cache_no_embeddings, str(binary_file), "a", "b")
 
+    async def test_edit_miss_returns_close_matches(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Anchor miss appends nearest-line suggestions from the file."""
+        file_path = temp_dir / "edit_fuzzy.py"
+        file_path.write_text(
+            "def fetch_user(uid):\n"
+            "    return db.lookup(uid)\n"
+            "\n"
+            "def update_user(uid, data):\n"
+            "    return db.upsert(uid, data)\n"
+        )
+        with pytest.raises(ValueError) as exc:
+            await smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "def fetch_users(uid):",
+                "def fetch_users(uid: int):",
+            )
+        msg = str(exc.value)
+        assert "Closest lines in file:" in msg
+        assert "fetch_user" in msg
+
+    async def test_edit_miss_skips_large_file(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Large files skip the fuzzy scan (only the base hint is shown)."""
+        file_path = temp_dir / "edit_huge.txt"
+        file_path.write_text("placeholder line\n" * 5500)
+        with pytest.raises(ValueError) as exc:
+            await smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "absent_anchor_xyz",
+                "replacement",
+            )
+        assert "Closest lines in file:" not in str(exc.value)
+
 
 class TestSmartEditCache:
     """Tests for cache integration."""

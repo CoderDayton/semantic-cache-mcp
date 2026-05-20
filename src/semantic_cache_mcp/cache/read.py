@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import stat as stat_module
 import time
 from pathlib import Path
@@ -18,6 +19,42 @@ from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResul
 from ..utils import aread_bytes, aread_text, astat
 from ._helpers import _is_binary_content
 from .store import SemanticCache
+
+# Magic-byte prefixes for cheap mime sniffing when extension lookup fails.
+# Intentionally small — covers the formats users most commonly try to read.
+_MIME_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"PK\x03\x04", "application/zip"),
+    (b"%PDF-", "application/pdf"),
+    (b"\x7fELF", "application/x-elf"),
+    (b"\xca\xfe\xba\xbe", "application/java-vm"),
+)
+
+# RIFF containers share a prefix across WebP / WAVE / AVI — the form is at
+# bytes 8..12. Disambiguated separately so WAV/AVI files aren't mis-labelled
+# as image/webp.
+_RIFF_FORMS: dict[bytes, str] = {
+    b"WEBP": "image/webp",
+    b"WAVE": "audio/wav",
+    b"AVI ": "video/x-msvideo",
+}
+
+
+def _guess_mime(path: Path, raw: bytes) -> str:
+    """Best-effort mime guess. Extension first, then magic-byte sniff."""
+    guess = mimetypes.guess_type(str(path))[0]
+    if guess:
+        return guess
+    for prefix, mime in _MIME_MAGIC:
+        if raw.startswith(prefix):
+            return mime
+    if raw.startswith(b"RIFF") and len(raw) >= 12:
+        return _RIFF_FORMS.get(raw[8:12], "application/octet-stream")
+    return "application/octet-stream"
+
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +132,20 @@ async def smart_read(
     # Slow path: file changed, missing from cache, or force_full requested.
     raw = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw):
-        raise ValueError(
-            f"Binary file not supported: {path}. Semantic cache only handles text files."
+        # Surface structured metadata instead of raising. Tool callers
+        # branch on `is_binary` and skip downstream content processing.
+        return ReadResult(
+            content="",
+            from_cache=False,
+            is_diff=False,
+            tokens_original=0,
+            tokens_returned=0,
+            tokens_saved=0,
+            truncated=False,
+            compression_ratio=1.0,
+            is_binary=True,
+            size=len(raw),
+            mime=_guess_mime(file_path, raw),
         )
     try:
         content = raw.decode("utf-8")
@@ -390,7 +439,7 @@ async def batch_smart_read(
         try:
             _raw = await aread_bytes(_resolved, cache._io_executor)
             if _is_binary_content(_raw):
-                continue  # binary file — smart_read will raise ValueError
+                continue  # binary file — smart_read returns is_binary=True; batch skips it below
             _content = _raw.decode("utf-8")
             _to_embed.append((_path, _resolved_str, _content))
         except Exception:  # nosec B112 — pre-scan best-effort; smart_read handles real errors
@@ -441,6 +490,15 @@ async def batch_smart_read(
                 force_full=False,
                 _embedding=_prefetched.get(_resolved_key),
             )
+
+            if result.is_binary:
+                # Binary files are silently skipped from batch results; the
+                # single-file `read` tool surfaces structured metadata instead.
+                files.append(
+                    FileReadSummary(path=path, tokens=0, status="skipped", from_cache=False)
+                )
+                files_skipped += 1
+                continue
 
             # Unchanged detection: from_cache=True and is_diff=False means LLM already has content
             if result.from_cache and not result.is_diff:

@@ -575,12 +575,15 @@ class TestFitContentToMaxSize:
 class TestSmartReadEdgeCases:
     """Lines 76, 91-93, 227, 231-234 — binary detection, unicode replacement, offset/limit."""
 
-    async def test_binary_file_raises_value_error(self, tmp_path: Path) -> None:
+    async def test_binary_file_returns_structured_result(self, tmp_path: Path) -> None:
+        """As of 0.4.7, smart_read returns a structured is_binary result instead of raising."""
         cache = _make_cache(tmp_path)
         binary_file = tmp_path / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\x02\x03\xff\xfe\x80")
-        with pytest.raises(ValueError, match="Binary file"):
-            await smart_read(cache, str(binary_file))
+        result = await smart_read(cache, str(binary_file))
+        assert result.is_binary is True
+        assert result.size == 7
+        assert result.content == ""
 
     async def test_unicode_replacement_on_decode_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)

@@ -29,7 +29,13 @@ from .search import (
     semantic_search,
 )
 from .store import SemanticCache
-from .write import MAX_BATCH_EDITS, smart_batch_edit, smart_edit, smart_write
+from .write import (
+    MAX_BATCH_EDITS,
+    find_edit_anchors,
+    smart_batch_edit,
+    smart_edit,
+    smart_write,
+)
 
 __all__ = [
     # Store
@@ -44,6 +50,7 @@ __all__ = [
     "smart_write",
     "smart_edit",
     "smart_batch_edit",
+    "find_edit_anchors",
     "MAX_BATCH_EDITS",
     # Search
     "semantic_search",

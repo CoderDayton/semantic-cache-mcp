@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
@@ -20,6 +21,7 @@ from ._helpers import (
     _find_match_line_numbers,
     _format_file,
     _is_binary_content,
+    _PhaseTimer,
     _suppress_large_diff,
 )
 from .store import SemanticCache
@@ -240,6 +242,71 @@ async def smart_write(
     )
 
 
+def find_edit_anchors(
+    content: str,
+    old_string: str,
+    *,
+    max_results: int = 50,
+) -> tuple[int, list[int]]:
+    """Return (match_count, line_numbers) for `old_string` in `content`.
+
+    Used by both the edit tool and the read-only `edit_preview` tool.
+    `line_numbers` is 1-based and capped at `max_results`; `match_count`
+    is the true total even if line numbers are truncated.
+    """
+    if not old_string:
+        return 0, []
+    count = content.count(old_string)
+    if count == 0:
+        return 0, []
+    line_numbers = _find_match_line_numbers(content, old_string)
+    if len(line_numbers) > max_results:
+        line_numbers = line_numbers[:max_results]
+    return count, line_numbers
+
+
+def _format_anchor_miss_hint(
+    content: str,
+    old_string: str,
+    *,
+    max_suggestions: int = 3,
+    max_lines: int = 5000,
+    min_ratio: float = 0.6,
+) -> str:
+    """Produce a hint string with nearest-line matches for an edit-anchor miss.
+
+    Returns an empty string when the file is too large to scan cheaply or
+    when no line scores above `min_ratio`. The result is appended verbatim
+    to the ValueError message.
+    """
+    if not old_string:
+        return ""
+    lines = content.splitlines()
+    if len(lines) > max_lines:
+        return ""
+    # Compare against the first non-empty line of old_string — fuzzy-matching
+    # the entire anchor is N^2 on long anchors; the first non-empty line is
+    # almost always the distinctive part.
+    needle = next((line for line in old_string.splitlines() if line.strip()), old_string)
+    if not needle:
+        return ""
+    matcher = SequenceMatcher(a=needle, b="", autojunk=False)
+    scored: list[tuple[float, int, str]] = []
+    for idx, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        matcher.set_seq2(line)
+        ratio = matcher.ratio()
+        if ratio >= min_ratio:
+            scored.append((ratio, idx, line))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    top = scored[:max_suggestions]
+    suggestions = "\n".join(f"  L{idx}: {line.rstrip()[:120]}" for _ratio, idx, line in top)
+    return f"\nClosest lines in file:\n{suggestions}"
+
+
 async def smart_edit(
     cache: SemanticCache,
     path: str,
@@ -250,6 +317,7 @@ async def smart_edit(
     auto_format: bool = False,
     start_line: int | None = None,
     end_line: int | None = None,
+    timer: _PhaseTimer | None = None,
 ) -> EditResult:
     """Edit file using find/replace with cached read.
 
@@ -264,6 +332,8 @@ async def smart_edit(
                    invalid line range, or old_string equals new_string
         PermissionError: Insufficient permissions
     """
+    if timer is not None:
+        timer.enter("input_validation")
     # --- Fail-fast validation (before any I/O) ---
     has_line_range = start_line is not None or end_line is not None
 
@@ -301,6 +371,8 @@ async def smart_edit(
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
     # Check for binary file
+    if timer is not None:
+        timer.enter("binary_check")
     try:
         sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
         if _is_binary_content(sample):
@@ -309,6 +381,8 @@ async def smart_edit(
         raise PermissionError(f"Cannot read file: {e}") from e
 
     # Try to get content from cache first (huge token savings!)
+    if timer is not None:
+        timer.enter("cache_lookup")
     content: str
     from_cache = False
     mtime: float | None = None
@@ -349,6 +423,8 @@ async def smart_edit(
         )
 
     # --- Mode dispatch ---
+    if timer is not None:
+        timer.enter("anchor_search")
     if old_string is None:
         # Mode C: line-range replacement (start_line/end_line guaranteed non-None by validation)
         if start_line is None or end_line is None:
@@ -377,9 +453,10 @@ async def smart_edit(
             )
 
         if quick_count == 0:
+            hint = _format_anchor_miss_hint(substring, old_string)
             raise ValueError(
                 f"old_string not found within lines {start_line}-{end_line} of {path}. "
-                "Hint: Ensure exact whitespace and indentation match."
+                "Hint: Ensure exact whitespace and indentation match." + hint
             )
 
         if quick_count > 1 and not replace_all:
@@ -422,9 +499,10 @@ async def smart_edit(
         matches_found = len(line_numbers)
 
         if matches_found == 0:
+            hint = _format_anchor_miss_hint(content, old_string)
             raise ValueError(
                 f"old_string not found in {path}. "
-                "Hint: Ensure exact whitespace and indentation match."
+                "Hint: Ensure exact whitespace and indentation match." + hint
             )
 
         if matches_found > 1 and not replace_all:
@@ -442,6 +520,8 @@ async def smart_edit(
             line_numbers = line_numbers[:1]
 
     # Generate diff
+    if timer is not None:
+        timer.enter("diff_gen")
     diff_content = generate_diff(content, new_content)
     diff_stats_result = diff_stats(content, new_content)
     content_tokens = count_tokens(content)
@@ -456,6 +536,8 @@ async def smart_edit(
 
     # Write file (unless dry_run)
     if not dry_run:
+        if timer is not None:
+            timer.enter("atomic_write")
         try:
             await awrite_atomic(file_path, new_content, cache._io_executor)
         except OSError as e:
@@ -464,6 +546,8 @@ async def smart_edit(
         # Auto-format if requested
         formatted = False
         if auto_format:
+            if timer is not None:
+                timer.enter("format_subprocess")
             formatted = await _format_file(file_path)
             if formatted:
                 # Re-read formatted content
@@ -477,6 +561,8 @@ async def smart_edit(
 
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
+        if timer is not None:
+            timer.enter("cache_refresh")
         if mtime is None:
             mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)

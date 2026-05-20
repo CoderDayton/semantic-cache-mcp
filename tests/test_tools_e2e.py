@@ -472,10 +472,12 @@ class TestReadEdgeCases:
     """Edge case handling for read."""
 
     async def test_binary_file_rejected(self, cache: SemanticCache, tmp_path: Path) -> None:
+        """Binary files return a structured is_binary marker (no longer raises)."""
         binary = tmp_path / "data.bin"
         binary.write_bytes(b"\x00\x01\x02\xff\xfe\x80")
-        with pytest.raises(ValueError, match="[Bb]inary"):
-            await smart_read(cache, str(binary))
+        result = await smart_read(cache, str(binary))
+        assert result.is_binary is True
+        assert result.content == ""
 
     async def test_empty_file(self, cache: SemanticCache, tmp_path: Path) -> None:
         empty = tmp_path / "empty.txt"

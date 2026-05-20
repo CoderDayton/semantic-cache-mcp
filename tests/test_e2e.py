@@ -250,12 +250,13 @@ class TestEdgeCases:
         assert result.tokens_original == 0
 
     async def test_binary_file_error(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
-        """Binary files should raise appropriate error."""
+        """Binary files return structured is_binary result (was: ValueError)."""
         binary_file = temp_dir / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\xff\xfe")
 
-        with pytest.raises(ValueError, match="Binary file not supported"):
-            await smart_read(semantic_cache, str(binary_file))
+        result = await smart_read(semantic_cache, str(binary_file))
+        assert result.is_binary is True
+        assert result.content == ""
 
     async def test_unicode_content(self, semantic_cache: SemanticCache, temp_dir: Path) -> None:
         """Unicode content should be handled correctly."""

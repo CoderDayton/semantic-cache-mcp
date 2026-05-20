@@ -203,3 +203,30 @@ class TestGrepEndToEndUsesPrefilter:
             assert [r["path"] for r in results] == ["/repo/src/a.py"]
         finally:
             vs.close()
+
+
+class TestHasCachedPathsUnder:
+    async def test_no_cached_files_under_path(self, tmp_path: Path) -> None:
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/repo/src/a.py", "x = 1\n", mtime=1.0)
+            assert await vs.has_cached_paths_under("uncached/sub/") is False
+            assert await vs.has_cached_paths_under("src/a.py") is True
+        finally:
+            vs.close()
+
+    async def test_none_filter_matches_anything(self, tmp_path: Path) -> None:
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/repo/src/a.py", "x = 1\n", mtime=1.0)
+            assert await vs.has_cached_paths_under(None) is True
+        finally:
+            vs.close()
+
+    async def test_empty_cache_returns_false(self, tmp_path: Path) -> None:
+        vs = _make_vs(tmp_path)
+        try:
+            assert await vs.has_cached_paths_under(None) is False
+            assert await vs.has_cached_paths_under("anywhere") is False
+        finally:
+            vs.close()

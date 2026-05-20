@@ -18,6 +18,7 @@ from ...cache import (
     SemanticCache,
     batch_smart_read,
     compare_files,
+    find_edit_anchors,
     find_similar_files,
     glob_with_cache_status,
     semantic_search,
@@ -26,6 +27,10 @@ from ...cache import (
     smart_read,
     smart_write,
 )
+from ...cache._helpers import _PhaseTimer
+from .._read_session import get_tracker as _get_read_session_tracker
+
+_read_session_tracker = _get_read_session_tracker()
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
 from ...utils._async_io import aunlink
@@ -36,6 +41,7 @@ from .._tool_models import (
     ClearResponse,
     DeleteResponse,
     DiffResponse,
+    EditPreviewResponse,
     EditResponse,
     GlobResponse,
     GrepResponse,
@@ -335,7 +341,8 @@ async def read(
         path: File path (absolute or relative to project root). Use absolute
             paths for files outside the current project root.
         max_size: Maximum content size to return before summarization.
-        offset: 1-based starting line number for targeted reads.
+        offset: 1-based starting line number for targeted reads. `0` is
+            treated as "from the start" (equivalent to omitting).
         limit: Number of lines to return from `offset`.
     """
     state = await _tool_call_state(ctx)
@@ -357,9 +364,11 @@ async def read(
     if remote_result is not None:
         return remote_result
 
-    # Validate bounds
-    if offset is not None and offset < 1:
-        _raise_tool_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
+    # Validate bounds. `offset=0` is accepted and treated as from-start.
+    if offset is not None and offset < 0:
+        _raise_tool_error(
+            "read", "offset must be >= 0 (1-based; 0 is from start)", max_response_tokens
+        )
     if limit is not None and limit < 1:
         _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
@@ -379,8 +388,18 @@ async def read(
                 timeout=_TOOL_TIMEOUT,
             )
             cache.metrics.record("read", result)
+            if result.is_binary:
+                binary_payload: dict[str, Any] = {
+                    "ok": True,
+                    "tool": "read",
+                    "path": path,
+                    "is_binary": True,
+                    "size": result.size,
+                    "mime": result.mime,
+                }
+                return _finalize_payload(binary_payload, max_response_tokens)
             lines = result.content.splitlines(keepends=True)
-            start = (offset or 1) - 1  # Convert to 0-based
+            start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
 
@@ -419,10 +438,30 @@ async def read(
             timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
+
+        # Binary fallback: structured metadata instead of an error so callers
+        # can branch on is_binary without parsing the error string.
+        if result.is_binary:
+            binary_payload: dict[str, Any] = {
+                "ok": True,
+                "tool": "read",
+                "path": path,
+                "is_binary": True,
+                "size": result.size,
+                "mime": result.mime,
+            }
+            return _finalize_payload(binary_payload, max_response_tokens)
+
         # Detect unchanged files: from_cache=True + is_diff=False means the
         # cached file matches the on-disk file. This is a cache fact, not proof
-        # that the current client already has the file text in context.
-        unchanged = result.from_cache and not result.is_diff
+        # that the current client already has the file text in context — we
+        # also gate on the per-session tracker so the first read of a session
+        # always returns content even when the cache already has it.
+        cache_fresh = result.from_cache and not result.is_diff
+        abs_path = str(Path(path).expanduser().resolve())
+        session_id = getattr(ctx, "session_id", None) or getattr(ctx, "client_id", None)
+        already_seen = _read_session_tracker.seen(session_id, abs_path)
+        unchanged = cache_fresh and already_seen
 
         payload = {
             "ok": True,
@@ -430,8 +469,31 @@ async def read(
             "path": path,
         }
         if unchanged:
+            # Skip sending content; give the model enough metadata to decide
+            # locally whether a ranged re-read is worth it.
             payload["unchanged"] = True
-        payload["content"] = result.content
+            entry = await cache.get(abs_path)
+            if entry is not None:
+                payload["content_hash"] = entry.content_hash
+                # smart_read returns either the full content (small files) or
+                # an "// File unchanged" marker (large files). Reuse the bytes
+                # if we already have them; only re-fetch from cache otherwise.
+                if result.content and result.tokens_returned >= result.tokens_original > 0:
+                    cached_text: str | None = result.content
+                else:
+                    cached_text = await cache.get_content(entry)
+                if cached_text:
+                    payload["total_lines"] = cached_text.count("\n") + (
+                        0 if cached_text.endswith("\n") else 1
+                    )
+        else:
+            payload["content"] = result.content
+            # Only mark as "seen" when the model actually received the full
+            # bytes. Diff payloads carry only the delta — marking would later
+            # cause an unchanged:true response for a file the model has never
+            # seen in full.
+            if not result.is_diff:
+                _read_session_tracker.mark(session_id, abs_path)
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True
@@ -696,6 +758,7 @@ async def clear(
 
     count = await cache.clear()
     cache.metrics.record("clear", None)
+    _read_session_tracker.clear()
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
@@ -774,6 +837,7 @@ async def delete(
             cache_removed_count += await cache.delete_path(candidate)
 
         cache.metrics.record("delete", None)
+        _read_session_tracker.invalidate(str(Path(path).expanduser().resolve()))
         payload = {
             "ok": True,
             "tool": "delete",
@@ -871,6 +935,7 @@ async def write(
             ),
         )
         cache.metrics.record("write", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -944,7 +1009,8 @@ async def edit(
 ) -> dict[str, Any]:
     """Edit one file via exact replacement.
 
-    Use `batch_edit` for multiple changes, `write` for full rewrites.
+    For multiple edits to the same file, use `batch_edit` (single response,
+    atomic, faster). For full rewrites, use `write`.
 
     Modes: find/replace (`old_string`+`new_string`), scoped (add `start_line`/`end_line`),
     or line-range (omit `old_string`, provide both lines). Keep `old_string` short
@@ -985,6 +1051,7 @@ async def edit(
     if remote_result is not None:
         return remote_result
 
+    timer = _PhaseTimer()
     try:
         result = await _shielded_write(
             cache,
@@ -998,9 +1065,11 @@ async def edit(
                 auto_format=auto_format,
                 start_line=start_line,
                 end_line=end_line,
+                timer=timer,
             ),
         )
         cache.metrics.record("edit", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -1044,7 +1113,12 @@ async def edit(
         _raise_tool_error("edit", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "edit", path)
-        _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error(
+            "edit",
+            f"timed out in phase '{timer.current_phase}' after "
+            f"{timer.elapsed():.1f}s (budget {_TOOL_TIMEOUT}s)",
+            max_response_tokens,
+        )
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
         _raise_tool_error("edit", f"I/O operation failed - {e}", max_response_tokens)
@@ -1053,6 +1127,78 @@ async def edit(
     except Exception:
         logger.exception("Unexpected error in edit")
         _raise_tool_error("edit", "Internal error occurred while editing file", max_response_tokens)
+
+
+@mcp.tool(output_schema=output_schema(EditPreviewResponse))
+async def edit_preview(
+    ctx: Context,
+    path: str,
+    old_string: str,
+) -> dict[str, Any]:
+    """Preview where `old_string` matches in a file without modifying it.
+
+    Returns match count, 1-based line numbers, and small snippets so the
+    caller can confirm an anchor is unique before committing to `edit`.
+    Read-only and intentionally cheap — under ~200 tokens — so it can be
+    called freely as a probe.
+
+    Args:
+        path: File path to search.
+        old_string: Anchor text. Must match exactly (whitespace, indentation).
+    """
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    max_response_tokens = state.max_response_tokens
+
+    if not old_string:
+        _raise_tool_error("edit_preview", "old_string cannot be empty", max_response_tokens)
+
+    try:
+        result = await asyncio.wait_for(
+            smart_read(
+                cache=cache,
+                path=path,
+                max_size=MAX_CONTENT_SIZE * 10,
+                diff_mode=False,
+                force_full=True,
+                refresh_cache=False,
+            ),
+            timeout=_TOOL_TIMEOUT,
+        )
+    except FileNotFoundError as e:
+        _raise_tool_error("edit_preview", str(e), max_response_tokens)
+    except TimeoutError:
+        _raise_tool_error("edit_preview", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+
+    if result.is_binary:
+        _raise_tool_error("edit_preview", f"binary file not supported: {path}", max_response_tokens)
+
+    content = result.content
+    match_count, line_numbers = find_edit_anchors(content, old_string, max_results=50)
+
+    # Build small context snippets — cap at 5 entries and 120 chars/line so
+    # the response fits well under 200 tokens even on dense files.
+    lines = content.splitlines()
+    context: list[dict[str, Any]] = []
+    for ln in line_numbers[:5]:
+        if 1 <= ln <= len(lines):
+            snippet = lines[ln - 1].rstrip()[:120]
+            context.append({"line": ln, "snippet": snippet})
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "tool": "edit_preview",
+        "path": path,
+        "found": match_count > 0,
+        "match_count": match_count,
+        "line_numbers": line_numbers,
+        "context": context,
+    }
+    if match_count > len(line_numbers):
+        payload["truncated"] = True
+
+    return _finalize_payload(payload, max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(BatchEditResponse))
@@ -1067,9 +1213,9 @@ async def batch_edit(
 ) -> dict[str, Any]:
     """Apply multiple exact edits to one file in a single call.
 
-    Use this when several independent edits belong in the same file. For one
-    change, prefer `edit`. For cross-file work, call the relevant tools per
-    file instead of trying to batch across files.
+    Preferred over repeated `edit` calls on the same file: single response,
+    atomic across all edits, and faster on large files. For cross-file work,
+    call the relevant tools per file instead of trying to batch across files.
 
     Supported entry forms:
     - `[old, new]` for full-file exact replacement
@@ -1158,6 +1304,7 @@ async def batch_edit(
             ),
         )
         cache.metrics.record("batch_edit", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         status = (
             "edited"
@@ -1802,6 +1949,14 @@ async def grep(
             payload["files_in_response"] = len(files_payload)
             if truncated_files > 0:
                 payload["truncated_files"] = truncated_files
+        # Distinguish "no files cached under that path" from "no matches".
+        # The audit found 22/29 empty greps fit the cache-miss shape, so the
+        # caller should know whether to seed via batch_read/glob.
+        if total_matches == 0 and path is not None:
+            has_cached = await cache._storage.has_cached_paths_under(path)
+            if not has_cached:
+                payload["reason"] = "no_files_cached_under_path"
+                payload["hint"] = "use batch_read or glob to seed the cache"
         if mode == _MODE_DEBUG:
             payload["fixed_string"] = fixed_string
             payload["case_sensitive"] = case_sensitive

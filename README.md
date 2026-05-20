@@ -35,7 +35,7 @@
 
 **Cut your MCP client's token usage by 98% on cached reads. Respond in milliseconds.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, batch_read, write, edit, batch_edit, search, grep, glob, similar, diff, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Fourteen tools (read, batch_read, write, edit, edit_preview, batch_edit, search, grep, glob, similar, diff, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
 
 ---
 
@@ -171,8 +171,9 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | `read` | Single-file cache-aware read. Returns full content on first read, unchanged markers on cache hits, diffs on modifications, and supports `offset`/`limit` for targeted recovery. |
 | `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
-| `edit` | Single-file exact edit using cached content. Best for one localized change; supports scoped and line-range replacement plus `dry_run=true`. |
-| `batch_edit` | Multiple exact edits in one file with partial success reporting. Best when several localized changes belong in the same file. |
+| `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. For multiple edits to the same file, prefer `batch_edit`. |
+| `batch_edit` | Multiple exact edits in one file with partial success reporting. Preferred over repeated `edit` calls on the same file: single response, atomic, faster on large files. |
+| `edit_preview` | Read-only probe that returns match count, line numbers, and small context snippets for a candidate `old_string`. Use before a costly `edit` to confirm anchor uniqueness. |
 
 ### Discovery
 

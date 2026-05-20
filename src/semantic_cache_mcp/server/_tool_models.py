@@ -42,6 +42,11 @@ class ReadResponse(ToolResponseModel):
     tokens_original: int | None = None
     tokens_returned: int | None = None
     params: ReadParams | None = None
+    is_binary: bool | None = None
+    size: int | None = None
+    mime: str | None = None
+    content_hash: str | None = None
+    total_lines: int | None = None
 
 
 class ClearResponse(ToolResponseModel):
@@ -145,6 +150,20 @@ class EditResponse(ToolResponseModel):
     content_hash: str | None = None
     from_cache: bool | None = None
     params: EditParams | None = None
+
+
+class EditPreviewMatch(ToolResponseModel):
+    line: int | None = None
+    snippet: str | None = None
+
+
+class EditPreviewResponse(ToolResponseModel):
+    path: str | None = None
+    found: bool | None = None
+    match_count: int | None = None
+    line_numbers: list[int] | None = None
+    context: list[EditPreviewMatch] | None = None
+    truncated: bool | None = None
 
 
 class BatchEditFailure(ToolResponseModel):
