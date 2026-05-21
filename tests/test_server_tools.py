@@ -7,6 +7,7 @@ branch coverage without spinning up the full MCP server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -25,13 +26,12 @@ from semantic_cache_mcp.server.tools import (
     batch_read,
     clear,
     delete,
-    diff,
     edit,
+    edit_preview,
     glob,
     grep,
     read,
     search,
-    similar,
     stats,
     write,
 )
@@ -209,20 +209,32 @@ class TestReadTool:
         d = _parse(await read(ctx, str(sample_file)))
         assert "line1" in d["content"]
 
-    async def test_second_read_returns_content(self, ctx: MagicMock, sample_file: Path) -> None:
+    async def test_second_read_returns_unchanged_metadata(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        """Per item 7: second read in a session returns the unchanged marker plus hash/total_lines, no content body."""
+        from semantic_cache_mcp.server._read_session import get_tracker
+
+        get_tracker().clear()
         await read(ctx, str(sample_file))
         d = _parse(await read(ctx, str(sample_file)))
         assert "path" in d
         assert d["unchanged"] is True
-        assert "content" in d
+        assert "content" not in d
+        assert "content_hash" in d
+        assert d.get("total_lines", 0) > 0
 
     async def test_warm_cache_first_read_still_returns_content(
         self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
     ) -> None:
+        """Warming the cache via smart_read does NOT mark the session — the first read in the session must still send content."""
+        from semantic_cache_mcp.server._read_session import get_tracker
+
+        get_tracker().clear()
         await smart_read(tmp_cache, str(sample_file))
         d = _parse(await read(ctx, str(sample_file)))
-        assert d["unchanged"] is True
         assert "content" in d
+        assert "unchanged" not in d
 
     async def test_offset_limit_returns_line_range(self, ctx: MagicMock, sample_file: Path) -> None:
         d = _parse(await read(ctx, str(sample_file), offset=2, limit=2))
@@ -236,9 +248,15 @@ class TestReadTool:
         # Format: "     1\tline1"
         assert "\t" in d["content"]
 
-    async def test_offset_zero_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
-        with pytest.raises(ToolError, match="read: offset must be >= 1"):
-            await read(ctx, str(sample_file), offset=0)
+    async def test_offset_zero_returns_from_start(self, ctx: MagicMock, sample_file: Path) -> None:
+        d_zero = _parse(await read(ctx, str(sample_file), offset=0, limit=1))
+        d_one = _parse(await read(ctx, str(sample_file), offset=1, limit=1))
+        # offset=0 must behave identically to offset=1 (both start at line 1).
+        assert d_zero["content"] == d_one["content"]
+
+    async def test_negative_offset_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
+        with pytest.raises(ToolError, match="read: offset must be >= 0"):
+            await read(ctx, str(sample_file), offset=-1)
 
     async def test_limit_zero_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
         with pytest.raises(ToolError, match="read: limit must be >= 1"):
@@ -248,11 +266,23 @@ class TestReadTool:
         with pytest.raises(ToolError, match="read: "):
             await read(ctx, "/nonexistent/file.txt")
 
-    async def test_binary_file_returns_error(self, ctx: MagicMock, tmp_path: Path) -> None:
+    async def test_binary_file_returns_structured_payload(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
         bf = tmp_path / "binary.bin"
         bf.write_bytes(b"\x00\xff\xfe\x80" * 100)
-        with pytest.raises(ToolError, match="read: "):
-            await read(ctx, str(bf))
+        d = _parse(await read(ctx, str(bf)))
+        assert d["is_binary"] is True
+        assert d["size"] == 400
+        assert d["mime"]  # any non-empty mime guess
+        assert "content" not in d
+
+    async def test_binary_png_returns_mime(self, ctx: MagicMock, tmp_path: Path) -> None:
+        bf = tmp_path / "tiny.png"
+        bf.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        d = _parse(await read(ctx, str(bf)))
+        assert d["is_binary"] is True
+        assert d["mime"] == "image/png"
 
     async def test_debug_mode_includes_extra_fields(
         self, ctx: MagicMock, sample_file: Path
@@ -535,6 +565,88 @@ class TestEditTool:
 
 
 # ===========================================================================
+# edit_preview tool
+# ===========================================================================
+
+
+class TestEditPreviewTool:
+    async def test_edit_preview_finds_unique(self, ctx: MagicMock, tmp_path: Path) -> None:
+        f = tmp_path / "preview.py"
+        f.write_text("alpha\nbeta\ngamma\n")
+        d = _parse(await edit_preview(ctx, str(f), "beta"))
+        assert d["found"] is True
+        assert d["match_count"] == 1
+        assert d["line_numbers"] == [2]
+        assert d["context"][0]["line"] == 2
+        assert "beta" in d["context"][0]["snippet"]
+
+    async def test_edit_preview_no_match(self, ctx: MagicMock, tmp_path: Path) -> None:
+        f = tmp_path / "preview.py"
+        f.write_text("alpha\nbeta\n")
+        d = _parse(await edit_preview(ctx, str(f), "nope_zzz"))
+        assert d["found"] is False
+        assert d["match_count"] == 0
+        assert d["line_numbers"] == []
+        assert d["context"] == []
+
+    async def test_edit_preview_multi_match(self, ctx: MagicMock, tmp_path: Path) -> None:
+        f = tmp_path / "preview.py"
+        f.write_text("foo\nbar\nfoo\nbaz\nfoo\n")
+        d = _parse(await edit_preview(ctx, str(f), "foo"))
+        assert d["match_count"] == 3
+        assert d["line_numbers"] == [1, 3, 5]
+
+    async def test_edit_preview_does_not_modify_file(self, ctx: MagicMock, tmp_path: Path) -> None:
+        f = tmp_path / "preview.py"
+        original = "alpha\nbeta\n"
+        f.write_text(original)
+        await edit_preview(ctx, str(f), "alpha")
+        assert f.read_text() == original
+
+    async def test_edit_preview_empty_old_string_errors(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        f = tmp_path / "preview.py"
+        f.write_text("content\n")
+        with pytest.raises(ToolError, match="old_string cannot be empty"):
+            await edit_preview(ctx, str(f), "")
+
+    async def test_edit_preview_is_serialized(self, ctx: MagicMock, tmp_path: Path) -> None:
+        """edit_preview touches the cache layer, so it must acquire the global
+        tool lock like every other cache-touching tool — otherwise it can
+        interleave executor work with a concurrent tool call.
+        """
+        import semantic_cache_mcp.server.tools as tools_mod
+
+        tools_mod._tool_lock = None
+        lock = tools_mod._get_tool_lock()
+        missing = tmp_path / "does_not_exist.txt"
+
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(edit_preview(ctx, str(missing), "anchor"))
+            # A serialized tool blocks at lock acquisition before any I/O,
+            # so it cannot finish while the lock is held by this test.
+            await asyncio.sleep(0.2)
+            assert not task.done(), "edit_preview ran without acquiring the tool lock"
+        finally:
+            lock.release()
+        # Once the lock frees it proceeds and fails fast on the missing file.
+        with pytest.raises(ToolError):
+            await asyncio.wait_for(task, timeout=5.0)
+
+    async def test_edit_preview_rejects_directory(self, ctx: MagicMock, tmp_path: Path) -> None:
+        """A directory path makes smart_read raise ValueError ("Not a regular
+        file"). edit_preview must convert it to a clean ToolError instead of
+        letting an internal -32603 escape — matching read/read_image.
+        """
+        d = tmp_path / "a_directory"
+        d.mkdir()
+        with pytest.raises(ToolError, match="edit_preview: Not a regular file"):
+            await edit_preview(ctx, str(d), "anchor")
+
+
+# ===========================================================================
 # batch_edit tool
 # ===========================================================================
 
@@ -709,73 +821,6 @@ class TestSearchTool:
 
 
 # ===========================================================================
-# diff tool
-# ===========================================================================
-
-
-class TestDiffTool:
-    async def test_diff_identical_files(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("same\n")
-        b.write_text("same\n")
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "diff" in d
-        assert d["diff_state"] == "unchanged"
-
-    async def test_diff_different_files(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("old content\n")
-        b.write_text("new content\n")
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "diff" in d
-        assert d["diff_state"] == "full"
-
-    async def test_diff_file_not_found(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        a.write_text("content")
-        with pytest.raises(ToolError, match="diff: "):
-            await diff(ctx, str(a), "/nonexistent.txt")
-
-    async def test_diff_normal_mode_includes_similarity(
-        self, ctx: MagicMock, tmp_path: Path
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("hello\n")
-        b.write_text("world\n")
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
-            d = _parse(await diff(ctx, str(a), str(b)))
-        assert "similarity" in d
-        assert "diff_stats" in d
-
-    async def test_diff_debug_mode_includes_cache_info(
-        self, ctx: MagicMock, tmp_path: Path
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("a\n")
-        b.write_text("b\n")
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            d = _parse(await diff(ctx, str(a), str(b)))
-        assert "from_cache" in d
-        assert "context_lines" in d
-
-    async def test_diff_uses_cached_content(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("cached\n")
-        b.write_text("also cached\n")
-        await smart_read(tmp_cache, str(a))
-        await smart_read(tmp_cache, str(b))
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "error" not in d  # compact strips ok on success
-
-
-# ===========================================================================
 # batch_read tool
 # ===========================================================================
 
@@ -871,58 +916,6 @@ class TestBatchReadTool:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await batch_read(ctx, str(sample_file)))
         assert "total_tokens" in d["summary"]
-
-
-# ===========================================================================
-# similar tool
-# ===========================================================================
-
-
-class TestSimilarTool:
-    async def test_similar_empty_cache_returns_empty(self, ctx: MagicMock, py_file: Path) -> None:
-        d = _parse(await similar(ctx, str(py_file)))
-        assert isinstance(d.get("similar_files"), list)
-
-    async def test_similar_with_cached_files(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        files = []
-        for i in range(3):
-            f = tmp_path / f"m{i}.py"
-            f.write_text(f"def func{i}(): pass\n")
-            await smart_read(tmp_cache, str(f))
-            files.append(f)
-        d = _parse(await similar(ctx, str(files[0])))
-        assert "similar_files" in d
-
-    async def test_similar_file_not_found(self, ctx: MagicMock) -> None:
-        with pytest.raises(ToolError, match="similar: "):
-            await similar(ctx, "/nonexistent.py")
-
-    async def test_similar_normal_mode(self, ctx: MagicMock, py_file: Path) -> None:
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
-            d = _parse(await similar(ctx, str(py_file)))
-        assert "source_tokens" in d
-        assert "files_searched" in d
-
-    async def test_similar_debug_mode_includes_k(self, ctx: MagicMock, py_file: Path) -> None:
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            d = _parse(await similar(ctx, str(py_file), k=3))
-        assert d.get("k") == 3
-
-    async def test_similar_compact_mode_omits_tokens(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        a = tmp_path / "a.py"
-        b = tmp_path / "b.py"
-        a.write_text("def a(): pass\n")
-        b.write_text("def b(): pass\n")
-        await smart_read(tmp_cache, str(a))
-        await smart_read(tmp_cache, str(b))
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact"):
-            d = _parse(await similar(ctx, str(a)))
-        for sf in d.get("similar_files", []):
-            assert "tokens" not in sf
 
 
 # ===========================================================================
@@ -1071,6 +1064,33 @@ class TestGrepTool:
                 assert "line_number" in m
                 assert "line" in m
 
+    async def test_grep_uncached_path_emits_reason(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        # Seed an unrelated file so the cache isn't empty.
+        seeded = tmp_path / "real" / "code.py"
+        seeded.parent.mkdir(parents=True, exist_ok=True)
+        seeded.write_text("def foo(): pass\n")
+        await smart_read(tmp_cache, str(seeded))
+
+        d = _parse(await grep(ctx, "foo", fixed_string=True, path="uncached_subtree/"))
+        assert d["total_matches"] == 0
+        assert d["reason"] == "no_files_cached_under_path"
+        assert "batch_read" in d["hint"]
+
+    async def test_grep_zero_matches_with_cached_path_no_reason(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        seeded = tmp_path / "real" / "code.py"
+        seeded.parent.mkdir(parents=True, exist_ok=True)
+        seeded.write_text("def foo(): pass\n")
+        await smart_read(tmp_cache, str(seeded))
+
+        d = _parse(await grep(ctx, "absent_pattern_zzz", fixed_string=True, path="real/code.py"))
+        assert d["total_matches"] == 0
+        # Path IS cached → no cache-miss reason should be emitted.
+        assert "reason" not in d
+
     async def test_grep_accepts_optional_path_filter(
         self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
     ) -> None:
@@ -1157,17 +1177,6 @@ class TestRelativePathSupport:
         assert d["succeeded"] == 2
         assert Path("rel-batch-edit.txt").read_text() == "111\n222\n"
 
-    async def test_diff_accepts_relative_paths(
-        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.chdir(tmp_path)
-        Path("left.txt").write_text("left\n")
-        Path("right.txt").write_text("right\n")
-
-        d = _parse(await diff(ctx, "left.txt", "right.txt"))
-
-        assert "diff" in d
-
     async def test_batch_read_accepts_relative_paths(
         self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1179,7 +1188,7 @@ class TestRelativePathSupport:
 
         assert d["summary"]["files_read"] == 2
 
-    async def test_search_and_similar_accept_relative_paths(
+    async def test_search_accepts_relative_paths(
         self,
         ctx: MagicMock,
         tmp_path: Path,
@@ -1196,11 +1205,9 @@ class TestRelativePathSupport:
         await smart_read(tmp_cache, "pkg/b.py")
 
         search_result = _parse(await search(ctx, "alpha", directory="pkg"))
-        similar_result = _parse(await similar(ctx, "pkg/a.py"))
 
         assert search_result["matches"]
         assert all(str(subdir.resolve()) in match["path"] for match in search_result["matches"])
-        assert "similar_files" in similar_result
 
     async def test_glob_accepts_relative_directory(
         self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

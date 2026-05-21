@@ -35,7 +35,7 @@
 
 **Cut your MCP client's token usage by 98% on cached reads. Respond in milliseconds.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, batch_read, write, edit, batch_edit, search, grep, glob, similar, diff, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, read_image, batch_read, write, edit, edit_preview, batch_edit, search, grep, glob, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
 
 ---
 
@@ -45,7 +45,7 @@ In order of impact:
 
 **1. Reads stop costing tokens.** The first read seeds the cache. Re-reads of unchanged files return a 5-token marker (`mtime` match, no disk I/O). Modified files return a unified diff. Files larger than the budget collapse to a semantic skeleton that preserves structure rather than slicing at a byte offset.
 
-**2. Search and grep run on the cache, not the disk.** Semantic search (hybrid BM25 + HNSW), similar-file lookup, glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
+**2. Search and grep run on the cache, not the disk.** Semantic search (hybrid BM25 + HNSW), glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
 
 **3. Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, support `dry_run`, can run formatters, and refresh the cache atomically. Local FastEmbed is the default embedding provider; OpenAI-compatible endpoints are opt-in.
 
@@ -169,21 +169,21 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | Tool | Description |
 |------|-------------|
 | `read` | Single-file cache-aware read. Returns full content on first read, unchanged markers on cache hits, diffs on modifications, and supports `offset`/`limit` for targeted recovery. |
+| `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP) — not by extension. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
-| `edit` | Single-file exact edit using cached content. Best for one localized change; supports scoped and line-range replacement plus `dry_run=true`. |
-| `batch_edit` | Multiple exact edits in one file with partial success reporting. Best when several localized changes belong in the same file. |
+| `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. For multiple edits to the same file, prefer `batch_edit`. |
+| `batch_edit` | Multiple exact edits in one file with partial success reporting. Preferred over repeated `edit` calls on the same file: single response, atomic, faster on large files. |
+| `edit_preview` | Read-only probe that returns match count, line numbers, and small context snippets for a candidate `old_string`. Use before a costly `edit` to confirm anchor uniqueness. |
 
 ### Discovery
 
 | Tool | Description |
 |------|-------------|
-| `search` | Cache-only semantic search for meaning or mixed keyword intent. Seed likely files first with `batch_read`; use `grep` for exact text. |
-| `similar` | Cache-only nearest-neighbor lookup for one source file. Best after seeding a directory with `batch_read`. |
+| `search` | Cache-only semantic search — find code by meaning when you don't know the exact symbol to grep for. Seed likely files first with `batch_read`. |
 | `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
 | `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
 | `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
-| `diff` | Explicit side-by-side file comparison with unified diff and semantic similarity. Use `read` instead for “what changed since last read?”. |
 
 ### Management
 
@@ -291,14 +291,12 @@ batch_read paths="/src/*.py" max_total_tokens=30000
 </details>
 
 <details>
-<summary><strong>discovery</strong> — Search, similar, glob, grep, diff</summary>
+<summary><strong>discovery</strong> — Search, glob, grep</summary>
 
 ```
 search query="authentication middleware logic" k=5
-similar path="/src/auth.py" k=3
 glob pattern="**/*.py" directory="./src" cached_only=true
 grep pattern="class Cache" path="src/**/*.py"
-diff path1="/src/v1.py" path2="/src/v2.py"
 ```
 
 </details>
@@ -414,7 +412,6 @@ Measured on this project's 43 source files (**168,614 tokens**), CPU embeddings,
 | Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; **2,000×+ vs cold** |
 | Search k=5 (cache **miss**) | 5.6 ms | embed query + hybrid BM25/HNSW |
 | Edit (scoped find/replace) | 3.3 ms | uses cached content |
-| Find similar (k=3) | 2.2 ms | cached embedding reused |
 | Grep (literal `def `) | 1.4 ms | FTS5 over cached corpus |
 | Grep (regex) | 2.1 ms | regex compiled once |
 | Batch read (43 files, diff mode) | 40.2 ms | one ONNX inference for all new/changed files |

@@ -3,7 +3,6 @@
 Covers:
   - Idempotent close() on VectorStorage and SemanticCache
   - ConnectionPool close_all() draining in-use connections
-  - Binary file guard in find_similar_files
   - Grep parameter clamping
   - Diff context_lines clamping
   - _clear_sync() replacing asyncio.get_event_loop().run_until_complete()
@@ -145,43 +144,6 @@ class TestConnectionPoolCloseAll:
         # Pool reuses connections — only 1 should exist
         assert pool._total == 1
         assert len(pool._all_conns) == 1
-
-
-# ---------------------------------------------------------------------------
-# Binary file guard in find_similar_files
-# ---------------------------------------------------------------------------
-
-
-class TestFindSimilarFilesBinaryGuard:
-    """find_similar_files should reject binary files."""
-
-    @pytest.mark.asyncio
-    async def test_binary_file_raises(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.cache.search import find_similar_files
-        from semantic_cache_mcp.cache.store import SemanticCache
-
-        # Create a binary file
-        binary_file = tmp_path / "image.png"
-        binary_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
-
-        cache = SemanticCache(tmp_path / "vec.db")
-        try:
-            with pytest.raises(ValueError, match="Binary file not supported"):
-                await find_similar_files(cache, str(binary_file))
-        finally:
-            cache.close()
-
-    @pytest.mark.asyncio
-    async def test_nonexistent_file_raises(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.cache.search import find_similar_files
-        from semantic_cache_mcp.cache.store import SemanticCache
-
-        cache = SemanticCache(tmp_path / "vec.db")
-        try:
-            with pytest.raises(FileNotFoundError):
-                await find_similar_files(cache, str(tmp_path / "nope.txt"))
-        finally:
-            cache.close()
 
 
 # ---------------------------------------------------------------------------

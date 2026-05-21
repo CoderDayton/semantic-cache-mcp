@@ -49,7 +49,7 @@
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
 - **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/vecdb.db` and restart
 
-**`search` or `similar` returns no results / stale results**
+**`search` returns no results / stale results**
 - **Cause:** Only cached files are searched. New or unread files aren't in the HNSW index.
 - **Fix:** Seed the cache with `read` or `batch_read` first.
 

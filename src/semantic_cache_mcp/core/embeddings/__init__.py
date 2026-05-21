@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 def _numpy_to_array(embedding: np.ndarray) -> array.array[float]:
+    if embedding.dtype != np.float32:
+        embedding = embedding.astype(np.float32, copy=False)
     result = array.array("f")
-    result.frombytes(embedding.astype(np.float32).tobytes())
+    result.frombytes(embedding.tobytes())
     return result
 
 

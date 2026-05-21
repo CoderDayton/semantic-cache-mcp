@@ -644,8 +644,15 @@ class SemanticCache:
         )
         return True
 
-    async def get_content(self, entry: CacheEntry) -> str:
-        return await self._storage.get_content(entry)
+    async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
+        """Reassemble cached content for ``entry``.
+
+        ``max_bytes`` (UTF-8 bytes) caps how much is returned; truncation
+        happens on a code-point boundary, so the result may be slightly
+        shorter than the cap. ``None`` returns the full content. See
+        :meth:`VectorStorage.get_content` for the full contract.
+        """
+        return await self._storage.get_content(entry, max_bytes=max_bytes)
 
     async def record_access(self, path: str) -> None:
         await self._storage.record_access(path)

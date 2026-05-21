@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import shutil
 import sys
 import tempfile
@@ -208,6 +209,74 @@ async def bench_write_edit(
     print(stats.render())
 
 
+async def bench_chunked_write(
+    report: BenchmarkReport, cache: SemanticCache, tmp: Path, iters: int
+) -> None:
+    """Files >= CHUNK_THRESHOLD (8 KB) are CDC-chunked on write.
+
+    The chunked path does N per-chunk operations (BPE token counts, JSON
+    history fan-out, zero-embedding allocations). This case exercises the
+    code paths most affected by 0.4.7's hot-path optimisations and is
+    therefore where any future regression would surface first.
+    """
+    # ~50 KB → ~25 chunks at CHUNK_MIN_SIZE=2048.
+    medium_text = "".join(f"def func_{i}():\n    return {i} * 2\n\n" for i in range(2000))
+
+    # ~250 KB → ~125 chunks; stresses the per-chunk fan-out paths.
+    big_text = medium_text * 5
+
+    medium_kb = len(medium_text.encode("utf-8")) // 1024
+    big_kb = len(big_text.encode("utf-8")) // 1024
+
+    # Each timed write targets a fresh path so every iteration measures a
+    # cold chunked ingest — writing one fixed path would have iterations 2+
+    # hit the warm overwrite/diff path and report misleadingly fast.
+    medium_counter = itertools.count()
+    big_counter = itertools.count()
+
+    async def _write_medium() -> None:
+        path = tmp / f"bench_chunked_medium_{next(medium_counter)}.py"
+        await smart_write(cache, str(path), medium_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({medium_kb} KB, ~25 chunks)",
+        _write_medium,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    async def _write_big() -> None:
+        path = tmp / f"bench_chunked_big_{next(big_counter)}.py"
+        await smart_write(cache, str(path), big_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({big_kb} KB, ~125 chunks)",
+        _write_big,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    # Re-read of a chunked file goes through record_access, which now does
+    # one json round-trip total instead of N (one per chunk). Seed a fixed
+    # path so the re-read measures a genuine cache hit.
+    reread_path = tmp / "bench_chunked_reread.py"
+    await smart_write(cache, str(reread_path), medium_text)
+    await smart_read(cache, str(reread_path))
+
+    async def _reread_chunked() -> None:
+        await smart_read(cache, str(reread_path))
+
+    _, stats = await time_async(
+        f"Chunked re-read ({medium_kb} KB, record_access fan-out)",
+        _reread_chunked,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+
 async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int) -> None:
     query = "embedding model configuration"
 
@@ -374,6 +443,10 @@ async def main() -> int:
         if not args.quiet:
             print("\n--- Write + Edit ---")
         await bench_write_edit(report, cache, tmp, iters)
+
+        if not args.quiet:
+            print("\n--- Chunked Write ---")
+        await bench_chunked_write(report, cache, tmp, iters)
 
         if not args.quiet:
             print("\n--- Search ---")

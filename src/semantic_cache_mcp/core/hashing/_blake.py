@@ -67,15 +67,16 @@ DEFAULT_CONFIG = HashConfig()
 # ---------------------------------------------------------------------------
 
 
-def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
-    if DEFAULT_CONFIG.USE_BLAKE3:
-        try:
-            return blake3.blake3(data).digest()
-        except (ImportError, AttributeError, OSError):
-            pass  # BLAKE3 not available, use fallback
+if HAS_BLAKE3:
+    _blake3_blake3 = blake3.blake3
 
-    # Fallback
-    return hashlib.blake2b(data, digest_size=digest_size).digest()
+    def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
+        return _blake3_blake3(data).digest(length=digest_size)
+else:
+    _hashlib_blake2b = hashlib.blake2b
+
+    def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
+        return _hashlib_blake2b(data, digest_size=digest_size).digest()
 
 
 def _hash_hex(data: bytes, digest_size: int = 32) -> str:

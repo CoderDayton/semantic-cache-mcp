@@ -10,7 +10,6 @@ from semantic_cache_mcp.cache import (
     smart_edit,
     smart_batch_edit,
     semantic_search,
-    find_similar_files,
     compare_files,
     batch_smart_read,
     glob_with_cache_status,
@@ -116,11 +115,6 @@ search_result = semantic_search(
 )
 for match in search_result.matches:
     print(f"{match.path}: {match.similarity:.2f}")
-
-# Find similar files — must seed cache first
-similar_result = find_similar_files(cache=cache, path="/src/auth.py", k=5)
-for f in similar_result.similar_files:
-    print(f"{f.path}: {f.similarity:.2f}")
 
 # Compare two files
 diff_result = compare_files(
@@ -365,19 +359,12 @@ print(f"Cleared {cleared} entries")
 | `content_hash` | `str`                   | BLAKE3 hex digest of final content   |
 | `from_cache`   | `bool`                  | Whether content came from cache      |
 
-### SearchResult / SimilarFilesResult
+### SearchResult
 
 | Field          | Type                | Description                              |
 |----------------|---------------------|------------------------------------------|
 | `matches`      | `list[SearchMatch]` | Ranked matches with path + similarity    |
 | `cached_files` | `int`               | Total files searched                     |
-
-| Field           | Type               | Description                           |
-|-----------------|--------------------|---------------------------------------|
-| `source_path`   | `str`              | Source file                           |
-| `source_tokens` | `int`              | Token count of source file            |
-| `similar_files` | `list[SimilarFile]`| Ranked similar files                  |
-| `files_searched`| `int`              | Total cached files searched           |
 
 ### BatchReadResult / FileReadSummary
 

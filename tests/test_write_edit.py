@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -259,6 +260,44 @@ class TestSmartEditErrors:
         """Cannot edit binary files."""
         with pytest.raises(ValueError, match="Binary file"):
             await smart_edit(semantic_cache_no_embeddings, str(binary_file), "a", "b")
+
+    async def test_edit_miss_returns_close_matches(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Anchor miss appends nearest-line suggestions from the file."""
+        file_path = temp_dir / "edit_fuzzy.py"
+        file_path.write_text(
+            "def fetch_user(uid):\n"
+            "    return db.lookup(uid)\n"
+            "\n"
+            "def update_user(uid, data):\n"
+            "    return db.upsert(uid, data)\n"
+        )
+        with pytest.raises(ValueError) as exc:
+            await smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "def fetch_users(uid):",
+                "def fetch_users(uid: int):",
+            )
+        msg = str(exc.value)
+        assert "Closest lines in file:" in msg
+        assert "fetch_user" in msg
+
+    async def test_edit_miss_skips_large_file(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Large files skip the fuzzy scan (only the base hint is shown)."""
+        file_path = temp_dir / "edit_huge.txt"
+        file_path.write_text("placeholder line\n" * 5500)
+        with pytest.raises(ValueError) as exc:
+            await smart_edit(
+                semantic_cache_no_embeddings,
+                str(file_path),
+                "absent_anchor_xyz",
+                "replacement",
+            )
+        assert "Closest lines in file:" not in str(exc.value)
 
 
 class TestSmartEditCache:
@@ -1010,3 +1049,60 @@ class TestBestEffortCacheRefresh:
 
         assert result.succeeded == 1
         assert file_path.read_text() == "a\nbeta\nc\n"
+
+
+class TestPostWriteMtimeRefresh:
+    """Regression: write/edit paths must cache the post-write mtime so the
+    next read is a cache hit instead of a needless disk re-hash."""
+
+    async def test_write_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "w.py"
+        f.write_text("a = 1\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_write(semantic_cache_no_embeddings, str(f), "a = 2\n")
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old
+
+    async def test_edit_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "e.py"
+        f.write_text("a = 1\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_edit(semantic_cache_no_embeddings, str(f), "a = 1", "a = 2")
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old
+
+    async def test_batch_edit_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "b.py"
+        f.write_text("a = 1\nb = 2\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(f),
+            [("a = 1", "a = 9"), ("b = 2", "b = 8")],
+        )
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old

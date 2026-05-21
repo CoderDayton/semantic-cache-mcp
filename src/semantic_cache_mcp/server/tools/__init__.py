@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
+import stat as stat_module
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -13,12 +16,12 @@ from typing import Any, TypeVar, cast
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
+from mcp.types import ImageContent, TextContent
 
 from ...cache import (
     SemanticCache,
     batch_smart_read,
-    compare_files,
-    find_similar_files,
+    find_edit_anchors,
     glob_with_cache_status,
     semantic_search,
     smart_batch_edit,
@@ -26,22 +29,26 @@ from ...cache import (
     smart_read,
     smart_write,
 )
+from ...cache._helpers import _PhaseTimer
+from ...cache.read import _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
+from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
 from .._mcp import mcp
+from .._read_session import get_tracker as _get_read_session_tracker
 from .._tool_models import (
     BatchEditResponse,
     BatchReadResponse,
     ClearResponse,
     DeleteResponse,
-    DiffResponse,
+    EditPreviewResponse,
     EditResponse,
     GlobResponse,
     GrepResponse,
+    ReadImageResponse,
     ReadResponse,
     SearchResponse,
-    SimilarResponse,
     StatsResponse,
     WriteResponse,
     output_schema,
@@ -55,6 +62,8 @@ from ..response import (
     _response_mode,
     _response_token_cap,
 )
+
+_read_session_tracker = _get_read_session_tracker()
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +317,17 @@ async def _shielded_write(cache: SemanticCache, coro: Any, *, timeout: float | N
             raise asyncio.CancelledError() from None
 
 
+def _binary_read_payload(path: str, result: Any) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "read",
+        "path": path,
+        "is_binary": True,
+        "size": result.size,
+        "mime": result.mime,
+    }
+
+
 @mcp.tool(
     output_schema=output_schema(ReadResponse),
     meta={
@@ -335,7 +355,8 @@ async def read(
         path: File path (absolute or relative to project root). Use absolute
             paths for files outside the current project root.
         max_size: Maximum content size to return before summarization.
-        offset: 1-based starting line number for targeted reads.
+        offset: 1-based starting line number for targeted reads. `0` is
+            treated as "from the start" (equivalent to omitting).
         limit: Number of lines to return from `offset`.
     """
     state = await _tool_call_state(ctx)
@@ -357,9 +378,11 @@ async def read(
     if remote_result is not None:
         return remote_result
 
-    # Validate bounds
-    if offset is not None and offset < 1:
-        _raise_tool_error("read", "offset must be >= 1 (1-based)", max_response_tokens)
+    # Validate bounds. `offset=0` is accepted and treated as from-start.
+    if offset is not None and offset < 0:
+        _raise_tool_error(
+            "read", "offset must be >= 0 (1-based; 0 is from start)", max_response_tokens
+        )
     if limit is not None and limit < 1:
         _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
@@ -379,16 +402,19 @@ async def read(
                 timeout=_TOOL_TIMEOUT,
             )
             cache.metrics.record("read", result)
+            if result.is_binary:
+                return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
             lines = result.content.splitlines(keepends=True)
-            start = (offset or 1) - 1  # Convert to 0-based
+            start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
 
-            # Format with line numbers like built-in Read tool
-            numbered = []
-            for i, line in enumerate(selected, start=start + 1):
-                numbered.append(f"{i:6d}\t{line.rstrip()}")
-            content = "\n".join(numbered)
+            # Format with line numbers like built-in Read tool. Generator
+            # expression avoids materializing the intermediate list — `selected`
+            # may be thousands of lines on partial reads of large files.
+            content = "\n".join(
+                f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
+            )
             line_info = {
                 "start": start + 1,
                 "end": min(end, len(lines)),
@@ -418,10 +444,22 @@ async def read(
             timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("read", result)
+
+        # Binary fallback: structured metadata instead of an error so callers
+        # can branch on is_binary without parsing the error string.
+        if result.is_binary:
+            return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
+
         # Detect unchanged files: from_cache=True + is_diff=False means the
         # cached file matches the on-disk file. This is a cache fact, not proof
-        # that the current client already has the file text in context.
-        unchanged = result.from_cache and not result.is_diff
+        # that the current client already has the file text in context — we
+        # also gate on the per-session tracker so the first read of a session
+        # always returns content even when the cache already has it.
+        cache_fresh = result.from_cache and not result.is_diff
+        abs_path = str(Path(path).expanduser().resolve())
+        session_id = getattr(ctx, "session_id", None) or getattr(ctx, "client_id", None)
+        already_seen = _read_session_tracker.seen(session_id, abs_path)
+        unchanged = cache_fresh and already_seen
 
         payload = {
             "ok": True,
@@ -429,8 +467,54 @@ async def read(
             "path": path,
         }
         if unchanged:
+            # Skip sending content; give the model enough metadata to decide
+            # locally whether a ranged re-read is worth it.
             payload["unchanged"] = True
-        payload["content"] = result.content
+            entry = await cache.get(abs_path)
+            if entry is not None:
+                payload["content_hash"] = entry.content_hash
+                # smart_read returns either the full content (small files) or
+                # an "// File unchanged" marker (large files). Reuse the bytes
+                # if we already have them; only re-fetch from cache otherwise.
+                if result.content and result.tokens_returned >= result.tokens_original > 0:
+                    cached_text: str | None = result.content
+                else:
+                    cached_text = await cache.get_content(entry)
+                if cached_text:
+                    payload["total_lines"] = cached_text.count("\n") + (
+                        0 if cached_text.endswith("\n") else 1
+                    )
+        else:
+            # `result.content` is real bytes only for new/changed/small-cached
+            # files. For a file already warm in the cache, smart_read returns
+            # the "// File unchanged" marker (tokens_returned < tokens_original);
+            # the first read of a session must still deliver actual content, so
+            # re-fetch it from the cache.
+            content_text = result.content
+            delivered_full = (
+                not result.is_diff
+                and not result.truncated
+                and result.tokens_returned >= result.tokens_original > 0
+            )
+            if (
+                not delivered_full
+                and not result.is_diff
+                and not result.truncated
+                and result.from_cache
+            ):
+                entry = await cache.get(abs_path)
+                if entry is not None:
+                    fetched = await cache.get_content(entry)
+                    if fetched:
+                        content_text = fetched
+                        delivered_full = True
+            payload["content"] = content_text
+            # Mark as "seen" only when the model received the complete file.
+            # A diff carries only the delta and a truncated read only a
+            # non-contiguous summary — marking either would later answer
+            # unchanged:true for a file the model never saw in full.
+            if delivered_full:
+                _read_session_tracker.mark(session_id, abs_path)
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True
@@ -473,6 +557,139 @@ async def read(
         raise
     except Exception as e:
         _raise_tool_error("read", f"reading failed: {e}", max_response_tokens)
+
+
+# Image pass-through: maximum bytes inlined as a single MCP image block.
+# Anthropic's vision API rejects images over ~5MB; cap defends both response
+# budget and upstream contract. Override via SCMCP_MAX_IMAGE_BYTES.
+_DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _parse_max_image_bytes() -> int:
+    raw = os.environ.get("SCMCP_MAX_IMAGE_BYTES", str(_DEFAULT_MAX_IMAGE_BYTES))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SCMCP_MAX_IMAGE_BYTES=%r; using default %d",
+            raw,
+            _DEFAULT_MAX_IMAGE_BYTES,
+        )
+        return _DEFAULT_MAX_IMAGE_BYTES
+    return max(1024, value)
+
+
+_MAX_IMAGE_BYTES: int = _parse_max_image_bytes()
+
+
+# read_image deliberately omits @_serialized: it never touches the cache or
+# the ONNX worker executor (it reads bytes via the default loop executor),
+# so it has nothing to serialize against and need not queue behind other tools.
+@mcp.tool(
+    output_schema=output_schema(ReadImageResponse),
+    meta={
+        "version": _pkg_version("semantic-cache-mcp"),
+        "author": "Dayton Dunbar",
+        "github": "https://github.com/CoderDayton/semantic-cache-mcp",
+    },
+)
+async def read_image(
+    ctx: Context,
+    path: str,
+) -> ToolResult:
+    """Read an image file and pass the bytes through to the model.
+
+    Returns an MCP image content block (base64-encoded with mime type) plus a
+    JSON metadata sidecar. Use this when the model needs to actually see the
+    image; for any other file type use `read`.
+
+    Images are NOT cached — every call re-reads from disk. Cap is
+    `SCMCP_MAX_IMAGE_BYTES` (default 5 MiB) to protect both the response
+    budget and Anthropic's ~5 MB upload limit.
+
+    Args:
+        path: Image file path (absolute or relative to project root).
+    """
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    max_response_tokens = state.max_response_tokens
+
+    # Image reads bypass the cache (and the worker process). They use the
+    # default loop executor — aread_bytes/astat accept `None` and fall back
+    # to asyncio's default ThreadPoolExecutor, which is the right thing in
+    # the server process (no GIL contention with the worker's ONNX thread).
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.exists():
+        _raise_tool_error("read_image", f"File not found: {path}", max_response_tokens)
+
+    try:
+        st = await astat(file_path, None)
+    except OSError as e:
+        _raise_tool_error("read_image", f"Cannot stat file: {e}", max_response_tokens)
+
+    if not stat_module.S_ISREG(st.st_mode):
+        _raise_tool_error("read_image", f"Not a regular file: {path}", max_response_tokens)
+
+    if st.st_size > _MAX_IMAGE_BYTES:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"image too large: {st.st_size} bytes exceeds limit {_MAX_IMAGE_BYTES} "
+                f"(raise via SCMCP_MAX_IMAGE_BYTES)"
+            ),
+            max_response_tokens,
+        )
+
+    try:
+        raw = await asyncio.wait_for(aread_bytes(file_path, None), timeout=_TOOL_TIMEOUT)
+    except TimeoutError:
+        _raise_tool_error("read_image", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except OSError as e:
+        _raise_tool_error("read_image", f"I/O error: {e}", max_response_tokens)
+
+    # Re-check size against the bytes actually read: the pre-read st_size
+    # check races a file that grows — or a swapped symlink target — between
+    # the stat and the read. Reject here so an oversized image never reaches
+    # the base64 step or the response budget.
+    if len(raw) > _MAX_IMAGE_BYTES:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"image too large: {len(raw)} bytes exceeds limit {_MAX_IMAGE_BYTES} "
+                f"(raise via SCMCP_MAX_IMAGE_BYTES)"
+            ),
+            max_response_tokens,
+        )
+
+    # Verify by magic bytes, not by extension — a file named `x.png` that
+    # holds text must be refused, and a real image with a wrong/missing
+    # extension must still be accepted. Supports PNG, JPEG, GIF, TIFF, BMP,
+    # and WebP.
+    mime = _sniff_image_mime(raw)
+    if mime is None:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"not a recognized image: {path} — content is not PNG/JPEG/GIF/"
+                "TIFF/BMP/WebP; use `read` for non-image files"
+            ),
+            max_response_tokens,
+        )
+
+    metadata: dict[str, Any] = {
+        "ok": True,
+        "tool": "read_image",
+        "path": path,
+        "size": st.st_size,
+        "mime": mime,
+    }
+    image_block = ImageContent(
+        type="image",
+        data=base64.b64encode(raw).decode("ascii"),
+        mimeType=mime,
+    )
+    text_block = TextContent(type="text", text=json.dumps(metadata))
+    return ToolResult(content=[text_block, image_block], structured_content=metadata)
 
 
 @mcp.tool(output_schema=output_schema(StatsResponse))
@@ -695,6 +912,7 @@ async def clear(
 
     count = await cache.clear()
     cache.metrics.record("clear", None)
+    _read_session_tracker.clear()
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
@@ -773,6 +991,7 @@ async def delete(
             cache_removed_count += await cache.delete_path(candidate)
 
         cache.metrics.record("delete", None)
+        _read_session_tracker.invalidate(str(Path(path).expanduser().resolve()))
         payload = {
             "ok": True,
             "tool": "delete",
@@ -824,6 +1043,10 @@ async def write(
 ) -> dict[str, Any]:
     """Create or replace a file. Prefer `edit`/`batch_edit` for localized changes.
 
+    Overwrites the whole file, or appends with `append=true`. Reports status
+    `created` for a new path or `updated` for an existing one; an update also
+    returns a unified diff against the previous content.
+
     Args:
         path: File path to create or replace.
         content: Full content to write, or appended content when
@@ -870,6 +1093,7 @@ async def write(
             ),
         )
         cache.metrics.record("write", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -943,7 +1167,8 @@ async def edit(
 ) -> dict[str, Any]:
     """Edit one file via exact replacement.
 
-    Use `batch_edit` for multiple changes, `write` for full rewrites.
+    For multiple edits to the same file, use `batch_edit` (single response,
+    atomic, faster). For full rewrites, use `write`.
 
     Modes: find/replace (`old_string`+`new_string`), scoped (add `start_line`/`end_line`),
     or line-range (omit `old_string`, provide both lines). Keep `old_string` short
@@ -984,6 +1209,7 @@ async def edit(
     if remote_result is not None:
         return remote_result
 
+    timer = _PhaseTimer()
     try:
         result = await _shielded_write(
             cache,
@@ -997,9 +1223,11 @@ async def edit(
                 auto_format=auto_format,
                 start_line=start_line,
                 end_line=end_line,
+                timer=timer,
             ),
         )
         cache.metrics.record("edit", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -1043,7 +1271,12 @@ async def edit(
         _raise_tool_error("edit", str(e), max_response_tokens)
     except TimeoutError:
         _handle_timeout(cache, "edit", path)
-        _raise_tool_error("edit", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+        _raise_tool_error(
+            "edit",
+            f"timed out in phase '{timer.current_phase}' after "
+            f"{timer.elapsed():.1f}s (budget {_TOOL_TIMEOUT}s)",
+            max_response_tokens,
+        )
     except OSError as e:
         logger.warning(f"I/O error in edit: {e}")
         _raise_tool_error("edit", f"I/O operation failed - {e}", max_response_tokens)
@@ -1052,6 +1285,88 @@ async def edit(
     except Exception:
         logger.exception("Unexpected error in edit")
         _raise_tool_error("edit", "Internal error occurred while editing file", max_response_tokens)
+
+
+@mcp.tool(output_schema=output_schema(EditPreviewResponse))
+@_serialized
+async def edit_preview(
+    ctx: Context,
+    path: str,
+    old_string: str,
+) -> dict[str, Any]:
+    """Preview where `old_string` matches in a file without modifying it.
+
+    Returns match count, 1-based line numbers, and small snippets so the
+    caller can confirm an anchor is unique before committing to `edit`.
+    Read-only and intentionally cheap — under ~200 tokens — so it can be
+    called freely as a probe.
+
+    Args:
+        path: File path to search.
+        old_string: Anchor text. Must match exactly (whitespace, indentation).
+    """
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    cache = state.cache
+    max_response_tokens = state.max_response_tokens
+
+    if not old_string:
+        _raise_tool_error("edit_preview", "old_string cannot be empty", max_response_tokens)
+
+    try:
+        result = await asyncio.wait_for(
+            smart_read(
+                cache=cache,
+                path=path,
+                max_size=MAX_CONTENT_SIZE * 10,
+                diff_mode=False,
+                force_full=True,
+                refresh_cache=False,
+            ),
+            timeout=_TOOL_TIMEOUT,
+        )
+    except FileNotFoundError as e:
+        _raise_tool_error("edit_preview", str(e), max_response_tokens)
+    except TimeoutError:
+        _raise_tool_error("edit_preview", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ValueError as e:
+        # smart_read raises ValueError for a non-regular file — a directory,
+        # FIFO, or device. Surface its message as a clean ToolError.
+        _raise_tool_error("edit_preview", str(e), max_response_tokens)
+    except OSError as e:
+        # An unreadable regular file reaches smart_read as an OSError
+        # (PermissionError, ...). Surface a clean ToolError instead of
+        # leaking an internal -32603, matching read/read_image.
+        _raise_tool_error("edit_preview", f"cannot read file: {e}", max_response_tokens)
+
+    if result.is_binary:
+        _raise_tool_error("edit_preview", f"binary file not supported: {path}", max_response_tokens)
+
+    content = result.content
+    match_count, line_numbers = find_edit_anchors(content, old_string, max_results=50)
+
+    # Build small context snippets — cap at 5 entries and 120 chars/line so
+    # the response fits well under 200 tokens even on dense files.
+    lines = content.splitlines()
+    context: list[dict[str, Any]] = []
+    for ln in line_numbers[:5]:
+        if 1 <= ln <= len(lines):
+            snippet = lines[ln - 1].rstrip()[:120]
+            context.append({"line": ln, "snippet": snippet})
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "tool": "edit_preview",
+        "path": path,
+        "found": match_count > 0,
+        "match_count": match_count,
+        "line_numbers": line_numbers,
+        "context": context,
+    }
+    if match_count > len(line_numbers):
+        payload["truncated"] = True
+
+    return _finalize_payload(payload, max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(BatchEditResponse))
@@ -1066,9 +1381,9 @@ async def batch_edit(
 ) -> dict[str, Any]:
     """Apply multiple exact edits to one file in a single call.
 
-    Use this when several independent edits belong in the same file. For one
-    change, prefer `edit`. For cross-file work, call the relevant tools per
-    file instead of trying to batch across files.
+    Preferred over repeated `edit` calls on the same file: single response,
+    atomic across all edits, and faster on large files. For cross-file work,
+    call the relevant tools per file instead of trying to batch across files.
 
     Supported entry forms:
     - `[old, new]` for full-file exact replacement
@@ -1157,6 +1472,7 @@ async def batch_edit(
             ),
         )
         cache.metrics.record("batch_edit", result)
+        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         status = (
             "edited"
@@ -1248,10 +1564,16 @@ async def search(
     directory: str | None = None,
     show_preview: bool = False,
 ) -> dict[str, Any]:
-    """Cache-only semantic search by meaning.
+    """Find code by meaning when you don't know the exact name to grep for.
 
-    Use `grep` for exact strings, `glob` to discover files. Empty results
-    usually mean files weren't seeded via `read`/`batch_read`.
+    Use this first for concept-level questions — "where is rate limiting
+    handled", "what validates the config", "code that retries failed
+    requests" — where you have intent but not a literal string or symbol.
+    Once you know the exact token, `grep` is the faster, exact follow-up.
+
+    Ranks cached files by semantic similarity to the query. Operates on
+    files already seeded via `read`/`batch_read`; if results look thin,
+    seed more of the repo with `batch_read` and retry.
 
     Args:
         query: Natural-language query, keywords, or a mixture of both.
@@ -1316,80 +1638,6 @@ async def search(
     except Exception as e:
         logger.exception("Error in search")
         _raise_tool_error("search", str(e), max_response_tokens)
-
-
-@mcp.tool(output_schema=output_schema(DiffResponse))
-@_serialized
-async def diff(
-    ctx: Context,
-    path1: str,
-    path2: str,
-    context_lines: int = 3,
-) -> dict[str, Any]:
-    """Compare two files side by side and return a unified diff.
-
-    Use this for explicit file-to-file comparison. For "what changed since I
-    last read this file?", use `read` instead of `diff`.
-
-    Behavior:
-    - Returns unified diff plus semantic similarity score.
-    - Reuses cached content when possible.
-    - Large diffs may be suppressed to stay within token budget.
-
-    Args:
-        path1: First file path.
-        path2: Second file path.
-        context_lines: Number of context lines to include around changes.
-    """
-    state = await _tool_call_state(ctx)
-    path1, path2 = state.resolve(path1), state.resolve(path2)
-    cache = state.cache
-    mode = state.mode
-    max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "diff",
-        {"path1": path1, "path2": path2, "context_lines": context_lines},
-        timeout=_TOOL_TIMEOUT,
-    )
-    if remote_result is not None:
-        return remote_result
-
-    try:
-        result = await asyncio.wait_for(
-            compare_files(cache, path1, path2, context_lines=context_lines),
-            timeout=_TOOL_TIMEOUT,
-        )
-        cache.metrics.record("diff", result)
-
-        payload: dict[str, Any] = {
-            "ok": True,
-            "tool": "diff",
-            "path1": result.path1,
-            "path2": result.path2,
-            "diff": result.diff_content,
-            "diff_state": _diff_state(result.diff_content),
-        }
-        if mode in _MODE_NORMAL:
-            payload["similarity"] = round(result.similarity, 4)
-            payload["diff_stats"] = result.diff_stats
-        if mode == _MODE_DEBUG:
-            payload["tokens_saved"] = result.tokens_saved
-            payload["from_cache"] = result.from_cache
-            payload["context_lines"] = context_lines
-
-        return _finalize_payload(payload, max_response_tokens)
-
-    except FileNotFoundError as e:
-        _raise_tool_error("diff", str(e), max_response_tokens)
-    except TimeoutError:
-        _handle_timeout(cache, "diff")
-        _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.exception("Error in diff")
-        _raise_tool_error("diff", str(e), max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(BatchReadResponse))
@@ -1520,71 +1768,6 @@ async def batch_read(
     except Exception as e:
         logger.exception("Error in batch_read")
         _raise_tool_error("batch_read", str(e), max_response_tokens)
-
-
-@mcp.tool(output_schema=output_schema(SimilarResponse))
-@_serialized
-async def similar(
-    ctx: Context,
-    path: str,
-    k: int = 5,
-) -> dict[str, Any]:
-    """Find cached files semantically similar to one source file.
-
-    Neighbors must already be cached (seed with `batch_read` first).
-
-    Args:
-        path: Source file path.
-        k: Maximum number of similar files to return.
-    """
-    state = await _tool_call_state(ctx)
-    path = state.resolve(path)
-    cache = state.cache
-    mode = state.mode
-    max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "similar",
-        {"path": path, "k": k},
-        timeout=_TOOL_TIMEOUT,
-    )
-    if remote_result is not None:
-        return remote_result
-
-    try:
-        result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
-        cache.metrics.record("similar", result)
-
-        similar_payload = [
-            {"path": f.path, "similarity": round(f.similarity, 4)}
-            if mode == "compact"
-            else {"path": f.path, "similarity": round(f.similarity, 4), "tokens": f.tokens}
-            for f in result.similar_files
-        ]
-        payload: dict[str, Any] = {
-            "ok": True,
-            "tool": "similar",
-            "source_path": result.source_path,
-            "similar_files": similar_payload,
-        }
-        if mode in _MODE_NORMAL:
-            payload["source_tokens"] = result.source_tokens
-            payload["files_searched"] = result.files_searched
-        if mode == _MODE_DEBUG:
-            payload["k"] = k
-
-        return _finalize_payload(payload, max_response_tokens)
-
-    except FileNotFoundError as e:
-        _raise_tool_error("similar", str(e), max_response_tokens)
-    except TimeoutError:
-        _handle_timeout(cache, "similar", path)
-        _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.exception("Error in similar")
-        _raise_tool_error("similar", str(e), max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(GlobResponse))
@@ -1801,6 +1984,14 @@ async def grep(
             payload["files_in_response"] = len(files_payload)
             if truncated_files > 0:
                 payload["truncated_files"] = truncated_files
+        # Distinguish "no files cached under that path" from "no matches".
+        # The audit found 22/29 empty greps fit the cache-miss shape, so the
+        # caller should know whether to seed via batch_read/glob.
+        if total_matches == 0 and path is not None:
+            has_cached = await cache._storage.has_cached_paths_under(path)
+            if not has_cached:
+                payload["reason"] = "no_files_cached_under_path"
+                payload["hint"] = "use batch_read or glob to seed the cache"
         if mode == _MODE_DEBUG:
             payload["fixed_string"] = fixed_string
             payload["case_sensitive"] = case_sensitive

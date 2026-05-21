@@ -275,24 +275,25 @@ class BPETokenizer:
 
     def _encode_chunk(self, text: str) -> list[int]:
         token_ids: list[int] = []
+        token_ids_append = token_ids.append
         pat = self._compile_pattern()
-        matches = pat.findall(text)
+        inverse_vocab_get = self.inverse_vocab.get
+        bpe_merge = self._bpe_merge_optimized
 
-        for piece in matches:
+        for piece in pat.findall(text):
             piece_bytes = piece.encode("utf-8")
 
-            # Fast path: single byte or already in vocab
             if len(piece_bytes) == 1:
-                token_ids.append(self.inverse_vocab.get(piece_bytes, 0))
+                token_ids_append(inverse_vocab_get(piece_bytes, 0))
                 continue
 
-            if piece_bytes in self.inverse_vocab:
-                token_ids.append(self.inverse_vocab[piece_bytes])
+            tid = inverse_vocab_get(piece_bytes)
+            if tid is not None:
+                token_ids_append(tid)
                 continue
 
-            # Apply optimized BPE merge
-            for part in self._bpe_merge_optimized(piece_bytes):
-                token_ids.append(self.inverse_vocab.get(part, 0))
+            for part in bpe_merge(piece_bytes):
+                token_ids_append(inverse_vocab_get(part, 0))
 
         return token_ids
 
@@ -393,9 +394,10 @@ def _ensure_tokenizer() -> BPETokenizer | None:
             import urllib.request
 
             TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            # Download to temp file then rename atomically
+            # Download to temp file then rename atomically. URL is a
+            # compile-time constant and the result is hash-verified below.
             tmp_file = cache_file.with_suffix(".tmp")
-            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310 — compile-time constant URL, hash-verified post-download
+            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310
 
             if not _verify_hash(tmp_file, O200K_BASE_SHA256):
                 tmp_file.unlink(missing_ok=True)

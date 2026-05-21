@@ -36,6 +36,12 @@ class ReadResult:
     truncated: bool
     compression_ratio: float
     semantic_match: str | None = None
+    # Binary fallback: set when the file is not text. `content` is empty
+    # in that case; the read tool surfaces these fields as structured
+    # metadata instead of raising.
+    is_binary: bool = False
+    size: int | None = None
+    mime: str | None = None
 
 
 @dataclass(slots=True)
@@ -140,30 +146,6 @@ class BatchReadResult:
     files_read: int
     files_skipped: int
     unchanged_paths: list[str] = field(default_factory=list)
-
-
-# -----------------------------------------------------------------------------
-# Similar files tool types
-# -----------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class SimilarFile:
-    """A file similar to the source."""
-
-    path: str
-    similarity: float
-    tokens: int
-
-
-@dataclass(slots=True)
-class SimilarFilesResult:
-    """Result from find_similar_files operation."""
-
-    source_path: str
-    source_tokens: int
-    similar_files: list[SimilarFile]
-    files_searched: int
 
 
 # -----------------------------------------------------------------------------

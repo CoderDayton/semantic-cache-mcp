@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-05-21
+
+DX & feedback-loop hardening based on a 24h behavioral audit of production
+traffic. Closes the most common wasted-call shapes (silent grep empties,
+unactionable `unchanged:true`, opaque edit timeouts, alias confusion) and
+adds the `edit_preview` probe.
+
+### Added
+
+- **`edit_preview` tool** — Read-only probe returning `{found, match_count,
+  line_numbers, context}` for a given `old_string` against a file. Lets
+  callers verify an anchor is unique before committing to a 30s `edit`.
+  Response budget ≈ 200 tokens.
+- **`read_image` tool** — Pass-through for image files. Returns an MCP
+  image content block (base64 + mime) alongside a JSON metadata sidecar,
+  so vision-capable models see the actual pixels. Format is verified by
+  magic bytes, not by file extension: PNG, JPEG, GIF, TIFF, BMP, and
+  WebP are accepted regardless of filename, and a mis-named file (text
+  saved as `.png`) is refused. Bypasses the semantic cache (no
+  embedding/description). Capped at 5 MiB; override via
+  `SCMCP_MAX_IMAGE_BYTES`. Use `read` for non-image files.
+- **Per-phase timing in edit timeouts** — `edit` and `batch_edit` now thread
+  a `_PhaseTimer` through `smart_edit` (input_validation, binary_check,
+  cache_lookup, anchor_search, diff_gen, atomic_write, format_subprocess,
+  cache_refresh). Timeout errors name the phase that was running and report
+  elapsed seconds.
+- **Fuzzy edit-miss hints** — When `old_string` doesn't match, the
+  ValueError now appends up to 3 nearest-line suggestions (via
+  `difflib.SequenceMatcher`). Skipped on files over 5000 lines.
+- **Grep cache-miss reason** — `grep` with a `path=` that has no cached
+  files under it now returns `reason: "no_files_cached_under_path"` and a
+  `hint` pointing at `batch_read`/`glob`, instead of returning `[]`
+  silently.
+- **Structured binary file responses** — Reading a binary file no longer
+  raises. The read tool returns `{ok: true, is_binary: true, size, mime}`
+  so callers can branch without parsing error strings. Mime is sniffed
+  from extension + a small magic-byte table.
+- **Did-you-mean for unknown parameters** — A new FastMCP middleware
+  silently rewrites common aliases (`abs_path`/`paths`/`file` → `path`,
+  `query`/`q` → `pattern`) and replaces unknown-param `-32602` errors with
+  a clean ToolError plus a `difflib` close-match suggestion.
+- **Per-session unchanged tracking** — `read` now consults a process-wide
+  LRU keyed by `(session_id, abs_path)`. The first read in a session
+  always sends full content; subsequent reads return `unchanged: true`
+  with `content_hash` and `total_lines` so the model can decide locally
+  whether a ranged re-read is warranted. Mutations (`write`, `edit`,
+  `batch_edit`, `delete`) invalidate the entry; `clear` resets the
+  tracker.
+
+### Changed
+
+- **`read.offset=0` accepted** — Previously rejected with
+  "offset must be >= 1"; now treated as from-start (equivalent to
+  omitting). Negative offsets still rejected.
+- **Formatter timeout default 10s → 15s** — Configurable via the
+  `SCMCP_FORMAT_TIMEOUT_S` environment variable.
+- **`edit`/`batch_edit` descriptions** — `edit` now leads with the
+  recommendation to use `batch_edit` for multiple changes on the same
+  file. `batch_edit` description drops the "for one change, prefer edit"
+  softener that contradicted the audit signal (270 single edits vs 35
+  batch in production).
+- **`search` description rewritten** — Repositions semantic search as the
+  first move for concept-level queries ("where is rate limiting handled")
+  rather than a grep alternative, after an audit found the tool was never
+  called. Drops the failure-first "empty results usually mean..." framing.
+- **`write` description** — Adds a behavior block (overwrite vs. `append`,
+  `created`/`updated` status, diff-on-update) so the tool's return shape is
+  documented alongside `edit`/`batch_edit`, instead of jumping straight from
+  summary to arguments.
+
+### Removed
+
+- **`similar` tool** — Removed end to end: the MCP tool, the
+  `find_similar_files()` function, the `SimilarFilesResult`/`SimilarFile`
+  and `SimilarResponse` types, and `MAX_SIMILAR_K`. The tool went unused
+  in production — agents always reached for `grep` or `search`. The
+  vector index it shared with `search` and `read`'s diff-against-similar
+  path is unaffected.
+- **`diff` tool** — Removed the MCP tool for explicit two-file comparison.
+  Agents reach for `git diff` instead, and `read` already returns a unified
+  diff for "what changed since I last read this file". The `compare_files()`
+  core function is retained as a library API.
+
+### Fixed
+
+- **TinyLFU bootstrap race** — A `remove()` landing while
+  `TinyLFUIndex.ensure_loaded()` awaited its loader could not see the
+  half-built index, so a path deleted mid-bootstrap was resurrected by a
+  loader snapshot taken before the delete committed. Such removals are
+  now recorded and replayed onto the rebuilt index.
+- **`read_image` size recheck** — The size limit is re-checked against
+  the bytes actually read, closing a race where a file growing (or a
+  swapped symlink target) between the `stat` and the read could exceed
+  `SCMCP_MAX_IMAGE_BYTES`.
+- **`edit_preview` error mapping** — A non-regular-file or unreadable
+  target now surfaces as a clean `ToolError` instead of leaking an
+  internal `-32603`, matching `read`/`read_image`.
+- **Defensive `access_history` parsing** — A corrupt or non-list
+  `access_history` value in DB metadata no longer crashes a cache-hit
+  read; non-numeric entries are dropped, matching `TinyLFUIndex`.
+- **Stale mtime persisted after writes** — `write`, `edit`, and
+  `batch_edit` refreshed the cache with the pre-write mtime captured for
+  the freshness check, so the next read saw cache-mtime < disk-mtime and
+  needlessly re-read and re-hashed the file. The cache now stores the
+  post-write mtime.
+- **First read could deliver a bare marker** — On the first read of a
+  session, a file already warm in the cache returned the
+  `// File unchanged` marker instead of real content, and truncated reads
+  were marked fully "seen" — so a follow-up read collapsed to
+  `unchanged:true` for a file the model never received in full. The first
+  read now re-fetches real content, and a file is marked seen only when
+  the complete file was sent.
+
 ## [0.4.6] - 2026-05-06
 
 ### Changed

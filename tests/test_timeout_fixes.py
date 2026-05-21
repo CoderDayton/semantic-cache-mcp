@@ -597,3 +597,52 @@ async def test_glob_path_walk_does_not_block_event_loop() -> None:
             assert loop_responsive.is_set(), "event loop was blocked during glob"
             await pulse_task
             assert elapsed >= 0.3, f"glob completed in {elapsed:.3f}s, blocking sleep missed"
+
+
+# ---------------------------------------------------------------------------
+# edit: per-phase timing in timeout messages
+# ---------------------------------------------------------------------------
+
+
+async def test_edit_timeout_reports_phase(tmp_path: Path) -> None:
+    """Timeout error must name the phase that was running, not just elapsed time."""
+    from unittest.mock import patch as _patch
+
+    import fastmcp.exceptions as _fme
+
+    from semantic_cache_mcp.server.tools import edit as edit_tool
+
+    target = tmp_path / "slow.py"
+    target.write_text("def foo():\n    return 1\n")
+
+    ctx = MagicMock()
+    # _tool_call_state is what plumbs lifespan_context — provide a minimal stub.
+    state = MagicMock()
+    state.resolve.side_effect = lambda p: p
+    real_cache = MagicMock()
+    real_cache.begin_operation.return_value = True
+    real_cache.end_operation = MagicMock()
+    real_cache.reset_executor = MagicMock()
+    real_cache._shutting_down = False
+    state.cache = real_cache
+    state.mode = "compact"
+    state.max_response_tokens = 4000
+
+    async def fake_smart_edit(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        timer = kwargs.get("timer")
+        if timer is not None:
+            timer.enter("format_subprocess")
+        raise TimeoutError()
+
+    with (
+        _patch("semantic_cache_mcp.server.tools._tool_call_state", AsyncMock(return_value=state)),
+        _patch(
+            "semantic_cache_mcp.server.tools._maybe_call_remote_tool", AsyncMock(return_value=None)
+        ),
+        _patch("semantic_cache_mcp.server.tools.smart_edit", side_effect=fake_smart_edit),
+    ):
+        with pytest.raises(_fme.ToolError) as exc:
+            await edit_tool(ctx, str(target), "def foo():", "def foo() -> int:")
+        msg = str(exc.value)
+        assert "phase 'format_subprocess'" in msg
+        assert "budget" in msg

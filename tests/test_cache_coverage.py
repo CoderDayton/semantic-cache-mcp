@@ -471,18 +471,18 @@ class TestVectorStorageGetStats:
     async def test_evict_if_needed_triggered(self, tmp_path: Path) -> None:
         """Patch MAX_CACHE_ENTRIES to force eviction after a few puts."""
         vs = _make_vector_storage(tmp_path)
-        from semantic_cache_mcp.storage import vector as vec_mod
+        from semantic_cache_mcp import config as cfg
 
-        original_max = vec_mod.MAX_CACHE_ENTRIES
+        original_max = cfg.MAX_CACHE_ENTRIES
         try:
-            vec_mod.MAX_CACHE_ENTRIES = 3
+            cfg.MAX_CACHE_ENTRIES = 3
             for i in range(6):
                 await vs.put(f"/evict/file{i}.txt", f"content {i}\n" * 5, mtime=float(i))
             # After eviction, count should be <= original_max * doc_count
             stats = await vs.get_stats()
             assert stats["files_cached"] >= 0  # Just verifying no crash
         finally:
-            vec_mod.MAX_CACHE_ENTRIES = original_max
+            cfg.MAX_CACHE_ENTRIES = original_max
 
 
 class TestVectorStorageSearchHybrid:
@@ -575,12 +575,26 @@ class TestFitContentToMaxSize:
 class TestSmartReadEdgeCases:
     """Lines 76, 91-93, 227, 231-234 — binary detection, unicode replacement, offset/limit."""
 
-    async def test_binary_file_raises_value_error(self, tmp_path: Path) -> None:
+    async def test_binary_file_returns_structured_result(self, tmp_path: Path) -> None:
+        """As of 0.4.7, smart_read returns a structured is_binary result instead of raising."""
         cache = _make_cache(tmp_path)
         binary_file = tmp_path / "binary.bin"
         binary_file.write_bytes(b"\x00\x01\x02\x03\xff\xfe\x80")
-        with pytest.raises(ValueError, match="Binary file"):
-            await smart_read(cache, str(binary_file))
+        result = await smart_read(cache, str(binary_file))
+        assert result.is_binary is True
+        assert result.size == 7
+        assert result.content == ""
+        assert result.mime == "application/octet-stream"
+
+    async def test_binary_file_mime_sniffed_from_content(self, tmp_path: Path) -> None:
+        """A binary file's mime is sniffed from magic bytes, not its extension."""
+        cache = _make_cache(tmp_path)
+        # PNG magic bytes saved with a non-image extension.
+        f = tmp_path / "image.dat"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        result = await smart_read(cache, str(f))
+        assert result.is_binary is True
+        assert result.mime == "image/png"
 
     async def test_unicode_replacement_on_decode_error(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
@@ -648,6 +662,24 @@ class TestBatchSmartRead:
         result = await batch_smart_read(cache, [str(bin_file), str(txt_file)])
         statuses = {s.path: s.status for s in result.files}
         assert statuses.get(str(bin_file)) == "skipped"
+
+    async def test_batch_read_binary_summary_shape(self, tmp_path: Path) -> None:
+        """A binary file in a batch is reported as a skipped, zero-token
+        summary while sibling text files are still read."""
+        cache = _make_cache(tmp_path)
+        bin_file = tmp_path / "blob.bin"
+        bin_file.write_bytes(b"\x00\x01\x02\x03\xff\xfe")
+        txt_file = tmp_path / "doc.txt"
+        txt_file.write_text("readable content\n")
+
+        result = await batch_smart_read(cache, [str(bin_file), str(txt_file)])
+        summaries = {s.path: s for s in result.files}
+        bin_summary = summaries[str(bin_file)]
+        assert bin_summary.status == "skipped"
+        assert bin_summary.tokens == 0
+        assert bin_summary.from_cache is False
+        assert result.files_skipped >= 1
+        assert result.files_read >= 1
 
     async def test_batch_read_token_budget_overflow(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)

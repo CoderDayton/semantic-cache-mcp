@@ -50,6 +50,43 @@ class SummarizationConfig:
 DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
 
 
+# Translation table used by _information_density: maps every syntax char to
+# \x01 and every whitespace char to \x02. One str.translate (C call) folds
+# what was 23 separate str.count scans into a single pass over the string;
+# two str.count calls on the translated copy then recover the totals.
+# Markers are SOH/STX control codes — disjoint from the syntax/whitespace
+# sets; any that occur verbatim in the input are subtracted back out by
+# _information_density so the per-char-sum equivalence stays bit-exact.
+_DENSITY_TRANS: dict[int, int] = str.maketrans(
+    {
+        **dict.fromkeys("{}[]()=;:,.<>+-*/&|!", 0x01),
+        " ": 0x02,
+        "\n": 0x02,
+        "\t": 0x02,
+    }
+)
+_DENSITY_SYNTAX_MARK = "\x01"
+_DENSITY_WHITESPACE_MARK = "\x02"
+
+
+# ASCII word LUT used by _information_density: word chars ([A-Za-z0-9_]) map
+# to their lowercase byte; every non-word ASCII byte maps to 0x20 (space).
+# After bytes.translate the input becomes lowercase word runs separated by
+# space runs; bytes.split() (no-arg) returns the maximal word runs in one
+# C call — bit-exact vs re.findall(r"\b\w+\b", content.lower()) on ASCII,
+# which is the dominant case for code/prose. Non-ASCII falls back to regex.
+def _build_word_lut() -> bytes:
+    out = bytearray(b" " * 256)
+    for b in range(128):
+        c = chr(b)
+        if c.isalnum() or c == "_":
+            out[b] = ord(c.lower())
+    return bytes(out)
+
+
+_WORD_LUT = _build_word_lut()
+
+
 # ---------------------------------------------------------------------------
 # Segment extraction
 # ---------------------------------------------------------------------------
@@ -92,15 +129,15 @@ def extract_segments(
     if n_lines == 0:
         return []
 
-    # Find boundary lines
+    # Find boundary lines (i==0 already in list; otherwise append in order).
     boundary_lines = [0]
-
+    match = _BOUNDARY_REGEX.match
     for i, line in enumerate(lines):
-        if _BOUNDARY_REGEX.match(line) and i not in boundary_lines:
+        if i > 0 and match(line):
             boundary_lines.append(i)
 
-    boundary_lines.append(n_lines)
-    boundary_lines = sorted(set(boundary_lines))
+    if boundary_lines[-1] != n_lines:
+        boundary_lines.append(n_lines)
 
     # Create segments from boundaries
     segments = []
@@ -188,20 +225,30 @@ def _information_density(segment: Segment) -> float:
     if not content.strip():
         return 0.0
 
-    # Count unique words (normalized)
-    words = re.findall(r"\b\w+\b", content.lower())
+    # Count unique words (normalized). ASCII fast path swaps the regex VM
+    # for one encode + one translate + one split — three C calls instead of
+    # a Python-level regex scan + Unicode .lower() pass. Bit-exact on ASCII;
+    # non-ASCII keeps the regex so Unicode \w semantics are preserved.
+    if content.isascii():
+        words = content.encode("ascii").translate(_WORD_LUT).split()
+    else:
+        words = re.findall(r"\b\w+\b", content.lower())
     if not words:
         return 0.0
 
     unique_ratio = len(set(words)) / len(words)
 
-    # Code density: presence of syntax characters
-    syntax_chars = sum(1 for c in content if c in "{}[]()=;:,.<>+-*/&|!")
-    syntax_ratio = min(1.0, syntax_chars / (len(content) + 1) * 10)
-
-    # Penalize pure whitespace or comments
-    non_whitespace = len(content.replace(" ", "").replace("\n", "").replace("\t", ""))
-    content_ratio = non_whitespace / (len(content) + 1)
+    # CLAW: one C-level str.translate folds the 20 syntax + 3 whitespace
+    # str.count scans into a single pass; two counts on the marker chars
+    # recover the totals. SOH/STX may also occur verbatim in the input —
+    # translate() leaves those untouched, so subtract any pre-existing
+    # occurrences to stay bit-exact vs the per-char sum.
+    n = len(content)
+    flagged = content.translate(_DENSITY_TRANS)
+    syntax_chars = flagged.count(_DENSITY_SYNTAX_MARK) - content.count(_DENSITY_SYNTAX_MARK)
+    whitespace = flagged.count(_DENSITY_WHITESPACE_MARK) - content.count(_DENSITY_WHITESPACE_MARK)
+    syntax_ratio = min(1.0, syntax_chars / (n + 1) * 10)
+    content_ratio = (n - whitespace) / (n + 1)
 
     return 0.4 * unique_ratio + 0.3 * syntax_ratio + 0.3 * content_ratio
 
@@ -211,18 +258,31 @@ def _compute_diversity_penalty(
     embeddings: list[NDArray[np.float32]],
     selected_indices: set[int],
     threshold: float = 0.85,
+    *,
+    selected_matrix: NDArray[np.float32] | None = None,
 ) -> float:
-    """Penalty that ramps linearly when similarity to any selected segment exceeds threshold."""
+    """Penalty that ramps linearly when similarity to any selected segment exceeds threshold.
+
+    Pass ``selected_matrix`` (shape ``(k, dim)``) for the batched matmul fast
+    path used by ``summarize_semantic`` — collapses k Python-level dot products
+    into one BLAS call. The legacy per-index loop is retained as a fallback for
+    callers that don't maintain the running matrix.
+    """
     if not selected_indices:
         return 0.0
 
     seg_emb = embeddings[segment_idx]
-    max_similarity = 0.0
 
-    for idx in selected_indices:
-        if idx < len(embeddings):
-            sim = np.dot(seg_emb, embeddings[idx])
-            max_similarity = max(max_similarity, sim)
+    if selected_matrix is not None and selected_matrix.size > 0:
+        # One BLAS gemv: (k, dim) @ (dim,) → (k,); take the max similarity.
+        max_similarity = float((selected_matrix @ seg_emb).max())
+    else:
+        max_similarity = 0.0
+        for idx in selected_indices:
+            if idx < len(embeddings):
+                sim = float(np.dot(seg_emb, embeddings[idx]))
+                if sim > max_similarity:
+                    max_similarity = sim
 
     if max_similarity > threshold:
         return (max_similarity - threshold) / (1.0 - threshold)
@@ -318,10 +378,22 @@ def summarize_semantic(
     selected_indices: set[int] = set()
     current_size = 0
 
+    # Running matrix of selected embeddings — appended to as segments are
+    # accepted, then dotted in one BLAS call inside the diversity check. Pure
+    # numpy: avoids per-candidate Python loops over selected indices.
+    selected_rows: list[NDArray[np.float32]] = []
+    selected_matrix: NDArray[np.float32] | None = None
+
+    def _accept(idx: int, size: int) -> None:
+        nonlocal current_size, selected_matrix
+        selected_indices.add(idx)
+        current_size += size
+        selected_rows.append(resolved[idx])
+        selected_matrix = np.stack(selected_rows) if selected_rows else None
+
     # Always include first segment — typically contains imports, module docstring, headers
     if segments and len(segments[0].content) < content_budget:
-        selected_indices.add(0)
-        current_size += len(segments[0].content)
+        _accept(0, len(segments[0].content))
 
     for seg_idx, base_score in scored:
         if seg_idx in selected_indices:
@@ -333,14 +405,18 @@ def summarize_semantic(
         if current_size + seg_size > content_budget:
             continue
 
-        # Apply diversity penalty
-        diversity_penalty = _compute_diversity_penalty(seg_idx, resolved, selected_indices)
+        # Apply diversity penalty using the running matrix (one matmul).
+        diversity_penalty = _compute_diversity_penalty(
+            seg_idx,
+            resolved,
+            selected_indices,
+            selected_matrix=selected_matrix,
+        )
         adjusted_score = base_score * (1.0 - config.diversity_weight * diversity_penalty)
 
         # Accept if score is still reasonable
         if adjusted_score > 0.1 or (config.preserve_structure and segment.is_header):
-            selected_indices.add(seg_idx)
-            current_size += seg_size
+            _accept(seg_idx, seg_size)
 
     if not selected_indices:
         selected_indices = {0, len(segments) - 1}

@@ -20,8 +20,6 @@ from ..types import (
     GlobResult,
     SearchMatch,
     SearchResult,
-    SimilarFile,
-    SimilarFilesResult,
 )
 from ..utils import aread_bytes, astat
 from ._helpers import _is_binary_content, _suppress_large_diff
@@ -32,7 +30,6 @@ logger = logging.getLogger(__name__)
 # DoS limits
 MAX_SEARCH_K = 100
 MAX_SEARCH_QUERY_LEN = 8000
-MAX_SIMILAR_K = 50
 MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
 
@@ -147,9 +144,14 @@ async def semantic_search(
     # Normalize scores to 0–1 range (best result = 1.0) so LLMs can
     # judge relevance without knowing RRF score internals.
     max_score = filtered[0][2] if filtered else 1.0
+
+    filtered_paths = [path for path, _, _ in filtered]
+    entries = await asyncio.gather(*(cache.get(p) for p in filtered_paths))
+    entry_map = dict(zip(filtered_paths, entries, strict=False))
+
     matches: list[SearchMatch] = []
     for path, preview, score in filtered:
-        entry = await cache.get(path)
+        entry = entry_map[path]
         tokens = entry.tokens if entry else 0
         normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
@@ -254,86 +256,6 @@ async def compare_files(
         tokens_saved=tokens_saved,
         similarity=round(similarity, 4),
         from_cache=(from_cache1, from_cache2),
-    )
-
-
-async def find_similar_files(
-    cache: SemanticCache,
-    path: str,
-    k: int = 5,
-) -> SimilarFilesResult:
-    """Find files semantically similar to the given file using HNSW search."""
-    k = max(1, min(k, MAX_SIMILAR_K))
-    file_path = Path(path).expanduser().resolve()
-
-    if not file_path.is_file():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    cached = await cache.get(str(file_path))
-    source_tokens = 0
-    source_embedding: EmbeddingVector | None
-
-    if cached is not None:
-        file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        if cached.mtime >= file_mtime:
-            source_tokens = cached.tokens
-            if cached.embedding is not None:
-                source_embedding = cached.embedding
-            else:
-                cached_content = await cache.get_content(cached)
-                source_embedding = await cache.get_embedding(cached_content, str(file_path))
-        else:
-            content = await _read_text_file(cache, file_path, path)
-            if hash_content(content) == cached.content_hash:
-                await cache.update_mtime(str(file_path), file_mtime)
-                source_tokens = cached.tokens
-                source_embedding = cached.embedding or await cache.get_embedding(
-                    content, str(file_path)
-                )
-            else:
-                source_tokens = count_tokens(content)
-                source_embedding = await cache.get_embedding(content, str(file_path))
-    else:
-        content = await _read_text_file(cache, file_path, path)
-        source_tokens = count_tokens(content)
-        source_embedding = await cache.get_embedding(content, str(file_path))
-
-    if source_embedding is None:
-        return SimilarFilesResult(
-            source_path=str(file_path),
-            source_tokens=source_tokens,
-            similar_files=[],
-            files_searched=0,
-        )
-
-    # Use VectorStorage HNSW search
-    storage = cache._storage
-    results = await storage.find_similar_multi(
-        embedding=source_embedding,
-        exclude_path=str(file_path),
-        k=k,
-    )
-
-    similar_files: list[SimilarFile] = []
-    for sim_path, sim_score in results:
-        entry = await cache.get(sim_path)
-        tokens = entry.tokens if entry else 0
-        similar_files.append(
-            SimilarFile(
-                path=sim_path,
-                similarity=round(sim_score, 4),
-                tokens=tokens,
-            )
-        )
-
-    stats = await storage.get_stats()
-    total = stats.get("files_cached", 0)
-
-    return SimilarFilesResult(
-        source_path=str(file_path),
-        source_tokens=source_tokens,
-        similar_files=similar_files,
-        files_searched=int(total),
     )
 
 

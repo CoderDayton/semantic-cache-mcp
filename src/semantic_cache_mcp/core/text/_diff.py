@@ -224,12 +224,13 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
 
 def diff_stats(old: str, new: str) -> dict:
     delta = compute_delta(old, new)
+    original_size = len(old.encode()) if old else 0
 
     return {
         "insertions": len(delta.insertions),
         "deletions": len(delta.deletions),
         "modifications": len(delta.modifications),
         "delta_size_bytes": delta.size_bytes,
-        "original_size": len(old.encode()),
-        "compression_ratio": delta.size_bytes / len(old.encode()) if old else 0,
+        "original_size": original_size,
+        "compression_ratio": delta.size_bytes / original_size if original_size else 0,
     }

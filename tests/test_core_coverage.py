@@ -269,6 +269,22 @@ class TestHashBytesDirectFallback:
         finally:
             hashing.DEFAULT_CONFIG.USE_BLAKE3 = original
 
+    def test_hash_bytes_honors_digest_size(self) -> None:
+        """_hash_bytes must produce a digest of the requested size on every
+        backend — the BLAKE3 path previously ignored digest_size.
+        """
+        from semantic_cache_mcp.core.hashing import _hash_bytes
+
+        assert len(_hash_bytes(b"sized digest", digest_size=16)) == 16
+        assert len(_hash_bytes(b"sized digest", digest_size=32)) == 32
+        assert len(_hash_bytes(b"sized digest", digest_size=64)) == 64
+
+    def test_hash_hex_honors_digest_size(self) -> None:
+        """_hash_hex returns two hex chars per requested digest byte."""
+        from semantic_cache_mcp.core.hashing import _hash_hex
+
+        assert len(_hash_hex(b"abc", digest_size=16)) == 32
+
 
 class TestCollisionTracker:
     def test_no_collision_same_data(self) -> None:

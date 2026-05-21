@@ -16,7 +16,6 @@ from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.cache.read import batch_smart_read
 from semantic_cache_mcp.cache.search import (
     compare_files,
-    find_similar_files,
     glob_with_cache_status,
     semantic_search,
 )
@@ -472,10 +471,12 @@ class TestReadEdgeCases:
     """Edge case handling for read."""
 
     async def test_binary_file_rejected(self, cache: SemanticCache, tmp_path: Path) -> None:
+        """Binary files return a structured is_binary marker (no longer raises)."""
         binary = tmp_path / "data.bin"
         binary.write_bytes(b"\x00\x01\x02\xff\xfe\x80")
-        with pytest.raises(ValueError, match="[Bb]inary"):
-            await smart_read(cache, str(binary))
+        result = await smart_read(cache, str(binary))
+        assert result.is_binary is True
+        assert result.content == ""
 
     async def test_empty_file(self, cache: SemanticCache, tmp_path: Path) -> None:
         empty = tmp_path / "empty.txt"
@@ -892,24 +893,6 @@ class TestGrepTool:
         results = await cache._storage.grep("def ", max_matches=5)
         total = sum(len(r["matches"]) for r in results)
         assert total <= 5
-
-
-# ---------------------------------------------------------------------------
-# Phase 8: Similar Files Tests
-# ---------------------------------------------------------------------------
-
-
-class TestSimilarFiles:
-    """Similar file search."""
-
-    async def test_similar_no_results_single_file(
-        self, cache: SemanticCache, small_py: Path
-    ) -> None:
-        """Only file in cache should return empty similar list."""
-        await smart_read(cache, str(small_py))
-        result = await find_similar_files(cache, str(small_py), k=3)
-        # The source file is excluded, so no similar files
-        assert len(result.similar_files) == 0
 
 
 # ---------------------------------------------------------------------------

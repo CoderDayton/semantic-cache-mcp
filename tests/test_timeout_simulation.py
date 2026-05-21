@@ -76,6 +76,7 @@ async def _fast_result(*args: Any, **kwargs: Any) -> MagicMock:
     result.content = "hello"
     result.from_cache = False
     result.is_diff = False
+    result.is_binary = False
     result.truncated = False
     result.tokens_saved = 0
     result.tokens_original = 5

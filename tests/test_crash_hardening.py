@@ -40,7 +40,9 @@ class TestResolveEmbeddingDimGuard:
             return_value=TEST_EMBEDDING_DIM,
         ):
             result = storage._resolve_embedding(None)
-        assert isinstance(result, list)
+        # Sequence[float] contract — module-level cache returns a shared list,
+        # so the test no longer requires a specific concrete type.
+        assert hasattr(result, "__len__") and hasattr(result, "__iter__")
         assert len(result) == TEST_EMBEDDING_DIM
         assert all(v == 0.0 for v in result)
 
@@ -52,7 +54,9 @@ class TestResolveEmbeddingDimGuard:
         ):
             vec = array.array("f", [0.1] * TEST_EMBEDDING_DIM)
             result = storage._resolve_embedding(vec)
-        assert isinstance(result, list)
+        # Pass-through contract: returns a Sequence[float] of the same length;
+        # avoids a defensive list() copy on the search/upsert hot path.
+        assert hasattr(result, "__len__") and hasattr(result, "__iter__")
         assert len(result) == TEST_EMBEDDING_DIM
 
 

@@ -22,14 +22,18 @@ from .search import (
     MAX_GLOB_MATCHES,
     MAX_SEARCH_K,
     MAX_SEARCH_QUERY_LEN,
-    MAX_SIMILAR_K,
     compare_files,
-    find_similar_files,
     glob_with_cache_status,
     semantic_search,
 )
 from .store import SemanticCache
-from .write import MAX_BATCH_EDITS, smart_batch_edit, smart_edit, smart_write
+from .write import (
+    MAX_BATCH_EDITS,
+    find_edit_anchors,
+    smart_batch_edit,
+    smart_edit,
+    smart_write,
+)
 
 __all__ = [
     # Store
@@ -44,15 +48,14 @@ __all__ = [
     "smart_write",
     "smart_edit",
     "smart_batch_edit",
+    "find_edit_anchors",
     "MAX_BATCH_EDITS",
     # Search
     "semantic_search",
     "compare_files",
-    "find_similar_files",
     "glob_with_cache_status",
     "MAX_SEARCH_K",
     "MAX_SEARCH_QUERY_LEN",
-    "MAX_SIMILAR_K",
     "MAX_GLOB_MATCHES",
     # Core embeddings re-exported so tests can patch semantic_cache_mcp.cache.embed
     "embed",

@@ -42,6 +42,17 @@ class ReadResponse(ToolResponseModel):
     tokens_original: int | None = None
     tokens_returned: int | None = None
     params: ReadParams | None = None
+    is_binary: bool | None = None
+    size: int | None = None
+    mime: str | None = None
+    content_hash: str | None = None
+    total_lines: int | None = None
+
+
+class ReadImageResponse(ToolResponseModel):
+    path: str | None = None
+    size: int | None = None
+    mime: str | None = None
 
 
 class ClearResponse(ToolResponseModel):
@@ -147,6 +158,20 @@ class EditResponse(ToolResponseModel):
     params: EditParams | None = None
 
 
+class EditPreviewMatch(ToolResponseModel):
+    line: int | None = None
+    snippet: str | None = None
+
+
+class EditPreviewResponse(ToolResponseModel):
+    path: str | None = None
+    found: bool | None = None
+    match_count: int | None = None
+    line_numbers: list[int] | None = None
+    context: list[EditPreviewMatch] | None = None
+    truncated: bool | None = None
+
+
 class BatchEditFailure(ToolResponseModel):
     old: str | None = None
     error: str | None = None
@@ -201,19 +226,6 @@ class SearchResponse(ToolResponseModel):
     show_preview: bool | None = None
 
 
-class DiffResponse(ToolResponseModel):
-    path1: str | None = None
-    path2: str | None = None
-    diff: str | None = None
-    diff_state: str | None = None
-    diff_omitted: bool | None = None
-    similarity: float | None = None
-    diff_stats: dict[str, Any] | None = None
-    tokens_saved: int | None = None
-    from_cache: bool | None = None
-    context_lines: int | None = None
-
-
 class BatchReadSummary(ToolResponseModel):
     files_read: int | None = None
     files_skipped: int | None = None
@@ -243,20 +255,6 @@ class BatchReadResponse(ToolResponseModel):
     summary: BatchReadSummary | None = None
     skipped: list[BatchReadSkipped] | None = None
     files: list[BatchReadFile] | None = None
-
-
-class SimilarFile(ToolResponseModel):
-    path: str | None = None
-    similarity: float | None = None
-    tokens: int | None = None
-
-
-class SimilarResponse(ToolResponseModel):
-    source_path: str | None = None
-    similar_files: list[SimilarFile] | None = None
-    source_tokens: int | None = None
-    files_searched: int | None = None
-    k: int | None = None
 
 
 class GlobMatch(ToolResponseModel):
