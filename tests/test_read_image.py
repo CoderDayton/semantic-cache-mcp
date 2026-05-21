@@ -195,3 +195,25 @@ def test_parse_max_image_bytes_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("SCMCP_MAX_IMAGE_BYTES", "1")
     assert tools_mod._parse_max_image_bytes() == 1024
+
+
+async def test_read_image_rejects_oversized_after_read(
+    mcp_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-read st_size gate races a file that grows between the stat and
+    the read. read_image must re-check the bytes it actually read and reject
+    an oversized image before base64-encoding it into the response.
+    """
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    png = tmp_path / "small.png"
+    png.write_bytes(_TINY_PNG)  # tiny on disk — passes the pre-read st_size gate
+
+    async def _grown_read(_path, _executor):
+        # Simulate the file having grown after the stat: return far more
+        # bytes than the cap even though the on-disk file is tiny.
+        return _TINY_PNG + b"\x00" * 4096
+
+    monkeypatch.setattr(tools_mod, "_MAX_IMAGE_BYTES", 1024)
+    monkeypatch.setattr(tools_mod, "aread_bytes", _grown_read)
+    await _expect_error(mcp_client, {"path": str(png)}, "image too large")

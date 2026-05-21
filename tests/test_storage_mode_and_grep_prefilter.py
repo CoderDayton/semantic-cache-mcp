@@ -11,9 +11,15 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from semantic_cache_mcp.storage.vector import _META_STORAGE_MODE, StorageMode, VectorStorage
+from semantic_cache_mcp.storage.vector import (
+    _META_ACCESS_HISTORY,
+    _META_STORAGE_MODE,
+    StorageMode,
+    VectorStorage,
+)
 
 
 def _make_vs(tmp_path: Path) -> VectorStorage:
@@ -289,5 +295,47 @@ class TestHasCachedPathsUnder:
         try:
             assert await vs.has_cached_paths_under(None) is False
             assert await vs.has_cached_paths_under("anywhere") is False
+        finally:
+            vs.close()
+
+
+class TestRecordAccessCorruptHistory:
+    """record_access is awaited bare on the cache-hit read path — a corrupt
+    persisted access_history value must not crash that read.
+    """
+
+    async def test_record_access_survives_unparseable_history(self, tmp_path: Path) -> None:
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/repo/a.py", "x = 1\n", mtime=1.0)
+            # Corrupt the persisted history out from under record_access.
+            docs = await vs._find_docs_by_path("/repo/a.py")  # noqa: SLF001
+            await vs._collection.update_metadata(  # noqa: SLF001
+                [(doc_id, {_META_ACCESS_HISTORY: "}{ not json"}) for doc_id, _m, _t in docs]
+            )
+            # Must not raise.
+            await vs.record_access("/repo/a.py")
+            # History was repaired to a valid JSON list with the new access.
+            docs_after = await vs._find_docs_by_path("/repo/a.py")  # noqa: SLF001
+            history = json.loads(docs_after[0][1][_META_ACCESS_HISTORY])
+            assert isinstance(history, list)
+            assert len(history) == 1
+        finally:
+            vs.close()
+
+    async def test_record_access_drops_non_numeric_entries(self, tmp_path: Path) -> None:
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/repo/b.py", "y = 2\n", mtime=1.0)
+            docs = await vs._find_docs_by_path("/repo/b.py")  # noqa: SLF001
+            await vs._collection.update_metadata(  # noqa: SLF001
+                [(doc_id, {_META_ACCESS_HISTORY: '[1.0, "bad", 3.0]'}) for doc_id, _m, _t in docs]
+            )
+            await vs.record_access("/repo/b.py")
+            docs_after = await vs._find_docs_by_path("/repo/b.py")  # noqa: SLF001
+            history = json.loads(docs_after[0][1][_META_ACCESS_HISTORY])
+            # 1.0 and 3.0 kept, "bad" dropped, plus the new access timestamp.
+            assert all(isinstance(t, int | float) for t in history)
+            assert len(history) == 3
         finally:
             vs.close()

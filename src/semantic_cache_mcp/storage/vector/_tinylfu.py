@@ -179,7 +179,9 @@ class TinyLFUIndex:
     Concurrency model: methods that mutate the index are sync — under
     cooperative asyncio they run to completion without yielding the loop,
     so dict mutations are safe. The async `ensure_loaded()` uses a lock to
-    serialize concurrent first-time bootstraps.
+    serialize concurrent first-time bootstraps. A `remove()` that lands
+    while a bootstrap is awaiting its loader is recorded and replayed onto
+    the rebuilt index so a concurrently deleted path is not resurrected.
     """
 
     __slots__ = (
@@ -191,6 +193,8 @@ class TinyLFUIndex:
         "_lock",
         "_loaded",
         "_dirty",
+        "_loading",
+        "_pending_removals",
     )
 
     # When sampling LRU candidates for eviction, look at this multiple of
@@ -206,6 +210,8 @@ class TinyLFUIndex:
         self._lock = asyncio.Lock()
         self._loaded = False
         self._dirty = False
+        self._loading = False
+        self._pending_removals: set[str] = set()
 
     @staticmethod
     def _hash(path: str) -> int:
@@ -250,6 +256,13 @@ class TinyLFUIndex:
             # that lands during the await re-arms it, and erasing that signal
             # would leave the index serving stale data with no re-bootstrap.
             self._dirty = False
+            # A remove() that lands during `await load_all()` cannot touch
+            # the half-built index, so it records the path here; replaying
+            # these after the rebuild stops a path deleted mid-bootstrap
+            # from being resurrected by a loader snapshot taken before the
+            # delete committed.
+            self._loading = True
+            self._pending_removals.clear()
             try:
                 self._entries.clear()
                 self._lru.clear()
@@ -270,6 +283,8 @@ class TinyLFUIndex:
                             self._sketch.increment(h)
                     else:
                         entry.doc_ids.append(doc_id)
+                for path in self._pending_removals:
+                    self._entries.pop(path, None)
                 for path, _ in sorted(self._entries.items(), key=lambda kv: kv[1].last_access):
                     self._lru[path] = None
                 self._loaded = True
@@ -280,19 +295,30 @@ class TinyLFUIndex:
                 # of trusting a half-cleared index as clean.
                 self._dirty = True
                 raise
+            finally:
+                self._loading = False
+                self._pending_removals.clear()
             logger.debug(f"TinyLFUIndex bootstrap: {len(self._entries)} paths loaded")
 
     @staticmethod
     def _parse_history(raw: object) -> list[float]:
-        if isinstance(raw, list):
-            return [float(t) for t in raw]
         if isinstance(raw, str):
             try:
-                parsed = json.loads(raw)
+                raw = json.loads(raw)
             except (ValueError, TypeError):
                 return []
-            return [float(t) for t in parsed] if isinstance(parsed, list) else []
-        return []
+        if not isinstance(raw, list):
+            return []
+        # Coerce element-wise: a corrupt access_history row may carry a
+        # non-numeric entry, and a single float() failure must not abort the
+        # whole index bootstrap. Skip bad elements instead of raising.
+        out: list[float] = []
+        for item in raw:
+            try:
+                out.append(float(item))
+            except (ValueError, TypeError):
+                continue
+        return out
 
     def upsert(self, path: str, doc_ids: Iterable[int], ts: float) -> None:
         """Register or replace doc_ids for a path; record an access at `ts`."""
@@ -327,6 +353,12 @@ class TinyLFUIndex:
         self._sketch.increment(self._hash(path))
 
     def remove(self, path: str) -> list[int]:
+        if self._loading:
+            # A bootstrap is awaiting its loader; the half-built index
+            # cannot see this removal. Record it so ensure_loaded() drops
+            # the path from the rebuilt index even when the loader's
+            # snapshot predates the DB delete.
+            self._pending_removals.add(path)
         entry = self._entries.pop(path, None)
         self._lru.pop(path, None)
         if entry is None:

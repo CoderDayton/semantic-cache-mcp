@@ -628,6 +628,20 @@ async def read_image(
     except OSError as e:
         _raise_tool_error("read_image", f"I/O error: {e}", max_response_tokens)
 
+    # Re-check size against the bytes actually read: the pre-read st_size
+    # check races a file that grows — or a swapped symlink target — between
+    # the stat and the read. Reject here so an oversized image never reaches
+    # the base64 step or the response budget.
+    if len(raw) > _MAX_IMAGE_BYTES:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"image too large: {len(raw)} bytes exceeds limit {_MAX_IMAGE_BYTES} "
+                f"(raise via SCMCP_MAX_IMAGE_BYTES)"
+            ),
+            max_response_tokens,
+        )
+
     # Verify by magic bytes, not by extension — a file named `x.png` that
     # holds text must be refused, and a real image with a wrong/missing
     # extension must still be accepted. Supports PNG, JPEG, GIF, TIFF, BMP,
@@ -1292,6 +1306,15 @@ async def edit_preview(
         _raise_tool_error("edit_preview", str(e), max_response_tokens)
     except TimeoutError:
         _raise_tool_error("edit_preview", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except ValueError as e:
+        # smart_read raises ValueError for a non-regular file — a directory,
+        # FIFO, or device. Surface its message as a clean ToolError.
+        _raise_tool_error("edit_preview", str(e), max_response_tokens)
+    except OSError as e:
+        # An unreadable regular file reaches smart_read as an OSError
+        # (PermissionError, ...). Surface a clean ToolError instead of
+        # leaking an internal -32603, matching read/read_image.
+        _raise_tool_error("edit_preview", f"cannot read file: {e}", max_response_tokens)
 
     if result.is_binary:
         _raise_tool_error("edit_preview", f"binary file not supported: {path}", max_response_tokens)

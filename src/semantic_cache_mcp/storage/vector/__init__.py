@@ -795,7 +795,17 @@ class VectorStorage:
         # then fan the same string out to every chunk doc — avoids N×
         # json.loads/dumps round-trips on every cached read.
         first_meta = results[0][1]
-        history = json.loads(first_meta.get(_META_ACCESS_HISTORY, "[]"))
+        # access_history is semi-trusted DB metadata: a corrupt or non-list
+        # value must not crash a cache-hit read (record_access is awaited
+        # bare on that path). Parse defensively and keep only numeric
+        # entries, matching TinyLFUIndex._parse_history.
+        try:
+            parsed = json.loads(first_meta.get(_META_ACCESS_HISTORY, "[]"))
+        except (ValueError, TypeError):
+            parsed = []
+        history: list[float] = (
+            [t for t in parsed if isinstance(t, (int, float))] if isinstance(parsed, list) else []
+        )
         history.append(now)
         history = history[-ACCESS_HISTORY_SIZE:]
         history_json = json.dumps(history)

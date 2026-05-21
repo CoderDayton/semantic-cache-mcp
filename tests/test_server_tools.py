@@ -637,6 +637,16 @@ class TestEditPreviewTool:
         with pytest.raises(ToolError):
             await asyncio.wait_for(task, timeout=5.0)
 
+    async def test_edit_preview_rejects_directory(self, ctx: MagicMock, tmp_path: Path) -> None:
+        """A directory path makes smart_read raise ValueError ("Not a regular
+        file"). edit_preview must convert it to a clean ToolError instead of
+        letting an internal -32603 escape — matching read/read_image.
+        """
+        d = tmp_path / "a_directory"
+        d.mkdir()
+        with pytest.raises(ToolError, match="edit_preview: Not a regular file"):
+            await edit_preview(ctx, str(d), "anchor")
+
 
 # ===========================================================================
 # batch_edit tool

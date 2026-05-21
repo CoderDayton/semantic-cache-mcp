@@ -161,6 +161,28 @@ class TestTinyLFUIndex:
         await idx.ensure_loaded(loader)
         assert calls["n"] == 2, "mark_dirty during bootstrap was lost"
 
+    async def test_remove_during_bootstrap_is_not_resurrected(self) -> None:
+        """A remove() that lands while ensure_loaded() awaits the loader must
+        drop the path from the rebuilt index, even when the loader's snapshot
+        still carries it (the DB delete committed after the snapshot).
+        """
+        idx = TinyLFUIndex(capacity=16, history_size=5)
+
+        async def loader() -> list[tuple[int, str, dict]]:
+            # Simulate a concurrent _delete_by_path: it calls index.remove()
+            # while ensure_loaded() holds the lock and awaits this loader,
+            # then returns a snapshot taken before that delete committed.
+            idx.remove("gone.py")
+            return [
+                (1, "", {"path": "gone.py", "access_history": "[1]"}),
+                (2, "", {"path": "kept.py", "access_history": "[2]"}),
+            ]
+
+        await idx.ensure_loaded(loader)
+        assert idx.doc_ids_for("gone.py") == [], "removed path was resurrected"
+        assert idx.doc_ids_for("kept.py") == [2]
+        assert idx.total_paths() == 1
+
     async def test_loader_exception_during_reload_keeps_dirty(self) -> None:
         """If the loader raises while reloading an already-loaded index, the
         dirty flag must stay set so the next ensure_loaded() retries — a
@@ -183,6 +205,38 @@ class TestTinyLFUIndex:
         await idx.ensure_loaded(loader)
         assert calls["n"] == 3, "index did not retry after a failed reload"
         assert idx.loaded is True
+
+    def test_parse_history_skips_non_numeric_elements(self) -> None:
+        """A corrupt access_history element must be skipped, not raised on —
+        one bad value cannot be allowed to abort the whole index bootstrap.
+        """
+        parse = TinyLFUIndex._parse_history  # noqa: SLF001
+        # JSON-string form with non-numeric entries mixed in.
+        assert parse('[1.0, "oops", 3.0, null]') == [1.0, 3.0]
+        # Direct-list form (metadata already deserialized upstream).
+        assert parse([1, "x", 2, None]) == [1.0, 2.0]
+        # Wholly invalid inputs degrade to an empty history.
+        assert parse("not json") == []
+        assert parse('{"not": "a list"}') == []
+        assert parse(None) == []
+
+    async def test_bootstrap_survives_corrupt_access_history(self) -> None:
+        """ensure_loaded() must not crash when a row's access_history holds a
+        malformed value — the path still loads, with an empty history.
+        """
+        idx = TinyLFUIndex(capacity=16, history_size=5)
+
+        async def loader() -> list[tuple[int, str, dict]]:
+            return [
+                (1, "", {"path": "good.py", "access_history": "[1.0, 2.0]"}),
+                (2, "", {"path": "bad.py", "access_history": '[1.0, "corrupt"]'}),
+                (3, "", {"path": "junk.py", "access_history": "not-json"}),
+            ]
+
+        await idx.ensure_loaded(loader)
+        assert idx.loaded is True
+        assert idx.total_paths() == 3
+        assert idx.doc_ids_for("bad.py") == [2]
 
 
 class TestVectorStorageEvictionUsesIndex:
