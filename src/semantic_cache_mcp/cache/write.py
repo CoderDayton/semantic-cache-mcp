@@ -210,8 +210,11 @@ async def smart_write(
         # Update cache with final content.
         # Skip re-embedding for small edits (< 20% changed) — the old
         # embedding is similar enough for retrieval, saving ~23ms ONNX call.
-        if mtime is None:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        # Re-stat after the write (and any formatter pass): awrite_atomic
+        # bumps the file mtime, so the value captured for the freshness
+        # check is now stale. Persisting it would make the next read treat
+        # the cache as stale and needlessly re-hash from disk.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(
             cache,
             file_path,
@@ -564,8 +567,10 @@ async def smart_edit(
         # Skip re-embedding for small edits — reuse cached embedding.
         if timer is not None:
             timer.enter("cache_refresh")
-        if mtime is None:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        # Re-stat after the write (and any formatter pass): the pre-write
+        # mtime captured for the freshness check is stale once awrite_atomic
+        # bumps it, and persisting it would make the next read miss cache.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)
         await cache.refresh_path(
             str(file_path),
@@ -815,8 +820,10 @@ async def smart_batch_edit(
 
         # Update cache with final content.
         # Skip re-embedding for small edits — reuse cached embedding.
-        if mtime is None:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
+        # Re-stat after the write (and any formatter pass): the pre-write
+        # mtime captured for the freshness check is stale once awrite_atomic
+        # bumps it, and persisting it would make the next read miss cache.
+        mtime = (await astat(file_path, cache._io_executor)).st_mtime
         embedding = await _maybe_reuse_cached_embedding(cache, file_path, stats)
         await cache.refresh_path(
             str(file_path),

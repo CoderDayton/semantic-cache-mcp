@@ -105,6 +105,18 @@ adds the `edit_preview` probe.
 - **Defensive `access_history` parsing** — A corrupt or non-list
   `access_history` value in DB metadata no longer crashes a cache-hit
   read; non-numeric entries are dropped, matching `TinyLFUIndex`.
+- **Stale mtime persisted after writes** — `write`, `edit`, and
+  `batch_edit` refreshed the cache with the pre-write mtime captured for
+  the freshness check, so the next read saw cache-mtime < disk-mtime and
+  needlessly re-read and re-hashed the file. The cache now stores the
+  post-write mtime.
+- **First read could deliver a bare marker** — On the first read of a
+  session, a file already warm in the cache returned the
+  `// File unchanged` marker instead of real content, and truncated reads
+  were marked fully "seen" — so a follow-up read collapsed to
+  `unchanged:true` for a file the model never received in full. The first
+  read now re-fetches real content, and a file is marked seen only when
+  the complete file was sent.
 
 ## [0.4.6] - 2026-05-06
 

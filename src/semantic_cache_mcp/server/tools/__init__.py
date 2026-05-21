@@ -485,12 +485,35 @@ async def read(
                         0 if cached_text.endswith("\n") else 1
                     )
         else:
-            payload["content"] = result.content
-            # Only mark as "seen" when the model actually received the full
-            # bytes. Diff payloads carry only the delta — marking would later
-            # cause an unchanged:true response for a file the model has never
-            # seen in full.
-            if not result.is_diff:
+            # `result.content` is real bytes only for new/changed/small-cached
+            # files. For a file already warm in the cache, smart_read returns
+            # the "// File unchanged" marker (tokens_returned < tokens_original);
+            # the first read of a session must still deliver actual content, so
+            # re-fetch it from the cache.
+            content_text = result.content
+            delivered_full = (
+                not result.is_diff
+                and not result.truncated
+                and result.tokens_returned >= result.tokens_original > 0
+            )
+            if (
+                not delivered_full
+                and not result.is_diff
+                and not result.truncated
+                and result.from_cache
+            ):
+                entry = await cache.get(abs_path)
+                if entry is not None:
+                    fetched = await cache.get_content(entry)
+                    if fetched:
+                        content_text = fetched
+                        delivered_full = True
+            payload["content"] = content_text
+            # Mark as "seen" only when the model received the complete file.
+            # A diff carries only the delta and a truncated read only a
+            # non-contiguous summary — marking either would later answer
+            # unchanged:true for a file the model never saw in full.
+            if delivered_full:
                 _read_session_tracker.mark(session_id, abs_path)
         if mode in _MODE_NORMAL:
             if result.is_diff:

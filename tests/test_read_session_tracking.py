@@ -153,3 +153,67 @@ async def test_edit_invalidates_session_entry(
     assert "content" in d3
     assert "unchanged" not in d3
     assert "return 2" in d3["content"]
+
+
+# ---------------------------------------------------------------------------
+# regression: the first-read branch must deliver real content, never the
+# "// File unchanged" marker or a truncated summary marked as fully seen
+# ---------------------------------------------------------------------------
+
+
+async def test_first_session_read_of_warm_cache_returns_content(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    """A file already warm in the cache must be delivered in full on the
+    first read of a new session — not the '// File unchanged' marker."""
+    f = tmp_path / "warm.py"
+    f.write_text("\n".join(f"value_{i} = {i}" for i in range(60)) + "\n")
+
+    # Session A populates the cache.
+    await read(ctx, str(f))
+
+    # Session B reads it for the first time.
+    ctx_b = MagicMock(spec=Context)
+    ctx_b.lifespan_context = {"cache": tmp_cache}
+    ctx_b.session_id = "other_session"
+    ctx_b.client_id = "other_client"
+    d = _parse(await read(ctx_b, str(f)))
+
+    assert d.get("unchanged") is not True
+    assert "content" in d
+    assert "value_0 = 0" in d["content"]
+    assert not d["content"].startswith("// File unchanged")
+
+
+async def test_edit_then_read_largish_file_returns_full_content(
+    ctx: MagicMock, tmp_path: Path
+) -> None:
+    """After editing a file big enough to hit the cache fast path, the next
+    read must return the full post-edit content, not the marker."""
+    f = tmp_path / "edited.py"
+    f.write_text("\n".join(f"item_{i} = {i}" for i in range(60)) + "\n")
+
+    await read(ctx, str(f))
+    await edit(ctx, str(f), "item_0 = 0", "item_0 = 999")
+
+    d = _parse(await read(ctx, str(f)))
+    assert d.get("unchanged") is not True
+    assert "content" in d
+    assert "item_0 = 999" in d["content"]
+    assert not d["content"].startswith("// File unchanged")
+
+
+async def test_truncated_read_does_not_block_reread(ctx: MagicMock, tmp_path: Path) -> None:
+    """A truncated read must not mark the file as fully seen — a follow-up
+    read must still deliver content, never a bare unchanged:true."""
+    big = tmp_path / "big.py"
+    body = "\n".join(f"row_{i} = {i}" for i in range(150)) + "\n"
+    big.write_text(body)
+
+    d1 = _parse(await read(ctx, str(big), max_size=200))
+    assert "content" in d1
+    assert len(d1["content"]) < len(body)  # summarized, not the whole file
+
+    d2 = _parse(await read(ctx, str(big), max_size=200))
+    assert d2.get("unchanged") is not True
+    assert "content" in d2

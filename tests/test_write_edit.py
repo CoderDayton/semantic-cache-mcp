@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -1048,3 +1049,60 @@ class TestBestEffortCacheRefresh:
 
         assert result.succeeded == 1
         assert file_path.read_text() == "a\nbeta\nc\n"
+
+
+class TestPostWriteMtimeRefresh:
+    """Regression: write/edit paths must cache the post-write mtime so the
+    next read is a cache hit instead of a needless disk re-hash."""
+
+    async def test_write_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "w.py"
+        f.write_text("a = 1\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_write(semantic_cache_no_embeddings, str(f), "a = 2\n")
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old
+
+    async def test_edit_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "e.py"
+        f.write_text("a = 1\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_edit(semantic_cache_no_embeddings, str(f), "a = 1", "a = 2")
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old
+
+    async def test_batch_edit_refreshes_cache_with_post_write_mtime(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "b.py"
+        f.write_text("a = 1\nb = 2\n")
+        old = f.stat().st_mtime - 100
+        os.utime(f, (old, old))
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(f),
+            [("a = 1", "a = 9"), ("b = 2", "b = 8")],
+        )
+
+        entry = await semantic_cache_no_embeddings.get(str(f.resolve()))
+        assert entry is not None
+        assert entry.mtime == f.stat().st_mtime
+        assert entry.mtime > old
