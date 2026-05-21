@@ -22,9 +22,7 @@ from .search import (
     MAX_GLOB_MATCHES,
     MAX_SEARCH_K,
     MAX_SEARCH_QUERY_LEN,
-    MAX_SIMILAR_K,
     compare_files,
-    find_similar_files,
     glob_with_cache_status,
     semantic_search,
 )
@@ -55,11 +53,9 @@ __all__ = [
     # Search
     "semantic_search",
     "compare_files",
-    "find_similar_files",
     "glob_with_cache_status",
     "MAX_SEARCH_K",
     "MAX_SEARCH_QUERY_LEN",
-    "MAX_SIMILAR_K",
     "MAX_GLOB_MATCHES",
     # Core embeddings re-exported so tests can patch semantic_cache_mcp.cache.embed
     "embed",

@@ -33,7 +33,6 @@ from semantic_cache_mcp.server.tools import (
     grep,
     read,
     search,
-    similar,
     stats,
     write,
 )
@@ -988,58 +987,6 @@ class TestBatchReadTool:
 
 
 # ===========================================================================
-# similar tool
-# ===========================================================================
-
-
-class TestSimilarTool:
-    async def test_similar_empty_cache_returns_empty(self, ctx: MagicMock, py_file: Path) -> None:
-        d = _parse(await similar(ctx, str(py_file)))
-        assert isinstance(d.get("similar_files"), list)
-
-    async def test_similar_with_cached_files(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        files = []
-        for i in range(3):
-            f = tmp_path / f"m{i}.py"
-            f.write_text(f"def func{i}(): pass\n")
-            await smart_read(tmp_cache, str(f))
-            files.append(f)
-        d = _parse(await similar(ctx, str(files[0])))
-        assert "similar_files" in d
-
-    async def test_similar_file_not_found(self, ctx: MagicMock) -> None:
-        with pytest.raises(ToolError, match="similar: "):
-            await similar(ctx, "/nonexistent.py")
-
-    async def test_similar_normal_mode(self, ctx: MagicMock, py_file: Path) -> None:
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
-            d = _parse(await similar(ctx, str(py_file)))
-        assert "source_tokens" in d
-        assert "files_searched" in d
-
-    async def test_similar_debug_mode_includes_k(self, ctx: MagicMock, py_file: Path) -> None:
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            d = _parse(await similar(ctx, str(py_file), k=3))
-        assert d.get("k") == 3
-
-    async def test_similar_compact_mode_omits_tokens(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        a = tmp_path / "a.py"
-        b = tmp_path / "b.py"
-        a.write_text("def a(): pass\n")
-        b.write_text("def b(): pass\n")
-        await smart_read(tmp_cache, str(a))
-        await smart_read(tmp_cache, str(b))
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="compact"):
-            d = _parse(await similar(ctx, str(a)))
-        for sf in d.get("similar_files", []):
-            assert "tokens" not in sf
-
-
-# ===========================================================================
 # glob tool
 # ===========================================================================
 
@@ -1320,7 +1267,7 @@ class TestRelativePathSupport:
 
         assert d["summary"]["files_read"] == 2
 
-    async def test_search_and_similar_accept_relative_paths(
+    async def test_search_accepts_relative_paths(
         self,
         ctx: MagicMock,
         tmp_path: Path,
@@ -1337,11 +1284,9 @@ class TestRelativePathSupport:
         await smart_read(tmp_cache, "pkg/b.py")
 
         search_result = _parse(await search(ctx, "alpha", directory="pkg"))
-        similar_result = _parse(await similar(ctx, "pkg/a.py"))
 
         assert search_result["matches"]
         assert all(str(subdir.resolve()) in match["path"] for match in search_result["matches"])
-        assert "similar_files" in similar_result
 
     async def test_glob_accepts_relative_directory(
         self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

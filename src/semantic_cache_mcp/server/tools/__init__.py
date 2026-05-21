@@ -23,7 +23,6 @@ from ...cache import (
     batch_smart_read,
     compare_files,
     find_edit_anchors,
-    find_similar_files,
     glob_with_cache_status,
     semantic_search,
     smart_batch_edit,
@@ -52,7 +51,6 @@ from .._tool_models import (
     ReadImageResponse,
     ReadResponse,
     SearchResponse,
-    SimilarResponse,
     StatsResponse,
     WriteResponse,
     output_schema,
@@ -1541,10 +1539,16 @@ async def search(
     directory: str | None = None,
     show_preview: bool = False,
 ) -> dict[str, Any]:
-    """Cache-only semantic search by meaning.
+    """Find code by meaning when you don't know the exact name to grep for.
 
-    Use `grep` for exact strings, `glob` to discover files. Empty results
-    usually mean files weren't seeded via `read`/`batch_read`.
+    Use this first for concept-level questions — "where is rate limiting
+    handled", "what validates the config", "code that retries failed
+    requests" — where you have intent but not a literal string or symbol.
+    Once you know the exact token, `grep` is the faster, exact follow-up.
+
+    Ranks cached files by semantic similarity to the query. Operates on
+    files already seeded via `read`/`batch_read`; if results look thin,
+    seed more of the repo with `batch_read` and retry.
 
     Args:
         query: Natural-language query, keywords, or a mixture of both.
@@ -1813,71 +1817,6 @@ async def batch_read(
     except Exception as e:
         logger.exception("Error in batch_read")
         _raise_tool_error("batch_read", str(e), max_response_tokens)
-
-
-@mcp.tool(output_schema=output_schema(SimilarResponse))
-@_serialized
-async def similar(
-    ctx: Context,
-    path: str,
-    k: int = 5,
-) -> dict[str, Any]:
-    """Find cached files semantically similar to one source file.
-
-    Neighbors must already be cached (seed with `batch_read` first).
-
-    Args:
-        path: Source file path.
-        k: Maximum number of similar files to return.
-    """
-    state = await _tool_call_state(ctx)
-    path = state.resolve(path)
-    cache = state.cache
-    mode = state.mode
-    max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "similar",
-        {"path": path, "k": k},
-        timeout=_TOOL_TIMEOUT,
-    )
-    if remote_result is not None:
-        return remote_result
-
-    try:
-        result = await asyncio.wait_for(find_similar_files(cache, path, k=k), timeout=_TOOL_TIMEOUT)
-        cache.metrics.record("similar", result)
-
-        similar_payload = [
-            {"path": f.path, "similarity": round(f.similarity, 4)}
-            if mode == "compact"
-            else {"path": f.path, "similarity": round(f.similarity, 4), "tokens": f.tokens}
-            for f in result.similar_files
-        ]
-        payload: dict[str, Any] = {
-            "ok": True,
-            "tool": "similar",
-            "source_path": result.source_path,
-            "similar_files": similar_payload,
-        }
-        if mode in _MODE_NORMAL:
-            payload["source_tokens"] = result.source_tokens
-            payload["files_searched"] = result.files_searched
-        if mode == _MODE_DEBUG:
-            payload["k"] = k
-
-        return _finalize_payload(payload, max_response_tokens)
-
-    except FileNotFoundError as e:
-        _raise_tool_error("similar", str(e), max_response_tokens)
-    except TimeoutError:
-        _handle_timeout(cache, "similar", path)
-        _raise_tool_error("similar", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.exception("Error in similar")
-        _raise_tool_error("similar", str(e), max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(GlobResponse))

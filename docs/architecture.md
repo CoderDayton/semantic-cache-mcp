@@ -11,7 +11,7 @@ src/semantic_cache_mcp/
 │   ├── store.py            # SemanticCache class: embedding, storage, metrics coordination
 │   ├── read.py             # smart_read, batch_smart_read (batch pre-scan + embed)
 │   ├── write.py            # smart_write, smart_edit, smart_batch_edit
-│   ├── search.py           # semantic_search, find_similar_files, glob_with_cache_status, compare_files
+│   ├── search.py           # semantic_search, glob_with_cache_status, compare_files
 │   ├── metrics.py          # SessionMetrics: per-session and lifetime metric tracking
 │   └── _helpers.py         # Internal utilities: _suppress_large_diff, formatter dispatch
 ├── server/                 # MCP interface — thin translation layer only

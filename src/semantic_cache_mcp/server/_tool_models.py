@@ -270,20 +270,6 @@ class BatchReadResponse(ToolResponseModel):
     files: list[BatchReadFile] | None = None
 
 
-class SimilarFile(ToolResponseModel):
-    path: str | None = None
-    similarity: float | None = None
-    tokens: int | None = None
-
-
-class SimilarResponse(ToolResponseModel):
-    source_path: str | None = None
-    similar_files: list[SimilarFile] | None = None
-    source_tokens: int | None = None
-    files_searched: int | None = None
-    k: int | None = None
-
-
 class GlobMatch(ToolResponseModel):
     path: str | None = None
     cached: bool | None = None

@@ -14,7 +14,6 @@ from semantic_cache_mcp.cache import (
     SemanticCache,
     batch_smart_read,
     compare_files,
-    find_similar_files,
     glob_with_cache_status,
     semantic_search,
     smart_batch_edit,
@@ -209,54 +208,6 @@ class TestBatchSmartRead:
 
         assert result.files_skipped >= 1
         assert result.files_read >= 1
-
-
-class TestFindSimilarFiles:
-    """Tests for find_similar_files function."""
-
-    async def test_similar_empty_cache(self, cache: SemanticCache, sample_files: dict):
-        """Similar files returns empty when cache is empty."""
-        result = await find_similar_files(cache, str(sample_files["py"]))
-        assert result.similar_files == []
-
-    async def test_similar_finds_related_files(self, cache: SemanticCache, sample_files: dict):
-        """Similar files finds related cached files."""
-        mock_emb = _make_embedding()
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_emb):
-            # Cache all files first (with mocked embeddings)
-            for f in sample_files.values():
-                await smart_read(cache, str(f))
-
-            result = await find_similar_files(cache, str(sample_files["py"]), k=3)
-            # files_searched reflects total cached files
-            assert result.files_searched >= 1
-
-    async def test_similar_excludes_source(self, cache: SemanticCache, sample_files: dict):
-        """Similar files excludes the source file."""
-        for f in sample_files.values():
-            await smart_read(cache, str(f))
-
-        source = str(sample_files["py"])
-        result = await find_similar_files(cache, source, k=10)
-
-        for sf in result.similar_files:
-            assert sf.path != source
-
-    async def test_similar_skips_disk_read_for_fresh_cached_source(
-        self, cache: SemanticCache, sample_files: dict
-    ):
-        """Fresh cached source file should reuse cache without re-reading disk."""
-        mock_emb = _make_embedding()
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_emb):
-            await smart_read(cache, str(sample_files["py"]))
-
-        with patch(
-            "semantic_cache_mcp.cache.search.aread_bytes",
-            side_effect=AssertionError("aread_bytes should not be called"),
-        ):
-            result = await find_similar_files(cache, str(sample_files["py"]))
-
-        assert result.source_path == str(sample_files["py"])
 
 
 class TestGlobWithCacheStatus:

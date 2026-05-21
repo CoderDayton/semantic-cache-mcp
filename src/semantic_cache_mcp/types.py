@@ -149,30 +149,6 @@ class BatchReadResult:
 
 
 # -----------------------------------------------------------------------------
-# Similar files tool types
-# -----------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class SimilarFile:
-    """A file similar to the source."""
-
-    path: str
-    similarity: float
-    tokens: int
-
-
-@dataclass(slots=True)
-class SimilarFilesResult:
-    """Result from find_similar_files operation."""
-
-    source_path: str
-    source_tokens: int
-    similar_files: list[SimilarFile]
-    files_searched: int
-
-
-# -----------------------------------------------------------------------------
 # Glob tool types
 # -----------------------------------------------------------------------------
 

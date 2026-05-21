@@ -14,7 +14,7 @@ from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cache_status
 from semantic_cache_mcp.cache._helpers import _format_file
-from semantic_cache_mcp.cache.search import find_similar_files, semantic_search
+from semantic_cache_mcp.cache.search import semantic_search
 from semantic_cache_mcp.cache.write import _atomic_write, smart_edit
 from semantic_cache_mcp.core.similarity._cosine import (
     _select_pruning_dims,
@@ -393,15 +393,6 @@ class TestSearchKValidation:
         ):
             result = await semantic_search(semantic_cache, query="test", k=0)
         assert result.matches is not None
-
-    async def test_similar_k_zero_clamped(
-        self, temp_dir: Path, semantic_cache: SemanticCache
-    ) -> None:
-        """find_similar_files with k=0 doesn't crash."""
-        f = temp_dir / "test.py"
-        f.write_text("x = 1\n")
-        result = await find_similar_files(semantic_cache, str(f), k=0)
-        assert result.similar_files is not None
 
 
 # ---------------------------------------------------------------------------

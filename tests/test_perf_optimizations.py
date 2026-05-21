@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from semantic_cache_mcp.cache import SemanticCache, batch_smart_read, smart_read
-from semantic_cache_mcp.cache.search import compare_files, find_similar_files
+from semantic_cache_mcp.cache.search import compare_files
 from semantic_cache_mcp.types import EmbeddingVector
 from tests.constants import TEST_EMBEDDING_DIM
 
@@ -205,89 +205,6 @@ class TestSmartReadNoDuplicateFetch:
         assert result.content == "alpha\nbeta\ngamma\n"
 
 
-# ---------------------------------------------------------------------------
-# Fix 3: find_similar_files reuses cached embedding
-# ---------------------------------------------------------------------------
-
-
-class TestFindSimilarEmbeddingReuse:
-    """find_similar_files should reuse cached.embedding, not call ONNX."""
-
-    async def test_cached_file_skips_onnx(self, tmp_path: Path) -> None:
-        """When file is cached with embedding, embed() should not be called."""
-        emb = _fake_embedding()
-        cache = _make_cache(tmp_path)
-        f = tmp_path / "similar.txt"
-        f.write_text("some content\n")
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
-            # Prime the cache with an embedding
-            await smart_read(cache, str(f))
-
-        # Now call find_similar — should reuse the cached embedding, not call embed()
-        with patch("semantic_cache_mcp.cache.embed", return_value=emb) as mock_embed:
-            result = await find_similar_files(cache, str(f))
-
-        # embed() should NOT be called — cached.embedding was reused
-        mock_embed.assert_not_called()
-        assert result.source_path == str(f)
-
-    async def test_uncached_file_does_call_onnx(self, tmp_path: Path) -> None:
-        """New file without cached embedding must call get_embedding."""
-        emb = _fake_embedding()
-        cache = _make_cache(tmp_path)
-        f = tmp_path / "new_file.txt"
-        f.write_text("brand new content\n")
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
-            result = await find_similar_files(cache, str(f))
-
-        # File was uncached, so it went through the else branch with ONNX
-        assert result.source_path == str(f)
-
-    async def test_uncached_file_skips_refresh_path(self, tmp_path: Path) -> None:
-        """Similarity search should not rewrite vecdb just to use a source embedding."""
-        emb = _fake_embedding()
-        cache = _make_cache(tmp_path)
-        source = tmp_path / "source.txt"
-        neighbor = tmp_path / "neighbor.txt"
-        source.write_text("source content\n")
-        neighbor.write_text("neighbor content\n")
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
-            await smart_read(cache, str(neighbor))
-
-        with (
-            patch("semantic_cache_mcp.cache.embed", return_value=emb),
-            patch.object(
-                SemanticCache,
-                "refresh_path",
-                new=AsyncMock(side_effect=AssertionError("refresh_path should not be called")),
-            ),
-        ):
-            result = await find_similar_files(cache, str(source))
-
-        assert result.source_path == str(source)
-
-    async def test_cached_file_skips_disk_read_when_fresh(self, tmp_path: Path) -> None:
-        """Fresh cached source file should not hit disk again."""
-        emb = _fake_embedding()
-        cache = _make_cache(tmp_path)
-        f = tmp_path / "fresh.txt"
-        f.write_text("fresh content\n")
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=emb):
-            await smart_read(cache, str(f))
-
-        with patch(
-            "semantic_cache_mcp.cache.search.aread_bytes",
-            side_effect=AssertionError("aread_bytes should not be called"),
-        ):
-            result = await find_similar_files(cache, str(f))
-
-        assert result.source_path == str(f)
-
-
 class TestCompareFilesNoRefresh:
     """compare_files should avoid vecdb rewrite when direct computation is enough."""
 
@@ -379,15 +296,3 @@ class TestEdgeCases:
         assert r2.from_cache
         assert not r2.is_diff
         assert "unchanged" in r2.content.lower()
-
-    async def test_find_similar_no_embedding_returns_empty(self, tmp_path: Path) -> None:
-        """File without embedding stored should still work (returns empty results)."""
-        cache = _make_cache(tmp_path)
-        f = tmp_path / "no_emb.txt"
-        f.write_text("no embedding\n")
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=None):
-            await smart_read(cache, str(f))
-            result = await find_similar_files(cache, str(f))
-
-        assert result.similar_files == []

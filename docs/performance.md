@@ -84,15 +84,13 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 | Write (200-line file) | 49.1 ms | 50.0 ms |
 | Edit (scoped find/replace) | 3.3 ms | 3.9 ms |
 
-### Search + similarity
+### Search
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
 | Search k=5 (cache **miss**) | 5.6 ms | — | Embed query + hybrid BM25/HNSW |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | < 0.01 ms | In-session result LRU |
 | Search k=10 (cache hit) | < 0.01 ms | < 0.01 ms | |
-| Find similar k=3 | 2.2 ms | 2.4 ms | Cached embedding reused |
-| Find similar k=10 | 3.7 ms | 3.9 ms | Embedding dominates; k is cheap |
 
 The in-session search cache delivers a **2,000×+ speedup** on repeated queries (warm 0.013 ms vs. cold 26.5 ms over 5 queries).
 

@@ -37,7 +37,7 @@ Size limits prevent memory exhaustion from oversized inputs:
 
 All limits are enforced **before** any I/O operation — fail-fast.
 
-**Search and similar** — Results are capped at 100 and 50 respectively; glob is capped at 1,000 matches with a 5-second timeout.
+**Search** — Results are capped at 100; glob is capped at 1,000 matches with a 5-second timeout.
 
 ### SQL Injection
 
