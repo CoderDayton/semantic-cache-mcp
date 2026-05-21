@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.7] - 2026-05-20
+## [0.4.7] - 2026-05-21
 
 DX & feedback-loop hardening based on a 24h behavioral audit of production
 traffic. Closes the most common wasted-call shapes (silent grep empties,
@@ -66,6 +66,37 @@ adds the `edit_preview` probe.
   file. `batch_edit` description drops the "for one change, prefer edit"
   softener that contradicted the audit signal (270 single edits vs 35
   batch in production).
+- **`search` description rewritten** — Repositions semantic search as the
+  first move for concept-level queries ("where is rate limiting handled")
+  rather than a grep alternative, after an audit found the tool was never
+  called. Drops the failure-first "empty results usually mean..." framing.
+
+### Removed
+
+- **`similar` tool** — Removed end to end: the MCP tool, the
+  `find_similar_files()` function, the `SimilarFilesResult`/`SimilarFile`
+  and `SimilarResponse` types, and `MAX_SIMILAR_K`. The tool went unused
+  in production — agents always reached for `grep` or `search`. The
+  vector index it shared with `search` and `read`'s diff-against-similar
+  path is unaffected.
+
+### Fixed
+
+- **TinyLFU bootstrap race** — A `remove()` landing while
+  `TinyLFUIndex.ensure_loaded()` awaited its loader could not see the
+  half-built index, so a path deleted mid-bootstrap was resurrected by a
+  loader snapshot taken before the delete committed. Such removals are
+  now recorded and replayed onto the rebuilt index.
+- **`read_image` size recheck** — The size limit is re-checked against
+  the bytes actually read, closing a race where a file growing (or a
+  swapped symlink target) between the `stat` and the read could exceed
+  `SCMCP_MAX_IMAGE_BYTES`.
+- **`edit_preview` error mapping** — A non-regular-file or unreadable
+  target now surfaces as a clean `ToolError` instead of leaking an
+  internal `-32603`, matching `read`/`read_image`.
+- **Defensive `access_history` parsing** — A corrupt or non-list
+  `access_history` value in DB metadata no longer crashes a cache-hit
+  read; non-numeric entries are dropped, matching `TinyLFUIndex`.
 
 ## [0.4.6] - 2026-05-06
 
