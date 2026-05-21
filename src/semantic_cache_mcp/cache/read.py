@@ -27,6 +27,9 @@ _MIME_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"\xff\xd8\xff", "image/jpeg"),
     (b"GIF87a", "image/gif"),
     (b"GIF89a", "image/gif"),
+    (b"II*\x00", "image/tiff"),  # little-endian TIFF
+    (b"MM\x00*", "image/tiff"),  # big-endian TIFF
+    (b"BM", "image/bmp"),
     (b"PK\x03\x04", "application/zip"),
     (b"%PDF-", "application/pdf"),
     (b"\x7fELF", "application/x-elf"),
@@ -54,6 +57,23 @@ def _guess_mime(path: Path, raw: bytes) -> str:
     if raw.startswith(b"RIFF") and len(raw) >= 12:
         return _RIFF_FORMS.get(raw[8:12], "application/octet-stream")
     return "application/octet-stream"
+
+
+def _sniff_image_mime(raw: bytes) -> str | None:
+    """Detect an image format from magic bytes alone, ignoring the filename.
+
+    Returns an ``image/*`` mime when `raw` begins with a recognized image
+    signature (PNG, JPEG, GIF, TIFF, BMP, WebP), else ``None``. The
+    extension is deliberately not consulted: `read_image` uses this so a
+    mis-named file — text saved as ``.png``, or a real image with the
+    wrong/no extension — is judged by content, not by its name.
+    """
+    for prefix, mime in _MIME_MAGIC:
+        if mime.startswith("image/") and raw.startswith(prefix):
+            return mime
+    if raw.startswith(b"RIFF") and len(raw) >= 12 and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 logger = logging.getLogger(__name__)

@@ -20,10 +20,12 @@ adds the `edit_preview` probe.
   Response budget ≈ 200 tokens.
 - **`read_image` tool** — Pass-through for image files. Returns an MCP
   image content block (base64 + mime) alongside a JSON metadata sidecar,
-  so vision-capable models see the actual pixels. Bypasses the semantic
-  cache (no embedding/description). Capped at 5 MiB; override via
-  `SCMCP_MAX_IMAGE_BYTES`. Refuses non-image binaries — use `read` for
-  those.
+  so vision-capable models see the actual pixels. Format is verified by
+  magic bytes, not by file extension: PNG, JPEG, GIF, TIFF, BMP, and
+  WebP are accepted regardless of filename, and a mis-named file (text
+  saved as `.png`) is refused. Bypasses the semantic cache (no
+  embedding/description). Capped at 5 MiB; override via
+  `SCMCP_MAX_IMAGE_BYTES`. Use `read` for non-image files.
 - **Per-phase timing in edit timeouts** — `edit` and `batch_edit` now thread
   a `_PhaseTimer` through `smart_edit` (input_validation, binary_check,
   cache_lookup, anchor_search, diff_gen, atomic_write, format_subprocess,

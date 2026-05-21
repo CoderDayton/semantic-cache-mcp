@@ -169,7 +169,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | Tool | Description |
 |------|-------------|
 | `read` | Single-file cache-aware read. Returns full content on first read, unchanged markers on cache hits, diffs on modifications, and supports `offset`/`limit` for targeted recovery. |
-| `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
+| `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP) — not by extension. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
 | `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. For multiple edits to the same file, prefer `batch_edit`. |

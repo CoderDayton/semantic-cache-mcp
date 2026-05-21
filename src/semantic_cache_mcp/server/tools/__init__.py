@@ -32,7 +32,7 @@ from ...cache import (
     smart_write,
 )
 from ...cache._helpers import _PhaseTimer
-from ...cache.read import _guess_mime
+from ...cache.read import _sniff_image_mime
 from ...utils import aread_bytes, astat
 from .._read_session import get_tracker as _get_read_session_tracker
 
@@ -625,11 +625,18 @@ async def read_image(
     except OSError as e:
         _raise_tool_error("read_image", f"I/O error: {e}", max_response_tokens)
 
-    mime = _guess_mime(file_path, raw)
-    if not mime.startswith("image/"):
+    # Verify by magic bytes, not by extension — a file named `x.png` that
+    # holds text must be refused, and a real image with a wrong/missing
+    # extension must still be accepted. Supports PNG, JPEG, GIF, TIFF, BMP,
+    # and WebP.
+    mime = _sniff_image_mime(raw)
+    if mime is None:
         _raise_tool_error(
             "read_image",
-            f"not an image (mime={mime}): {path} — use `read` for non-image binaries",
+            (
+                f"not a recognized image: {path} — content is not PNG/JPEG/GIF/"
+                "TIFF/BMP/WebP; use `read` for non-image files"
+            ),
             max_response_tokens,
         )
 

@@ -17,6 +17,13 @@ _TINY_PNG = bytes.fromhex(
     "0000000d49444154789c620001000005000101dab2880000000049454e44ae426082"
 )
 
+# Magic-byte headers padded to a plausible size. read_image sniffs the
+# leading bytes and never decodes pixels, so a valid header is enough to
+# exercise format detection.
+_BMP_HEADER = b"BM" + b"\x00" * 126
+_TIFF_LE_HEADER = b"II*\x00" + b"\x00" * 124
+_JPEG_HEADER = b"\xff\xd8\xff\xe0" + b"\x00" * 124
+
 
 @pytest.fixture
 async def mcp_client():
@@ -65,7 +72,45 @@ async def test_read_image_rejects_non_image(mcp_client, tmp_path: Path) -> None:
     """Text and arbitrary binaries are refused — `read` owns those."""
     txt = tmp_path / "notes.txt"
     txt.write_text("just some text\n")
-    await _expect_error(mcp_client, {"path": str(txt)}, "not an image")
+    await _expect_error(mcp_client, {"path": str(txt)}, "not a recognized image")
+
+
+async def test_read_image_rejects_text_with_image_extension(mcp_client, tmp_path: Path) -> None:
+    """Extension is not trusted: text saved as `.png` is refused on content."""
+    fake = tmp_path / "fake.png"
+    fake.write_text("this is plain text, not a PNG\n")
+    await _expect_error(mcp_client, {"path": str(fake)}, "not a recognized image")
+
+
+@pytest.mark.parametrize(
+    ("header", "ext", "expected_mime"),
+    [
+        (_BMP_HEADER, ".bmp", "image/bmp"),
+        (_TIFF_LE_HEADER, ".tiff", "image/tiff"),
+        (_JPEG_HEADER, ".jpg", "image/jpeg"),
+    ],
+)
+async def test_read_image_accepts_formats_by_magic(
+    mcp_client, tmp_path: Path, header: bytes, ext: str, expected_mime: str
+) -> None:
+    """BMP/TIFF/JPEG are detected by magic bytes, including BMP/TIFF that
+    the magic table previously had no entry for."""
+    f = tmp_path / f"img{ext}"
+    f.write_bytes(header)
+    result = await mcp_client.call_tool("read_image", {"path": str(f)})
+    image_blocks = [b for b in result.content if getattr(b, "type", None) == "image"]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].mimeType == expected_mime
+
+
+async def test_read_image_accepts_image_with_wrong_extension(mcp_client, tmp_path: Path) -> None:
+    """A real image with a non-image extension is still accepted on content."""
+    f = tmp_path / "screenshot.dat"
+    f.write_bytes(_TINY_PNG)
+    result = await mcp_client.call_tool("read_image", {"path": str(f)})
+    image_blocks = [b for b in result.content if getattr(b, "type", None) == "image"]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].mimeType == "image/png"
 
 
 async def test_read_image_missing_file(mcp_client, tmp_path: Path) -> None:
