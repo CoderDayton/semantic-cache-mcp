@@ -394,9 +394,10 @@ def _ensure_tokenizer() -> BPETokenizer | None:
             import urllib.request
 
             TOKENIZER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            # Download to temp file then rename atomically
+            # Download to temp file then rename atomically. URL is a
+            # compile-time constant and the result is hash-verified below.
             tmp_file = cache_file.with_suffix(".tmp")
-            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310 — compile-time constant URL, hash-verified post-download
+            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310
 
             if not _verify_hash(tmp_file, O200K_BASE_SHA256):
                 tmp_file.unlink(missing_ok=True)

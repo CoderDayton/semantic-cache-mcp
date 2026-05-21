@@ -145,7 +145,8 @@ async def smart_write(
                         old_content = await cache.get_content(cached)
                         from_cache = True
                         logger.debug(f"Content hash match for diff: {path}")
-                except Exception:  # nosec B110 — fall through to disk read
+                # Fall through to the disk read below on any failure.
+                except Exception:  # nosec B110
                     pass
 
         # Fall back to disk read

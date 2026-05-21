@@ -86,3 +86,40 @@ async def test_read_image_oversize_rejected(
     png = tmp_path / "big.png"
     png.write_bytes(_TINY_PNG)  # ~70 bytes — well over the 10-byte cap
     await _expect_error(mcp_client, {"path": str(png)}, "image too large")
+
+
+async def test_read_image_rejects_directory(mcp_client, tmp_path: Path) -> None:
+    """A directory path hits the S_ISREG guard, not a confusing I/O error."""
+    d = tmp_path / "a_dir"
+    d.mkdir()
+    await _expect_error(mcp_client, {"path": str(d)}, "Not a regular file")
+
+
+def test_parse_max_image_bytes_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.delenv("SCMCP_MAX_IMAGE_BYTES", raising=False)
+    assert tools_mod._parse_max_image_bytes() == tools_mod._DEFAULT_MAX_IMAGE_BYTES
+
+
+def test_parse_max_image_bytes_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.setenv("SCMCP_MAX_IMAGE_BYTES", "1048576")
+    assert tools_mod._parse_max_image_bytes() == 1048576
+
+
+def test_parse_max_image_bytes_bad_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-integer override falls back to the default, doesn't crash."""
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.setenv("SCMCP_MAX_IMAGE_BYTES", "not-a-number")
+    assert tools_mod._parse_max_image_bytes() == tools_mod._DEFAULT_MAX_IMAGE_BYTES
+
+
+def test_parse_max_image_bytes_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absurdly small override is clamped up to the 1 KiB floor."""
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.setenv("SCMCP_MAX_IMAGE_BYTES", "1")
+    assert tools_mod._parse_max_image_bytes() == 1024

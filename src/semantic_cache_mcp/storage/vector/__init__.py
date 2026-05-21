@@ -428,12 +428,13 @@ class VectorStorage:
         # Retrieve embedding from catalog so compare_files() can compute similarity.
         # Must run in executor — catalog is not thread-safe.
         embedding: EmbeddingVector | None = None
+        # Best-effort embedding retrieval — a miss just leaves embedding None.
         try:
             emb_map = await self._collection.get_embeddings_by_ids([selected_id])
             raw = emb_map.get(selected_id)
             if raw is not None:
                 embedding = array.array("f", raw)
-        except Exception:  # nosec B110 — best-effort embedding retrieval
+        except Exception:  # nosec B110
             pass
 
         return CacheEntry(

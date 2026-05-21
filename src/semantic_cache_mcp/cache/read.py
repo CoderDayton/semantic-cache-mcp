@@ -436,13 +436,14 @@ async def batch_smart_read(
                 pass
         if _stat is None or not stat_module.S_ISREG(_stat.st_mode):
             continue  # will error in smart_read, skip pre-scan
+        # Pre-scan is best-effort; smart_read handles real errors.
         try:
             _raw = await aread_bytes(_resolved, cache._io_executor)
             if _is_binary_content(_raw):
                 continue  # binary file — smart_read returns is_binary=True; batch skips it below
             _content = _raw.decode("utf-8")
             _to_embed.append((_path, _resolved_str, _content))
-        except Exception:  # nosec B112 — pre-scan best-effort; smart_read handles real errors
+        except Exception:  # nosec B112
             continue
 
     # Batch embed all candidates; fall back to per-file if anything fails
