@@ -150,7 +150,7 @@ async def semantic_search(
 
     filtered_paths = [path for path, _, _ in filtered]
     entries = await asyncio.gather(*(cache.get(p) for p in filtered_paths))
-    entry_map = dict(zip(filtered_paths, entries))
+    entry_map = dict(zip(filtered_paths, entries, strict=False))
 
     matches: list[SearchMatch] = []
     for path, preview, score in filtered:
@@ -322,7 +322,7 @@ async def find_similar_files(
     similar_files: list[SimilarFile] = []
     result_paths = [sim_path for sim_path, _ in results]
     entries = await asyncio.gather(*(cache.get(p) for p in result_paths))
-    entry_map = dict(zip(result_paths, entries))
+    entry_map = dict(zip(result_paths, entries, strict=False))
 
     for sim_path, sim_score in results:
         entry = entry_map[sim_path]

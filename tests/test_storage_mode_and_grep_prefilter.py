@@ -3,11 +3,10 @@
 Covers:
   * `_META_STORAGE_MODE` is set to `chunked` for chunked files,
     `single_doc` for small files, and `single_doc_fallback` is selectable.
-  * `_grep_prefilter_query` extracts useful tokens from literals and regex,
-    quotes them as phrases (so reserved words don't break the FTS5 query),
-    and returns None when no usable tokens exist.
-  * `grep()` produces the same result set whether prefilter is engaged or
-    bypassed (the fallback path).
+  * `_grep_required_tokens` extracts the mandatory literal tokens a pattern
+    needs, and returns None when the pattern cannot be soundly prefiltered.
+  * `grep()` produces the same result set whether the prefilter is engaged
+    or bypassed (the full-scan fallback path).
 """
 
 from __future__ import annotations
@@ -46,70 +45,68 @@ class TestStorageModeTagging:
             vs.close()
 
 
-class TestGrepPrefilterTokenExtraction:
-    def test_literal_tokens_phrase_quoted(self) -> None:
-        # 5-char tokens — pass the gate (≥ 4 chars).
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
+class TestGrepRequiredTokens:
+    def test_literal_tokens_extracted(self) -> None:
+        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
             "hello world", fixed_string=True
         )
-        assert q == '"hello" "world"'
+        assert toks == ["hello", "world"]
 
-    def test_short_reserved_words_skip_prefilter_entirely(self) -> None:
-        """Short FTS5 reserved words (NOT/OR/AND ≤ 3 chars) gate out the prefilter.
-
-        Tokens shorter than _GREP_PREFILTER_MIN_TOKEN_LEN never reach FTS5,
-        so the boolean-operator interpretation risk is moot — full scan handles
-        the query.
-        """
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
-            "NOT OR AND", fixed_string=True
+    def test_short_tokens_only_returns_none(self) -> None:
+        # NOT(3) OR(2) AND(3) — none reach the >= 4 length gate.
+        assert (
+            VectorStorage._grep_required_tokens("NOT OR AND", fixed_string=True)  # noqa: SLF001
+            is None
         )
-        assert q is None
 
-    def test_engaged_tokens_are_phrase_quoted(self) -> None:
-        """When the prefilter engages, every token must be phrase-quoted.
-
-        Phrase quoting protects against any FTS5 reserved word (current or
-        future) that happens to land in a long-enough token, and against
-        chars like ``"`` and ``*`` that are FTS5 syntax.
-        """
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
-            "configure deploy", fixed_string=True
-        )
-        assert q == '"configure" "deploy"'
-
-    def test_regex_with_literal_substring_extracts(self) -> None:
-        # tokens "error" (5) and "code" (4) — both pass the ≥ 4 gate.
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
+    def test_regex_with_literal_run_extracts(self) -> None:
+        # '+' and ':' are safe metacharacters — the literal tokens stay mandatory.
+        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
             r"error: code \d+", fixed_string=False
         )
-        assert q == '"error" "code"'
+        assert toks == ["error", "code"]
 
-    def test_regex_with_only_short_tokens_returns_none(self) -> None:
-        # tokens "abc" (3) and "xyz" (3) — both below ≥ 4 gate.
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
-            r"abc.*xyz", fixed_string=False
+    def test_regex_alternation_returns_none(self) -> None:
+        # '|' makes a token non-mandatory; the prefilter must not engage.
+        assert (
+            VectorStorage._grep_required_tokens(  # noqa: SLF001
+                r"alpha|betagamma", fixed_string=False
+            )
+            is None
         )
-        assert q is None
 
-    def test_authoritative_empty_threshold(self) -> None:
-        # max token length determines whether empty BM25 is trusted.
-        assert VectorStorage._grep_empty_is_authoritative("identifier") is True  # noqa: SLF001
-        assert VectorStorage._grep_empty_is_authoritative("nicel") is False  # noqa: SLF001
-        assert VectorStorage._grep_empty_is_authoritative("[A-Z]+") is False  # noqa: SLF001
+    def test_regex_optional_quantifiers_return_none(self) -> None:
+        # '*', '?' and '{' all allow a token to be absent from a match.
+        for pat in (r"abcd.*wxyz", r"abcde?x", r"abcd{2,3}"):
+            assert (
+                VectorStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
+                is None
+            )
 
-    def test_regex_with_no_literal_runs_returns_none(self) -> None:
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
-            r"[A-Z][a-z]+", fixed_string=False
+    def test_regex_no_literal_runs_returns_none(self) -> None:
+        assert (
+            VectorStorage._grep_required_tokens(  # noqa: SLF001
+                r"[A-Z][a-z]+", fixed_string=False
+            )
+            is None
         )
-        assert q is None
 
-    def test_short_substring_filtered(self) -> None:
-        # All single chars + escapes — nothing of length >= 2.
-        q = VectorStorage._grep_prefilter_query(  # noqa: SLF001
-            r"a.b.c", fixed_string=False
+    def test_unsafe_metachars_are_literal_in_fixed_string(self) -> None:
+        # In fixed-string mode '|' is a literal char — tokens stay mandatory.
+        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
+            "alpha|betagamma", fixed_string=True
         )
-        assert q is None
+        assert toks == ["alpha", "betagamma"]
+
+    def test_regex_character_class_returns_none(self) -> None:
+        # A character class matches one char, but a >= 4-char alphanumeric
+        # run inside it ([abcd], [aeiou], [[:alpha:]]) would be extracted as
+        # a bogus mandatory token — the prefilter must decline these.
+        for pat in (r"x[abcd]y", r"vowel[aeiou]end", r"[[:alpha:]]word"):
+            assert (
+                VectorStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
+                is None
+            ), pat
 
 
 class TestGrepEndToEndUsesPrefilter:
@@ -140,6 +137,19 @@ class TestGrepEndToEndUsesPrefilter:
             await vs.put("/code.py", "Hello\n", mtime=1.0)
             results = await vs.grep(r"[A-Z][a-z]+")
             assert any(r["path"] == "/code.py" for r in results)
+        finally:
+            vs.close()
+
+    async def test_regex_character_class_does_not_miss_match(self, tmp_path: Path) -> None:
+        """A regex character class must not be mistaken for a literal token.
+        'xay' matches r'x[abcd]y'; the prefilter must full-scan rather than
+        treat 'abcd' as mandatory and short-circuit to an empty result.
+        """
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/hit.py", "xay\n", mtime=1.0)
+            results = await vs.grep(r"x[abcd]y")
+            assert [r["path"] for r in results] == ["/hit.py"]
         finally:
             vs.close()
 
@@ -201,6 +211,57 @@ class TestGrepEndToEndUsesPrefilter:
             await vs.put("/repo/tests/a.py", "shared = 2\n", mtime=1.0)
             results = await vs.grep("shared", fixed_string=True, path="src/*.py")
             assert [r["path"] for r in results] == ["/repo/src/a.py"]
+        finally:
+            vs.close()
+
+    async def test_grep_finds_token_inside_camelcase_identifier(self, tmp_path: Path) -> None:
+        """grep('function') must find a file whose only occurrence is inside a
+        camelCase compound identifier. FTS5's unicode61 tokenizer keeps
+        'functionHelper' whole, so a raw BM25 whole-token match would miss it.
+        """
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/camel.py", "const functionHelper = 1\n", mtime=1.0)
+            results = await vs.grep("function", fixed_string=True)
+            assert [r["path"] for r in results] == ["/camel.py"]
+        finally:
+            vs.close()
+
+    async def test_grep_regex_finds_token_inside_camelcase(self, tmp_path: Path) -> None:
+        """A metacharacter-free regex token must also match inside a compound
+        identifier ('register' inside 'registerHandler')."""
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/camel.py", "registerHandler()\n", mtime=1.0)
+            results = await vs.grep(r"register")
+            assert [r["path"] for r in results] == ["/camel.py"]
+        finally:
+            vs.close()
+
+    async def test_grep_regex_alternation_is_sound(self, tmp_path: Path) -> None:
+        """A regex with alternation must not require every branch — the
+        prefilter must fall back to a full scan rather than AND the tokens.
+        """
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/a.py", "alpha only here\n", mtime=1.0)
+            results = await vs.grep(r"alpha|betagamma")
+            assert [r["path"] for r in results] == ["/a.py"]
+        finally:
+            vs.close()
+
+    async def test_sound_candidates_uses_vocab_not_full_scan(self, tmp_path: Path) -> None:
+        """_grep_sound_candidates returns exact paths via the FTS5 vocabulary
+        expansion — a non-None result proves the BM25 prefilter (not the
+        full-scan fallback) resolved the camelCase substring.
+        """
+        vs = _make_vs(tmp_path)
+        try:
+            await vs.put("/camel.py", "const functionHelper = 1\n", mtime=1.0)
+            candidates = await vs._grep_sound_candidates(  # noqa: SLF001
+                "function", fixed_string=True, path_filter=None
+            )
+            assert candidates == ["/camel.py"]
         finally:
             vs.close()
 

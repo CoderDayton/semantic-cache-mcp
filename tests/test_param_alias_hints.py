@@ -119,3 +119,18 @@ async def test_file_alias_to_path(mcp_client, tmp_path: Path) -> None:
     f.write_text("data\n")
     result = await mcp_client.call_tool("read", {"file": str(f)})
     assert "data" in _payload(result)["content"]
+
+
+async def test_explicit_param_wins_over_alias(mcp_client, tmp_path: Path) -> None:
+    """When the caller sends both the real name and an alias for it, the
+    explicitly-provided real parameter wins regardless of argument order.
+    """
+    real = tmp_path / "real.txt"
+    real.write_text("REAL_CONTENT\n")
+    decoy = tmp_path / "decoy.txt"
+    decoy.write_text("DECOY_CONTENT\n")
+    # `path` (real) sent before `abs_path` (alias): the alias must not clobber it.
+    result = await mcp_client.call_tool("read", {"path": str(real), "abs_path": str(decoy)})
+    payload = _payload(result)
+    assert "REAL_CONTENT" in payload["content"]
+    assert "DECOY_CONTENT" not in payload["content"]

@@ -246,29 +246,40 @@ class TinyLFUIndex:
         async with self._lock:
             if self._loaded and not self._dirty:
                 return
-            self._entries.clear()
-            self._lru.clear()
-            self._sketch = _CountMinSketch(self._capacity)
-            for doc_id, _text, meta in await load_all():
-                path = meta.get("path", "")
-                if not path:
-                    continue
-                entry = self._entries.get(path)
-                if entry is None:
-                    raw = meta.get("access_history", "[]")
-                    history = self._parse_history(raw)
-                    last = max(history) if history else 0.0
-                    entry = _Entry(doc_ids=[doc_id], last_access=last, history=history)
-                    self._entries[path] = entry
-                    h = self._hash(path)
-                    for _ in history:
-                        self._sketch.increment(h)
-                else:
-                    entry.doc_ids.append(doc_id)
-            for path, _ in sorted(self._entries.items(), key=lambda kv: kv[1].last_access):
-                self._lru[path] = None
-            self._loaded = True
+            # Clear the dirty flag before awaiting the loader: a mark_dirty()
+            # that lands during the await re-arms it, and erasing that signal
+            # would leave the index serving stale data with no re-bootstrap.
             self._dirty = False
+            try:
+                self._entries.clear()
+                self._lru.clear()
+                self._sketch = _CountMinSketch(self._capacity)
+                for doc_id, _text, meta in await load_all():
+                    path = meta.get("path", "")
+                    if not path:
+                        continue
+                    entry = self._entries.get(path)
+                    if entry is None:
+                        raw = meta.get("access_history", "[]")
+                        history = self._parse_history(raw)
+                        last = max(history) if history else 0.0
+                        entry = _Entry(doc_ids=[doc_id], last_access=last, history=history)
+                        self._entries[path] = entry
+                        h = self._hash(path)
+                        for _ in history:
+                            self._sketch.increment(h)
+                    else:
+                        entry.doc_ids.append(doc_id)
+                for path, _ in sorted(self._entries.items(), key=lambda kv: kv[1].last_access):
+                    self._lru[path] = None
+                self._loaded = True
+            except BaseException:
+                # Bootstrap failed mid-flight (typically a DB error from the
+                # loader, or cancellation). Re-arm the dirty flag the line
+                # above cleared so the next ensure_loaded() retries instead
+                # of trusting a half-cleared index as clean.
+                self._dirty = True
+                raise
             logger.debug(f"TinyLFUIndex bootstrap: {len(self._entries)} paths loaded")
 
     @staticmethod

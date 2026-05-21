@@ -39,6 +39,12 @@ class _ReadSessionTracker:
 
     @staticmethod
     def _normalize_session(session_id: str | None) -> str:
+        """Map a session id to its tracker key.
+
+        Both ``None`` and an empty string fall back to the process
+        sentinel — a client that passes ``""`` shares state with one that
+        passes ``None``, which is the intended stdio-transport behaviour.
+        """
         return session_id if session_id else _PROC_SENTINEL
 
     def seen(self, session_id: str | None, abs_path: str) -> bool:

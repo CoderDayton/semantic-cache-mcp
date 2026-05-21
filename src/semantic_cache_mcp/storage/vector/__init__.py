@@ -8,6 +8,7 @@ import enum
 import fnmatch
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Sequence
@@ -1096,34 +1097,25 @@ class VectorStorage:
                 logger.warning(f"Invalid regex pattern: {e}")
                 return []
 
-        # BM25 prefilter: avoid the full-collection scan when the pattern
-        # has usable literal tokens. Only when no tokens are extractable
-        # (e.g., regex like `[A-Z][a-z]+`) or the BM25 lookup fails do we
-        # fall back to scanning every doc. The need_full_scan flag is
-        # explicit because the prefilter has *three* terminal states
-        # (success / confidently empty / errored), and the dispatcher must
-        # not conflate "BM25 errored" with "BM25 confident no match".
-        keyword_query = self._grep_prefilter_query(pattern, fixed_string=fixed_string)
+        # Sound BM25 prefilter. Each required literal token is expanded to
+        # the FTS5 vocabulary terms that contain it as a substring, then
+        # BM25-matched. The candidate set stays complete even though FTS5's
+        # unicode61 tokenizer keeps compound identifiers whole —
+        # grep("function") still finds a file whose only hit is inside
+        # "functionHelper". A None result means the prefilter cannot be
+        # trusted for this pattern (complex regex, vocabulary unavailable,
+        # or too broad); the caller then does a full scan, always correct.
+        candidates = await self._grep_sound_candidates(
+            pattern, fixed_string=fixed_string, path_filter=path
+        )
         files: dict[str, list[tuple[int, str]]] = {}
-        need_full_scan = True
-        if keyword_query is not None:
-            candidates = await self._grep_candidate_paths(
-                keyword_query, max_files=max_files, path_filter=path
-            )
-            if candidates is not None:
-                if candidates:
-                    # Positive matches: regex post-filter on the targeted set
-                    # is exact, so no full scan is needed.
-                    need_full_scan = False
-                    files = await self._grep_load_files(candidates)
-                elif self._grep_empty_is_authoritative(pattern):
-                    # Pattern's longest token is long enough that BM25's empty
-                    # answer cannot hide a substring inside a larger document
-                    # token; trust it and short-circuit.
-                    return []
-                # Otherwise (empty + not authoritative): full scan certifies.
-            # candidates is None ⇒ BM25 errored; full scan stays armed.
-        if need_full_scan:
+        if candidates is not None:
+            # Vocabulary expansion makes the candidate set exact: empty means
+            # nothing matches, non-empty is complete — no full scan needed.
+            if not candidates:
+                return []
+            files = await self._grep_load_files(candidates)
+        else:
             all_docs = await self._collection.get_documents()
             for _doc_id, text, meta in all_docs:
                 if meta.get(_META_IS_PARENT, False):
@@ -1169,106 +1161,158 @@ class VectorStorage:
 
         return results
 
-    # Two thresholds govern the BM25 prefilter, both tuned to preserve
-    # grep's substring semantics over FTS5's whole-token semantics:
+    # Grep prefilter tuning.
     #
-    #   _GREP_PREFILTER_MIN_TOKEN_LEN = minimum token length to *engage*
-    #     the prefilter at all. Below this, short tokens like "foo" are
-    #     too likely to be substrings of larger document tokens (e.g.,
-    #     "needlefoo") for the FTS5 query to be safely informative.
-    #
-    #   _GREP_PREFILTER_AUTHORITATIVE_LEN = the longest token in the pattern
-    #     must be ≥ this for an *empty* BM25 result to be trusted as a true
-    #     "no match anywhere". For shorter tokens BM25 returning 0 may still
-    #     hide a substring inside a longer token, so we fall back to the
-    #     full scan to certify the empty answer.
-    #
-    # Net behavior:
-    #   * pattern with tokens of length < 4 → never engage prefilter
-    #   * pattern with longest token ≥ 8 and BM25 returns candidates → use them
-    #   * pattern with longest token ≥ 8 and BM25 returns []     → return [] fast
-    #   * pattern with all tokens in [4, 7] and BM25 returns []  → full-scan to
-    #     check for substrings inside longer document tokens
-    _GREP_MIN_TOKEN_LEN = 2
-    _GREP_PREFILTER_MIN_TOKEN_LEN = 4
-    _GREP_PREFILTER_AUTHORITATIVE_LEN = 8
-
-    @staticmethod
-    def _grep_prefilter_query(pattern: str, *, fixed_string: bool) -> str | None:
-        """Build an FTS5 query from a grep pattern, or None if not feasible.
-
-        Extracts contiguous alphanumeric runs (length ≥ ``_GREP_MIN_TOKEN_LEN``)
-        from the raw pattern — works for both literal strings and regex bodies
-        because regex metacharacters are non-alphanumeric and break up the runs.
-        Each token is wrapped as an FTS5 phrase so reserved words (``NOT``,
-        ``OR``, ``AND``) and double-quote chars are not interpreted as syntax.
-
-        Returns ``None`` when:
-          * no alphanumeric run of length ≥ ``_GREP_MIN_TOKEN_LEN`` exists, or
-          * the *shortest* extracted token is below
-            ``_GREP_PREFILTER_MIN_TOKEN_LEN`` — short tokens may legitimately
-            appear as substrings inside longer document tokens that BM25
-            would not return, breaking grep's substring semantics.
-
-        In both cases the caller falls back to the full collection scan.
-        """
-        import re as _re  # noqa: PLC0415
-
-        del fixed_string  # extraction is the same: pull literal alphanumerics
-        tokens = _re.findall(rf"[A-Za-z0-9]{{{VectorStorage._GREP_MIN_TOKEN_LEN},}}", pattern)
-        if not tokens:
-            return None
-        if min(len(t) for t in tokens) < VectorStorage._GREP_PREFILTER_MIN_TOKEN_LEN:
-            return None
-        # Phrase-quote each token; FTS5 implicit AND combines them.
-        return " ".join(f'"{t}"' for t in tokens)
-
-    @staticmethod
-    def _grep_empty_is_authoritative(pattern: str) -> bool:
-        """Whether a 0-result BM25 reply can be trusted as a true 'no match'.
-
-        A long token is implausible as a substring of an even longer
-        alphanumeric run in real-world documents, so BM25 returning empty
-        is reliably "no occurrences anywhere". For shorter tokens we cannot
-        rule out a substring hidden inside a larger document token (e.g.,
-        ``"nicel"`` inside ``"mynicelongword"``) so the caller must full-scan.
-        """
-        import re as _re  # noqa: PLC0415
-
-        tokens = _re.findall(rf"[A-Za-z0-9]{{{VectorStorage._GREP_MIN_TOKEN_LEN},}}", pattern)
-        if not tokens:
-            return False
-        return max(len(t) for t in tokens) >= VectorStorage._GREP_PREFILTER_AUTHORITATIVE_LEN
-
-    # Hard cap on the BM25 over-fetch so an unusually large `max_files`
-    # (clamped at _GREP_MAX_FILES = 500) doesn't translate into a 2k-result
-    # FTS5 query. 4× headroom on max_files is plenty to absorb regex
-    # post-filter false positives.
+    # A literal token must be at least this long to drive the prefilter —
+    # shorter tokens expand to too large a slice of the FTS5 vocabulary to
+    # be selective.
+    _GREP_TOKEN_MIN_LEN = 4
+    # Cap on the vocabulary terms a single token may expand to. Past this
+    # the OR-query is unwieldy and the token is too common to prefilter
+    # usefully, so the caller falls back to a full scan.
+    _GREP_VOCAB_TERM_CAP = 256
+    # Cap on BM25 rows fetched. If the match hits this cap the result may be
+    # truncated and can no longer be trusted as complete — full scan instead.
     _GREP_PREFILTER_FETCH_CAP = 1000
+    # Regex metacharacters that can make an extracted token non-mandatory:
+    # alternation, zero-allowing quantifiers, and character classes — a run
+    # like [abcd] yields the token "abcd" though the class matches only one
+    # character. Their presence in a regex pattern disqualifies the
+    # token-AND prefilter; fixed-string patterns are immune because there
+    # the characters are literal.
+    _GREP_UNSAFE_REGEX_CHARS = frozenset("|?*{[")
 
-    async def _grep_candidate_paths(
+    @staticmethod
+    def _grep_required_tokens(pattern: str, *, fixed_string: bool) -> list[str] | None:
+        """Literal alphanumeric tokens that must appear in every match.
+
+        Returns the tokens of length >= ``_GREP_TOKEN_MIN_LEN``, or ``None``
+        when the pattern cannot be soundly prefiltered: a regex carrying
+        alternation, a zero-allowing quantifier, or a character class
+        (whose extracted tokens are not guaranteed substrings of every
+        match), or a pattern with no token long enough to be selective.
+        ``None`` routes the caller to a full scan, which is always correct.
+        """
+        import re as _re  # noqa: PLC0415
+
+        if not fixed_string and any(c in VectorStorage._GREP_UNSAFE_REGEX_CHARS for c in pattern):
+            return None
+        tokens = [
+            t
+            for t in _re.findall(r"[A-Za-z0-9]+", pattern)
+            if len(t) >= VectorStorage._GREP_TOKEN_MIN_LEN
+        ]
+        return tokens or None
+
+    @staticmethod
+    def _grep_vocab_expand(
+        conn: sqlite3.Connection,
+        tokens: list[str],
+        term_cap: int,
+    ) -> list[list[str]] | None:
+        """Expand each token to the FTS5 vocabulary terms containing it.
+
+        Runs on the IO executor (blocking sqlite calls). Returns one term
+        list per token — an empty inner list means the token is absent from
+        the index entirely. Returns ``None`` when the vocabulary cannot be
+        queried or a token expands past ``term_cap`` (too broad to prefilter
+        soundly). Uses an ``fts5vocab`` table in the connection-local
+        ``temp`` schema, so it never touches the persistent simplevecdb
+        schema.
+        """
+        import re as _re  # noqa: PLC0415
+
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%' LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        fts_table = row[0]
+        # Validate before interpolating — table names cannot be bound params.
+        if not _re.fullmatch(r"[A-Za-z0-9_]+", fts_table):
+            return None
+
+        vocab = "scmcp_grep_vocab"
+        conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
+        # The 'main' schema argument is required: fts5vocab otherwise looks
+        # for the FTS table in the vocab table's own schema (temp), where it
+        # does not exist.
+        conn.execute(
+            f"CREATE VIRTUAL TABLE temp.{vocab} USING fts5vocab('main', '{fts_table}', 'row')"
+        )
+        try:
+            per_token: list[list[str]] = []
+            for token in tokens:
+                rows = conn.execute(
+                    f"SELECT DISTINCT term FROM temp.{vocab} "
+                    f"WHERE term LIKE '%' || ? || '%' LIMIT ?",
+                    (token.lower(), term_cap + 1),
+                ).fetchall()
+                if len(rows) > term_cap:
+                    return None  # token too broad for a bounded MATCH query
+                per_token.append([r[0] for r in rows])
+            return per_token
+        finally:
+            conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
+
+    async def _grep_sound_candidates(
         self,
-        keyword_query: str,
+        pattern: str,
         *,
-        max_files: int,
+        fixed_string: bool,
         path_filter: str | None,
     ) -> list[str] | None:
-        """BM25 lookup returning unique candidate paths for grep.
+        """Exact candidate paths for grep, or ``None`` to force a full scan.
 
-        Returns ``None`` when the keyword search itself errors (signals the
-        caller to fall back to a full scan). Returns a possibly-empty list
-        otherwise; an empty list means BM25 is confident no file contains
-        the tokens and grep can return immediately.
+        Expands each required token to the FTS5 vocabulary terms that
+        contain it as a substring, then runs one BM25 MATCH over those
+        terms. The candidate set is complete: every document whose line
+        contains the token also contains it inside some indexed term, so
+        the OR-of-terms / AND-of-tokens MATCH cannot miss it — this is what
+        the raw whole-token MATCH got wrong for compound identifiers.
+
+        Returns ``None`` on any condition that would break completeness — an
+        unsupported pattern, a vocabulary error, an over-broad token, or a
+        possibly-truncated BM25 result — so the caller falls back to a full
+        scan.
         """
-        fetch_k = min(max_files * 4, self._GREP_PREFILTER_FETCH_CAP)
+        tokens = self._grep_required_tokens(pattern, fixed_string=fixed_string)
+        if tokens is None:
+            return None
+
+        loop = asyncio.get_running_loop()
         try:
-            results = await self._collection.keyword_search(keyword_query, k=fetch_k)
+            per_token_terms = await loop.run_in_executor(
+                self._io_executor,
+                self._grep_vocab_expand,
+                self._sync_collection.conn,
+                tokens,
+                self._GREP_VOCAB_TERM_CAP,
+            )
+        except Exception as exc:
+            logger.debug(f"grep vocab expansion failed: {exc}; falling back to scan")
+            return None
+        if per_token_terms is None:
+            return None
+        if any(not terms for terms in per_token_terms):
+            return []  # a required token appears in no indexed term
+
+        # AND across tokens, OR across each token's vocabulary expansion.
+        match_query = " AND ".join(
+            "(" + " OR ".join(f'"{term}"' for term in terms) + ")" for terms in per_token_terms
+        )
+        try:
+            results = await self._collection.keyword_search(
+                match_query, k=self._GREP_PREFILTER_FETCH_CAP
+            )
         except Exception as exc:
             logger.debug(f"grep BM25 prefilter failed: {exc}; falling back to scan")
             return None
+        if len(results) >= self._GREP_PREFILTER_FETCH_CAP:
+            return None  # possibly truncated — completeness no longer assured
+
         seen: set[str] = set()
         candidates: list[str] = []
-        grep_path_matches = self._grep_path_matches
         for doc, _score in results:
             meta = doc.metadata
             if meta.get(_META_IS_PARENT, False):
@@ -1276,7 +1320,7 @@ class VectorStorage:
             doc_path = meta.get(_META_PATH, "")
             if not doc_path or doc_path in seen:
                 continue
-            if not grep_path_matches(doc_path, path_filter=path_filter):
+            if not self._grep_path_matches(doc_path, path_filter=path_filter):
                 continue
             seen.add(doc_path)
             candidates.append(doc_path)
@@ -1501,13 +1545,18 @@ class VectorStorage:
         # only used by the constructor at instance-creation time).
         cap = config.MAX_CACHE_ENTRIES
 
-        doc_count = await self._collection.count()
-        if doc_count <= cap:
-            return
-
-        # Lazy bootstrap. Captures the executor closure here so the index
-        # module stays decoupled from AsyncVectorCollection's exact API.
+        # Once the index is in memory, total_paths() is the exact path count
+        # — free, no DB round-trip. Only when it has not bootstrapped yet do
+        # we fall back to a cheap doc-count gate: count() counts every chunk,
+        # so it is an upper bound on the path count (>=1 doc per path), and
+        # doc_count <= cap proves we are under the path cap without scanning.
+        # This keeps a heavily-chunked collection from issuing a count()
+        # query on every put once the index is warm.
         if not self._index.loaded:
+            if await self._collection.count() <= cap:
+                return
+            # Lazy bootstrap. Captures the executor closure here so the index
+            # module stays decoupled from AsyncVectorCollection's exact API.
             await self._index.ensure_loaded(self._collection.get_documents)
 
         if self._index.total_paths() <= cap:

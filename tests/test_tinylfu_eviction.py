@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from semantic_cache_mcp.storage.vector import VectorStorage
 from semantic_cache_mcp.storage.vector._tinylfu import (
     TinyLFUIndex,
@@ -141,6 +143,47 @@ class TestTinyLFUIndex:
         await idx.ensure_loaded(loader)
         assert calls["n"] == 2
 
+    async def test_mark_dirty_during_bootstrap_is_not_lost(self) -> None:
+        """A mark_dirty() that lands while ensure_loaded() is awaiting the
+        loader must not be erased — the next ensure_loaded() must re-bootstrap.
+        """
+        idx = TinyLFUIndex(capacity=16, history_size=5)
+        calls = {"n": 0}
+
+        async def loader() -> list[tuple[int, str, dict]]:
+            calls["n"] += 1
+            # Simulate a concurrent mark_dirty() landing mid-bootstrap,
+            # while ensure_loaded() holds the lock and awaits this loader.
+            idx.mark_dirty()
+            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+
+        await idx.ensure_loaded(loader)
+        await idx.ensure_loaded(loader)
+        assert calls["n"] == 2, "mark_dirty during bootstrap was lost"
+
+    async def test_loader_exception_during_reload_keeps_dirty(self) -> None:
+        """If the loader raises while reloading an already-loaded index, the
+        dirty flag must stay set so the next ensure_loaded() retries — a
+        cleared flag would brick the index into serving an empty set.
+        """
+        idx = TinyLFUIndex(capacity=16, history_size=5)
+        calls = {"n": 0}
+
+        async def loader() -> list[tuple[int, str, dict]]:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("transient DB failure")
+            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+
+        await idx.ensure_loaded(loader)
+        idx.mark_dirty()
+        with pytest.raises(RuntimeError, match="transient DB failure"):
+            await idx.ensure_loaded(loader)
+        # The failed reload must not leave the index falsely clean.
+        await idx.ensure_loaded(loader)
+        assert calls["n"] == 3, "index did not retry after a failed reload"
+        assert idx.loaded is True
+
 
 class TestVectorStorageEvictionUsesIndex:
     """End-to-end: storage eviction goes through the TinyLFU index."""
@@ -177,5 +220,30 @@ class TestVectorStorageEvictionUsesIndex:
             for i in range(3):
                 await vs.put(f"/f{i}.txt", f"x {i}\n", mtime=float(i))
             assert vs._index.loaded is False  # noqa: SLF001
+        finally:
+            vs.close()
+
+    async def test_eviction_skips_doc_count_when_index_loaded(self, tmp_path: Path) -> None:
+        """Once the TinyLFU index is in memory, _evict_if_needed reads its
+        exact total_paths() and must not re-issue a doc-count DB query.
+        """
+        vs = VectorStorage(db_path=tmp_path / "vec.db")
+        try:
+            for i in range(3):
+                await vs.put(f"/f{i}.txt", f"x {i}\n", mtime=float(i))
+            # Force the index into memory.
+            await vs._index.ensure_loaded(vs._collection.get_documents)  # noqa: SLF001
+            assert vs._index.loaded is True  # noqa: SLF001
+
+            calls = {"n": 0}
+            real_count = vs._collection.count  # noqa: SLF001
+
+            async def counting_count() -> int:
+                calls["n"] += 1
+                return await real_count()
+
+            vs._collection.count = counting_count  # noqa: SLF001
+            await vs._evict_if_needed()  # noqa: SLF001
+            assert calls["n"] == 0, "doc-count DB query ran despite a loaded index"
         finally:
             vs.close()

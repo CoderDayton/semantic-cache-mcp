@@ -29,7 +29,6 @@ _MIME_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"GIF89a", "image/gif"),
     (b"II*\x00", "image/tiff"),  # little-endian TIFF
     (b"MM\x00*", "image/tiff"),  # big-endian TIFF
-    (b"BM", "image/bmp"),
     (b"PK\x03\x04", "application/zip"),
     (b"%PDF-", "application/pdf"),
     (b"\x7fELF", "application/x-elf"),
@@ -45,6 +44,20 @@ _RIFF_FORMS: dict[bytes, str] = {
     b"AVI ": "video/x-msvideo",
 }
 
+# Valid BMP DIB-header sizes (BITMAPCOREHEADER through BITMAPV5HEADER). The
+# 'BM' signature is only 2 bytes, so any binary starting 0x42 0x4D matches
+# it; requiring a known DIB header size at bytes 14-17 rejects that.
+_BMP_DIB_HEADER_SIZES: frozenset[int] = frozenset({12, 40, 52, 56, 64, 108, 124})
+
+
+def _is_bmp(raw: bytes) -> bool:
+    """Validate a BMP beyond its weak 2-byte 'BM' signature."""
+    return (
+        raw[:2] == b"BM"
+        and len(raw) >= 18
+        and int.from_bytes(raw[14:18], "little") in _BMP_DIB_HEADER_SIZES
+    )
+
 
 def _guess_mime(path: Path, raw: bytes) -> str:
     """Best-effort mime guess. Extension first, then magic-byte sniff."""
@@ -54,6 +67,8 @@ def _guess_mime(path: Path, raw: bytes) -> str:
     for prefix, mime in _MIME_MAGIC:
         if raw.startswith(prefix):
             return mime
+    if _is_bmp(raw):
+        return "image/bmp"
     if raw.startswith(b"RIFF") and len(raw) >= 12:
         return _RIFF_FORMS.get(raw[8:12], "application/octet-stream")
     return "application/octet-stream"
@@ -71,6 +86,8 @@ def _sniff_image_mime(raw: bytes) -> str | None:
     for prefix, mime in _MIME_MAGIC:
         if mime.startswith("image/") and raw.startswith(prefix):
             return mime
+    if _is_bmp(raw):
+        return "image/bmp"
     if raw.startswith(b"RIFF") and len(raw) >= 12 and raw[8:12] == b"WEBP":
         return "image/webp"
     return None
@@ -463,7 +480,7 @@ async def batch_smart_read(
                 continue  # binary file — smart_read returns is_binary=True; batch skips it below
             _content = _raw.decode("utf-8")
             _to_embed.append((_path, _resolved_str, _content))
-        except Exception:  # nosec B112
+        except Exception:  # nosec B112 — best-effort pre-scan; smart_read handles real errors
             continue
 
     # Batch embed all candidates; fall back to per-file if anything fails

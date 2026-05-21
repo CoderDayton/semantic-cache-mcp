@@ -33,14 +33,12 @@ from ...cache import (
 )
 from ...cache._helpers import _PhaseTimer
 from ...cache.read import _sniff_image_mime
-from ...utils import aread_bytes, astat
-from .._read_session import get_tracker as _get_read_session_tracker
-
-_read_session_tracker = _get_read_session_tracker()
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core.embeddings import get_model_info
+from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
 from .._mcp import mcp
+from .._read_session import get_tracker as _get_read_session_tracker
 from .._tool_models import (
     BatchEditResponse,
     BatchReadResponse,
@@ -68,6 +66,8 @@ from ..response import (
     _response_mode,
     _response_token_cap,
 )
+
+_read_session_tracker = _get_read_session_tracker()
 
 logger = logging.getLogger(__name__)
 
@@ -563,6 +563,9 @@ def _parse_max_image_bytes() -> int:
 _MAX_IMAGE_BYTES: int = _parse_max_image_bytes()
 
 
+# read_image deliberately omits @_serialized: it never touches the cache or
+# the ONNX worker executor (it reads bytes via the default loop executor),
+# so it has nothing to serialize against and need not queue behind other tools.
 @mcp.tool(
     output_schema=output_schema(ReadImageResponse),
     meta={
@@ -1248,6 +1251,7 @@ async def edit(
 
 
 @mcp.tool(output_schema=output_schema(EditPreviewResponse))
+@_serialized
 async def edit_preview(
     ctx: Context,
     path: str,

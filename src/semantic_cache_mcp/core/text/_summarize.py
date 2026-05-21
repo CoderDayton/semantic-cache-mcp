@@ -55,8 +55,8 @@ DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
 # what was 23 separate str.count scans into a single pass over the string;
 # two str.count calls on the translated copy then recover the totals.
 # Markers are SOH/STX control codes — disjoint from the syntax/whitespace
-# sets and absent from any realistic source-code or prose input, so the
-# equivalence proof against the per-char sum holds bit-exact.
+# sets; any that occur verbatim in the input are subtracted back out by
+# _information_density so the per-char-sum equivalence stays bit-exact.
 _DENSITY_TRANS: dict[int, int] = str.maketrans(
     {
         **dict.fromkeys("{}[]()=;:,.<>+-*/&|!", 0x01),
@@ -240,12 +240,13 @@ def _information_density(segment: Segment) -> float:
 
     # CLAW: one C-level str.translate folds the 20 syntax + 3 whitespace
     # str.count scans into a single pass; two counts on the marker chars
-    # recover the totals. Bit-exact vs the per-char sum on any input that
-    # does not contain the SOH/STX markers (true for source code & prose).
+    # recover the totals. SOH/STX may also occur verbatim in the input —
+    # translate() leaves those untouched, so subtract any pre-existing
+    # occurrences to stay bit-exact vs the per-char sum.
     n = len(content)
     flagged = content.translate(_DENSITY_TRANS)
-    syntax_chars = flagged.count(_DENSITY_SYNTAX_MARK)
-    whitespace = flagged.count(_DENSITY_WHITESPACE_MARK)
+    syntax_chars = flagged.count(_DENSITY_SYNTAX_MARK) - content.count(_DENSITY_SYNTAX_MARK)
+    whitespace = flagged.count(_DENSITY_WHITESPACE_MARK) - content.count(_DENSITY_WHITESPACE_MARK)
     syntax_ratio = min(1.0, syntax_chars / (n + 1) * 10)
     content_ratio = (n - whitespace) / (n + 1)
 

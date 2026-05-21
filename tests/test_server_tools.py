@@ -7,6 +7,7 @@ branch coverage without spinning up the full MCP server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -611,6 +612,30 @@ class TestEditPreviewTool:
         f.write_text("content\n")
         with pytest.raises(ToolError, match="old_string cannot be empty"):
             await edit_preview(ctx, str(f), "")
+
+    async def test_edit_preview_is_serialized(self, ctx: MagicMock, tmp_path: Path) -> None:
+        """edit_preview touches the cache layer, so it must acquire the global
+        tool lock like every other cache-touching tool — otherwise it can
+        interleave executor work with a concurrent tool call.
+        """
+        import semantic_cache_mcp.server.tools as tools_mod
+
+        tools_mod._tool_lock = None
+        lock = tools_mod._get_tool_lock()
+        missing = tmp_path / "does_not_exist.txt"
+
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(edit_preview(ctx, str(missing), "anchor"))
+            # A serialized tool blocks at lock acquisition before any I/O,
+            # so it cannot finish while the lock is held by this test.
+            await asyncio.sleep(0.2)
+            assert not task.done(), "edit_preview ran without acquiring the tool lock"
+        finally:
+            lock.release()
+        # Once the lock frees it proceeds and fails fast on the missing file.
+        with pytest.raises(ToolError):
+            await asyncio.wait_for(task, timeout=5.0)
 
 
 # ===========================================================================

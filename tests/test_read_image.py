@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
+from semantic_cache_mcp.cache.read import _sniff_image_mime
 from semantic_cache_mcp.server._mcp import mcp
 
 # Smallest valid 1x1 PNG — used as an inline test fixture so we don't
@@ -18,11 +19,22 @@ _TINY_PNG = bytes.fromhex(
 )
 
 # Magic-byte headers padded to a plausible size. read_image sniffs the
-# leading bytes and never decodes pixels, so a valid header is enough to
-# exercise format detection.
-_BMP_HEADER = b"BM" + b"\x00" * 126
+# leading bytes and never decodes pixels, so a structurally valid header is
+# enough to exercise format detection. A real BMP carries a DIB header size
+# at bytes 14-17 — 'BM' alone is too weak to trust.
+_BMP_HEADER = (
+    b"BM"
+    + (122).to_bytes(4, "little")  # file size
+    + b"\x00\x00\x00\x00"  # reserved
+    + (54).to_bytes(4, "little")  # pixel data offset
+    + (40).to_bytes(4, "little")  # DIB header size = BITMAPINFOHEADER
+    + b"\x00" * 104
+)
 _TIFF_LE_HEADER = b"II*\x00" + b"\x00" * 124
+_TIFF_BE_HEADER = b"MM\x00*" + b"\x00" * 124
 _JPEG_HEADER = b"\xff\xd8\xff\xe0" + b"\x00" * 124
+_GIF_HEADER = b"GIF89a" + b"\x00" * 122
+_WEBP_HEADER = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 116
 
 
 @pytest.fixture
@@ -43,6 +55,18 @@ async def _expect_error(client, args: dict, match: str) -> None:
         assert match in str(e), f"unexpected error: {type(e).__name__}: {e}"
         return
     pytest.fail(f"expected error containing {match!r}; tool succeeded")
+
+
+def test_sniff_rejects_non_bmp_starting_with_bm() -> None:
+    """'BM' is only a 2-byte signature; a non-BMP binary that merely begins
+    with 0x42 0x4D must not be mis-detected as image/bmp."""
+    fake = b"BM" + b"not a bitmap, just arbitrary bytes\x00\x01\x02\x03\x04\x05"
+    assert _sniff_image_mime(fake) is None
+
+
+def test_sniff_accepts_structurally_valid_bmp() -> None:
+    """A BMP with a valid DIB header size is detected on content alone."""
+    assert _sniff_image_mime(_BMP_HEADER) == "image/bmp"
 
 
 async def test_read_image_returns_image_content_block(mcp_client, tmp_path: Path) -> None:
@@ -87,7 +111,10 @@ async def test_read_image_rejects_text_with_image_extension(mcp_client, tmp_path
     [
         (_BMP_HEADER, ".bmp", "image/bmp"),
         (_TIFF_LE_HEADER, ".tiff", "image/tiff"),
+        (_TIFF_BE_HEADER, ".tiff", "image/tiff"),
         (_JPEG_HEADER, ".jpg", "image/jpeg"),
+        (_GIF_HEADER, ".gif", "image/gif"),
+        (_WEBP_HEADER, ".webp", "image/webp"),
     ],
 )
 async def test_read_image_accepts_formats_by_magic(

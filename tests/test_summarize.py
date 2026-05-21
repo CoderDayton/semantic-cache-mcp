@@ -160,6 +160,23 @@ class TestSegmentScoring:
         # Dense code should score higher than whitespace
         assert scores[1] > scores[0]
 
+    def test_information_density_treats_control_chars_as_ordinary(self) -> None:
+        """SOH/STX are used internally as density fold markers; when they
+        appear verbatim in the input they must count as ordinary characters,
+        not as syntax or whitespace. '~' is the reference char: non-word,
+        non-syntax, non-whitespace — SOH/STX must score identically to it.
+        """
+        from semantic_cache_mcp.core.text._summarize import _information_density
+
+        def seg(text: str) -> Segment:
+            return Segment(start_line=0, end_line=1, content=text)
+
+        plain = _information_density(seg("foo~bar"))
+        with_soh = _information_density(seg("foo\x01bar"))
+        with_stx = _information_density(seg("foo\x02bar"))
+        assert with_soh == pytest.approx(plain)
+        assert with_stx == pytest.approx(plain)
+
 
 class TestSemanticSummarization:
     """Tests for semantic summarization."""

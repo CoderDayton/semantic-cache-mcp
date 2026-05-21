@@ -82,9 +82,18 @@ class ParamHintsMiddleware(Middleware):
                 continue
             mapped = _ALIASES.get(key)
             if mapped and mapped in known:
-                # Last-write-wins handles the rare case where both the alias
-                # and the real name appear. Log so users can trace why their
-                # `query=` was accepted as `pattern=`.
+                if mapped in args:
+                    # Caller sent both the real name and an alias for it.
+                    # The explicit real parameter wins regardless of order;
+                    # drop the alias rather than let it clobber the value.
+                    logger.debug(
+                        "param-alias: ignoring %s for tool %s (%s explicitly set)",
+                        key,
+                        tool_name,
+                        mapped,
+                    )
+                    continue
+                # Log so users can trace why their `query=` became `pattern=`.
                 logger.debug("param-alias rewrite for tool %s: %s -> %s", tool_name, key, mapped)
                 rewritten[mapped] = value
                 continue
