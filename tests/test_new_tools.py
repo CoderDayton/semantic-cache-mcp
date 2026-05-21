@@ -1,4 +1,4 @@
-"""Tests for new MCP tools: search, diff, batch_read, similar, glob."""
+"""Tests for core cache functions: search, compare_files, batch_read, glob, batch_edit."""
 
 from __future__ import annotations
 

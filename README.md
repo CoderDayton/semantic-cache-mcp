@@ -35,7 +35,7 @@
 
 **Cut your MCP client's token usage by 98% on cached reads. Respond in milliseconds.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Fourteen tools (read, read_image, batch_read, write, edit, edit_preview, batch_edit, search, grep, glob, diff, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, read_image, batch_read, write, edit, edit_preview, batch_edit, search, grep, glob, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
 
 ---
 
@@ -184,7 +184,6 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
 | `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
 | `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
-| `diff` | Explicit side-by-side file comparison with unified diff and semantic similarity. Use `read` instead for “what changed since last read?”. |
 
 ### Management
 
@@ -292,13 +291,12 @@ batch_read paths="/src/*.py" max_total_tokens=30000
 </details>
 
 <details>
-<summary><strong>discovery</strong> — Search, glob, grep, diff</summary>
+<summary><strong>discovery</strong> — Search, glob, grep</summary>
 
 ```
 search query="authentication middleware logic" k=5
 glob pattern="**/*.py" directory="./src" cached_only=true
 grep pattern="class Cache" path="src/**/*.py"
-diff path1="/src/v1.py" path2="/src/v2.py"
 ```
 
 </details>

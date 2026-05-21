@@ -26,7 +26,6 @@ from semantic_cache_mcp.server.tools import (
     batch_read,
     clear,
     delete,
-    diff,
     edit,
     edit_preview,
     glob,
@@ -822,73 +821,6 @@ class TestSearchTool:
 
 
 # ===========================================================================
-# diff tool
-# ===========================================================================
-
-
-class TestDiffTool:
-    async def test_diff_identical_files(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("same\n")
-        b.write_text("same\n")
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "diff" in d
-        assert d["diff_state"] == "unchanged"
-
-    async def test_diff_different_files(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("old content\n")
-        b.write_text("new content\n")
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "diff" in d
-        assert d["diff_state"] == "full"
-
-    async def test_diff_file_not_found(self, ctx: MagicMock, tmp_path: Path) -> None:
-        a = tmp_path / "a.txt"
-        a.write_text("content")
-        with pytest.raises(ToolError, match="diff: "):
-            await diff(ctx, str(a), "/nonexistent.txt")
-
-    async def test_diff_normal_mode_includes_similarity(
-        self, ctx: MagicMock, tmp_path: Path
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("hello\n")
-        b.write_text("world\n")
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
-            d = _parse(await diff(ctx, str(a), str(b)))
-        assert "similarity" in d
-        assert "diff_stats" in d
-
-    async def test_diff_debug_mode_includes_cache_info(
-        self, ctx: MagicMock, tmp_path: Path
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("a\n")
-        b.write_text("b\n")
-        with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            d = _parse(await diff(ctx, str(a), str(b)))
-        assert "from_cache" in d
-        assert "context_lines" in d
-
-    async def test_diff_uses_cached_content(
-        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
-    ) -> None:
-        a = tmp_path / "a.txt"
-        b = tmp_path / "b.txt"
-        a.write_text("cached\n")
-        b.write_text("also cached\n")
-        await smart_read(tmp_cache, str(a))
-        await smart_read(tmp_cache, str(b))
-        d = _parse(await diff(ctx, str(a), str(b)))
-        assert "error" not in d  # compact strips ok on success
-
-
-# ===========================================================================
 # batch_read tool
 # ===========================================================================
 
@@ -1244,17 +1176,6 @@ class TestRelativePathSupport:
 
         assert d["succeeded"] == 2
         assert Path("rel-batch-edit.txt").read_text() == "111\n222\n"
-
-    async def test_diff_accepts_relative_paths(
-        self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.chdir(tmp_path)
-        Path("left.txt").write_text("left\n")
-        Path("right.txt").write_text("right\n")
-
-        d = _parse(await diff(ctx, "left.txt", "right.txt"))
-
-        assert "diff" in d
 
     async def test_batch_read_accepts_relative_paths(
         self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

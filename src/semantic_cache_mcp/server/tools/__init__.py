@@ -21,7 +21,6 @@ from mcp.types import ImageContent, TextContent
 from ...cache import (
     SemanticCache,
     batch_smart_read,
-    compare_files,
     find_edit_anchors,
     glob_with_cache_status,
     semantic_search,
@@ -43,7 +42,6 @@ from .._tool_models import (
     BatchReadResponse,
     ClearResponse,
     DeleteResponse,
-    DiffResponse,
     EditPreviewResponse,
     EditResponse,
     GlobResponse,
@@ -1022,6 +1020,10 @@ async def write(
 ) -> dict[str, Any]:
     """Create or replace a file. Prefer `edit`/`batch_edit` for localized changes.
 
+    Overwrites the whole file, or appends with `append=true`. Reports status
+    `created` for a new path or `updated` for an existing one; an update also
+    returns a unified diff against the previous content.
+
     Args:
         path: File path to create or replace.
         content: Full content to write, or appended content when
@@ -1613,80 +1615,6 @@ async def search(
     except Exception as e:
         logger.exception("Error in search")
         _raise_tool_error("search", str(e), max_response_tokens)
-
-
-@mcp.tool(output_schema=output_schema(DiffResponse))
-@_serialized
-async def diff(
-    ctx: Context,
-    path1: str,
-    path2: str,
-    context_lines: int = 3,
-) -> dict[str, Any]:
-    """Compare two files side by side and return a unified diff.
-
-    Use this for explicit file-to-file comparison. For "what changed since I
-    last read this file?", use `read` instead of `diff`.
-
-    Behavior:
-    - Returns unified diff plus semantic similarity score.
-    - Reuses cached content when possible.
-    - Large diffs may be suppressed to stay within token budget.
-
-    Args:
-        path1: First file path.
-        path2: Second file path.
-        context_lines: Number of context lines to include around changes.
-    """
-    state = await _tool_call_state(ctx)
-    path1, path2 = state.resolve(path1), state.resolve(path2)
-    cache = state.cache
-    mode = state.mode
-    max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "diff",
-        {"path1": path1, "path2": path2, "context_lines": context_lines},
-        timeout=_TOOL_TIMEOUT,
-    )
-    if remote_result is not None:
-        return remote_result
-
-    try:
-        result = await asyncio.wait_for(
-            compare_files(cache, path1, path2, context_lines=context_lines),
-            timeout=_TOOL_TIMEOUT,
-        )
-        cache.metrics.record("diff", result)
-
-        payload: dict[str, Any] = {
-            "ok": True,
-            "tool": "diff",
-            "path1": result.path1,
-            "path2": result.path2,
-            "diff": result.diff_content,
-            "diff_state": _diff_state(result.diff_content),
-        }
-        if mode in _MODE_NORMAL:
-            payload["similarity"] = round(result.similarity, 4)
-            payload["diff_stats"] = result.diff_stats
-        if mode == _MODE_DEBUG:
-            payload["tokens_saved"] = result.tokens_saved
-            payload["from_cache"] = result.from_cache
-            payload["context_lines"] = context_lines
-
-        return _finalize_payload(payload, max_response_tokens)
-
-    except FileNotFoundError as e:
-        _raise_tool_error("diff", str(e), max_response_tokens)
-    except TimeoutError:
-        _handle_timeout(cache, "diff")
-        _raise_tool_error("diff", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
-    except ToolError:
-        raise
-    except Exception as e:
-        logger.exception("Error in diff")
-        _raise_tool_error("diff", str(e), max_response_tokens)
 
 
 @mcp.tool(output_schema=output_schema(BatchReadResponse))

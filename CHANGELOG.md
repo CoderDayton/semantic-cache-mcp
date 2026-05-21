@@ -70,6 +70,10 @@ adds the `edit_preview` probe.
   first move for concept-level queries ("where is rate limiting handled")
   rather than a grep alternative, after an audit found the tool was never
   called. Drops the failure-first "empty results usually mean..." framing.
+- **`write` description** — Adds a behavior block (overwrite vs. `append`,
+  `created`/`updated` status, diff-on-update) so the tool's return shape is
+  documented alongside `edit`/`batch_edit`, instead of jumping straight from
+  summary to arguments.
 
 ### Removed
 
@@ -79,6 +83,10 @@ adds the `edit_preview` probe.
   in production — agents always reached for `grep` or `search`. The
   vector index it shared with `search` and `read`'s diff-against-similar
   path is unaffected.
+- **`diff` tool** — Removed the MCP tool for explicit two-file comparison.
+  Agents reach for `git diff` instead, and `read` already returns a unified
+  diff for "what changed since I last read this file". The `compare_files()`
+  core function is retained as a library API.
 
 ### Fixed
 

@@ -226,19 +226,6 @@ class SearchResponse(ToolResponseModel):
     show_preview: bool | None = None
 
 
-class DiffResponse(ToolResponseModel):
-    path1: str | None = None
-    path2: str | None = None
-    diff: str | None = None
-    diff_state: str | None = None
-    diff_omitted: bool | None = None
-    similarity: float | None = None
-    diff_stats: dict[str, Any] | None = None
-    tokens_saved: int | None = None
-    from_cache: bool | None = None
-    context_lines: int | None = None
-
-
 class BatchReadSummary(ToolResponseModel):
     files_read: int | None = None
     files_skipped: int | None = None
