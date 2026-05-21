@@ -18,6 +18,12 @@ adds the `edit_preview` probe.
   line_numbers, context}` for a given `old_string` against a file. Lets
   callers verify an anchor is unique before committing to a 30s `edit`.
   Response budget ≈ 200 tokens.
+- **`read_image` tool** — Pass-through for image files. Returns an MCP
+  image content block (base64 + mime) alongside a JSON metadata sidecar,
+  so vision-capable models see the actual pixels. Bypasses the semantic
+  cache (no embedding/description). Capped at 5 MiB; override via
+  `SCMCP_MAX_IMAGE_BYTES`. Refuses non-image binaries — use `read` for
+  those.
 - **Per-phase timing in edit timeouts** — `edit` and `batch_edit` now thread
   a `_PhaseTimer` through `smart_edit` (input_validation, binary_check,
   cache_lookup, anchor_search, diff_gen, atomic_write, format_subprocess,

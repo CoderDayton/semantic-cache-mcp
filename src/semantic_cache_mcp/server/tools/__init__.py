@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
+import stat as stat_module
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any, TypeVar, cast
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
+from mcp.types import ImageContent, TextContent
 
 from ...cache import (
     SemanticCache,
@@ -28,6 +32,8 @@ from ...cache import (
     smart_write,
 )
 from ...cache._helpers import _PhaseTimer
+from ...cache.read import _guess_mime
+from ...utils import aread_bytes, astat
 from .._read_session import get_tracker as _get_read_session_tracker
 
 _read_session_tracker = _get_read_session_tracker()
@@ -45,6 +51,7 @@ from .._tool_models import (
     EditResponse,
     GlobResponse,
     GrepResponse,
+    ReadImageResponse,
     ReadResponse,
     SearchResponse,
     SimilarResponse,
@@ -531,6 +538,115 @@ async def read(
         raise
     except Exception as e:
         _raise_tool_error("read", f"reading failed: {e}", max_response_tokens)
+
+
+# Image pass-through: maximum bytes inlined as a single MCP image block.
+# Anthropic's vision API rejects images over ~5MB; cap defends both response
+# budget and upstream contract. Override via SCMCP_MAX_IMAGE_BYTES.
+_DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _parse_max_image_bytes() -> int:
+    raw = os.environ.get("SCMCP_MAX_IMAGE_BYTES", str(_DEFAULT_MAX_IMAGE_BYTES))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SCMCP_MAX_IMAGE_BYTES=%r; using default %d",
+            raw,
+            _DEFAULT_MAX_IMAGE_BYTES,
+        )
+        return _DEFAULT_MAX_IMAGE_BYTES
+    return max(1024, value)
+
+
+_MAX_IMAGE_BYTES: int = _parse_max_image_bytes()
+
+
+@mcp.tool(
+    output_schema=output_schema(ReadImageResponse),
+    meta={
+        "version": _pkg_version("semantic-cache-mcp"),
+        "author": "Dayton Dunbar",
+        "github": "https://github.com/CoderDayton/semantic-cache-mcp",
+    },
+)
+async def read_image(
+    ctx: Context,
+    path: str,
+) -> ToolResult:
+    """Read an image file and pass the bytes through to the model.
+
+    Returns an MCP image content block (base64-encoded with mime type) plus a
+    JSON metadata sidecar. Use this when the model needs to actually see the
+    image; for any other file type use `read`.
+
+    Images are NOT cached — every call re-reads from disk. Cap is
+    `SCMCP_MAX_IMAGE_BYTES` (default 5 MiB) to protect both the response
+    budget and Anthropic's ~5 MB upload limit.
+
+    Args:
+        path: Image file path (absolute or relative to project root).
+    """
+    state = await _tool_call_state(ctx)
+    path = state.resolve(path)
+    max_response_tokens = state.max_response_tokens
+
+    # Image reads bypass the cache (and the worker process). They use the
+    # default loop executor — aread_bytes/astat accept `None` and fall back
+    # to asyncio's default ThreadPoolExecutor, which is the right thing in
+    # the server process (no GIL contention with the worker's ONNX thread).
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.exists():
+        _raise_tool_error("read_image", f"File not found: {path}", max_response_tokens)
+
+    try:
+        st = await astat(file_path, None)
+    except OSError as e:
+        _raise_tool_error("read_image", f"Cannot stat file: {e}", max_response_tokens)
+
+    if not stat_module.S_ISREG(st.st_mode):
+        _raise_tool_error("read_image", f"Not a regular file: {path}", max_response_tokens)
+
+    if st.st_size > _MAX_IMAGE_BYTES:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"image too large: {st.st_size} bytes exceeds limit {_MAX_IMAGE_BYTES} "
+                f"(raise via SCMCP_MAX_IMAGE_BYTES)"
+            ),
+            max_response_tokens,
+        )
+
+    try:
+        raw = await asyncio.wait_for(aread_bytes(file_path, None), timeout=_TOOL_TIMEOUT)
+    except TimeoutError:
+        _raise_tool_error("read_image", f"timed out after {_TOOL_TIMEOUT}s", max_response_tokens)
+    except OSError as e:
+        _raise_tool_error("read_image", f"I/O error: {e}", max_response_tokens)
+
+    mime = _guess_mime(file_path, raw)
+    if not mime.startswith("image/"):
+        _raise_tool_error(
+            "read_image",
+            f"not an image (mime={mime}): {path} — use `read` for non-image binaries",
+            max_response_tokens,
+        )
+
+    metadata: dict[str, Any] = {
+        "ok": True,
+        "tool": "read_image",
+        "path": path,
+        "size": st.st_size,
+        "mime": mime,
+    }
+    image_block = ImageContent(
+        type="image",
+        data=base64.b64encode(raw).decode("ascii"),
+        mimeType=mime,
+    )
+    text_block = TextContent(type="text", text=json.dumps(metadata))
+    return ToolResult(content=[text_block, image_block], structured_content=metadata)
 
 
 @mcp.tool(output_schema=output_schema(StatsResponse))

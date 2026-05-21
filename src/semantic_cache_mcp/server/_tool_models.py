@@ -49,6 +49,12 @@ class ReadResponse(ToolResponseModel):
     total_lines: int | None = None
 
 
+class ReadImageResponse(ToolResponseModel):
+    path: str | None = None
+    size: int | None = None
+    mime: str | None = None
+
+
 class ClearResponse(ToolResponseModel):
     status: str | None = None
     count: int | None = None
