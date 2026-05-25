@@ -564,6 +564,12 @@ async def read(
 # budget and upstream contract. Override via SCMCP_MAX_IMAGE_BYTES.
 _DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
+# Wire-side cap on the base64-encoded payload Anthropic will accept (~5 MB).
+# Raw bytes expand 4/3 on encoding, so 5 MiB raw → ~6.99 MB on the wire and
+# upstream rejects it. Guard the encoded size explicitly so the failure is a
+# tool-level error with a clear message rather than an opaque upstream 400.
+_DEFAULT_MAX_ENCODED_IMAGE_BYTES = 5_000_000
+
 
 def _parse_max_image_bytes() -> int:
     raw = os.environ.get("SCMCP_MAX_IMAGE_BYTES", str(_DEFAULT_MAX_IMAGE_BYTES))
@@ -579,7 +585,26 @@ def _parse_max_image_bytes() -> int:
     return max(1024, value)
 
 
+def _parse_max_encoded_image_bytes() -> int:
+    raw = os.environ.get("SCMCP_MAX_ENCODED_IMAGE_BYTES", str(_DEFAULT_MAX_ENCODED_IMAGE_BYTES))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SCMCP_MAX_ENCODED_IMAGE_BYTES=%r; using default %d",
+            raw,
+            _DEFAULT_MAX_ENCODED_IMAGE_BYTES,
+        )
+        return _DEFAULT_MAX_ENCODED_IMAGE_BYTES
+    return max(1024, value)
+
+
+def _predicted_base64_len(n: int) -> int:
+    return 4 * ((n + 2) // 3)
+
+
 _MAX_IMAGE_BYTES: int = _parse_max_image_bytes()
+_MAX_ENCODED_IMAGE_BYTES: int = _parse_max_encoded_image_bytes()
 
 
 # read_image deliberately omits @_serialized: it never touches the cache or
@@ -661,6 +686,21 @@ async def read_image(
             max_response_tokens,
         )
 
+    # Base64 expands 4/3 — guard the on-the-wire size against Anthropic's
+    # ~5 MB upload cap before paying for the encode. Cheap arithmetic check;
+    # no allocation.
+    predicted_encoded = _predicted_base64_len(len(raw))
+    if predicted_encoded > _MAX_ENCODED_IMAGE_BYTES:
+        _raise_tool_error(
+            "read_image",
+            (
+                f"image too large after base64: {predicted_encoded} encoded bytes "
+                f"exceeds limit {_MAX_ENCODED_IMAGE_BYTES} "
+                f"(raise via SCMCP_MAX_ENCODED_IMAGE_BYTES)"
+            ),
+            max_response_tokens,
+        )
+
     # Verify by magic bytes, not by extension — a file named `x.png` that
     # holds text must be refused, and a real image with a wrong/missing
     # extension must still be accepted. Supports PNG, JPEG, GIF, TIFF, BMP,
@@ -676,6 +716,23 @@ async def read_image(
             max_response_tokens,
         )
 
+    # Run base64 off the event loop and under the tool timeout. For a 5 MiB
+    # image the encode is ~tens of ms of pure CPU; doing it inline blocks
+    # every other coroutine and is unbounded if the buffer is unexpectedly
+    # large. (The MCP response write itself is framework-controlled and not
+    # covered by this timeout.)
+    try:
+        encoded = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(None, base64.b64encode, raw),
+            timeout=_TOOL_TIMEOUT,
+        )
+    except TimeoutError:
+        _raise_tool_error(
+            "read_image",
+            f"base64 encoding timed out after {_TOOL_TIMEOUT}s",
+            max_response_tokens,
+        )
+
     metadata: dict[str, Any] = {
         "ok": True,
         "tool": "read_image",
@@ -685,7 +742,7 @@ async def read_image(
     }
     image_block = ImageContent(
         type="image",
-        data=base64.b64encode(raw).decode("ascii"),
+        data=encoded.decode("ascii"),
         mimeType=mime,
     )
     text_block = TextContent(type="text", text=json.dumps(metadata))
