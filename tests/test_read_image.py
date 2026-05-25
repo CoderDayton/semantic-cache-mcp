@@ -197,6 +197,51 @@ def test_parse_max_image_bytes_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tools_mod._parse_max_image_bytes() == 1024
 
 
+async def test_read_image_rejects_oversized_encoded_payload(
+    mcp_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file under the raw cap whose base64 expansion would blow the wire
+    cap must be refused before encoding — surfaces as a tool error, not an
+    opaque upstream 400.
+    """
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    png = tmp_path / "img.png"
+    # 600 raw bytes encode to 800 base64 bytes (4 * ceil(600/3)). Setting
+    # the encoded cap to 700 catches it; the raw cap stays high so this test
+    # exercises only the encoded guard.
+    png.write_bytes(_TINY_PNG + b"\x00" * (600 - len(_TINY_PNG)))
+    monkeypatch.setattr(tools_mod, "_MAX_IMAGE_BYTES", 10_000)
+    monkeypatch.setattr(tools_mod, "_MAX_ENCODED_IMAGE_BYTES", 700)
+
+    await _expect_error(mcp_client, {"path": str(png)}, "image too large after base64")
+
+
+def test_parse_max_encoded_image_bytes_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.delenv("SCMCP_MAX_ENCODED_IMAGE_BYTES", raising=False)
+    assert tools_mod._parse_max_encoded_image_bytes() == tools_mod._DEFAULT_MAX_ENCODED_IMAGE_BYTES
+
+
+def test_parse_max_encoded_image_bytes_bad_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    monkeypatch.setenv("SCMCP_MAX_ENCODED_IMAGE_BYTES", "not-a-number")
+    assert tools_mod._parse_max_encoded_image_bytes() == tools_mod._DEFAULT_MAX_ENCODED_IMAGE_BYTES
+
+
+def test_predicted_base64_len_matches_actual() -> None:
+    """The predicted length must equal len(base64.b64encode(...)) for every
+    residue class mod 3 — otherwise the encoded-size guard is wrong.
+    """
+    from semantic_cache_mcp.server import tools as tools_mod
+
+    for n in (0, 1, 2, 3, 4, 5, 6, 100, 999, 1000, 1001):
+        expected = len(base64.b64encode(b"\x00" * n))
+        assert tools_mod._predicted_base64_len(n) == expected, n
+
+
 async def test_read_image_rejects_oversized_after_read(
     mcp_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

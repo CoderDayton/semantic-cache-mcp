@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] - 2026-05-24
+
+`read_image` hardening: guard the on-the-wire payload against Anthropic's
+~5 MB upload cap, and move base64 encoding off the event loop.
+
+### Added
+
+- **`SCMCP_MAX_ENCODED_IMAGE_BYTES`** (default 5,000,000) — wire-side cap on
+  the base64-encoded image payload. The existing raw cap of 5 MiB expands to
+  ~6.99 MB on the wire, which upstream rejects with an opaque 400. The
+  encoded-size guard catches this pre-encode and surfaces a clear tool-level
+  error naming the env var. Validated against the actual `base64.b64encode`
+  length for every residue class mod 3.
+
+### Changed
+
+- **`read_image` base64 runs off the event loop** — encoding moves to the
+  default `ThreadPoolExecutor` under `asyncio.wait_for(_TOOL_TIMEOUT)`, so a
+  multi-MB encode no longer blocks every other coroutine and a runaway
+  buffer can't hang the tool indefinitely.
+
 ## [0.4.7] - 2026-05-21
 
 DX & feedback-loop hardening based on a 24h behavioral audit of production
