@@ -398,6 +398,7 @@ async def read(
                     diff_mode=False,  # Line ranges bypass diff mode
                     force_full=True,
                     refresh_cache=False,
+                    summarize=False,  # Line ranges need literal lines, not a summary
                 ),
                 timeout=_TOOL_TIMEOUT,
             )
@@ -416,7 +417,9 @@ async def read(
                 f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
             )
             line_info = {
-                "start": start + 1,
+                # Empty window (offset past EOF / empty file): report
+                # start==end==total instead of a start that exceeds end.
+                "start": start + 1 if selected else len(lines),
                 "end": min(end, len(lines)),
                 "total": len(lines),
             }

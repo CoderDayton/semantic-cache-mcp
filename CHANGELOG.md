@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] - 2026-05-30
+
+Fixes a correctness bug in line-addressed reads that made fresh-but-summarized
+output look like a stale cache.
+
+### Fixed
+
+- **`read` with `offset`/`limit` no longer summarizes large files.** For files
+  over `MAX_CONTENT_SIZE` (100 KB default), ranged reads sliced over
+  *semantically summarized* content, so `lines.total` reported the summarized
+  line count and the emitted line numbers did not map to disk. Callers saw
+  `read` and `grep` disagree (e.g. `total: 2322` vs a real line 5352) and
+  mistook the fresh-but-summarized result for a stale cache. `smart_read` now
+  takes a `summarize` flag (default `True`); the offset/limit path passes
+  `summarize=False` to slice literal disk lines with real line numbers and a
+  true total. Side benefit: ranged reads of large files skip the embed/
+  summarize step entirely.
+- **`read` offset past EOF returns a coherent empty window.** An out-of-range
+  `offset` (or an empty file) previously reported `lines.start > lines.end`;
+  it now reports `start == end == total`.
+
 ## [0.4.8] - 2026-05-24
 
 `read_image` hardening: guard the on-the-wire payload against Anthropic's

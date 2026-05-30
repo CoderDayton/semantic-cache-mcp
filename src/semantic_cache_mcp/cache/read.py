@@ -107,6 +107,7 @@ async def smart_read(
     diff_mode: bool = True,
     force_full: bool = False,
     refresh_cache: bool = True,
+    summarize: bool = True,
     _embedding: EmbeddingVector | None = None,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
@@ -324,7 +325,10 @@ async def smart_read(
     truncated = False
     final_content = content
 
-    if len(content) > max_size:
+    # Line-addressed reads (offset/limit) pass summarize=False: they must slice
+    # literal disk lines, so summarizing here would fabricate line numbers and a
+    # false total. Full-file reads keep summarization for large files.
+    if summarize and len(content) > max_size:
         # Use semantic summarization to preserve important content.
         # The entire summarize_semantic call (including its embed_fn callback)
         # MUST run in the executor — ONNX is not thread-safe and embed_fn
