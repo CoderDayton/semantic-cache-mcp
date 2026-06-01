@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] - 2026-05-30
+
+Fixes a correctness bug in line-addressed reads that made fresh-but-summarized
+output look like a stale cache, plus internal hardening, a vector-storage
+refactor, and a round of hot-path performance work. No public API changes.
+
+### Fixed
+
+- **`read` with `offset`/`limit` no longer summarizes large files.** For files
+  over `MAX_CONTENT_SIZE` (100 KB default), ranged reads sliced over
+  *semantically summarized* content, so `lines.total` reported the summarized
+  line count and the emitted line numbers did not map to disk. Callers saw
+  `read` and `grep` disagree (e.g. `total: 2322` vs a real line 5352) and
+  mistook the fresh-but-summarized result for a stale cache. `smart_read` now
+  takes a `summarize` flag (default `True`); the offset/limit path passes
+  `summarize=False` to slice literal disk lines with real line numbers and a
+  true total. Side benefit: ranged reads of large files skip the embed/
+  summarize step entirely.
+- **`read` offset past EOF returns a coherent empty window.** An out-of-range
+  `offset` (or an empty file) previously reported `lines.start > lines.end`;
+  it now reports `start == end == total`.
+
+### Changed
+
+- **Remote-forwarding tools now forward their full parameter set automatically.**
+  In supervisor/remote mode, each forwarding tool (`read`, `grep`, `search`,
+  `batch_read`, …) previously hand-listed the kwargs it relayed to the remote
+  peer, so a newly added parameter could be silently dropped. A new
+  `_forward_kwargs` helper derives the forwarded set from the *calling tool's*
+  own signature — every parameter except `ctx`, including keyword-only ones —
+  and fails loudly on `*args`/`**kwargs` tools or unknown overrides. Guarded by
+  `tests/test_remote_forward.py`.
+- **Vector storage split into focused modules.** The monolithic
+  `storage/vector/__init__.py` (−442 lines) is now a thin package surface over
+  new `_grep.py` (pattern/vocab/phonetic grep) and `_search.py` (semantic and
+  hybrid search) modules. Pure refactor — same public symbols and behavior.
+- **Response-contract guard.** `tests/test_response_contract.py` asserts every
+  key a tool emits is declared in its response model, failing loudly if a tool
+  ever returns an undeclared key.
+
+### Performance
+
+- **`_is_binary_content` non-printable scan** now uses a single
+  `bytes.translate` C pass instead of a per-byte Python comprehension.
+- **`_extract_line_range`** computes char offsets in two non-overlapping passes
+  with O(1) extra memory, dropping the redundant prefix sum.
+- **`summarize_semantic`** fills a pre-allocated row buffer in place instead of
+  re-`np.stack`-ing the whole selection on every accept (was O(k²)); the
+  `_simple_embedding` fallback uses `np.bincount` over a single index array.
+- **`cosine_similarity` matrix build** fast-paths homogeneous `array.array("f")`
+  inputs by concatenating into one contiguous f32 buffer, skipping the per-row
+  Python assignment loop (typecode-guarded).
+- **`compute_delta`** sizes its estimate via `itertools.chain` instead of
+  building a temporary concatenated list.
+
 ## [0.4.8] - 2026-05-24
 
 `read_image` hardening: guard the on-the-wire payload against Anthropic's

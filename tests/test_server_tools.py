@@ -254,6 +254,49 @@ class TestReadTool:
         # offset=0 must behave identically to offset=1 (both start at line 1).
         assert d_zero["content"] == d_one["content"]
 
+    async def test_offset_limit_large_file_uses_real_line_numbers(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        """Regression: line-addressed reads of a file larger than max_size must
+        return literal disk lines with real line numbers and a true total.
+
+        Previously the offset/limit path sliced over semantically summarized
+        content, so `total` reported the summarized line count and the emitted
+        line numbers did not match disk — agents saw read/grep disagree and
+        mistook fresh-but-summarized output for a stale cache.
+        """
+        from semantic_cache_mcp.config import MAX_CONTENT_SIZE
+
+        n_lines = 6000
+        big = tmp_path / "big.py"
+        big.write_text(
+            "\n".join(
+                f"line_{i:05d} = {i}  # padding xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                for i in range(1, n_lines + 1)
+            )
+            + "\n"
+        )
+        # Must exceed max_size so summarization would otherwise trigger.
+        assert big.stat().st_size > MAX_CONTENT_SIZE
+
+        d = _parse(await read(ctx, str(big), offset=5400, limit=3))
+        # True total, not the summarized line count.
+        assert d["lines"]["total"] == n_lines
+        # The window is the actual disk lines 5400-5402 with real line numbers.
+        assert "line_05400 = 5400" in d["content"]
+        assert "5400\t" in d["content"]
+
+    async def test_offset_past_eof_returns_coherent_empty_window(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        """offset beyond EOF must not report start > end (regression)."""
+        d = _parse(await read(ctx, str(sample_file), offset=1000, limit=5))
+        info = d["lines"]
+        assert info["start"] <= info["end"]
+        assert info["start"] == info["total"]
+        assert info["end"] == info["total"]
+        assert d["content"] == ""
+
     async def test_negative_offset_returns_error(self, ctx: MagicMock, sample_file: Path) -> None:
         with pytest.raises(ToolError, match="read: offset must be >= 0"):
             await read(ctx, str(sample_file), offset=-1)

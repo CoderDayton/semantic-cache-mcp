@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -241,6 +242,47 @@ async def _maybe_call_remote_tool(
         _raise_tool_error(tool, f"timed out after {timeout}s", state.max_response_tokens)
 
 
+def _forward_kwargs(*, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build remote-forward kwargs from the *calling tool's* own signature.
+
+    Reads the caller frame's parameters (every tool parameter except ``ctx``)
+    and pulls their current values from the caller's locals. Because the
+    forwarded set is derived from the signature rather than hand-listed, a
+    newly added tool parameter is forwarded automatically — it can never be
+    silently dropped in remote/supervisor mode. ``overrides`` supplies values
+    for parameters that are transformed before forwarding (e.g. ``batch_read``
+    encodes its resolved path list as JSON).
+    """
+    frame = inspect.currentframe()
+    caller = frame.f_back if frame is not None else None
+    if caller is None:  # pragma: no cover - CPython always provides a frame
+        raise RuntimeError("_forward_kwargs requires a caller frame")
+    code = caller.f_code
+    # ``co_varnames`` lays out positional-or-keyword args first
+    # (``co_argcount``), then keyword-only args (``co_kwonlyargcount``). Both
+    # are real parameters that must be forwarded; slicing at ``co_argcount``
+    # alone would silently drop a keyword-only param — the exact regression
+    # this helper exists to prevent. A ``*args``/``**kwargs`` tool has no
+    # stable name to forward under, so fail loudly rather than drop it.
+    if code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS):
+        raise TypeError(
+            f"_forward_kwargs cannot forward {code.co_name}: "
+            "*args/**kwargs parameters have no stable forwarded name"
+        )
+    names = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
+    local_vars = caller.f_locals
+    over = overrides or {}
+    unknown = set(over) - set(names)
+    if unknown:
+        raise KeyError(
+            f"_forward_kwargs override(s) {sorted(unknown)} are not parameters "
+            f"of {code.co_name} — a typo'd override would forward the raw value"
+        )
+    return {
+        name: (over[name] if name in over else local_vars[name]) for name in names if name != "ctx"
+    }
+
+
 def _serialized(fn):
     """Decorator: acquire the global tool lock before running the handler.
 
@@ -365,15 +407,7 @@ async def read(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "read",
-        {
-            "path": path,
-            "max_size": max_size,
-            "offset": offset,
-            "limit": limit,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -398,6 +432,7 @@ async def read(
                     diff_mode=False,  # Line ranges bypass diff mode
                     force_full=True,
                     refresh_cache=False,
+                    summarize=False,  # Line ranges need literal lines, not a summary
                 ),
                 timeout=_TOOL_TIMEOUT,
             )
@@ -416,7 +451,9 @@ async def read(
                 f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
             )
             line_info = {
-                "start": start + 1,
+                # Empty window (offset past EOF / empty file): report
+                # start==end==total instead of a start that exceeds end.
+                "start": start + 1 if selected else len(lines),
                 "end": min(end, len(lines)),
                 "total": len(lines),
             }
@@ -766,7 +803,7 @@ async def stats(
     cache = state.cache
     mode = state.mode
     remote_result: ToolResult | None = await _maybe_call_remote_tool(
-        state, "stats", {}, timeout=_TOOL_TIMEOUT
+        state, "stats", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -962,7 +999,7 @@ async def clear(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state, "clear", {}, timeout=_TOOL_TIMEOUT
+        state, "clear", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1008,7 +1045,7 @@ async def delete(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state, "delete", {"path": path, "dry_run": dry_run}, timeout=_TOOL_TIMEOUT
+        state, "delete", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1120,18 +1157,7 @@ async def write(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "write",
-        {
-            "path": path,
-            "content": content,
-            "create_parents": create_parents,
-            "dry_run": dry_run,
-            "auto_format": auto_format,
-            "show_diff": show_diff,
-            "append": append,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "write", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1248,20 +1274,7 @@ async def edit(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "edit",
-        {
-            "path": path,
-            "old_string": old_string,
-            "new_string": new_string,
-            "replace_all": replace_all,
-            "dry_run": dry_run,
-            "auto_format": auto_format,
-            "show_diff": show_diff,
-            "start_line": start_line,
-            "end_line": end_line,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "edit", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1363,7 +1376,20 @@ async def edit_preview(
         old_string: Anchor text. Must match exactly (whitespace, indentation).
     """
     state = await _tool_call_state(ctx)
+    # Resolve against the client root *before* forwarding, like read/edit/write:
+    # _forward_kwargs() snapshots this frame's locals, and the worker process
+    # has no client root, so a raw relative path would resolve against the
+    # worker cwd and preview the wrong file.
     path = state.resolve(path)
+    # edit_preview reads through the cache via smart_read, so under the
+    # supervisor runtime the real cache lives in the worker — forward there
+    # like read/grep/search rather than calling smart_read on the proxy.
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "edit_preview", _forward_kwargs(), timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
+
     cache = state.cache
     max_response_tokens = state.max_response_tokens
 
@@ -1468,16 +1494,7 @@ async def batch_edit(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "batch_edit",
-        {
-            "path": path,
-            "edits": edits,
-            "dry_run": dry_run,
-            "auto_format": auto_format,
-            "show_diff": show_diff,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "batch_edit", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1644,10 +1661,7 @@ async def search(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "search",
-        {"query": query, "k": k, "directory": directory, "show_preview": show_preview},
-        timeout=_TOOL_TIMEOUT,
+        state, "search", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1728,11 +1742,12 @@ async def batch_read(
         remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
             state,
             "batch_read",
-            {
-                "paths": json.dumps(path_list),
-                "max_total_tokens": max_total_tokens,
-                "priority": json.dumps(priority_list) if priority_list else "",
-            },
+            _forward_kwargs(
+                overrides={
+                    "paths": json.dumps(path_list),
+                    "priority": json.dumps(priority_list) if priority_list else "",
+                }
+            ),
             timeout=_TOOL_TIMEOUT * 2,
         )
         if remote_result is not None:
@@ -1851,14 +1866,7 @@ async def glob(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "glob",
-        {
-            "pattern": pattern,
-            "directory": directory,
-            "cached_only": cached_only,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "glob", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
@@ -1939,18 +1947,7 @@ async def grep(
     mode = state.mode
     max_response_tokens = state.max_response_tokens
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state,
-        "grep",
-        {
-            "pattern": pattern,
-            "path": path,
-            "fixed_string": fixed_string,
-            "case_sensitive": case_sensitive,
-            "context_lines": context_lines,
-            "max_matches": max_matches,
-            "max_files": max_files,
-        },
-        timeout=_TOOL_TIMEOUT,
+        state, "grep", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result

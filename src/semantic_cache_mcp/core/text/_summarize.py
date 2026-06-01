@@ -378,18 +378,21 @@ def summarize_semantic(
     selected_indices: set[int] = set()
     current_size = 0
 
-    # Running matrix of selected embeddings — appended to as segments are
-    # accepted, then dotted in one BLAS call inside the diversity check. Pure
-    # numpy: avoids per-candidate Python loops over selected indices.
-    selected_rows: list[NDArray[np.float32]] = []
+    # Pre-allocated row buffer filled in place as segments are accepted; the
+    # diversity check dots a (count, dim) view of it in one BLAS call. Avoids
+    # the O(k^2) re-`np.stack` of the whole selection on every accept.
+    _emb_dim = len(resolved[0])
+    selected_buf: NDArray[np.float32] = np.empty((len(segments), _emb_dim), dtype=np.float32)
+    selected_count = 0
     selected_matrix: NDArray[np.float32] | None = None
 
     def _accept(idx: int, size: int) -> None:
-        nonlocal current_size, selected_matrix
+        nonlocal current_size, selected_matrix, selected_count
         selected_indices.add(idx)
         current_size += size
-        selected_rows.append(resolved[idx])
-        selected_matrix = np.stack(selected_rows) if selected_rows else None
+        selected_buf[selected_count] = resolved[idx]
+        selected_count += 1
+        selected_matrix = selected_buf[:selected_count]
 
     # Always include first segment — typically contains imports, module docstring, headers
     if segments and len(segments[0].content) < content_budget:
@@ -458,10 +461,8 @@ def _simple_embedding(text: str, dim: int = 256) -> NDArray[np.float32]:
     if not words:
         return np.zeros(dim, dtype=np.float32)
 
-    vec = np.zeros(dim, dtype=np.float32)
-    for word in words:
-        idx = hash(word) % dim
-        vec[idx] += 1.0
+    indices = np.fromiter((hash(word) % dim for word in words), dtype=np.intp, count=len(words))
+    vec = np.bincount(indices, minlength=dim).astype(np.float32)
 
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
