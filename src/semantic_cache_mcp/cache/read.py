@@ -444,7 +444,8 @@ async def batch_smart_read(
     # Priority-aware ordering: priority paths first (in given order), then remainder smallest-first.
     if priority:
         priority_set = set(priority)
-        priority_ordered = [p for p in priority if p in set(paths)]
+        paths_set = set(paths)
+        priority_ordered = [p for p in priority if p in paths_set]
         remainder = [p for p in paths if p not in priority_set]
         remainder_sorted = sorted(remainder, key=lambda p: token_estimates[p])
         paths_sorted = priority_ordered + remainder_sorted
@@ -457,8 +458,10 @@ async def batch_smart_read(
     # smart_read won't need an embedding for them.
     _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
     for _path in paths_sorted:
-        _resolved = Path(_path).expanduser().resolve()
-        _resolved_str = str(_resolved)
+        # Reuse the already-resolved path from resolved_map instead of a third
+        # expanduser().resolve() syscall per file on the event loop.
+        _resolved_str = resolved_map[_path]
+        _resolved = Path(_resolved_str)
         _cached = _cache_map.get(_resolved_str)
         # Reuse the stat result from the prefetch gather above instead of
         # making a fresh blocking stat() call in the event loop.
@@ -524,7 +527,7 @@ async def batch_smart_read(
             break
 
         try:
-            _resolved_key = str(Path(path).expanduser().resolve())
+            _resolved_key = resolved_map[path]
             result = await smart_read(
                 cache,
                 path,

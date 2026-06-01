@@ -50,7 +50,7 @@ src/semantic_cache_mcp/
 
 ---
 
-## Storage (`storage/vector.py`)
+## Storage (`storage/vector/`)
 
 ### VectorStorage (simplevecdb)
 

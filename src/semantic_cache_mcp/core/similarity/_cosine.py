@@ -141,6 +141,18 @@ def cosine_similarity_with_pruning(
 
 def _build_matrix(vectors: list[array.array | list | np.ndarray]) -> np.ndarray:
     dim = len(vectors[0])
+    # Fast path: homogeneous array.array("f") inputs concatenate into one
+    # contiguous f32 buffer, skipping the per-row Python assignment loop. The
+    # typecode check is load-bearing: a non-"f" array (e.g. "d"/"i") would
+    # join to a buffer that frombuffer(f32) silently misreads.
+    first = vectors[0]
+    if (
+        isinstance(first, array.array)
+        and first.typecode == "f"
+        and all(isinstance(v, array.array) and v.typecode == "f" for v in vectors)
+    ):
+        flat = np.frombuffer(b"".join(vectors), dtype=np.float32)
+        return flat.reshape(len(vectors), dim)
     matrix = np.empty((len(vectors), dim), dtype=np.float32)
     for i, v in enumerate(vectors):
         matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v

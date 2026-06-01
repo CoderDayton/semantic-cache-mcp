@@ -16,6 +16,12 @@ from ..core import count_tokens
 
 logger = logging.getLogger(__name__)
 
+# Control bytes (0x00–0x1F minus tab/newline/CR) treated as non-printable by
+# _is_binary_content. Everything else is deleted via bytes.translate so the
+# length of the translated sample is the non-printable count in one C pass.
+_NON_PRINTABLE = frozenset(range(32)) - {9, 10, 13}
+_PRINTABLE_DELETE = bytes(b for b in range(256) if b not in _NON_PRINTABLE)
+
 # Size limits for DoS protection
 MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10MB max content size for write
 MAX_EDIT_SIZE = 10 * 1024 * 1024  # 10MB max file size for edit
@@ -186,7 +192,7 @@ def _is_binary_content(data: bytes) -> bool:
 
     # 3. High ratio of non-printable characters (>30% is suspicious)
     # Exclude common whitespace: tab(9), newline(10), carriage return(13)
-    non_printable = sum(1 for b in sample if b < 32 and b not in (9, 10, 13))
+    non_printable = len(sample.translate(None, _PRINTABLE_DELETE))
     return len(sample) > 0 and non_printable / len(sample) > 0.3
 
 
@@ -244,9 +250,11 @@ def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[s
     if end_line > total:
         raise ValueError(f"end_line ({end_line}) exceeds total lines ({total})")
 
-    # Compute char offsets
+    # Two non-overlapping passes over line lengths: char_start covers the
+    # lines before the range, char_end extends it through the range. O(1)
+    # extra memory — no full prefix-sum list materialized for two indices.
     char_start = sum(len(lines[i]) for i in range(start_line - 1))
-    char_end = sum(len(lines[i]) for i in range(end_line))
+    char_end = char_start + sum(len(lines[i]) for i in range(start_line - 1, end_line))
 
     substring = content[char_start:char_end]
     return substring, char_start, char_end

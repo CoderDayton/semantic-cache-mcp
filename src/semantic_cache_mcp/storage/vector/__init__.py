@@ -5,10 +5,8 @@ from __future__ import annotations
 import array
 import asyncio
 import enum
-import fnmatch
 import json
 import logging
-import sqlite3
 import threading
 import time
 from collections.abc import Sequence
@@ -23,7 +21,6 @@ from ...config import (
     CACHE_DIR,
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
-    SIMILARITY_THRESHOLD,
     STARTUP_SENTINEL,
 )
 from ...core.chunking import get_optimal_chunker
@@ -847,49 +844,11 @@ class VectorStorage:
     async def find_similar(
         self, embedding: EmbeddingVector, exclude_path: str | None = None
     ) -> str | None:
-        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None."""
-        if self._closed:
-            return None
+        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None.
 
-        try:
-            results = await self._collection.similarity_search(
-                query=embedding,
-                k=10,  # Get candidates, then filter
-            )
-        except Exception as e:
-            logger.warning(f"Similarity search failed: {e}")
-            return None
-
-        if not results:
-            return None
-
-        for doc, distance in results:
-            # COSINE distance in simplevecdb: 0 = identical, 2 = opposite
-            # Convert to similarity: 1 - (distance / 2) maps [0,2] → [1,0]
-            similarity = 1.0 - (distance / 2.0)
-            candidate_path = doc.metadata.get(_META_PATH)
-            has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
-            # Defense-in-depth: chunk children carry zero embeddings; a query
-            # with near-zero magnitude could match them as false positives if
-            # `has_embedding` is ever stale (schema migration, partial write).
-            is_chunk_child = (
-                doc.metadata.get(_META_CHUNK_INDEX, -1) >= 0
-                and not doc.metadata.get(_META_IS_PARENT, False)
-                and doc.metadata.get(_META_TOTAL_CHUNKS, 1) > 1
-            )
-
-            is_match = (
-                has_emb
-                and not is_chunk_child
-                and candidate_path
-                and candidate_path != exclude_path
-                and similarity >= SIMILARITY_THRESHOLD
-            )
-            if is_match:
-                logger.debug(f"Similar file found: {candidate_path} (similarity={similarity:.3f})")
-                return candidate_path
-
-        return None
+        Implementation lives in ``_search`` to keep this module from becoming a god-object.
+        """
+        return await _search.find_similar(self, embedding, exclude_path)
 
     async def find_similar_multi(
         self,
@@ -899,48 +858,9 @@ class VectorStorage:
         threshold: float | None = None,
     ) -> list[tuple[str, float]]:
         """Return up to k (path, similarity) tuples above threshold."""
-        if self._closed:
-            return []
-        if threshold is None:
-            threshold = SIMILARITY_THRESHOLD
-
-        try:
-            results = await self._collection.similarity_search(
-                query=embedding,
-                k=k * 3,  # Over-fetch to account for filtering
-            )
-        except Exception as e:
-            logger.warning(f"Similarity search failed: {e}")
-            return []
-
-        matches: list[tuple[str, float]] = []
-        seen_paths: set[str] = set()
-
-        for doc, distance in results:
-            similarity = 1.0 - (distance / 2.0)
-            candidate_path = doc.metadata.get(_META_PATH)
-            has_emb = doc.metadata.get(_META_HAS_EMBEDDING, False)
-            is_chunk_child = (
-                doc.metadata.get(_META_CHUNK_INDEX, -1) >= 0
-                and not doc.metadata.get(_META_IS_PARENT, False)
-                and doc.metadata.get(_META_TOTAL_CHUNKS, 1) > 1
-            )
-
-            if (
-                has_emb
-                and not is_chunk_child
-                and candidate_path
-                and candidate_path != exclude_path
-                and candidate_path not in seen_paths
-                and similarity >= threshold
-            ):
-                seen_paths.add(candidate_path)
-                matches.append((candidate_path, similarity))
-
-                if len(matches) >= k:
-                    break
-
-        return matches
+        return await _search.find_similar_multi(
+            self, embedding, exclude_path, k=k, threshold=threshold
+        )
 
     # -------------------------------------------------------------------------
     # Query-based search
@@ -953,15 +873,7 @@ class VectorStorage:
         filter: dict | None = None,
     ) -> list[tuple[str, str, float]]:
         """BM25 keyword search over cached content. FTS5 syntax supported."""
-        if self._closed:
-            return []
-        try:
-            results = await self._collection.keyword_search(query, k=k * 2, filter=filter)
-        except Exception as e:
-            logger.warning(f"Keyword search failed: {e}")
-            return []
-
-        return self._dedupe_search_results(results, k)
+        return await _search.search_by_query(self, query, k=k, filter=filter)
 
     async def search_hybrid(
         self,
@@ -974,55 +886,11 @@ class VectorStorage:
 
         Falls back to keyword-only if no embedding provided.
         """
-        if self._closed:
-            return []
-
-        try:
-            results = await self._collection.hybrid_search(
-                query,
-                k=k * 2,
-                filter=filter,
-                query_vector=embedding,
-            )
-        except Exception as e:
-            logger.warning(f"Hybrid search failed: {e}")
-            return []
-
-        return self._dedupe_search_results(results, k)
-
-    def _dedupe_search_results(
-        self,
-        results: list[tuple],
-        k: int,
-    ) -> list[tuple[str, str, float]]:
-        """Deduplicate by path, keeping best score. Skips parent (empty) docs."""
-        seen_paths: set[str] = set()
-        matches: list[tuple[str, str, float]] = []
-        _preview_chars = _PREVIEW_CHARS
-
-        for doc, score in results:
-            meta = doc.metadata
-            if meta.get(_META_IS_PARENT, False):
-                continue
-            path = meta.get(_META_PATH, "")
-            if not path or path in seen_paths:
-                continue
-            seen_paths.add(path)
-            preview = meta.get(_META_PREVIEW) or doc.page_content[:_preview_chars]
-            matches.append((path, preview, float(score)))
-            if len(matches) >= k:
-                break
-
-        return matches
+        return await _search.search_hybrid(self, query, embedding, k=k, filter=filter)
 
     # -------------------------------------------------------------------------
     # Grep — regex/literal content search across cached files
     # -------------------------------------------------------------------------
-
-    # Upper bounds for grep parameters — prevent excessive memory/CPU usage
-    _GREP_MAX_CONTEXT_LINES = 20
-    _GREP_MAX_MATCHES = 10_000
-    _GREP_MAX_FILES = 500
 
     # Short TTL cache for has_cached_paths_under — the call is a fallback on
     # empty grep results, and a wrong `path` argument from a model can fire
@@ -1052,7 +920,7 @@ class VectorStorage:
         if not path_filter:
             result = any(not meta.get(_META_IS_PARENT, False) for _id, _text, meta in all_docs)
         else:
-            matcher = self._grep_path_matches
+            matcher = _grep.path_matches
             result = False
             for _doc_id, _text, meta in all_docs:
                 if meta.get(_META_IS_PARENT, False):
@@ -1083,187 +951,23 @@ class VectorStorage:
         """Exact pattern matching across cached files — like ripgrep on the cache.
 
         Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
+        Implementation lives in ``_grep`` to keep this module from becoming a god-object.
         """
-        if self._closed:
-            return []
-        import re  # noqa: PLC0415
-
-        # Clamp inputs to prevent excessive memory/CPU usage
-        context_lines = max(0, min(context_lines, self._GREP_MAX_CONTEXT_LINES))
-        max_matches = max(1, min(max_matches, self._GREP_MAX_MATCHES))
-        max_files = max(1, min(max_files, self._GREP_MAX_FILES))
-
-        flags = 0 if case_sensitive else re.IGNORECASE
-        if fixed_string:
-            compiled = re.compile(re.escape(pattern), flags)
-        else:
-            # Cap pattern length to mitigate ReDoS from pathological regexes.
-            if len(pattern) > 1000:
-                logger.warning(f"Regex pattern too long ({len(pattern)} chars), rejecting")
-                return []
-            try:
-                compiled = re.compile(pattern, flags)
-            except re.error as e:
-                logger.warning(f"Invalid regex pattern: {e}")
-                return []
-
-        # Sound BM25 prefilter. Each required literal token is expanded to
-        # the FTS5 vocabulary terms that contain it as a substring, then
-        # BM25-matched. The candidate set stays complete even though FTS5's
-        # unicode61 tokenizer keeps compound identifiers whole —
-        # grep("function") still finds a file whose only hit is inside
-        # "functionHelper". A None result means the prefilter cannot be
-        # trusted for this pattern (complex regex, vocabulary unavailable,
-        # or too broad); the caller then does a full scan, always correct.
-        candidates = await self._grep_sound_candidates(
-            pattern, fixed_string=fixed_string, path_filter=path
+        return await _grep.grep(
+            self,
+            pattern,
+            path=path,
+            fixed_string=fixed_string,
+            case_sensitive=case_sensitive,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_files=max_files,
         )
-        files: dict[str, list[tuple[int, str]]] = {}
-        if candidates is not None:
-            # Vocabulary expansion makes the candidate set exact: empty means
-            # nothing matches, non-empty is complete — no full scan needed.
-            if not candidates:
-                return []
-            files = await self._grep_load_files(candidates)
-        else:
-            all_docs = await self._collection.get_documents()
-            for _doc_id, text, meta in all_docs:
-                if meta.get(_META_IS_PARENT, False):
-                    continue  # Parent docs have empty content
-                doc_path = meta.get(_META_PATH, "")
-                if not doc_path or not self._grep_path_matches(doc_path, path_filter=path):
-                    continue
-                chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
-                files.setdefault(doc_path, []).append((chunk_idx, text))
-
-        # Search each file's content
-        results: list[dict] = []
-        total_matches = 0
-
-        for path, chunks in files.items():
-            if total_matches >= max_matches or len(results) >= max_files:
-                break
-
-            # Reconstruct file content from sorted chunks
-            chunks.sort(key=lambda c: c[0])
-            content = "".join(text for _, text in chunks)
-            lines = content.splitlines()
-
-            file_matches: list[dict] = []
-            for i, line in enumerate(lines):
-                if total_matches >= max_matches:
-                    break
-                if compiled.search(line):
-                    match_info: dict[str, object] = {
-                        "line_number": i + 1,
-                        "line": line,
-                    }
-                    if context_lines > 0:
-                        start = max(0, i - context_lines)
-                        end = min(len(lines), i + context_lines + 1)
-                        match_info["before"] = lines[start:i]
-                        match_info["after"] = lines[i + 1 : end]
-                    file_matches.append(match_info)
-                    total_matches += 1
-
-            if file_matches:
-                results.append({"path": path, "matches": file_matches})
-
-        return results
-
-    # Grep prefilter tuning.
-    #
-    # A literal token must be at least this long to drive the prefilter —
-    # shorter tokens expand to too large a slice of the FTS5 vocabulary to
-    # be selective.
-    _GREP_TOKEN_MIN_LEN = 4
-    # Cap on the vocabulary terms a single token may expand to. Past this
-    # the OR-query is unwieldy and the token is too common to prefilter
-    # usefully, so the caller falls back to a full scan.
-    _GREP_VOCAB_TERM_CAP = 256
-    # Cap on BM25 rows fetched. If the match hits this cap the result may be
-    # truncated and can no longer be trusted as complete — full scan instead.
-    _GREP_PREFILTER_FETCH_CAP = 1000
-    # Regex metacharacters that can make an extracted token non-mandatory:
-    # alternation, zero-allowing quantifiers, and character classes — a run
-    # like [abcd] yields the token "abcd" though the class matches only one
-    # character. Their presence in a regex pattern disqualifies the
-    # token-AND prefilter; fixed-string patterns are immune because there
-    # the characters are literal.
-    _GREP_UNSAFE_REGEX_CHARS = frozenset("|?*{[")
 
     @staticmethod
     def _grep_required_tokens(pattern: str, *, fixed_string: bool) -> list[str] | None:
-        """Literal alphanumeric tokens that must appear in every match.
-
-        Returns the tokens of length >= ``_GREP_TOKEN_MIN_LEN``, or ``None``
-        when the pattern cannot be soundly prefiltered: a regex carrying
-        alternation, a zero-allowing quantifier, or a character class
-        (whose extracted tokens are not guaranteed substrings of every
-        match), or a pattern with no token long enough to be selective.
-        ``None`` routes the caller to a full scan, which is always correct.
-        """
-        import re as _re  # noqa: PLC0415
-
-        if not fixed_string and any(c in VectorStorage._GREP_UNSAFE_REGEX_CHARS for c in pattern):
-            return None
-        tokens = [
-            t
-            for t in _re.findall(r"[A-Za-z0-9]+", pattern)
-            if len(t) >= VectorStorage._GREP_TOKEN_MIN_LEN
-        ]
-        return tokens or None
-
-    @staticmethod
-    def _grep_vocab_expand(
-        conn: sqlite3.Connection,
-        tokens: list[str],
-        term_cap: int,
-    ) -> list[list[str]] | None:
-        """Expand each token to the FTS5 vocabulary terms containing it.
-
-        Runs on the IO executor (blocking sqlite calls). Returns one term
-        list per token — an empty inner list means the token is absent from
-        the index entirely. Returns ``None`` when the vocabulary cannot be
-        queried or a token expands past ``term_cap`` (too broad to prefilter
-        soundly). Uses an ``fts5vocab`` table in the connection-local
-        ``temp`` schema, so it never touches the persistent simplevecdb
-        schema.
-        """
-        import re as _re  # noqa: PLC0415
-
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%' LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return None
-        fts_table = row[0]
-        # Validate before interpolating — table names cannot be bound params.
-        if not _re.fullmatch(r"[A-Za-z0-9_]+", fts_table):
-            return None
-
-        vocab = "scmcp_grep_vocab"
-        conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
-        # The 'main' schema argument is required: fts5vocab otherwise looks
-        # for the FTS table in the vocab table's own schema (temp), where it
-        # does not exist.
-        conn.execute(
-            f"CREATE VIRTUAL TABLE temp.{vocab} USING fts5vocab('main', '{fts_table}', 'row')"
-        )
-        try:
-            per_token: list[list[str]] = []
-            for token in tokens:
-                rows = conn.execute(
-                    f"SELECT DISTINCT term FROM temp.{vocab} "
-                    f"WHERE term LIKE '%' || ? || '%' LIMIT ?",
-                    (token.lower(), term_cap + 1),
-                ).fetchall()
-                if len(rows) > term_cap:
-                    return None  # token too broad for a bounded MATCH query
-                per_token.append([r[0] for r in rows])
-            return per_token
-        finally:
-            conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
+        """Literal tokens that must appear in every match (see ``_grep.required_tokens``)."""
+        return _grep.required_tokens(pattern, fixed_string=fixed_string)
 
     async def _grep_sound_candidates(
         self,
@@ -1272,130 +976,9 @@ class VectorStorage:
         fixed_string: bool,
         path_filter: str | None,
     ) -> list[str] | None:
-        """Exact candidate paths for grep, or ``None`` to force a full scan.
-
-        Expands each required token to the FTS5 vocabulary terms that
-        contain it as a substring, then runs one BM25 MATCH over those
-        terms. The candidate set is complete: every document whose line
-        contains the token also contains it inside some indexed term, so
-        the OR-of-terms / AND-of-tokens MATCH cannot miss it — this is what
-        the raw whole-token MATCH got wrong for compound identifiers.
-
-        Returns ``None`` on any condition that would break completeness — an
-        unsupported pattern, a vocabulary error, an over-broad token, or a
-        possibly-truncated BM25 result — so the caller falls back to a full
-        scan.
-        """
-        tokens = self._grep_required_tokens(pattern, fixed_string=fixed_string)
-        if tokens is None:
-            return None
-
-        loop = asyncio.get_running_loop()
-        try:
-            per_token_terms = await loop.run_in_executor(
-                self._io_executor,
-                self._grep_vocab_expand,
-                self._sync_collection.conn,
-                tokens,
-                self._GREP_VOCAB_TERM_CAP,
-            )
-        except Exception as exc:
-            logger.debug(f"grep vocab expansion failed: {exc}; falling back to scan")
-            return None
-        if per_token_terms is None:
-            return None
-        if any(not terms for terms in per_token_terms):
-            return []  # a required token appears in no indexed term
-
-        # AND across tokens, OR across each token's vocabulary expansion.
-        match_query = " AND ".join(
-            "(" + " OR ".join(f'"{term}"' for term in terms) + ")" for terms in per_token_terms
-        )
-        try:
-            results = await self._collection.keyword_search(
-                match_query, k=self._GREP_PREFILTER_FETCH_CAP
-            )
-        except Exception as exc:
-            logger.debug(f"grep BM25 prefilter failed: {exc}; falling back to scan")
-            return None
-        if len(results) >= self._GREP_PREFILTER_FETCH_CAP:
-            return None  # possibly truncated — completeness no longer assured
-
-        seen: set[str] = set()
-        candidates: list[str] = []
-        for doc, _score in results:
-            meta = doc.metadata
-            if meta.get(_META_IS_PARENT, False):
-                continue
-            doc_path = meta.get(_META_PATH, "")
-            if not doc_path or doc_path in seen:
-                continue
-            if not self._grep_path_matches(doc_path, path_filter=path_filter):
-                continue
-            seen.add(doc_path)
-            candidates.append(doc_path)
-        return candidates
-
-    async def _grep_load_files(self, paths: list[str]) -> dict[str, list[tuple[int, str]]]:
-        """Load chunk text for a set of paths in a single batched lookup.
-
-        Uses simplevecdb's list-value filter, which compiles to
-        ``json_extract(metadata, '$.path') IN (?, ?, ...)`` — one round trip
-        through the executor instead of N. Falls back to per-path lookups
-        only if the batch query itself errors.
-        """
-        files: dict[str, list[tuple[int, str]]] = {}
-        if not paths:
-            return files
-
-        try:
-            docs = await self._collection.get_documents(
-                filter_dict={_META_PATH: list(paths)},
-            )
-        except Exception as e:
-            logger.debug(f"Batched grep lookup failed ({len(paths)} paths): {e}")
-            for path in paths:
-                results = await self._find_docs_by_path(path)
-                for _doc_id, meta, text in results:
-                    if meta.get(_META_IS_PARENT, False):
-                        continue
-                    chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
-                    files.setdefault(path, []).append((chunk_idx, text))
-            return files
-
-        for _doc_id, text, meta in docs:
-            if meta.get(_META_IS_PARENT, False):
-                continue
-            doc_path = meta.get(_META_PATH)
-            if doc_path is None:
-                continue
-            chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
-            files.setdefault(doc_path, []).append((chunk_idx, text))
-        return files
-
-    @staticmethod
-    def _grep_path_matches(path: str, *, path_filter: str | None) -> bool:
-        """Match exact paths, relative suffixes, basenames, and glob filters."""
-        if not path_filter:
-            return True
-
-        normalized_path = path.replace("\\", "/")
-        normalized_filter = path_filter.replace("\\", "/")
-        has_glob = any(ch in normalized_filter for ch in "*?[")
-
-        if has_glob:
-            return any(
-                fnmatch.fnmatchcase(normalized_path, candidate)
-                for candidate in (
-                    normalized_filter,
-                    f"*/{normalized_filter}",
-                )
-            )
-
-        return (
-            normalized_path == normalized_filter
-            or normalized_path.endswith(f"/{normalized_filter}")
-            or Path(normalized_path).name == normalized_filter
+        """Exact candidate paths for grep, or ``None`` to force a full scan."""
+        return await _grep.sound_candidates(
+            self, pattern, fixed_string=fixed_string, path_filter=path_filter
         )
 
     # -------------------------------------------------------------------------
@@ -1619,3 +1202,9 @@ class VectorStorage:
                 return
             self._sync_collection.save()
             self._db.save()
+
+
+# Imported at end of module to break the import cycle: the _grep and _search
+# submodules read this module's metadata-key constants, so they can only load
+# once those constants exist.
+from . import _grep, _search  # noqa: E402

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher, unified_diff
+from itertools import chain
 
 # ---------------------------------------------------------------------------
 # Delta compression
@@ -61,7 +62,8 @@ def compute_delta(old: str, new: str) -> DiffDelta:
                 insertions.append((j, new_lines[j]))
 
     # Estimate compressed size
-    size_bytes = len(old_hash) + len(new_hash) + sum(len(s) for _, s in insertions + deletions)
+    size_bytes = len(old_hash) + len(new_hash)
+    size_bytes += sum(len(s) for _, s in chain(insertions, deletions))
     for _, old_s, new_s in modifications:
         size_bytes += len(old_s) + len(new_s)
 
