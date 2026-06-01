@@ -1376,17 +1376,20 @@ async def edit_preview(
         old_string: Anchor text. Must match exactly (whitespace, indentation).
     """
     state = await _tool_call_state(ctx)
+    # Resolve against the client root *before* forwarding, like read/edit/write:
+    # _forward_kwargs() snapshots this frame's locals, and the worker process
+    # has no client root, so a raw relative path would resolve against the
+    # worker cwd and preview the wrong file.
+    path = state.resolve(path)
     # edit_preview reads through the cache via smart_read, so under the
     # supervisor runtime the real cache lives in the worker — forward there
     # like read/grep/search rather than calling smart_read on the proxy.
-    # Forward before resolve() so the raw path is sent, matching the peers.
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state, "edit_preview", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
     if remote_result is not None:
         return remote_result
 
-    path = state.resolve(path)
     cache = state.cache
     max_response_tokens = state.max_response_tokens
 

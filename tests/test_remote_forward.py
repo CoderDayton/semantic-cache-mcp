@@ -12,6 +12,7 @@ cannot come back.
 from __future__ import annotations
 
 import inspect
+import os
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -110,6 +111,36 @@ async def test_remote_forward_covers_all_params(tool_name: str) -> None:
         f"{tool_name} forwarded {set(forwarded_kwargs)} but its signature "
         f"declares {_param_names(fn)} — a parameter would be silently dropped "
         f"in remote mode"
+    )
+
+
+@pytest.mark.parametrize("tool_name", _FORWARDING_TOOLS)
+async def test_remote_forward_resolves_path(tool_name: str) -> None:
+    """A path-bearing tool must resolve before forwarding.
+
+    ``_forward_kwargs()`` snapshots the caller's locals, so a tool that calls
+    it before ``state.resolve(path)`` forwards the raw (possibly relative) path.
+    The worker process has no client root, so it would resolve that against its
+    own cwd and hit the wrong file. The placeholder input ``"x"`` is relative;
+    a resolved path is always absolute. Regression guard for ``edit_preview``,
+    which forwarded before resolving.
+    """
+    fn = getattr(tools_mod, tool_name)
+    # Only tools with a *required* path forward a file target. grep's optional
+    # `path` filter defaults to None (nothing to resolve), so skip it.
+    if "path" not in _required_args(fn):
+        pytest.skip(f"{tool_name} has no required path parameter")
+    cache = _FakeRemoteCache()
+    ctx = _make_ctx(cache)
+
+    await fn(ctx, **_required_args(fn))
+
+    _, forwarded_kwargs = cache.calls[0]
+    forwarded_path = forwarded_kwargs["path"]
+    assert os.path.isabs(forwarded_path), (
+        f"{tool_name} forwarded non-absolute path {forwarded_path!r} — it must "
+        f"call state.resolve(path) before forwarding, or the worker resolves it "
+        f"against the wrong cwd"
     )
 
 
