@@ -145,14 +145,13 @@ def _build_matrix(vectors: list[array.array | list | np.ndarray]) -> np.ndarray:
     # contiguous f32 buffer, skipping the per-row Python assignment loop. The
     # typecode check is load-bearing: a non-"f" array (e.g. "d"/"i") would
     # join to a buffer that frombuffer(f32) silently misreads.
-    first = vectors[0]
-    if (
-        isinstance(first, array.array)
-        and first.typecode == "f"
-        and all(isinstance(v, array.array) and v.typecode == "f" for v in vectors)
-    ):
-        flat = np.frombuffer(b"".join(vectors), dtype=np.float32)
-        return flat.reshape(len(vectors), dim)
+    if isinstance(vectors[0], array.array) and vectors[0].typecode == "f":
+        # Comprehension narrows to list[array.array] (a Buffer iterable for
+        # ``join``); the length check keeps the all-or-nothing guarantee.
+        typed = [v for v in vectors if isinstance(v, array.array) and v.typecode == "f"]
+        if len(typed) == len(vectors):
+            flat = np.frombuffer(b"".join(typed), dtype=np.float32)
+            return flat.reshape(len(vectors), dim)
     matrix = np.empty((len(vectors), dim), dtype=np.float32)
     for i, v in enumerate(vectors):
         matrix[i] = np.frombuffer(v, dtype=np.float32) if isinstance(v, array.array) else v
