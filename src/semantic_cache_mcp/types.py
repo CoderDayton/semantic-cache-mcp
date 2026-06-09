@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import array
 from dataclasses import dataclass, field
 
 # Type aliases (Python 3.12+)
-type EmbeddingVector = array.array[float] | list[float]
 type ContentHash = str
 
 
@@ -18,7 +16,6 @@ class CacheEntry:
     content_hash: ContentHash
     mtime: float
     tokens: int
-    embedding: EmbeddingVector | None
     created_at: float
     access_history: list[float] = field(default_factory=list)
 
@@ -35,7 +32,6 @@ class ReadResult:
     tokens_saved: int
     truncated: bool
     compression_ratio: float
-    semantic_match: str | None = None
     # Binary fallback: set when the file is not text. `content` is empty
     # in that case; the read tool surfaces these fields as structured
     # metadata instead of raising.
@@ -115,7 +111,6 @@ class DiffResult:
     diff_content: str
     diff_stats: dict[str, int]  # insertions, deletions, modifications
     tokens_saved: int
-    similarity: float  # Semantic similarity between files
     from_cache: tuple[bool, bool]  # Which files came from cache
 
 

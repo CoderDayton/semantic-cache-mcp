@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import array
-import math
-
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
 from semantic_cache_mcp.core.hashing import hash_chunk, hash_content
-from semantic_cache_mcp.core.similarity import cosine_similarity
 from semantic_cache_mcp.core.text import generate_diff, truncate_smart
 
 
@@ -112,61 +108,6 @@ class TestHashing:
         assert len(result) == 64
 
 
-class TestSimilarity:
-    """Tests for cosine similarity."""
-
-    def test_identical_vectors_similarity_one(self) -> None:
-        """Identical normalized vectors should have similarity 1.0."""
-        vec = [0.5, 0.5, 0.5, 0.5]
-        # Normalize
-        mag = math.sqrt(sum(x * x for x in vec))
-        normalized = [x / mag for x in vec]
-        sim = cosine_similarity(normalized, normalized)
-        # int8 quantization introduces ~1-2% rounding error on small vectors
-        assert abs(sim - 1.0) < 0.02
-
-    def test_orthogonal_vectors_similarity_zero(self) -> None:
-        """Orthogonal vectors should have similarity 0.0."""
-        vec1 = [1.0, 0.0, 0.0]
-        vec2 = [0.0, 1.0, 0.0]
-        sim = cosine_similarity(vec1, vec2)
-        assert abs(sim) < 0.02
-
-    def test_opposite_vectors_similarity_negative(self) -> None:
-        """Opposite vectors should have similarity -1.0."""
-        vec1 = [1.0, 0.0]
-        vec2 = [-1.0, 0.0]
-        sim = cosine_similarity(vec1, vec2)
-        assert abs(sim - (-1.0)) < 0.02
-
-    def test_similar_vectors_high_similarity(self) -> None:
-        """Similar vectors should have high similarity."""
-        vec1 = [0.9, 0.1, 0.0]
-        vec2 = [0.85, 0.15, 0.0]
-        # Normalize both
-        mag1 = math.sqrt(sum(x * x for x in vec1))
-        mag2 = math.sqrt(sum(x * x for x in vec2))
-        norm1 = [x / mag1 for x in vec1]
-        norm2 = [x / mag2 for x in vec2]
-        sim = cosine_similarity(norm1, norm2)
-        assert sim > 0.9
-
-    def test_array_type_vectors(self) -> None:
-        """Should work with array.array type."""
-        vec1 = array.array("f", [0.6, 0.8])
-        vec2 = array.array("f", [0.6, 0.8])
-        sim = cosine_similarity(vec1, vec2)
-        # int8 quantization introduces small rounding error (<0.01)
-        assert abs(sim - 1.0) < 0.01
-
-    def test_zero_vector_handling(self) -> None:
-        """Zero vectors should return 0 similarity."""
-        vec1 = [0.0, 0.0, 0.0]
-        vec2 = [1.0, 0.0, 0.0]
-        sim = cosine_similarity(vec1, vec2)
-        assert sim == 0.0
-
-
 class TestDiffGeneration:
     """Tests for unified diff generation."""
 
@@ -201,6 +142,18 @@ class TestDiffGeneration:
         new = "Line 1\nLine 2\nLine 3 CHANGED\nLine 4\nLine 5\n"
         result = generate_diff(old, new, context_lines=1)
         assert "Line 2" in result or "Line 4" in result
+
+    def test_diff_omits_file_headers_keeps_hunk_header(self) -> None:
+        """The diff drops difflib's `--- `/`+++ ` file headers (pure token
+        overhead) but keeps the `@@` hunk header that carries line numbers."""
+        old = "Line 1\nLine 2\nLine 3\n"
+        new = "Line 1\nLine 2 changed\nLine 3\n"
+        result = generate_diff(old, new)
+        assert "@@" in result  # line-number anchor preserved
+        assert not result.startswith("--- ")
+        assert "+++ " not in result
+        assert "-Line 2\n" in result
+        assert "+Line 2 changed\n" in result
 
 
 class TestSmartTruncation:

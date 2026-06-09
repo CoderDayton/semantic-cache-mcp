@@ -34,7 +34,6 @@ class ReadResponse(ToolResponseModel):
     lines: ReadLineRange | None = None
     unchanged: bool | None = None
     is_diff: bool | None = None
-    semantic_match: str | None = None
     total_tokens: int | None = None
     hint: str | None = None
     from_cache: bool | None = None
@@ -105,19 +104,12 @@ class StatsLifetime(ToolResponseModel):
     files_edited: int | None = None
 
 
-class StatsEmbedding(ToolResponseModel):
-    model: str | None = None
-    provider: str | None = None
-    ready: bool | None = None
-    process_rss_mb: float | None = None
-
-
 class StatsResponse(ToolResponseModel):
     mode: str | None = None
     storage: StatsStorage | None = None
     session: StatsSession | None = None
     lifetime: StatsLifetime | None = None
-    embedding: StatsEmbedding | None = None
+    process_rss_mb: float | None = None
 
 
 class WriteResponse(ToolResponseModel):

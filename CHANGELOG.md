@@ -5,6 +5,98 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-09: Biggest release yet, a near-complete rewrite
+
+This is the biggest release so far. The embedding and vector search code is gone,
+the third-party vector database is replaced by a small SQLite + FTS5 store we
+vendor ourselves, the storage package is renamed, reads get a new hash check that
+lets the cache skip work, all the tool descriptions are rewritten, and the MCP
+framework is bumped. Nothing that saves tokens was lost: chunking, chunk
+reassembly, the content cache, `grep`, `glob`, `diff`, and summarization all work
+the same as before. The server uses about 400 MB less memory now that it never
+loads an ONNX model, it starts faster, and it depends on only three packages at
+runtime.
+
+### Added
+
+- Incremental chunk updates. Editing a large file now rewrites only the chunks
+  that actually changed instead of re-chunking and re-storing the whole file.
+  Each chunk carries its own BLAKE3 hash and the file keeps a manifest of those
+  hashes, so on a re-write the cache keeps every chunk whose bytes are unchanged
+  — no row rewrite, no search re-index — and writes only the few that differ. A
+  one-line edit to a file that splits into 43 chunks now touches about 2 of them.
+  It stays crash-safe by ordering: the file's `content_hash` is written last, so
+  a write that fails partway is caught by the next read's freshness check and
+  re-stored, and the eviction index rebuilds itself from disk on failure. The
+  token-savings benchmark now reports chunk economics — how many files chunk,
+  how much chunk content repeats, and the share of per-edit chunk writes this
+  avoids — so the win is measured, not assumed.
+- Hash-driven read freshness. Every `read` returns a `content_hash`, and `read`
+  takes an optional `known_hash`. Send back the hash you already have and the
+  server answers `unchanged: true` instead of resending the file. The caller
+  knows that hash for sure, so there is no guessing about what was sent earlier
+  in the session. `write`, `edit`, and `batch_edit` return the new `content_hash`
+  too, so right after changing a file you can pass it as `known_hash` and skip
+  the re-read. Ranged reads with `offset`/`limit` answer `unchanged` from a stat
+  alone when the hash matches, and when they do need the lines they cut them from
+  the cached copy instead of re-reading the whole file from disk. The stats count
+  only the lines a ranged read returns, not the whole file.
+
+### Changed
+
+- `search` is BM25 keyword only. It ranks cached files by how well their words
+  match the query and returns a score from 0 to 1, where the best match is 1.0.
+  Punctuation in a query is treated as plain text, so a term like `in-flight` or
+  a stray `*` still matches instead of coming back empty. It matches on words,
+  not meaning, so use `grep` for exact strings and `batch_read` to pull more
+  files into the cache.
+- A small SQLite + FTS5 store replaces `simplevecdb`. A focused `DocStore` and
+  `AsyncDocStore` now back storage, using FTS5 `bm25()` ranking and JSON metadata
+  filters copied straight from the old catalog code. There is no embedding
+  column, no stub vector, no usearch index, and no crash-recovery sidecar files,
+  since SQLite WAL handles crash safety on its own.
+- The storage package was renamed. `storage/vector` is now `storage/docstore`,
+  `VectorStorage` is now `ContentStorage`, `VECDB_PATH` is now `CONTENT_DB_PATH`,
+  and the cache file `vecdb.db` is now `docstore.db`.
+- Diffs do more of the work now. The `read` diff gate went from 0.6 to 0.9, with
+  a floor at 200 tokens, so a small edit to a medium or large file comes back as
+  a diff with the changed line numbers instead of the whole file. Tiny files
+  still come back in full. The diff itself is leaner too: it drops the
+  `--- old`/`+++ new` file headers and the prose prefix and keeps just the `@@`
+  hunks, which already carry the line numbers.
+- All 13 tool descriptions were rewritten so they read as one workflow: `glob` to
+  find files, `batch_read` to cache them, `search` or `grep` to look inside,
+  `read` to open, then `edit` or `write` to change. They share the same wording
+  for errors and statuses, and they describe what the tools actually do,
+  including the BM25 fix for `search`.
+- `fastmcp` was upgraded to 3.2 or newer (3.4.2). Parameter docs now show up as
+  real per-argument descriptions instead of one long blob.
+
+### Removed
+
+- Embedding and vector search. Deleted `core/embeddings` (FastEmbed/ONNX, the
+  OpenAI-compatible provider, and the HuggingFace model registry) and
+  `core/similarity` (cosine). Vector similarity (`find_similar`, `search_hybrid`,
+  per-file embeddings) is gone, and `diff` no longer reports a similarity score.
+- Dependencies. Dropped `fastembed`, `openai`, the gpu extra (`fastembed-gpu` and
+  `onnxruntime`), and now `simplevecdb`, `usearch`, and `sqlcipher3-binary` too.
+  The runtime now needs only `blake3`, `fastmcp`, and `numpy`.
+- Config. Removed `EMBEDDING_DEVICE`, `EMBEDDING_MODEL`,
+  `OPENAI_EMBEDDINGS_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+  `OPENAI_EMBEDDING_MODEL`, and `OPENAI_EMBEDDING_DIMENSIONS`.
+- Stats. The embedding block (`model`, `provider`, `ready`) is gone from the
+  `stats` payload. Process RSS is still reported.
+
+### Migration
+
+- The first time you start after upgrading, the cache runs a one-time cleanup
+  that deletes the old `vecdb.db` files (simplevecdb plus usearch, and the
+  short-lived FTS build) and their sidecars, guarded by a `.docstore_v1` marker.
+  The cache rebuilds itself on demand into `docstore.db`.
+- Upgrading to chunk-level content addressing clears any existing `docstore.db`
+  the first time you start, so the cache repopulates in the new chunk format.
+  This runs once, guarded by a `.docstore_manifest_v1` marker.
+
 ## [0.4.9] - 2026-05-30
 
 Fixes a correctness bug in line-addressed reads that made fresh-but-summarized

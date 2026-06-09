@@ -6,7 +6,6 @@ Targets:
   - cache/store.py close() (79% → 85%+)
   - config.py validation (82% → 90%+)
   - storage/sqlite.py pool (85% → 90%+)
-  - core/embeddings/_model.py (71% → 80%+)
 """
 
 from __future__ import annotations
@@ -177,7 +176,7 @@ class TestSemanticCacheClose:
 
         cache = SemanticCache(tmp_path / "vec.db")
         # Just call close and verify it doesn't raise — the real close()
-        # exercises persist + VectorStorage.close + pool.close_all.
+        # exercises persist + ContentStorage.close + pool.close_all.
         cache.close()
 
     def test_close_continues_after_metrics_failure(self, tmp_path: Path) -> None:
@@ -197,26 +196,26 @@ class TestSemanticCacheClose:
 
         cache = SemanticCache(tmp_path / "vec.db")
         with patch(
-            "semantic_cache_mcp.storage.vector.VectorStorage.close",
-            side_effect=Exception("usearch hung"),
+            "semantic_cache_mcp.storage.docstore.ContentStorage.close",
+            side_effect=Exception("storage hung"),
         ):
             cache.close()  # should not raise
 
 
 # ===========================================================================
-# storage/vector — close() with timeout
+# storage/docstore — close() with timeout
 # ===========================================================================
 
 
-class TestVectorStorageClose:
-    """Tests for VectorStorage.close() timeout behavior."""
+class TestContentStorageClose:
+    """Tests for ContentStorage.close() timeout behavior."""
 
     def test_close_timeout_does_not_block(self, tmp_path: Path) -> None:
         """A hung save times out within deadline, not at thread exit."""
 
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
 
         # Use a real daemon thread but with a short timeout — assert it
         # returns promptly even when save blocks. Use generous bound (10s)
@@ -234,9 +233,9 @@ class TestVectorStorageClose:
 
     def test_close_save_error_logged(self, tmp_path: Path) -> None:
         """An error in save is caught and logged."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
 
         with patch.object(vs._db, "save", side_effect=RuntimeError("corrupt")):
             vs.close()  # should not raise
@@ -305,47 +304,6 @@ class TestConfigValidation:
         with (
             patch.object(config, "TOOL_MAX_RESPONSE_TOKENS", -5),
             pytest.raises(ValueError, match="TOOL_MAX_RESPONSE_TOKENS"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_bad_embedding_device(self) -> None:
-        """Invalid EMBEDDING_DEVICE should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "EMBEDDING_DEVICE", "tpu"),
-            pytest.raises(ValueError, match="EMBEDDING_DEVICE"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_bad_similarity_threshold(self) -> None:
-        """SIMILARITY_THRESHOLD outside (0, 1) should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "SIMILARITY_THRESHOLD", 1.5),
-            pytest.raises(ValueError, match="SIMILARITY_THRESHOLD"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_bad_near_duplicate_threshold(self) -> None:
-        """NEAR_DUPLICATE_THRESHOLD outside (0, 1] should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "NEAR_DUPLICATE_THRESHOLD", 0),
-            pytest.raises(ValueError, match="NEAR_DUPLICATE_THRESHOLD"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_near_dup_below_similarity(self) -> None:
-        """NEAR_DUPLICATE_THRESHOLD < SIMILARITY_THRESHOLD should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "SIMILARITY_THRESHOLD", 0.8),
-            patch.object(config, "NEAR_DUPLICATE_THRESHOLD", 0.5),
-            pytest.raises(ValueError, match="NEAR_DUPLICATE_THRESHOLD.*SIMILARITY_THRESHOLD"),
         ):
             config._validate_config()
 

@@ -1,21 +1,16 @@
 [project]
 name = "semantic-cache-mcp"
-version = "0.4.9"
+version = "0.5.0"
 description = "Lightweight MCP server for semantic file caching with 80%+ token reduction"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "blake3>=1.0.8",
-    "fastembed>=0.5.1",
-    "fastmcp>=3.0.0b1",
-    "openai>=2.33.0",
-    "simplevecdb>=2.6.0",
+    "fastmcp>=3.2",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
-gpu = [
-    "fastembed-gpu>=0.5.1",
-]
 dev = [
     "bandit>=1.7.0",
     "mypy>=1.8.0",
@@ -26,14 +21,6 @@ dev = [
 
 [project.scripts]
 semantic-cache-mcp = "semantic_cache_mcp.server:main"
-
-[tool.uv]
-# sqlcipher3-binary only has Linux wheels; simplevecdb uses it only for
-# optional encryption (which we don't use). Override to avoid install
-# failures on macOS/Windows.
-override-dependencies = [
-    "sqlcipher3-binary>=0.5.0; sys_platform == 'linux'",
-]
 
 [build-system]
 requires = ["hatchling"]
@@ -85,6 +72,5 @@ skips = [
     "B310",  # urllib.urlretrieve - we use known hardcoded URL
     "B311",  # random - used for deterministic Gear hash table, not security
     "B608",  # SQL injection - false positive, we use parameterized placeholders
-    "B615",  # HF Hub download without revision pin - we verify SHA256 post-download
     "B110",  # try/except/pass - intentional for optional config files (pooling)
 ]

@@ -14,16 +14,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from semantic_cache_mcp.storage.vector import (
+from semantic_cache_mcp.storage.docstore import (
     _META_ACCESS_HISTORY,
     _META_STORAGE_MODE,
+    ContentStorage,
     StorageMode,
-    VectorStorage,
 )
 
 
-def _make_vs(tmp_path: Path) -> VectorStorage:
-    return VectorStorage(db_path=tmp_path / "vec.db")
+def _make_vs(tmp_path: Path) -> ContentStorage:
+    return ContentStorage(db_path=tmp_path / "vec.db")
 
 
 class TestStorageModeTagging:
@@ -53,7 +53,7 @@ class TestStorageModeTagging:
 
 class TestGrepRequiredTokens:
     def test_literal_tokens_extracted(self) -> None:
-        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
+        toks = ContentStorage._grep_required_tokens(  # noqa: SLF001
             "hello world", fixed_string=True
         )
         assert toks == ["hello", "world"]
@@ -61,13 +61,13 @@ class TestGrepRequiredTokens:
     def test_short_tokens_only_returns_none(self) -> None:
         # NOT(3) OR(2) AND(3) — none reach the >= 4 length gate.
         assert (
-            VectorStorage._grep_required_tokens("NOT OR AND", fixed_string=True)  # noqa: SLF001
+            ContentStorage._grep_required_tokens("NOT OR AND", fixed_string=True)  # noqa: SLF001
             is None
         )
 
     def test_regex_with_literal_run_extracts(self) -> None:
         # '+' and ':' are safe metacharacters — the literal tokens stay mandatory.
-        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
+        toks = ContentStorage._grep_required_tokens(  # noqa: SLF001
             r"error: code \d+", fixed_string=False
         )
         assert toks == ["error", "code"]
@@ -75,7 +75,7 @@ class TestGrepRequiredTokens:
     def test_regex_alternation_returns_none(self) -> None:
         # '|' makes a token non-mandatory; the prefilter must not engage.
         assert (
-            VectorStorage._grep_required_tokens(  # noqa: SLF001
+            ContentStorage._grep_required_tokens(  # noqa: SLF001
                 r"alpha|betagamma", fixed_string=False
             )
             is None
@@ -85,13 +85,13 @@ class TestGrepRequiredTokens:
         # '*', '?' and '{' all allow a token to be absent from a match.
         for pat in (r"abcd.*wxyz", r"abcde?x", r"abcd{2,3}"):
             assert (
-                VectorStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
+                ContentStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
                 is None
             )
 
     def test_regex_no_literal_runs_returns_none(self) -> None:
         assert (
-            VectorStorage._grep_required_tokens(  # noqa: SLF001
+            ContentStorage._grep_required_tokens(  # noqa: SLF001
                 r"[A-Z][a-z]+", fixed_string=False
             )
             is None
@@ -99,7 +99,7 @@ class TestGrepRequiredTokens:
 
     def test_unsafe_metachars_are_literal_in_fixed_string(self) -> None:
         # In fixed-string mode '|' is a literal char — tokens stay mandatory.
-        toks = VectorStorage._grep_required_tokens(  # noqa: SLF001
+        toks = ContentStorage._grep_required_tokens(  # noqa: SLF001
             "alpha|betagamma", fixed_string=True
         )
         assert toks == ["alpha", "betagamma"]
@@ -110,7 +110,7 @@ class TestGrepRequiredTokens:
         # a bogus mandatory token — the prefilter must decline these.
         for pat in (r"x[abcd]y", r"vowel[aeiou]end", r"[[:alpha:]]word"):
             assert (
-                VectorStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
+                ContentStorage._grep_required_tokens(pat, fixed_string=False)  # noqa: SLF001
                 is None
             ), pat
 

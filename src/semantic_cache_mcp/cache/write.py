@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
 from ..core.hashing import hash_content
-from ..types import BatchEditResult, EditResult, EmbeddingVector, SingleEditOutcome, WriteResult
+from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
 from ..utils import aread_bytes, aread_text, astat, awrite_atomic
 from ..utils._async_io import (
     _atomic_write_sync as _atomic_write,  # noqa: F401 — re-exported for tests
@@ -30,33 +30,6 @@ logger = logging.getLogger(__name__)
 
 # DoS limit for batch_edit
 MAX_BATCH_EDITS = 50
-
-# Embedding reuse threshold: when an edit changes less than this fraction
-# of the file's lines, skip re-embedding and reuse the cached vector. The
-# old embedding remains representative for retrieval purposes, saving the
-# ~23ms ONNX inference call. Values: [0.0, 1.0]; 0 = always re-embed.
-EMBED_REUSE_THRESHOLD = 0.20
-
-
-async def _maybe_reuse_cached_embedding(
-    cache: SemanticCache,
-    file_path: Path,
-    stats: dict[str, int] | None,
-) -> EmbeddingVector | None:
-    """Reuse the cached embedding for small text changes when it is still representative."""
-    if not stats:
-        return None
-
-    changed = stats.get("insertions", 0) + stats.get("deletions", 0)
-    total = stats.get("total_lines", changed + 1)
-    if total <= 0 or changed / total >= EMBED_REUSE_THRESHOLD:
-        return None
-
-    cached_entry = await cache.get(str(file_path))
-    if cached_entry and cached_entry.embedding:
-        logger.debug(f"Reusing cached embedding ({changed}/{total} lines changed)")
-        return cached_entry.embedding
-    return None
 
 
 async def smart_write(
@@ -208,24 +181,15 @@ async def smart_write(
                     tokens_saved = max(0, tokens_written - diff_tokens)
 
         # Update cache with final content.
-        # Skip re-embedding for small edits (< 20% changed) — the old
-        # embedding is similar enough for retrieval, saving ~23ms ONNX call.
         # Re-stat after the write (and any formatter pass): awrite_atomic
         # bumps the file mtime, so the value captured for the freshness
         # check is now stale. Persisting it would make the next read treat
         # the cache as stale and needlessly re-hash from disk.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await _maybe_reuse_cached_embedding(
-            cache,
-            file_path,
-            diff_stats_result if (not created and from_cache) else None,
-        )
         await cache.refresh_path(
             str(file_path),
             content,
             mtime,
-            embedding,
-            embedding_path=path,
         )
         action = "Created" if created else "Updated"
         if formatted:
@@ -564,20 +528,16 @@ async def smart_edit(
                 diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
         # Update cache with final content.
-        # Skip re-embedding for small edits — reuse cached embedding.
         if timer is not None:
             timer.enter("cache_refresh")
         # Re-stat after the write (and any formatter pass): the pre-write
         # mtime captured for the freshness check is stale once awrite_atomic
         # bumps it, and persisting it would make the next read miss cache.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await _maybe_reuse_cached_embedding(cache, file_path, diff_stats_result)
         await cache.refresh_path(
             str(file_path),
             new_content,
             mtime,
-            embedding,
-            embedding_path=path,
         )
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
@@ -819,18 +779,14 @@ async def smart_batch_edit(
                 diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
         # Update cache with final content.
-        # Skip re-embedding for small edits — reuse cached embedding.
         # Re-stat after the write (and any formatter pass): the pre-write
         # mtime captured for the freshness check is stale once awrite_atomic
         # bumps it, and persisting it would make the next read miss cache.
         mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        embedding = await _maybe_reuse_cached_embedding(cache, file_path, stats)
         await cache.refresh_path(
             str(file_path),
             new_content,
             mtime,
-            embedding,
-            embedding_path=path,
         )
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:

@@ -36,7 +36,7 @@ See `docs/architecture.md` for the full package layout.
 
 **Rules:**
 - `core/` must remain **stateless and I/O-free** — no file reads, no DB access, no subprocess calls
-- New algorithms belong in the appropriate sub-package (`chunking/`, `similarity/`, `text/`)
+- New algorithms belong in the appropriate sub-package (`chunking/`, `text/`, `hashing/`)
 - New MCP tools go in `server/tools.py` only; business logic stays in `cache/`
 - `storage/` is a swappable backend — `core/` must never import from it
 
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
 
 ### Performance
 
-This is a performance-critical project. When touching hot paths (chunking, hashing, similarity, tokenization, embeddings):
+This is a performance-critical project. When touching hot paths (chunking, hashing, tokenization, diffing):
 
 - Profile before and after with `cProfile`: `python -m cProfile -o out.prof script.py`
 - Document algorithmic complexity with O(N) notation in comments
@@ -101,9 +101,7 @@ from semantic_cache_mcp.cache import smart_read, SemanticCache
 
 @pytest.fixture
 def cache(tmp_path):
-    from semantic_cache_mcp.storage.vector import VectorStorage
-    storage = VectorStorage(db_path=tmp_path / "cache.db")
-    return SemanticCache(storage=storage)
+    return SemanticCache(db_path=tmp_path / "cache.db")
 
 def test_read_unchanged_returns_message(cache, tmp_path):
     path = tmp_path / "file.py"
@@ -116,7 +114,7 @@ def test_read_unchanged_returns_message(cache, tmp_path):
 
 - `asyncio_mode = "auto"` — all async tests work without `@pytest.mark.asyncio`
 - Mock disk I/O for unit tests; use `tmp_path` fixture for integration tests
-- Property-based tests for: hashing (determinism), compression (round-trip), similarity (range), tokenization (byte-level correctness)
+- Property-based tests for: hashing (determinism), chunking (boundary stability), tokenization (byte-level correctness)
 
 ## Commit Conventions
 
@@ -142,10 +140,10 @@ Enforced by the `commit-msg` lefthook:
 ```
 feat: add cached_only filter to glob tool
 fix: propagate diff_mode through batch_smart_read
-perf: accelerate similarity search with LSH for caches ≥100 files
+perf: speed up BM25 ranking for large cached corpora
 refactor: restructure cache.py into cache/ sub-package
 docs: update architecture.md with sub-package structure
-test: add property tests for int8 quantization round-trip
+test: add property tests for chunk boundary stability
 ```
 
 ## Pull Request Process

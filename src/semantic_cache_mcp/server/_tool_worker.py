@@ -16,7 +16,6 @@ from typing import Any
 from fastmcp.exceptions import ToolError
 
 from ..cache import SemanticCache
-from ..core.embeddings import get_embedding_dim, get_model_info
 from ..core.tokenizer import get_tokenizer
 from ..logger import log_marker
 from .response import _response_overrides
@@ -54,7 +53,7 @@ class ToolProcessSupervisor:
         self,
         *,
         worker_target: Any | None = None,
-        startup_timeout: float = 120.0,
+        startup_timeout: float = 30.0,
         shutdown_timeout: float = 8.0,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
@@ -119,9 +118,9 @@ class ToolProcessSupervisor:
                 )
                 logger.warning(f"{tool} timed out after {timeout}s in worker process")
                 # Drop the wedged worker immediately so the timeout stays bounded.
-                # Starting a replacement worker can trigger tokenizer/model init and
-                # GPU warmup, which would otherwise make a "30s" timeout take far
-                # longer before the caller sees the error.
+                # Starting a replacement worker re-inits the tokenizer and opens the
+                # cache, which would otherwise make a "30s" timeout take longer before
+                # the caller sees the error.
                 await asyncio.to_thread(self._invalidate_worker_blocking, f"{tool} timeout")
                 raise
             except Exception as exc:
@@ -323,24 +322,9 @@ async def _tool_worker_main_async(conn: Connection) -> None:
             "worker.init.cache.end",
             elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
         )
-        stage_started = time.perf_counter()
-        log_marker(logger, "worker.init.embedding_meta.begin")
-        embedding_dim = get_embedding_dim()
-        log_marker(
-            logger,
-            "worker.init.embedding_meta.end",
-            dim=embedding_dim,
-            elapsed_ms=round((time.perf_counter() - stage_started) * 1000, 1),
-        )
-        model_info = get_model_info()
-        if cache is not None and embedding_dim > 0:
-            cache._storage.clear_if_model_changed(str(model_info["model"]), embedding_dim)
-
         log_marker(
             logger,
             "worker.init.end",
-            ready=model_info.get("ready"),
-            provider=model_info.get("provider"),
             elapsed_ms=round((time.perf_counter() - init_started) * 1000, 1),
         )
         await _send_worker_message(conn, {"op": "ready"})

@@ -213,8 +213,12 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
-    diff = unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=context_lines)
-
+    diff = list(unified_diff(old_lines, new_lines, n=context_lines))
+    # Drop difflib's boilerplate file headers ("--- \n", "+++ \n"): the path is
+    # known from the response envelope and the @@ hunk headers carry the line
+    # numbers, so the headers are pure token overhead on every diff.
+    if len(diff) >= 2 and diff[0].startswith("--- ") and diff[1].startswith("+++ "):
+        diff = diff[2:]
     result = "".join(diff)
     return result if result else "// No changes"
 

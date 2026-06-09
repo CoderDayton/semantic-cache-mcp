@@ -1,6 +1,6 @@
 """Storage backends for semantic caching."""
 
+from .docstore import ContentStorage
 from .sqlite import SQLiteStorage
-from .vector import VectorStorage
 
-__all__ = ["SQLiteStorage", "VectorStorage"]
+__all__ = ["SQLiteStorage", "ContentStorage"]

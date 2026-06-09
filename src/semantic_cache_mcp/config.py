@@ -40,11 +40,6 @@ DB_PATH: Final = CACHE_DIR / "cache.db"
 LOG_DIR: Final = get_log_dir(CACHE_DIR, environ.get("LOG_DIR"))
 LOG_FILE_PATH: Final = get_log_file_path(LOG_DIR)
 
-# Crash sentinel — written on startup, removed on clean shutdown.
-# If present at next startup → previous run crashed → wipe vecdb to avoid
-# heap corruption from corrupted usearch index files.
-STARTUP_SENTINEL: Final = CACHE_DIR / ".startup.lock"
-
 
 # Logging configuration — explicit stderr handler to prevent stdout pollution
 # in stdio MCP transport, plus a dated file handler for post-mortem debugging.
@@ -64,16 +59,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_optional_int(name: str) -> int | None:
-    raw = environ.get(name)
-    if raw is None or not raw.strip():
-        return None
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return None
-
-
 def _env_float(name: str, default: float) -> float:
     raw = environ.get(name)
     if raw is None:
@@ -91,62 +76,21 @@ def _env_mode(name: str, default: str) -> str:
     return raw.strip().lower()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 # Cache limits
 MAX_CONTENT_SIZE: Final = _env_int("MAX_CONTENT_SIZE", 100_000)  # 100KB default max return size
-MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # LRU-K eviction limit
-
-# Embedding device: "cpu" (default), "gpu"/"cuda" (NVIDIA GPU), "auto" (detect)
-_raw_device = environ.get("EMBEDDING_DEVICE", "cpu").strip().lower()
-EMBEDDING_DEVICE: Final = "cuda" if _raw_device == "gpu" else _raw_device
-
-# Embedding model: any FastEmbed-supported model name
-EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip()
-
-# OpenAI-compatible embedding provider. Disabled by default so local FastEmbed
-# remains the zero-config path. Defaults target Ollama's OpenAI-compatible API.
-OPENAI_EMBEDDINGS_ENABLED: Final = _env_bool("OPENAI_EMBEDDINGS_ENABLED", False)
-OPENAI_BASE_URL: Final = environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1").strip()
-OPENAI_API_KEY: Final = environ.get("OPENAI_API_KEY", "ollama").strip()
-OPENAI_EMBEDDING_MODEL: Final = environ.get("OPENAI_EMBEDDING_MODEL", "nomic-embed-text").strip()
-OPENAI_EMBEDDING_DIMENSIONS_RAW: Final = environ.get("OPENAI_EMBEDDING_DIMENSIONS")
-OPENAI_EMBEDDING_DIMENSIONS: Final = _env_optional_int("OPENAI_EMBEDDING_DIMENSIONS")
+MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # W-TinyLFU eviction limit
 
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)
 TOOL_TIMEOUT: Final = _env_float("TOOL_TIMEOUT", 30.0)  # seconds before tool call times out
 
-# Similarity
-SIMILARITY_THRESHOLD: Final = 0.85  # Semantic similarity threshold
-NEAR_DUPLICATE_THRESHOLD: Final = 0.98  # Early termination threshold
-
-# Chunking (Rabin fingerprinting)
+# Chunking
 CHUNK_MIN_SIZE: Final = 2048
 CHUNK_MAX_SIZE: Final = 65536
-RH_PRIME: Final = 31
-RH_MOD: Final = (1 << 32) - 1
-RH_WINDOW: Final = 48
-RH_MASK: Final = 0x1FFF  # 13 bits - average chunk size ~8KB
-RH_POW_OUT: Final = pow(RH_PRIME, RH_WINDOW - 1, RH_MOD)
 
-# Compression (Brotli)
-ENTROPY_SAMPLE_SIZE: Final = 4096
-COMPRESSION_QUALITY: Final = {
-    "high_entropy": 1,  # Already compressed (entropy > 7.0)
-    "medium_entropy": 4,  # Medium compressibility (entropy > 5.5)
-    "low_entropy": 6,  # Highly compressible (entropy <= 5.5)
-}
-
-# LRU-K
-LRU_K: Final = 2  # K-th most recent access for eviction scoring
-ACCESS_HISTORY_SIZE: Final = 5  # Number of accesses to track
+# W-TinyLFU eviction
+ACCESS_HISTORY_SIZE: Final = 5  # accesses tracked per entry for frequency scoring
 
 # ---------------------------------------------------------------------------
 # Configuration validation
@@ -178,41 +122,6 @@ def _validate_config() -> None:
 
     if TOOL_TIMEOUT <= 0:
         errors.append(f"TOOL_TIMEOUT ({TOOL_TIMEOUT}) must be > 0")
-
-    if EMBEDDING_DEVICE not in {"cpu", "cuda", "auto"}:
-        errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, gpu, cuda, auto")
-
-    if OPENAI_EMBEDDINGS_ENABLED:
-        if not OPENAI_BASE_URL:
-            errors.append("OPENAI_BASE_URL must not be empty when OPENAI_EMBEDDINGS_ENABLED=true")
-        if not OPENAI_API_KEY:
-            errors.append("OPENAI_API_KEY must not be empty when OPENAI_EMBEDDINGS_ENABLED=true")
-        if not OPENAI_EMBEDDING_MODEL:
-            errors.append(
-                "OPENAI_EMBEDDING_MODEL must not be empty when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
-        if OPENAI_EMBEDDING_DIMENSIONS_RAW is not None and OPENAI_EMBEDDING_DIMENSIONS is None:
-            errors.append(
-                "OPENAI_EMBEDDING_DIMENSIONS must be an integer when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
-        elif OPENAI_EMBEDDING_DIMENSIONS is not None and OPENAI_EMBEDDING_DIMENSIONS <= 0:
-            errors.append(
-                "OPENAI_EMBEDDING_DIMENSIONS must be > 0 when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
-
-    if not 0 < SIMILARITY_THRESHOLD < 1:
-        errors.append(f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD}) must be between 0 and 1")
-
-    if not 0 < NEAR_DUPLICATE_THRESHOLD <= 1:
-        errors.append(
-            f"NEAR_DUPLICATE_THRESHOLD ({NEAR_DUPLICATE_THRESHOLD}) must be between 0 and 1"
-        )
-
-    if NEAR_DUPLICATE_THRESHOLD < SIMILARITY_THRESHOLD:
-        errors.append(
-            f"NEAR_DUPLICATE_THRESHOLD ({NEAR_DUPLICATE_THRESHOLD}) must be >= "
-            f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD})"
-        )
 
     if errors:
         raise ValueError("Configuration errors:\n  " + "\n  ".join(errors))

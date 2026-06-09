@@ -14,12 +14,11 @@ from semantic_cache_mcp.cache import (
     batch_smart_read,
     glob_with_cache_status,
 )
-from semantic_cache_mcp.core.embeddings import embed_batch
 
 # Initialize cache
 cache = SemanticCache()
 
-# Smart read — diffs by default
+# Smart read, diffs by default
 result = smart_read(cache, path="/path/to/file.py", diff_mode=True)
 print(f"Tokens saved: {result.tokens_saved}")
 print(f"From cache:   {result.from_cache}")
@@ -31,7 +30,7 @@ result = smart_read(cache, path="/path/to/file.py", diff_mode=False)
 # Read a specific line range (no full file load)
 result = smart_read(cache, path="/path/to/file.py", offset=80, limit=40)
 
-# Smart write — returns diff on overwrite, creates if new
+# Smart write, returns diff on overwrite, creates if new
 write_result = smart_write(
     cache=cache,
     path="/path/to/file.py",
@@ -44,12 +43,12 @@ print(f"Created:      {write_result.created}")
 print(f"Tokens saved: {write_result.tokens_saved}")
 print(f"Hash:         {write_result.content_hash}")
 
-# Append mode — write large files in chunks
+# Append mode: write large files in chunks
 smart_write(cache, path="/tmp/out.py", content="# chunk 1\n")
 smart_write(cache, path="/tmp/out.py", content="# chunk 2\n", append=True)
 smart_write(cache, path="/tmp/out.py", content="# chunk 3\n", append=True, auto_format=True)
 
-# smart_edit — Mode A: full-file find/replace (existing behavior)
+# smart_edit Mode A: full-file find/replace (existing behavior)
 edit_result = smart_edit(
     cache=cache,
     path="/path/to/file.py",
@@ -62,20 +61,20 @@ print(f"Matches found:    {edit_result.matches_found}")
 print(f"Lines modified:   {edit_result.line_numbers}")
 print(f"Tokens saved:     {edit_result.tokens_saved}")
 
-# smart_edit — Mode B: scoped find/replace within a line range
-# Useful when read() gave you line numbers — shorter old_string suffices
+# smart_edit Mode B: scoped find/replace within a line range
+# Useful when read() gave you line numbers, so a shorter old_string suffices
 edit_result = smart_edit(
     cache=cache,
     path="/path/to/file.py",
-    old_string="pass",       # matched only within lines 42–42
+    old_string="pass",       # matched only within lines 42 to 42
     new_string="return x",
     start_line=42,
     end_line=42,
 )
 print(f"Lines modified: {edit_result.line_numbers}")  # absolute line numbers
 
-# smart_edit — Mode C: direct line replacement (maximum token savings)
-# No old_string needed — replaces the entire range unconditionally
+# smart_edit Mode C: direct line replacement (maximum token savings)
+# No old_string needed; replaces the entire range unconditionally
 edit_result = smart_edit(
     cache=cache,
     path="/path/to/file.py",
@@ -85,7 +84,7 @@ edit_result = smart_edit(
     end_line=83,
 )
 
-# smart_batch_edit — 2+ independent edits; accepts 2-tuples (Mode A) or 4-tuples (Modes B/C)
+# smart_batch_edit, 2+ independent edits; accepts 2-tuples (Mode A) or 4-tuples (Modes B/C)
 multi_result = smart_batch_edit(
     cache=cache,
     path="/path/to/file.py",
@@ -105,8 +104,8 @@ multi_result = smart_batch_edit(
     edits=[("old1", "new1"), ("old2", "new2")],
 )
 
-# Semantic search — hybrid BM25 + HNSW vector search
-# Must seed cache first with smart_read / batch_smart_read
+# Keyword search (BM25) over cached files
+# Must seed the cache first with smart_read / batch_smart_read
 search_result = semantic_search(
     cache=cache,
     query="authentication logic",
@@ -116,14 +115,13 @@ search_result = semantic_search(
 for match in search_result.matches:
     print(f"{match.path}: {match.similarity:.2f}")
 
-# Compare two files
+# Compare two files (returns a unified diff)
 diff_result = compare_files(
     cache=cache,
     path1="/path/to/old.py",
     path2="/path/to/new.py",
     context_lines=2,
 )
-print(f"Similarity: {diff_result.similarity:.2f}")
 print(diff_result.diff_content)
 
 # Batch read with glob expansion
@@ -160,32 +158,11 @@ print(f"Cached: {glob_result.cached_count}")
 
 ```python
 from pathlib import Path
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 from semantic_cache_mcp.cache import SemanticCache
 
 # Use a custom database path
 cache = SemanticCache(db_path=Path("/tmp/my-cache.db"))
-```
-
----
-
-## Embedding Model Management
-
-```python
-from semantic_cache_mcp.core.embeddings import configure, warmup, embed, embed_query, get_model_info
-
-configure(cache_dir="/path/to/custom/models")  # defaults to ~/.cache/semantic-cache-mcp/models
-
-warmup()  # called automatically at server start
-
-# Get model status
-info = get_model_info()
-print(f"Model: {info['model']}")
-print(f"Ready: {info['ready']}")
-
-# Generate embeddings
-doc_vec   = embed("This is a document.")
-query_vec = embed_query("search query here")
 ```
 
 ---
@@ -217,39 +194,14 @@ print(f"Lifetime saved:     {lifetime['tokens_saved']}")
 ### Semantic Summarization
 
 ```python
-import numpy as np
 from semantic_cache_mcp.core import summarize_semantic
 
-def embed_fn(text: str) -> np.ndarray | None:
-    vec = cache.get_embedding(text)
-    return np.asarray(vec, dtype=np.float32) if vec else None
-
+# Summarization scores segments on its own; no embedding function is needed.
 summary = summarize_semantic(
     content=large_file_content,
     max_size=10000,
-    embed_fn=embed_fn,
 )
 ```
-
-### Batch Embedding
-
-```python
-from semantic_cache_mcp.core.embeddings import embed_batch
-
-texts = [
-    "python: def authenticate(user, password): ...",
-    "typescript: async function fetchUser(id: string): ...",
-    "rust: pub fn parse_config(path: &Path) -> Result<Config, Error>",
-]
-
-# Single ONNX Runtime call for N texts (much faster than N separate embed() calls)
-vectors = embed_batch(texts)  # list[array.array[float] | None]
-for text, vec in zip(texts, vectors):
-    if vec is not None:
-        print(f"Embedded {len(text)} chars → {len(vec)}-dim vector")
-```
-
-`batch_smart_read` calls this automatically — you rarely need it directly.
 
 ### Delta Compression
 
@@ -269,30 +221,24 @@ assert recovered == new_content
 
 > **Search-cache invalidation:** `SemanticCache` keeps an in-session LRU of
 > recent search results (32 entries, keyed on `query`/`k`/`directory`). All
-> mutations — `put`, `clear`, `delete_path`, `update_mtime` — automatically
+> mutations (`put`, `clear`, `delete_path`, `update_mtime`) automatically
 > call `_bump_search_cache()` to invalidate it, so callers never see a
 > result that predates their last write. If you bypass the public API and
 > mutate underlying storage directly (rare), call `cache._bump_search_cache()`
 > manually.
 
 ```python
-# Store a file manually (pass pre-computed tokens to avoid redundant tokenization)
+# Store a file manually
 cache.put(
     path="/path/to/file.py",
     content="file content here",
     mtime=1234567890.0,
-    embedding=cache.get_embedding("file content here"),
-    tokens=42,
 )
 
-# Retrieve cached entry
+# Retrieve a cached entry
 entry = cache.get("/path/to/file.py")
 if entry:
     content = cache.get_content(entry)
-
-# Find semantically similar cached file
-embedding = cache.get_embedding("search text")
-similar_path = cache.find_similar(embedding, exclude_path="/current/file.py")
 
 # Clear all entries
 cleared = cache.clear()
@@ -315,7 +261,7 @@ print(f"Cleared {cleared} entries")
 | `tokens_saved`     | `int`         | Tokens saved vs returning full content         |
 | `truncated`        | `bool`        | Whether content was truncated/summarized       |
 | `compression_ratio`| `float`       | Size ratio (returned / original)               |
-| `semantic_match`   | `str \| None` | Path of similar file if matched                |
+| `semantic_match`   | `str \| None` | Unused; always `None` since the embedding layer was removed |
 
 ### WriteResult
 
@@ -394,7 +340,6 @@ print(f"Cleared {cleared} entries")
 | `path2`        | `str`            | Second file path                    |
 | `diff_content` | `str`            | Unified diff                        |
 | `diff_stats`   | `dict`           | Insertions, deletions, modifications|
-| `similarity`   | `float`          | Semantic similarity (0.0–1.0)       |
 | `tokens_saved` | `int`            | Tokens saved by cache               |
 | `from_cache`   | `tuple[bool, bool]` | Cache status for each file       |
 

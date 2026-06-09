@@ -114,7 +114,7 @@ class ConnectionPool:
 
 
 class SQLiteStorage:
-    """Session metrics persistence. File content lives in VectorStorage."""
+    """Session metrics persistence. File content lives in ContentStorage."""
 
     __slots__ = ("_pool", "db_path")
 

@@ -1,8 +1,8 @@
 """Semantic Cache MCP public package surface.
 
 Keep the package root import-light. Submodule imports such as
-``semantic_cache_mcp.utils`` should not eagerly pull in the server, cache, or
-embedding stack just to resolve the package namespace.
+``semantic_cache_mcp.utils`` should not eagerly pull in the server, cache, or storage
+layer just to resolve the package namespace.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ __all__ = [
     "DB_PATH",
     "MAX_CACHE_ENTRIES",
     "MAX_CONTENT_SIZE",
-    "SIMILARITY_THRESHOLD",
     "TOOL_OUTPUT_MODE",
     "TOOL_MAX_RESPONSE_TOKENS",
 ]
@@ -49,7 +48,6 @@ def __getattr__(name: str) -> Any:
         "DB_PATH",
         "MAX_CACHE_ENTRIES",
         "MAX_CONTENT_SIZE",
-        "SIMILARITY_THRESHOLD",
         "TOOL_OUTPUT_MODE",
         "TOOL_MAX_RESPONSE_TOKENS",
     }:

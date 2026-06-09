@@ -34,17 +34,13 @@ def _link_or_copy_tree(src: Path, dst: Path) -> None:
 
 def _prepare_runtime_cache(temp_cache: Path) -> None:
     tokenizer_src = CACHE_DIR / "tokenizer"
-    models_src = CACHE_DIR / "models"
     tokenizer_file = tokenizer_src / "o200k_base.tiktoken"
 
     if not tokenizer_file.exists():
         pytest.skip("stdio integration test requires cached tokenizer assets")
-    if not models_src.exists():
-        pytest.skip("stdio integration test requires cached embedding model assets")
 
     temp_cache.mkdir(parents=True, exist_ok=True)
     _link_or_copy_tree(tokenizer_src, temp_cache / "tokenizer")
-    _link_or_copy_tree(models_src, temp_cache / "models")
 
 
 @pytest.mark.asyncio
@@ -57,7 +53,9 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
     files_dir.mkdir()
 
     paths: list[str] = []
-    payload = "alpha beta gamma delta epsilon\n" * 4000
+    # Large payload so chunking + BPE tokenization of all files reliably exceeds
+    # TOOL_TIMEOUT. (The old timeout trigger — slow embedding inference — is gone.)
+    payload = "alpha beta gamma delta epsilon\n" * 30000
     for i in range(20):
         p = files_dir / f"big_{i}.txt"
         p.write_text(payload + f"file={i}\n")
@@ -67,7 +65,6 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
     env["SEMANTIC_CACHE_DIR"] = str(runtime_cache)
     env["TOOL_TIMEOUT"] = "0.2"
     env["TOOL_OUTPUT_MODE"] = "debug"
-    env["EMBEDDING_DEVICE"] = "cpu"
     env["LOG_LEVEL"] = "WARNING"
 
     server_log = tmp_path / "server.stderr.log"

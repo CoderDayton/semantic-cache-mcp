@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
-from semantic_cache_mcp.types import EmbeddingVector
 
 
 class TestSmartReadUnchangedFile:
@@ -102,61 +100,6 @@ class TestSmartReadChangedFile:
 
         assert result.truncated is True
         assert len(result.content) <= 5_000
-
-
-class TestSmartReadSemanticMatch:
-    """Tests for smart_read with semantic similarity."""
-
-    async def test_semantic_match_with_similar_file(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """Should find and reference semantically similar cached file."""
-        db_path = temp_dir / "semantic_test.db"
-
-        # Mock embed to return consistent embeddings
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
-            cache = SemanticCache(db_path=db_path)
-
-            # Create two similar files
-            file1 = temp_dir / "similar1.py"
-            file1.write_text("def hello():\n    return 'Hello'\n")
-
-            file2 = temp_dir / "similar2.py"
-            file2.write_text("def hello():\n    return 'Hi'\n")
-
-            # Cache first file
-            await smart_read(cache, str(file1))
-
-            # Read second file - might find semantic match
-            result = await smart_read(cache, str(file2))
-            # The result should indicate it processed the file
-            assert result.content is not None
-
-    async def test_semantic_diff_includes_base_file_context(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """Semantic diff responses should include the base cached path."""
-        db_path = temp_dir / "semantic_context.db"
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
-            cache = SemanticCache(db_path=db_path)
-
-            base = temp_dir / "base.py"
-            variant = temp_dir / "variant.py"
-
-            base_lines = [f"line {i}\n" for i in range(250)]
-            variant_lines = base_lines.copy()
-            variant_lines[123] = "line 123 changed\n"
-
-            base.write_text("".join(base_lines))
-            variant.write_text("".join(variant_lines))
-
-            await smart_read(cache, str(base))
-            result = await smart_read(cache, str(variant))
-
-            assert result.is_diff is True
-            assert result.semantic_match == str(base)
-            assert f"// Similar to cached: {base}" in result.content
 
 
 class TestSmartReadLargeFile:
@@ -263,26 +206,6 @@ class TestCacheOperations:
         assert await semantic_cache_no_embeddings.get(str(Path(simple).resolve())) is None
         assert await semantic_cache_no_embeddings.get(str(Path(python).resolve())) is not None
 
-    async def test_get_embedding_without_embeddings_service(
-        self, semantic_cache_no_embeddings: SemanticCache
-    ) -> None:
-        """get_embedding returns None when embed returns None."""
-        result = await semantic_cache_no_embeddings.get_embedding("test text")
-        assert result is None
-
-    async def test_get_embedding_with_embeddings_service(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """get_embedding returns embedding when embed returns a value."""
-        db_path = temp_dir / "emb_test.db"
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
-            cache = SemanticCache(db_path=db_path)
-            result = await cache.get_embedding("test text")
-
-            assert result is not None
-            assert len(result) == len(mock_embeddings)
-
 
 class TestCacheReadResult:
     """Tests for ReadResult structure."""
@@ -331,46 +254,3 @@ class TestSmartReadDiffMode:
         )
         # Should not be a diff response
         assert result.is_diff is False
-
-
-class TestEmbeddingsIntegration:
-    """Tests for FastEmbed integration."""
-
-    async def test_embed_function_called(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """Verify embed function is called when generating embeddings."""
-        db_path = temp_dir / "embed_test.db"
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings) as mock_embed:
-            cache = SemanticCache(db_path=db_path)
-
-            # Create and read a file
-            test_file = temp_dir / "test.txt"
-            test_file.write_text("Test content for embedding")
-
-            await smart_read(cache, str(test_file))
-
-            # Verify embed was called
-            assert mock_embed.called
-
-    async def test_embedding_stored_in_cache(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """Verify embedding is stored and file is retrievable."""
-        db_path = temp_dir / "store_test.db"
-
-        with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
-            cache = SemanticCache(db_path=db_path)
-
-            test_file = temp_dir / "test.txt"
-            test_file.write_text("Test content")
-
-            await smart_read(cache, str(test_file))
-
-            entry = await cache.get(str(test_file))
-            assert entry is not None
-            # Embedding is stored in HNSW index, not returned on CacheEntry
-            # Verify the file is findable via similarity search
-            similar = await cache.find_similar(mock_embeddings)
-            assert similar is not None

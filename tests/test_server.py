@@ -10,7 +10,7 @@ import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.server._mcp import _migrate_v2_to_v3
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 
 
 class TestFileNotFoundHandling:
@@ -161,7 +161,7 @@ class TestConcurrentAccess:
     async def test_concurrent_writes(self, temp_dir: Path) -> None:
         """Sequential writes should not corrupt database."""
         db_path = temp_dir / "concurrent.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
 
         for i in range(10):
             await storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
@@ -174,56 +174,22 @@ class TestCorruptedCacheRecovery:
     """Tests for corrupted cache scenarios."""
 
     async def test_empty_storage_stats(self, temp_dir: Path) -> None:
-        """Empty VectorStorage should return zero stats."""
+        """Empty ContentStorage should return zero stats."""
         db_path = temp_dir / "empty.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         stats = await storage.get_stats()
         assert stats["files_cached"] == 0
         assert stats["total_documents"] == 0
 
 
-class TestMissingEmbeddingsService:
-    """Tests for missing embeddings service."""
+class TestBasicSmartRead:
+    """smart_read works on a fresh BM25-only cache."""
 
-    async def test_graceful_without_embeddings(
+    async def test_read_returns_content(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
-        """Cache should work without embeddings service."""
         result = await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
         assert result.content is not None
-        assert result.semantic_match is None
-
-    async def test_embedding_error_handled(self, temp_dir: Path) -> None:
-        """Embedding service errors should be handled gracefully."""
-        db_path = temp_dir / "error_test.db"
-
-        # Mock embed to raise an exception
-        with patch("semantic_cache_mcp.cache.embed", side_effect=Exception("Model Error")):
-            cache = SemanticCache(db_path=db_path)
-            result = await cache.get_embedding("test text")
-            assert result is None
-
-
-class TestNetworkTimeoutSimulation:
-    """Tests for network timeout scenarios."""
-
-    async def test_embedding_timeout_handled(
-        self, temp_dir: Path, sample_files: dict[str, Path]
-    ) -> None:
-        """Network timeout for embeddings should be handled."""
-        db_path = temp_dir / "timeout_test.db"
-
-        def slow_embedding(*args, **kwargs):
-            time.sleep(0.1)
-            raise TimeoutError("Connection timed out")
-
-        # Mock embed to simulate timeout
-        with patch("semantic_cache_mcp.cache.embed", side_effect=slow_embedding):
-            cache = SemanticCache(db_path=db_path)
-
-            # Should complete without hanging
-            result = await smart_read(cache, str(sample_files["simple"]))
-            assert result.content is not None
 
 
 class TestPathTraversalPrevention:
@@ -273,17 +239,17 @@ class TestDatabaseIntegrity:
     """Tests for database integrity."""
 
     async def test_storage_creation(self, temp_dir: Path) -> None:
-        """VectorStorage should initialize and create database file."""
+        """ContentStorage should initialize and create database file."""
         db_path = temp_dir / "new_db.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         assert db_path.exists()
         stats = await storage.get_stats()
         assert stats["files_cached"] == 0
 
     async def test_put_and_retrieve(self, temp_dir: Path) -> None:
-        """VectorStorage should store and retrieve content."""
+        """ContentStorage should store and retrieve content."""
         db_path = temp_dir / "integrity.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         await storage.put("/test/file.txt", "Test content", time.time())
         entry = await storage.get("/test/file.txt")
         assert entry is not None

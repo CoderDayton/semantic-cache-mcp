@@ -1,19 +1,17 @@
-"""simplevecdb-backed storage: raw text + HNSW embeddings, HyperCDC chunking for large files."""
+"""SQLite + FTS5 storage: raw text + HyperCDC chunking for large files."""
 
 from __future__ import annotations
 
-import array
 import asyncio
 import enum
 import json
 import logging
 import threading
 import time
-from collections.abc import Sequence
+from collections import defaultdict, deque
 from concurrent.futures import Executor, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-
-from simplevecdb import AsyncVectorCollection, DistanceStrategy, Quantization, VectorDB
 
 from ... import config
 from ...config import (
@@ -21,22 +19,22 @@ from ...config import (
     CACHE_DIR,
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
-    STARTUP_SENTINEL,
 )
 from ...core.chunking import get_optimal_chunker
-from ...core.hashing import hash_content
+from ...core.hashing import hash_chunk, hash_content
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
-from ...types import CacheEntry, EmbeddingVector
+from ...types import CacheEntry
+from ._docstore import AsyncDocStore, DocStore
 from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CHUNK_THRESHOLD", "StorageMode", "VECDB_PATH", "VectorStorage"]
+__all__ = ["CHUNK_THRESHOLD", "StorageMode", "CONTENT_DB_PATH", "ContentStorage"]
 
-VECDB_PATH = CACHE_DIR / "vecdb.db"
+CONTENT_DB_PATH = CACHE_DIR / "docstore.db"
 
-# Metadata keys stored with each document in simplevecdb
+# Metadata keys stored with each document
 _META_PATH = "path"
 _META_CHUNK_INDEX = "chunk_index"
 _META_TOTAL_CHUNKS = "total_chunks"
@@ -46,20 +44,24 @@ _META_TOKENS = "tokens"
 _META_CREATED_AT = "created_at"
 _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
-_META_HAS_EMBEDDING = "has_embedding"
 _META_PREVIEW = "preview"
 _META_STORAGE_MODE = "storage_mode"
+_META_CHUNK_HASH = "chunk_hash"
+_META_MANIFEST = "manifest"
 _PREVIEW_CHARS = 200
+
+# Safety cap: when CDC produces more than this many chunks, store the file as a
+# single unchunked document instead of exploding the doc table.
+_MAX_CHUNKS = 500
 
 
 class StorageMode(enum.StrEnum):
     """How a file's content was stored. Surfaces retrieval-quality signals.
 
-    SINGLE_DOC          — file fits in one doc, embedding represents it well.
-    CHUNKED             — file split via CDC; per-chunk text + parent embedding.
+    SINGLE_DOC          — file fits in one doc.
+    CHUNKED             — file split via CDC into per-chunk child docs.
     SINGLE_DOC_FALLBACK — chunk count exceeded the cap; whole file stored as
-                          one doc with one embedding. Embedding quality and
-                          retrieval granularity are degraded vs CHUNKED.
+                          one doc. Retrieval granularity is degraded vs CHUNKED.
     """
 
     SINGLE_DOC = "single_doc"
@@ -67,35 +69,35 @@ class StorageMode(enum.StrEnum):
     SINGLE_DOC_FALLBACK = "single_doc_fallback"
 
 
+@dataclass(slots=True)
+class _ChunkPlan:
+    """A file cut into content-addressed chunks, ready to store or reconcile.
+
+    ``hashes`` is the file's manifest: the ordered list of per-chunk BLAKE3
+    hashes. Two writes that share a chunk's bytes share its hash, which is what
+    lets ``_reconcile_chunks`` reuse an existing row instead of re-inserting and
+    re-indexing it.
+    """
+
+    texts: list[str]
+    hashes: list[str]
+    token_estimates: list[int]
+    line_starts: list[int]
+    total: int
+
+
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
-# each stored as a child document with its own vector. Smaller files are stored
-# as a single document. CHUNK_MIN_SIZE (2KB) is the CDC minimum chunk size.
+# each stored as a child document. Smaller files are stored as a single
+# document. CHUNK_MIN_SIZE (2KB) is the CDC minimum chunk size.
 CHUNK_THRESHOLD = CHUNK_MIN_SIZE * 4  # 8KB — files below this stay as one doc
 
 
-# Per-dimension cached zero embeddings used by chunk children (which carry no
-# real embedding — similarity uses the parent's vector). Populating this once
-# avoids re-allocating `[0.0] * dim` on every chunked write.
-_ZERO_EMB_CACHE: dict[int, list[float]] = {}
-
-
-def _zero_embedding(dim: int) -> list[float]:
-    # Returns a shared list — callers MUST NOT mutate. simplevecdb copies via
-    # np.asarray on ingest, so the cache stays clean in practice.
-    cached = _ZERO_EMB_CACHE.get(dim)
-    if cached is None:
-        cached = [0.0] * dim
-        _ZERO_EMB_CACHE[dim] = cached
-    return cached
-
-
-class VectorStorage:
-    """simplevecdb-backed storage for file content and embeddings.
+class ContentStorage:
+    """SQLite + FTS5 backed storage for file content.
 
     Architecture:
-    - Files stored as Documents with raw text (no compression)
-    - HNSW index for O(log N) semantic similarity search
-    - Metadata-based filtering for path lookups
+    - Files stored as documents with raw text (no compression)
+    - FTS5 BM25 keyword search + metadata filtering for path lookups
     - TinyLFU eviction (frequency + recency) backed by an in-memory index
       that bootstraps from access_history metadata on first need
     """
@@ -113,41 +115,32 @@ class VectorStorage:
         "_has_cached_cache",
     )
 
-    # Quantization currently in use — stored in sidecar to detect future changes.
-    _QUANTIZATION = Quantization.INT8
     _COLLECTION_NAME = "files"
 
     def __init__(
         self,
-        db_path: Path = VECDB_PATH,
+        db_path: Path = CONTENT_DB_PATH,
         *,
         executor: Executor | None = None,
     ) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
-        self._clear_if_quantization_changed(db_path)
-        self._recover_if_crashed(db_path)
-        # Use the sync VectorDB directly (not AsyncVectorDB) so we own the
-        # executor: ONNX/usearch require a single-threaded executor to avoid
-        # segfaults, and SemanticCache needs rebind_executor() to swap the
-        # IO executor after a hung worker. AsyncVectorDB manages its own
-        # internal pool and exposes neither hook. Async behavior is provided
-        # by wrapping the sync collection in AsyncVectorCollection below.
-        self._db = VectorDB(
-            path=str(db_path),
-            distance_strategy=DistanceStrategy.COSINE,
-            quantization=self._QUANTIZATION,
-        )
+        self._migrate_legacy_db(db_path)
+        # Sync DocStore (SQLite + FTS5). Async behaviour is provided by wrapping
+        # it in AsyncDocStore (runs each call on the IO executor) below, so
+        # SemanticCache.rebind_executor() can swap the executor after a hung
+        # worker without recreating the store.
+        self._db = DocStore(db_path)
         self._closed = False
         # TTL cache keyed by path_filter for has_cached_paths_under (see
         # comment there). Initialized here so the slot is always present.
         self._has_cached_cache: dict[str, tuple[float, bool]] = {}
         # Mutex between save() (called from the IO executor during eviction)
-        # and the close() daemon thread's final save. usearch's save is not
-        # thread-safe, so the two cannot run concurrently.
+        # and the close() daemon thread's final save, so the two never run
+        # concurrently on the shared connection.
         self._save_lock = threading.Lock()
-        # Sync VectorDB has no executor, so we own one when none is injected.
-        # Single-thread by default — ONNX/usearch are not thread-safe, and
+        # DocStore has no executor, so we own one when none is injected.
+        # Single-thread by default — all storage I/O serializes through it, and
         # SemanticCache always passes its own DetachedExecutor in production.
         # Annotate explicitly so mypy widens to Executor — both branches must
         # be assignable, including the rebind_executor seam below.
@@ -161,6 +154,9 @@ class VectorStorage:
             self._io_executor = executor
             self._owns_executor = False
         self._collection = self._build_collection()
+        # One-time wipe of a pre-manifest chunked cache so the store is uniformly
+        # in the content-addressed format (see method).
+        self._migrate_chunk_manifest()
         # In-memory eviction index. Bootstraps lazily on first eviction-need
         # so __init__ stays sync; the first scan after threshold is the only
         # O(N) read against the collection.
@@ -168,26 +164,17 @@ class VectorStorage:
             capacity=MAX_CACHE_ENTRIES,
             history_size=ACCESS_HISTORY_SIZE,
         )
-        # Write sentinel — removed on clean shutdown by _remove_sentinel().
-        STARTUP_SENTINEL.touch()
-        logger.info(f"VectorStorage initialized at {db_path}")
+        logger.info(f"ContentStorage initialized at {db_path}")
 
     def _reset_collection_sync(self, *, reason: str) -> None:
-        """Drop and recreate the collection synchronously.
+        """Drop all documents and rebuild the async wrapper synchronously.
 
-        Uses ``delete_collection`` which atomically drops the SQLite tables,
-        FTS index, and usearch file in one call. The new wrapper for the
-        recreated collection is reattached to
-        ``self._collection`` so further async ops keep working. Safe to call
-        from sync startup paths — no event loop required.
+        Safe to call from sync startup paths — no event loop required.
         """
         try:
-            self._db.delete_collection(self._COLLECTION_NAME)
-        except KeyError:
-            # Collection didn't exist yet — nothing to drop.
-            pass
+            self._db.clear()
         except Exception as exc:
-            logger.warning(f"delete_collection failed during {reason}: {exc}")
+            logger.warning(f"clear failed during {reason}: {exc}")
         self._collection = self._build_collection()
         # Index may not be initialized yet on cold-path resets (constructor
         # calls _reset_collection_sync before assigning _index). Tolerate
@@ -201,10 +188,8 @@ class VectorStorage:
         """Swap the IO executor used by the async collection wrapper.
 
         Called by ``SemanticCache.reset_executor`` after a hung worker is
-        abandoned. Re-creates the AsyncVectorCollection wrapper around the
-        same sync collection so the new executor takes effect on subsequent
-        calls. Sync VectorDB has no executor of its own, so nothing else
-        needs to be touched.
+        abandoned. Re-creates the AsyncDocStore wrapper around the same
+        DocStore so the new executor takes effect on subsequent calls.
 
         Ownership transfers OUT: the caller passing a replacement executor
         owns its lifecycle. If we previously owned the executor (no executor
@@ -219,144 +204,88 @@ class VectorStorage:
                 logger.debug(f"Old owned executor shutdown failed: {exc}")
         self._io_executor = new_executor
         self._owns_executor = False
-        # Reuse the existing sync collection — we only need a fresh async
-        # wrapper bound to the new executor.
-        self._collection = AsyncVectorCollection(self._sync_collection, new_executor)
+        # Reuse the existing sync store — we only need a fresh async wrapper
+        # bound to the new executor.
+        self._collection = AsyncDocStore(self._sync_collection, new_executor)
 
-    def _build_collection(self) -> AsyncVectorCollection:
-        """Open the ``files`` collection with ``store_embeddings=True`` and
-        wrap it for async use.
+    def _build_collection(self) -> AsyncDocStore:
+        """Wrap the DocStore for async use on the IO executor.
 
-        ``store_embeddings=True`` is required so ``get_embeddings_by_ids``
-        can return the vectors used by ``SemanticCache.get()`` /
-        ``compare_files()``. simplevecdb defaults this to False.
-        Stores a direct reference to the sync collection for sync code paths
-        (``save``, ``_clear_sync``) so they don't have to reach through the
-        async wrapper.
+        Stores a direct reference to the sync store for sync code paths
+        (``save``, ``_clear_sync``) so they don't reach through the async
+        wrapper.
         """
-        sync_coll = self._db.collection(
-            self._COLLECTION_NAME,
-            distance_strategy=DistanceStrategy.COSINE,
-            quantization=self._QUANTIZATION,
-            store_embeddings=True,
-        )
-        self._sync_collection = sync_coll
-        return AsyncVectorCollection(sync_coll, self._io_executor)
-
-    @staticmethod
-    def _remove_sentinel() -> None:
-        """Remove crash sentinel on clean shutdown."""
-        STARTUP_SENTINEL.unlink(missing_ok=True)
+        self._sync_collection = self._db
+        return AsyncDocStore(self._db, self._io_executor)
 
     @classmethod
-    def _recover_if_crashed(cls, db_path: Path) -> None:
-        """Wipe vecdb if the previous run crashed (sentinel still present).
+    def _migrate_legacy_db(cls, db_path: Path) -> None:
+        """One-time wipe of the legacy ``vecdb.db`` cache on upgrade.
 
-        A C-level crash (SIGABRT from malloc corruption, SIGSEGV) kills the
-        process before Python cleanup runs, leaving the sentinel behind.
-        On next startup we detect this and delete the potentially corrupted
-        usearch index + SQLite WAL so the DB rebuilds cleanly.
+        Earlier releases stored the cache in ``vecdb.db`` (simplevecdb + usearch,
+        then an interim FTS build). The current store is ``docstore.db`` with a
+        different schema, so delete any stale ``vecdb.db`` files once, guarded by
+        a sentinel. The cache is fully rebuildable and repopulates on demand;
+        new installs just create the sentinel with nothing to delete.
         """
-        if not STARTUP_SENTINEL.exists():
+        marker = db_path.parent / ".docstore_v1"
+        if marker.exists():
             return
-
-        logger.warning(
-            "Crash sentinel detected — previous run did not shut down cleanly. "
-            "Clearing vecdb to prevent heap corruption from stale index files."
-        )
-        # Delete usearch index, SQLite DB, WAL, SHM, and metadata sidecar.
-        for pattern in (
-            f".{cls._COLLECTION_NAME}.usearch",
-            "",
-            "-wal",
-            "-shm",
-            ".meta.json",
-        ):
-            target = db_path.parent / (db_path.name + pattern) if pattern else db_path
+        legacy_db = db_path.parent / "vecdb.db"
+        legacy = [
+            legacy_db,
+            legacy_db.with_name("vecdb.db-wal"),
+            legacy_db.with_name("vecdb.db-shm"),
+            legacy_db.with_name(f"vecdb.db.{cls._COLLECTION_NAME}.usearch"),
+            legacy_db.with_name("vecdb.db.meta.json"),
+            db_path.parent / ".vectors_removed",
+            db_path.parent / ".fts_store_v1",
+        ]
+        for target in legacy:
             if target.exists():
                 target.unlink()
-                logger.info(f"Deleted stale file: {target}")
+                logger.info(f"Migration: deleted legacy storage file {target}")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("docstore v1\n")
 
-        STARTUP_SENTINEL.unlink(missing_ok=True)
+    def _has_premanifest_chunks(self) -> bool:
+        """True if the store holds a chunked parent doc with no manifest — the
+        pre-chunk-hash format that predates content-addressed reconciliation."""
+        for _doc_id, _text, meta in self._sync_collection.get_documents():
+            if meta.get(_META_IS_PARENT, False) and _META_MANIFEST not in meta:
+                return True
+        return False
 
-    @classmethod
-    def _clear_if_quantization_changed(cls, db_path: Path) -> None:
-        """Delete stale usearch index when quantization setting changes.
+    def _migrate_chunk_manifest(self) -> None:
+        """One-time wipe of a pre-manifest docstore on upgrade.
 
-        Opening a usearch index built with one quantization type (e.g. FLOAT16)
-        using a different type (e.g. INT8) causes heap corruption (free():
-        corrupted unsorted chunks). We track the active quantization in a JSON
-        sidecar and wipe the index files on mismatch so usearch rebuilds clean.
+        Chunked entries written before chunk-level content addressing carry no
+        ``manifest`` on the parent and no ``chunk_hash`` on children. Reconcile
+        now upgrades them correctly, but clearing once on first startup keeps the
+        store uniformly in the new format and skips the one-time re-write churn.
+        Guarded by a sentinel; the cache repopulates on demand. Single-doc caches
+        have no parent doc, so they are left untouched.
         """
-        meta_path = db_path.with_suffix(".meta.json")
-        current_quant = cls._QUANTIZATION.value
-        stored_quant: str | None = None
-
-        import contextlib
-
-        if meta_path.exists():
-            with contextlib.suppress(Exception):
-                stored_quant = json.loads(meta_path.read_text()).get("quantization")
-
-        if stored_quant != current_quant:
-            if stored_quant is not None:
-                logger.warning(
-                    f"Quantization changed {stored_quant!r} → {current_quant!r}; "
-                    "clearing stale usearch index (cache content preserved in SQLite)"
-                )
-            # Delete usearch index files so VectorDB rebuilds with correct quantization.
-            # Pattern: {db_path}.{collection}.usearch
-            for suffix in (f".{cls._COLLECTION_NAME}.usearch",):
-                stale = db_path.parent / (db_path.name + suffix)
-                if stale.exists():
-                    stale.unlink()
-                    logger.info(f"Deleted stale index: {stale}")
-            meta_path.write_text(json.dumps({"quantization": current_quant}))
-
-    def clear_if_model_changed(self, model_name: str, dim: int) -> None:
-        """Wipe vector index and stored embeddings when the embedding model changes.
-
-        Different models produce incompatible embeddings (different dimensions,
-        different vector spaces). Detect via sidecar metadata and rebuild clean.
-        """
-        meta_path = self._db_path.with_suffix(".meta.json")
-        meta: dict = {}
-
-        import contextlib
-
-        if meta_path.exists():
-            with contextlib.suppress(Exception):
-                meta = json.loads(meta_path.read_text())
-
-        stored_model = meta.get("embedding_model")
-        if stored_model is not None and stored_model != model_name:
-            logger.warning(
-                f"Embedding model changed {stored_model!r} -> {model_name!r} "
-                f"(dim {meta.get('embedding_dim', '?')} -> {dim}); "
-                "rebuilding vector index and clearing cached embeddings"
-            )
-            self._reset_collection_sync(reason="embedding model change")
-
-        # Runtime dim check: even if the sidecar matches, verify the live
-        # index dimension agrees with the current model. A stale or missing
-        # sidecar could leave a dim-mismatched index that segfaults on add.
-        index_dim = self._collection.dim
-        if index_dim is not None and index_dim > 0 and index_dim != dim:
-            logger.warning(
-                f"Index dimension {index_dim} != model dimension {dim}; "
-                "clearing index to prevent usearch segfault"
-            )
-            self._reset_collection_sync(reason="dimension mismatch")
-
-        meta["embedding_model"] = model_name
-        meta["embedding_dim"] = dim
-        meta_path.write_text(json.dumps(meta))
+        marker = self._db_path.parent / ".docstore_manifest_v1"
+        if marker.exists():
+            return
+        try:
+            if self._has_premanifest_chunks():
+                removed = self._db.clear()
+                logger.info(f"Migration: cleared {removed} docs from a pre-manifest cache")
+        except Exception as exc:
+            logger.warning(f"chunk-manifest migration check failed: {exc}")
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("manifest v1\n")
+        except OSError as exc:
+            logger.debug(f"could not write manifest migration marker: {exc}")
 
     def close(self, *, timeout: float = 5.0) -> None:
         """Save and close the database with a deadline.
 
-        Uses a background thread so a hung usearch/SQLite save cannot block
-        the asyncio event loop or delay process exit past *timeout* seconds.
+        Uses a background thread so a hung SQLite save cannot block the
+        asyncio event loop or delay process exit past *timeout* seconds.
         Idempotent — safe to call multiple times.
         """
         if self._closed:
@@ -383,13 +312,13 @@ class VectorStorage:
 
         if t.is_alive():
             logger.warning(
-                f"VectorStorage close timed out after {timeout}s — "
+                f"ContentStorage close timed out after {timeout}s — "
                 "index may need recovery on next startup"
             )
         elif close_error is not None:
-            logger.warning(f"VectorStorage close error: {close_error}")
+            logger.warning(f"ContentStorage close error: {close_error}")
         else:
-            logger.debug("VectorStorage closed cleanly")
+            logger.debug("ContentStorage closed cleanly")
 
         # Shut down the executor only when we own it. SemanticCache injects
         # its own DetachedExecutor and manages its lifecycle separately.
@@ -413,34 +342,19 @@ class VectorStorage:
 
         # Prefer parent doc metadata (has file-level tokens, hash, etc.)
         # For single-doc files there is no parent, so use the only doc.
-        selected_id = results[0][0]
         meta = results[0][1]
-        for doc_id, m, _text in results:
+        for _doc_id, m, _text in results:
             if m.get(_META_IS_PARENT, False):
-                selected_id = doc_id
                 meta = m
                 break
 
         access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
-
-        # Retrieve embedding from catalog so compare_files() can compute similarity.
-        # Must run in executor — catalog is not thread-safe.
-        embedding: EmbeddingVector | None = None
-        # Best-effort embedding retrieval — a miss just leaves embedding None.
-        try:
-            emb_map = await self._collection.get_embeddings_by_ids([selected_id])
-            raw = emb_map.get(selected_id)
-            if raw is not None:
-                embedding = array.array("f", raw)
-        except Exception:  # nosec B110
-            pass
 
         return CacheEntry(
             path=meta[_META_PATH],
             content_hash=meta[_META_CONTENT_HASH],
             mtime=meta[_META_MTIME],
             tokens=meta[_META_TOKENS],
-            embedding=embedding,
             created_at=meta[_META_CREATED_AT],
             access_history=access_history,
         )
@@ -450,9 +364,8 @@ class VectorStorage:
         path: str,
         content: str,
         mtime: float,
-        embedding: EmbeddingVector | None = None,
     ) -> None:
-        """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
+        """Store file as raw text. Large files (>8KB) are HyperCDC-chunked."""
         if self._closed:
             return
         started = time.perf_counter()
@@ -462,16 +375,13 @@ class VectorStorage:
         now = time.time()
         chunked = len(content_bytes) >= CHUNK_THRESHOLD
 
-        emb_list = self._resolve_embedding(embedding)
-        has_embedding = embedding is not None
         log_marker(
             logger,
-            "vector.put.begin",
+            "docstore.put.begin",
             path=path,
             tokens=tokens,
             bytes=len(content_bytes),
             chunked=chunked,
-            has_embedding=has_embedding,
         )
 
         # Pre-compute a stable preview from the start of the file so that
@@ -484,58 +394,55 @@ class VectorStorage:
             _META_TOKENS: tokens,
             _META_CREATED_AT: now,
             _META_ACCESS_HISTORY: json.dumps([now]),
-            _META_HAS_EMBEDDING: has_embedding,
             _META_PREVIEW: content[:_PREVIEW_CHARS],
         }
 
-        # Remove old entry for this path
-        delete_started = time.perf_counter()
-        log_marker(logger, "vector.put.delete.begin", path=path)
-        await self._delete_by_path(path)
-        log_marker(
-            logger,
-            "vector.put.delete.end",
-            path=path,
-            elapsed_ms=round((time.perf_counter() - delete_started) * 1000, 1),
-        )
+        # Load the current docs for this path once. A chunked re-write reuses
+        # the rows whose chunk bytes are unchanged (addressed by chunk_hash)
+        # rather than deleting and re-indexing every chunk — the manifest design.
+        existing = await self._find_docs_by_path(path)
+        parent_id: int | None = None
+        for doc_id, meta, _text in existing:
+            if meta.get(_META_IS_PARENT, False):
+                parent_id = doc_id
+                break
 
         add_started = time.perf_counter()
-        log_marker(logger, "vector.put.add.begin", path=path, chunked=chunked)
+        log_marker(logger, "docstore.put.add.begin", path=path, chunked=chunked)
         new_doc_ids: list[int] = []
-        if not chunked:
-            # Small file: single document
-            meta = {
-                **base_meta,
-                _META_CHUNK_INDEX: 0,
-                _META_TOTAL_CHUNKS: 1,
-                _META_STORAGE_MODE: StorageMode.SINGLE_DOC.value,
-            }
-            ids = await self._collection.add_texts(
-                texts=[content],
-                metadatas=[meta],
-                embeddings=[emb_list],
-            )
-            new_doc_ids = list(ids) if ids else []
-            logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
-        else:
-            # Large file: try chunked storage, fall back to single-doc if too many chunks
-            stored_ids = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
-            if not stored_ids:
-                meta = {
-                    **base_meta,
-                    _META_CHUNK_INDEX: 0,
-                    _META_TOTAL_CHUNKS: 1,
-                    _META_STORAGE_MODE: StorageMode.SINGLE_DOC_FALLBACK.value,
-                }
-                ids = await self._collection.add_texts(
-                    texts=[content],
-                    metadatas=[meta],
-                    embeddings=[emb_list],
+        try:
+            if not chunked:
+                new_doc_ids = await self._store_single(
+                    path, content, base_meta, existing, fallback=False
                 )
-                new_doc_ids = list(ids) if ids else []
-                logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
+                logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
             else:
-                new_doc_ids = list(stored_ids)
+                plan = self._plan_chunks(content_bytes, tokens)
+                if plan is None:
+                    logger.warning(
+                        f"File {path} exceeded {_MAX_CHUNKS} chunks; "
+                        "storing as a single doc to preserve full content"
+                    )
+                    new_doc_ids = await self._store_single(
+                        path, content, base_meta, existing, fallback=True
+                    )
+                elif parent_id is not None:
+                    new_doc_ids = await self._reconcile_chunks(
+                        path, plan, base_meta, existing, parent_id
+                    )
+                else:
+                    if existing:
+                        await self._delete_by_path(path)
+                    new_doc_ids = await self._insert_chunks_fresh(path, plan, base_meta)
+        except Exception:
+            # A store that fails partway can leave the DB and the in-memory
+            # eviction index divergent (rows deleted/inserted, but the index not
+            # yet upserted below). Flag the index dirty so the next eviction-need
+            # re-bootstraps from the DB instead of trusting a stale path→doc_ids
+            # map — the same recovery discipline _delete_by_path and
+            # _evict_if_needed apply when their delete fails.
+            self._index.mark_dirty()
+            raise
         # Mirror the new doc IDs into the in-memory eviction index. Only do
         # this once the index has been bootstrapped, to keep the very first
         # put cheap; once bootstrap fires, every subsequent put updates the
@@ -544,188 +451,226 @@ class VectorStorage:
             self._index.upsert(path, new_doc_ids, now)
         log_marker(
             logger,
-            "vector.put.add.end",
+            "docstore.put.add.end",
             path=path,
             chunked=chunked,
             elapsed_ms=round((time.perf_counter() - add_started) * 1000, 1),
         )
 
         evict_started = time.perf_counter()
-        log_marker(logger, "vector.put.evict.begin", path=path)
+        log_marker(logger, "docstore.put.evict.begin", path=path)
         await self._evict_if_needed()
         log_marker(
             logger,
-            "vector.put.evict.end",
+            "docstore.put.evict.end",
             path=path,
             elapsed_ms=round((time.perf_counter() - evict_started) * 1000, 1),
         )
         log_marker(
             logger,
-            "vector.put.end",
+            "docstore.put.end",
             path=path,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
 
-    async def _put_chunked(
+    async def _store_single(
         self,
         path: str,
         content: str,
-        content_bytes: bytes,
         base_meta: dict,
-        file_embedding: Sequence[float],
+        existing: list[tuple[int, dict, str]],
+        *,
+        fallback: bool,
     ) -> list[int]:
-        """Store large file as parent doc + CDC-chunked children.
+        """Store the whole file as one document, clearing any prior rows first.
 
-        Returns:
-            list[int]: Stored doc IDs in insertion order — ``[parent_id,
-            child_id_0, child_id_1, ...]`` on success. **Empty list signals
-            fallback**: CDC produced more than ``_MAX_CHUNKS`` (500) chunks,
-            so nothing was written and the caller MUST retry as single-doc
-            storage to preserve full content. Treat the empty case as a
-            silent contract — no exception is raised — so callers must not
-            interpret ``[]`` as "stored zero docs".
+        Used for files below the chunk threshold and for the over-cap fallback
+        (``fallback=True`` tags the doc ``single_doc_fallback`` so retrieval
+        quality is observable).
+        """
+        if existing:
+            await self._delete_by_path(path)
+        mode = StorageMode.SINGLE_DOC_FALLBACK if fallback else StorageMode.SINGLE_DOC
+        meta = {
+            **base_meta,
+            _META_CHUNK_INDEX: 0,
+            _META_TOTAL_CHUNKS: 1,
+            _META_STORAGE_MODE: mode.value,
+        }
+        ids = await self._collection.add_texts(texts=[content], metadatas=[meta])
+        return list(ids) if ids else []
+
+    def _plan_chunks(self, content_bytes: bytes, parent_tokens: int) -> _ChunkPlan | None:
+        """Cut ``content_bytes`` into CDC chunks with per-chunk hashes and token
+        estimates, or return ``None`` when the count exceeds ``_MAX_CHUNKS`` (the
+        caller then stores the file as a single doc to preserve full content).
         """
         chunker = get_optimal_chunker(prefer_simd=True)
         chunks_bytes = list(chunker(content_bytes))
-        total_chunks = len(chunks_bytes)
+        total = len(chunks_bytes)
+        if total > _MAX_CHUNKS:
+            return None
 
-        # Safety cap: if CDC produces too many chunks, bail out and let
-        # the caller store the file as a single unchunked document instead
-        # of silently truncating (which would cause data loss).
-        _MAX_CHUNKS = 500  # noqa: N806
-        if total_chunks > _MAX_CHUNKS:
-            logger.warning(
-                f"File {path} produced {total_chunks} chunks (max {_MAX_CHUNKS}); "
-                "falling back to single-doc storage to preserve full content"
-            )
-            return []
-
-        # Decode each chunk back to str, tracking line offsets and byte
-        # lengths (used below for proportional per-chunk token estimates).
-        chunk_texts: list[str] = []
-        chunk_byte_lens: list[int] = []
+        texts: list[str] = []
+        hashes: list[str] = []
+        byte_lens: list[int] = []
+        line_starts: list[int] = []
         line_offset = 0
-        chunk_line_starts: list[int] = []
-
         for chunk_b in chunks_bytes:
             text = chunk_b.decode("utf-8", errors="replace")
-            chunk_texts.append(text)
-            chunk_byte_lens.append(len(chunk_b))
-            chunk_line_starts.append(line_offset)
+            texts.append(text)
+            hashes.append(hash_chunk(chunk_b))
+            byte_lens.append(len(chunk_b))
+            line_starts.append(line_offset)
             line_offset += text.count("\n")
 
-        # Per-chunk token counts: estimate proportionally from the parent's
-        # exact total instead of running the BPE encoder N times serially on
-        # the single-threaded executor. The encoder dominates a chunked write
-        # for large files. We preserve the sum invariant
-        # (sum(chunk_tokens) == parent_tokens) by giving the final chunk the
-        # remainder. Estimates remain stable for display/sort heuristics.
-        parent_tokens = int(base_meta[_META_TOKENS])
-        total_bytes_sum = sum(chunk_byte_lens) or 1
-        chunk_token_estimates: list[int] = []
+        # Per-chunk token counts estimated proportionally from the parent's exact
+        # total instead of running the BPE encoder N times on the single IO
+        # thread. Preserves sum(chunk_tokens) == parent_tokens by giving the last
+        # chunk the remainder.
+        total_bytes_sum = sum(byte_lens) or 1
+        token_estimates: list[int] = []
         running = 0
-        for i, byte_len in enumerate(chunk_byte_lens):
-            if i == total_chunks - 1:
+        for i, byte_len in enumerate(byte_lens):
+            if i == total - 1:
                 est = max(0, parent_tokens - running)
             else:
                 est = (parent_tokens * byte_len) // total_bytes_sum
                 running += est
-            chunk_token_estimates.append(est)
+            token_estimates.append(est)
 
-        # Store parent document (holds file-level metadata, searchable by file embedding)
-        parent_meta = {
+        return _ChunkPlan(
+            texts=texts,
+            hashes=hashes,
+            token_estimates=token_estimates,
+            line_starts=line_starts,
+            total=total,
+        )
+
+    def _child_meta(self, path: str, i: int, plan: _ChunkPlan, base_meta: dict) -> dict:
+        """Metadata for chunk ``i`` — carries its own ``chunk_hash`` so a later
+        re-write can content-address it for reuse."""
+        return {
+            _META_PATH: path,
+            _META_CHUNK_INDEX: i,
+            _META_TOTAL_CHUNKS: plan.total,
+            _META_CHUNK_HASH: plan.hashes[i],
+            _META_CONTENT_HASH: base_meta[_META_CONTENT_HASH],
+            _META_MTIME: base_meta[_META_MTIME],
+            _META_TOKENS: plan.token_estimates[i],
+            _META_CREATED_AT: base_meta[_META_CREATED_AT],
+            _META_ACCESS_HISTORY: base_meta[_META_ACCESS_HISTORY],
+            _META_STORAGE_MODE: StorageMode.CHUNKED.value,
+            "line_start": plan.line_starts[i],
+        }
+
+    def _parent_meta(self, plan: _ChunkPlan, base_meta: dict) -> dict:
+        """File-level parent metadata, including the manifest (ordered chunk
+        hashes) — the explicit recipe a reconcile diffs against."""
+        return {
             **base_meta,
             _META_IS_PARENT: True,
             _META_CHUNK_INDEX: -1,
-            _META_TOTAL_CHUNKS: total_chunks,
+            _META_TOTAL_CHUNKS: plan.total,
             _META_STORAGE_MODE: StorageMode.CHUNKED.value,
+            _META_MANIFEST: plan.hashes,
         }
+
+    async def _insert_chunks_fresh(self, path: str, plan: _ChunkPlan, base_meta: dict) -> list[int]:
+        """First-time chunked store: one empty parent doc + one child per chunk."""
         parent_ids = await self._collection.add_texts(
             texts=[""],  # Parent has no content — children hold raw text
-            metadatas=[parent_meta],
-            embeddings=[file_embedding],
+            metadatas=[self._parent_meta(plan, base_meta)],
         )
         parent_id = parent_ids[0]
-
-        # Store children — each chunk is a child of the parent.
-        # AsyncVectorCollection.add_texts does not expose parent_ids, so we call
-        # the underlying sync collection directly via run_in_executor.
-        child_metas: list[dict] = []
-        child_embeddings: list[Sequence[float]] = []
-        # Module-level cache; same list object is shared across all child
-        # rows. add_texts does not mutate, so this is safe.
-        zero_emb = self._resolve_embedding(None)
-
-        for i, _text in enumerate(chunk_texts):
-            child_meta = {
-                _META_PATH: path,
-                _META_CHUNK_INDEX: i,
-                _META_TOTAL_CHUNKS: total_chunks,
-                _META_CONTENT_HASH: base_meta[_META_CONTENT_HASH],
-                _META_MTIME: base_meta[_META_MTIME],
-                _META_TOKENS: chunk_token_estimates[i],
-                _META_CREATED_AT: base_meta[_META_CREATED_AT],
-                _META_ACCESS_HISTORY: base_meta[_META_ACCESS_HISTORY],
-                _META_STORAGE_MODE: StorageMode.CHUNKED.value,
-                "line_start": chunk_line_starts[i],
-            }
-            child_metas.append(child_meta)
-            # Chunks use zero embedding — similarity search uses the parent's
-            # file-level embedding. Per-chunk embeddings would require N model
-            # calls which is too expensive for the cache hot path.
-            child_embeddings.append(zero_emb)
-
+        child_metas = [self._child_meta(path, i, plan, base_meta) for i in range(plan.total)]
         child_ids = await self._collection.add_texts(
-            texts=chunk_texts,
+            texts=plan.texts,
             metadatas=child_metas,
-            embeddings=child_embeddings,
-            parent_ids=[parent_id] * total_chunks,
+            parent_ids=[parent_id] * plan.total,
         )
-
         logger.debug(
-            f"Stored {path} as {total_chunks} chunks "
+            f"Stored {path} as {plan.total} chunks "
             f"(parent_id={parent_id}, {base_meta[_META_TOKENS]} tokens)"
         )
         return [parent_id, *(list(child_ids) if child_ids else [])]
 
-    def _expected_dim(self) -> int:
-        """Return the expected embedding dimension, querying the model if needed."""
-        dim = self._collection.dim
-        if dim is not None and dim > 0:
-            return dim
-        from ...core.embeddings import get_embedding_dim  # noqa: PLC0415
+    async def _reconcile_chunks(
+        self,
+        path: str,
+        plan: _ChunkPlan,
+        base_meta: dict,
+        existing: list[tuple[int, dict, str]],
+        parent_id: int,
+    ) -> list[int]:
+        """Re-store a chunked file, reusing rows whose chunk bytes are unchanged.
 
-        dim = get_embedding_dim()
-        if dim == 0:
-            raise RuntimeError(
-                "Cannot determine embedding dimension — model not loaded yet. "
-                "Ensure warmup() completes before storing documents."
-            )
-        return dim
+        Pools the existing children by their stored ``chunk_hash``; each new
+        chunk that hits the pool reuses that row via a cheap metadata refresh
+        (no FTS re-index), each miss is inserted, and leftover rows are deleted.
+        A small edit to a large file thus rewrites ~1 chunk instead of all of
+        them — the write-amplification this design exists to remove.
 
-    def _resolve_embedding(self, embedding: EmbeddingVector | None) -> Sequence[float]:
-        """Validate dim and return a Sequence[float] suitable for simplevecdb.
-
-        Skips the defensive ``list(embedding)`` copy: simplevecdb's
-        ``add_texts`` / ``similarity_search`` accept any ``Sequence[float]``,
-        and the call sites do not mutate the buffer. For the zero-vector path
-        (``embedding is None``), the result is reused from a module-level
-        per-dim cache to avoid re-allocating ``[0.0] * dim`` on every chunked
-        write or unembedded put.
+        Non-atomic across its three store calls, which is fine for a cache: a
+        crash mid-reconcile leaves an entry whose content_hash no longer matches
+        disk, and the next read transparently re-puts it.
         """
-        expected = self._expected_dim()
-        if embedding is not None:
-            actual = len(embedding)
-            if actual != expected:
-                raise ValueError(
-                    f"Embedding dimension mismatch: got {actual}, expected {expected}. "
-                    "This usually means the embedding model changed mid-session."
-                )
-            return embedding
-        return _zero_embedding(expected)
+        existing_child_ids: list[int] = []
+        pool: defaultdict[str, deque[int]] = defaultdict(deque)
+        for doc_id, meta, _text in existing:
+            if meta.get(_META_IS_PARENT, False):
+                continue
+            existing_child_ids.append(doc_id)
+            chunk_hash = meta.get(_META_CHUNK_HASH)
+            if chunk_hash is not None:
+                pool[chunk_hash].append(doc_id)
+
+        reused_updates: list[tuple[int, dict]] = []
+        reused_ids: list[int] = []
+        insert_texts: list[str] = []
+        insert_metas: list[dict] = []
+        for i in range(plan.total):
+            child_meta = self._child_meta(path, i, plan, base_meta)
+            available = pool.get(plan.hashes[i])
+            if available:
+                reused_id = available.popleft()
+                reused_ids.append(reused_id)
+                reused_updates.append((reused_id, child_meta))
+            else:
+                insert_texts.append(plan.texts[i])
+                insert_metas.append(child_meta)
+
+        # Every existing child not reused must be deleted — including legacy
+        # rows with no chunk_hash, which never entered the pool. A pool-only
+        # leftover would orphan them and duplicate the file against the freshly
+        # inserted chunks.
+        reused_set = set(reused_ids)
+        leftover = [doc_id for doc_id in existing_child_ids if doc_id not in reused_set]
+
+        # Drop stale rows, insert only genuinely-new chunks (the sole FTS work),
+        # then refresh metadata for the parent and every reused child (text
+        # untouched → their FTS rows are never re-tokenized).
+        if leftover:
+            await self._collection.delete_by_ids(leftover)
+        new_ids: list[int] = []
+        if insert_texts:
+            ids = await self._collection.add_texts(
+                texts=insert_texts,
+                metadatas=insert_metas,
+                parent_ids=[parent_id] * len(insert_texts),
+            )
+            new_ids = list(ids) if ids else []
+        await self._collection.update_metadata(
+            [(parent_id, self._parent_meta(plan, base_meta)), *reused_updates]
+        )
+        logger.debug(
+            f"Reconciled {path}: {plan.total} chunks "
+            f"({len(reused_ids)} reused, {len(new_ids)} new, {len(leftover)} dropped)"
+        )
+        return [parent_id, *reused_ids, *new_ids]
 
     async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
-        """Reassemble full text from simplevecdb chunks (sorted by chunk_index).
+        """Reassemble full text from stored chunks (sorted by chunk_index).
 
         Args:
             entry: Cache entry whose path identifies the stored content.
@@ -819,7 +764,7 @@ class VectorStorage:
             self._index.add_access(path, now)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
-        """Update cached mtime without re-storing content or re-embedding.
+        """Update cached mtime without re-storing content.
 
         Used when content hash matches but mtime changed (touch, git checkout).
         Prevents repeated hash checks on subsequent reads.
@@ -838,31 +783,6 @@ class VectorStorage:
             await self._collection.update_metadata(updates)
 
     # -------------------------------------------------------------------------
-    # Similarity search
-    # -------------------------------------------------------------------------
-
-    async def find_similar(
-        self, embedding: EmbeddingVector, exclude_path: str | None = None
-    ) -> str | None:
-        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None.
-
-        Implementation lives in ``_search`` to keep this module from becoming a god-object.
-        """
-        return await _search.find_similar(self, embedding, exclude_path)
-
-    async def find_similar_multi(
-        self,
-        embedding: EmbeddingVector,
-        exclude_path: str | None = None,
-        k: int = 5,
-        threshold: float | None = None,
-    ) -> list[tuple[str, float]]:
-        """Return up to k (path, similarity) tuples above threshold."""
-        return await _search.find_similar_multi(
-            self, embedding, exclude_path, k=k, threshold=threshold
-        )
-
-    # -------------------------------------------------------------------------
     # Query-based search
     # -------------------------------------------------------------------------
 
@@ -874,19 +794,6 @@ class VectorStorage:
     ) -> list[tuple[str, str, float]]:
         """BM25 keyword search over cached content. FTS5 syntax supported."""
         return await _search.search_by_query(self, query, k=k, filter=filter)
-
-    async def search_hybrid(
-        self,
-        query: str,
-        embedding: EmbeddingVector | None = None,
-        k: int = 5,
-        filter: dict | None = None,
-    ) -> list[tuple[str, str, float]]:
-        """Hybrid BM25 + vector search with RRF fusion.
-
-        Falls back to keyword-only if no embedding provided.
-        """
-        return await _search.search_hybrid(self, query, embedding, k=k, filter=filter)
 
     # -------------------------------------------------------------------------
     # Grep — regex/literal content search across cached files
@@ -950,7 +857,7 @@ class VectorStorage:
     ) -> list[dict]:
         """Exact pattern matching across cached files — like ripgrep on the cache.
 
-        Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
+        Unlike search, returns line numbers and context, not ranked scores.
         Implementation lives in ``_grep`` to keep this module from becoming a god-object.
         """
         return await _grep.grep(
@@ -1058,23 +965,13 @@ class VectorStorage:
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of documents removed.
 
-        Uses ``delete_collection`` to atomically drop the SQLite tables, FTS
-        index, and usearch file in one call, then rebuilds
-        an empty collection. Faster and safer than the previous per-id loop.
-        Runs the (sync) ``delete_collection`` on the shared IO executor so it
-        does not block the event loop.
+        Deletes all rows from the doc store (text + FTS) on the shared IO
+        executor so it does not block the event loop.
         """
-        import contextlib  # noqa: PLC0415
-
         count = await self._collection.count()
         if count > 0:
             loop = asyncio.get_running_loop()
-            with contextlib.suppress(KeyError):
-                await loop.run_in_executor(
-                    self._io_executor,
-                    lambda: self._db.delete_collection(self._COLLECTION_NAME),
-                )
-            self._collection = self._build_collection()
+            await loop.run_in_executor(self._io_executor, self._db.clear)
         self._index.clear()
         return count
 
@@ -1149,7 +1046,7 @@ class VectorStorage:
             if await self._collection.count() <= cap:
                 return
             # Lazy bootstrap. Captures the executor closure here so the index
-            # module stays decoupled from AsyncVectorCollection's exact API.
+            # module stays decoupled from the async store's exact API.
             await self._index.ensure_loaded(self._collection.get_documents)
 
         if self._index.total_paths() <= cap:
@@ -1189,18 +1086,16 @@ class VectorStorage:
         )
 
     def save(self) -> None:
-        """Persist index to disk.
+        """Commit + checkpoint the store to disk.
 
-        Guarded by `_save_lock` against the close() daemon thread's final
-        save: usearch's save is not thread-safe, and a concurrent save from
-        eviction (running on the IO executor) racing with close() would
-        corrupt the heap. The lock also covers a re-check of `_closed` so
-        we never write after close() has begun tearing down the DB.
+        Guarded by `_save_lock` against the close() daemon thread's final save
+        so an eviction-triggered save (on the IO executor) never races close().
+        The lock also covers a re-check of `_closed` so we never write after
+        close() has begun tearing down the connection.
         """
         with self._save_lock:
             if self._closed:
                 return
-            self._sync_collection.save()
             self._db.save()
 
 

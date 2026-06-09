@@ -9,7 +9,6 @@ Covers:
 
 from __future__ import annotations
 
-import array
 import asyncio
 import time
 from pathlib import Path
@@ -90,7 +89,6 @@ async def test_refresh_path_timeout_marks_stale_and_resets_executor(tmp_path: Pa
             path,
             "content\n",
             1.0,
-            array.array("f", [0.1]),
             timeout=0.01,
         )
 
@@ -116,25 +114,11 @@ async def test_refresh_path_uses_adaptive_default_timeout(tmp_path: Path) -> Non
             path,
             "content\n",
             1.0,
-            array.array("f", [0.1]),
         )
 
     assert ok is False
     assert cache.is_stale(path) is True
     mock_reset.assert_called_once()
-
-
-def test_compute_refresh_timeout_adapts_to_remaining_work(tmp_path: Path) -> None:
-    """Adaptive timeout should be shortest when embedding work is already done."""
-    cache = SemanticCache(db_path=tmp_path / "refresh_heuristic.db")
-
-    with patch("semantic_cache_mcp.core.embeddings._model._model_ready", False):
-        cold_timeout = cache._compute_refresh_timeout(has_embedding=False)
-    with patch("semantic_cache_mcp.core.embeddings._model._model_ready", True):
-        warm_timeout = cache._compute_refresh_timeout(has_embedding=False)
-    fast_timeout = cache._compute_refresh_timeout(has_embedding=True)
-
-    assert fast_timeout <= warm_timeout <= cold_timeout
 
 
 # ---------------------------------------------------------------------------
@@ -428,12 +412,9 @@ async def test_batch_read_prefetches_stats_async() -> None:
         mock_cache.get = AsyncMock(return_value=None)
         mock_cache._io_executor = None
         mock_cache.begin_operation.return_value = True
-        mock_cache.get_embedding = AsyncMock(return_value=None)
-        mock_cache.get_embeddings_batch = AsyncMock(return_value=[])
         mock_cache.put = AsyncMock()
         mock_cache.refresh_path = AsyncMock(return_value=True)
         mock_cache.record_access = AsyncMock()
-        mock_cache.find_similar = AsyncMock(return_value=None)
         mock_cache.update_mtime = AsyncMock()
 
         real_stat = os.stat(tmp / "x.txt")
@@ -442,11 +423,9 @@ async def test_batch_read_prefetches_stats_async() -> None:
         with (
             patch("semantic_cache_mcp.cache.read.astat", astat_mock),
             patch("semantic_cache_mcp.cache.read.aread_bytes", new_callable=AsyncMock) as rb_mock,
-            patch("semantic_cache_mcp.cache.read.aread_text", new_callable=AsyncMock) as rt_mock,
         ):
             # aread_bytes returns file content for smart_read
             rb_mock.side_effect = lambda p, ex: (tmp / p.name).read_bytes()
-            rt_mock.side_effect = lambda p, executor: (tmp / p.name).read_text()
 
             result = await batch_smart_read(
                 mock_cache,
@@ -501,38 +480,6 @@ async def test_shielded_write_propagates_inner_exception() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_get_embeddings_batch_dispatches_to_io_executor(tmp_path: Path) -> None:
-    """The batch embed path must run on the SemanticCache IO executor.
-
-    Original bug: get_embeddings_batch was a sync def that ran ONNX inference
-    on whatever thread called it. That broke the single-thread ONNX/usearch
-    invariant whenever the caller was the asyncio event-loop thread.
-
-    Regression check: capture the thread that runs `_embed_batch`. It must
-    not be the calling (event-loop) thread.
-    """
-    import threading as _threading
-
-    cache = SemanticCache(db_path=tmp_path / "exec_dispatch.db")
-    try:
-        calling_thread = _threading.get_ident()
-        seen_thread: list[int] = []
-
-        def _capture(texts: list[str]) -> list[None]:
-            seen_thread.append(_threading.get_ident())
-            return [None] * len(texts)
-
-        with patch("semantic_cache_mcp.cache.embed_batch", _capture):
-            await cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
-
-        assert len(seen_thread) == 1
-        assert seen_thread[0] != calling_thread, (
-            "embed_batch ran on the event-loop thread; the executor dispatch was bypassed"
-        )
-    finally:
-        await cache.async_close()
-
-
 async def test_shielded_write_inflight_zero_after_post_timeout_completion() -> None:
     """After a write times out and the inner task later finishes, the
     drain counter must return to zero. Original bug: end_operation() was
@@ -571,7 +518,7 @@ async def test_glob_path_walk_does_not_block_event_loop() -> None:
         mock_cache = MagicMock()
         mock_cache.get = AsyncMock(return_value=None)
         # None routes run_in_executor to asyncio's default ThreadPoolExecutor
-        # — fine for filesystem ops; ONNX/usearch paths set a single-thread
+        # — fine for filesystem ops; storage paths use a dedicated single-thread
         # executor explicitly.
         mock_cache._io_executor = None
 

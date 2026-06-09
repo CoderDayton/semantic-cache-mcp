@@ -21,7 +21,7 @@ def _migrate_v2_to_v3() -> None:
     """Remove legacy v0.2.0 SQLite cache on first v0.3.0 startup.
 
     v0.3.0 switched from SQLiteStorage (cache.db with chunks/files/lsh_index tables)
-    to VectorStorage (vecdb.db). The old database is incompatible and just wastes disk.
+    to ContentStorage (docstore.db). The old database is incompatible and just wastes disk.
     """
     if not DB_PATH.exists():
         return
@@ -56,14 +56,14 @@ def _migrate_v2_to_v3() -> None:
 
 @lifespan
 async def app_lifespan(server: FastMCP):
-    """Initialize cache and embedding model on startup."""
+    """Initialize cache on startup."""
     logger.info("Semantic cache MCP server starting...")
 
     cache: ToolProcessSupervisor | None = None
 
     # Redirect stdout → stderr during initialization to prevent third-party
-    # libraries (fastembed, onnxruntime) from printing to stdout and corrupting
-    # the stdio MCP transport. The lifespan runs BEFORE stdio_server() captures
+    # libraries from printing to stdout and corrupting the stdio MCP
+    # transport. The lifespan runs BEFORE stdio_server() captures
     # sys.stdout.buffer, so we must restore before yielding.
     with contextlib.redirect_stdout(sys.stderr):
         try:
