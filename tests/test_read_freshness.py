@@ -11,14 +11,14 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastmcp import Context
 
 from semantic_cache_mcp.cache import SemanticCache
 from semantic_cache_mcp.cache.read import smart_read
-from semantic_cache_mcp.server.tools import edit, read
+from semantic_cache_mcp.server.tools import _ranged_metrics, batch_edit, edit, read, write
 
 
 @pytest.fixture()
@@ -257,3 +257,152 @@ async def test_ranged_read_known_hash_mtime_bump_falls_through(
     d = _parse(await read(ctx, str(f), offset=1, limit=3, known_hash=h))
     assert d.get("unchanged") is not True
     assert "content" in d
+
+
+# ---------------------------------------------------------------------------
+# Ranged-read token accounting: bill the slice, not the whole file, and serve
+# from cache without re-reading disk when the file is fresh.
+# ---------------------------------------------------------------------------
+
+
+def test_ranged_metrics_helper_bills_slice() -> None:
+    """The full file is the denominator; only the slice counts as returned."""
+    r = _ranged_metrics(1000, 30, from_cache=True)
+    assert r.tokens_original == 1000
+    assert r.tokens_returned == 30
+    assert r.tokens_saved == 970
+    assert r.from_cache is True
+    # A returned count somehow exceeding the original never goes negative.
+    assert _ranged_metrics(10, 50, from_cache=False).tokens_saved == 0
+
+
+async def test_ranged_read_bills_only_the_slice(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    """A ranged read records the slice as returned and the rest as saved,
+    not the whole file as both original and returned."""
+    f = tmp_path / "ranged_metrics.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(200)) + "\n")
+    await read(ctx, str(f))  # full read caches the file
+    entry = await tmp_cache.get(str(f.resolve()))
+    assert entry is not None
+    full_tokens = entry.tokens
+
+    before = tmp_cache.metrics.snapshot()
+    await read(ctx, str(f), offset=10, limit=3)
+    after = tmp_cache.metrics.snapshot()
+
+    d_original = after["tokens_original"] - before["tokens_original"]
+    d_returned = after["tokens_returned"] - before["tokens_returned"]
+    d_saved = after["tokens_saved"] - before["tokens_saved"]
+
+    assert d_original == full_tokens  # whole-file denominator
+    assert 0 < d_returned < full_tokens  # only the slice was billed
+    assert d_saved == full_tokens - d_returned  # the rest is saved
+
+
+async def test_ranged_read_fresh_does_not_reread_disk(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cache-fresh file, a ranged read slices cached bytes and never
+    re-reads the whole file off disk."""
+    import semantic_cache_mcp.cache.read as read_mod
+
+    f = tmp_path / "no_disk.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(80)) + "\n")
+    await read(ctx, str(f))  # caches it (this read does touch disk)
+
+    calls = {"n": 0}
+    real = read_mod.aread_bytes
+
+    async def _counting(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        calls["n"] += 1
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(read_mod, "aread_bytes", _counting)
+
+    d = _parse(await read(ctx, str(f), offset=5, limit=4))
+    assert "row_4 = 4" in d["content"]  # correct slice (line 5 is row_4)
+    assert calls["n"] == 0  # served from cache, no disk byte-read
+
+
+# ---------------------------------------------------------------------------
+# write returns content_hash so the caller can skip the re-read it would
+# otherwise do right after writing a file.
+# ---------------------------------------------------------------------------
+
+
+async def test_write_returns_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    f = tmp_path / "written.py"
+    body = "\n".join(f"a_{i} = {i}" for i in range(60)) + "\n"
+    d = _parse(await write(ctx, str(f), body))
+    assert d["status"] == "created"
+    assert d.get("content_hash")
+
+
+async def test_write_content_hash_works_as_known_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """The hash a write returns lets the very next read answer `unchanged`."""
+    f = tmp_path / "roundtrip.py"
+    body = "\n".join(f"a_{i} = {i}" for i in range(60)) + "\n"
+    w = _parse(await write(ctx, str(f), body))
+    h = w["content_hash"]
+
+    d = _parse(await read(ctx, str(f), known_hash=h))
+    assert d.get("unchanged") is True
+    assert d["content_hash"] == h
+    assert "content" not in d
+
+
+async def test_write_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """A dry_run writes nothing, so it must not advertise a hash to echo back."""
+    f = tmp_path / "dry.py"
+    d = _parse(await write(ctx, str(f), "x = 1\n", dry_run=True))
+    assert "content_hash" not in d
+
+
+async def test_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """The hash an edit returns lets the next read answer `unchanged`."""
+    f = tmp_path / "edited_hash.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    await read(ctx, str(f))
+    e = _parse(await edit(ctx, str(f), "a_0 = 0", "a_0 = 999"))
+    h = e["content_hash"]
+    assert h
+
+    d = _parse(await read(ctx, str(f), known_hash=h))
+    assert d.get("unchanged") is True
+    assert d["content_hash"] == h
+
+
+async def test_edit_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    f = tmp_path / "edit_dry.py"
+    f.write_text("a = 1\nb = 2\n")
+    await read(ctx, str(f))
+    d = _parse(await edit(ctx, str(f), "a = 1", "a = 9", dry_run=True))
+    assert "content_hash" not in d
+
+
+async def test_batch_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    f = tmp_path / "batch_hash.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    await read(ctx, str(f))
+    b = _parse(
+        await batch_edit(ctx, str(f), '[["a_0 = 0", "a_0 = 111"], ["a_1 = 1", "a_1 = 222"]]')
+    )
+    h = b["content_hash"]
+    assert h
+
+    d = _parse(await read(ctx, str(f), known_hash=h))
+    assert d.get("unchanged") is True
+    assert d["content_hash"] == h
+
+
+async def test_debug_mode_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """Even in debug mode, a dry_run must not advertise a content_hash, while a
+    real write still surfaces one."""
+    f = tmp_path / "debug_dry.py"
+    with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
+        real = _parse(await write(ctx, str(f), "x = 1\n"))
+        assert real.get("content_hash")  # real write surfaces it in debug too
+        dry = _parse(await write(ctx, str(f), "x = 2\n", dry_run=True))
+        assert "content_hash" not in dry

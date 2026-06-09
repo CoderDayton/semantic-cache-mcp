@@ -23,15 +23,21 @@ runtime.
   takes an optional `known_hash`. Send back the hash you already have and the
   server answers `unchanged: true` instead of resending the file. The caller
   knows that hash for sure, so there is no guessing about what was sent earlier
-  in the session. Ranged reads with `offset`/`limit` do the same thing with just
-  a stat and no file read when the hash matches and the file has not changed.
+  in the session. `write`, `edit`, and `batch_edit` return the new `content_hash`
+  too, so right after changing a file you can pass it as `known_hash` and skip
+  the re-read. Ranged reads with `offset`/`limit` answer `unchanged` from a stat
+  alone when the hash matches, and when they do need the lines they cut them from
+  the cached copy instead of re-reading the whole file from disk. The stats count
+  only the lines a ranged read returns, not the whole file.
 
 ### Changed
 
 - `search` is BM25 keyword only. It ranks cached files by how well their words
   match the query and returns a score from 0 to 1, where the best match is 1.0.
-  It matches on words, not meaning, so use `grep` for exact strings and
-  `batch_read` to pull more files into the cache.
+  Punctuation in a query is treated as plain text, so a term like `in-flight` or
+  a stray `*` still matches instead of coming back empty. It matches on words,
+  not meaning, so use `grep` for exact strings and `batch_read` to pull more
+  files into the cache.
 - A small SQLite + FTS5 store replaces `simplevecdb`. A focused `DocStore` and
   `AsyncDocStore` now back storage, using FTS5 `bm25()` ranking and JSON metadata
   filters copied straight from the old catalog code. There is no embedding

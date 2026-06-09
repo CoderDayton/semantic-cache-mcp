@@ -33,6 +33,8 @@ from ...cache import (
 from ...cache._helpers import _PhaseTimer
 from ...cache.read import _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
+from ...core import count_tokens
+from ...types import ReadResult
 from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
 from .._mcp import mcp
@@ -67,6 +69,28 @@ logger = logging.getLogger(__name__)
 
 # Tool timeout from config (env TOOL_TIMEOUT, default 30s).
 _TOOL_TIMEOUT: float = TOOL_TIMEOUT
+
+
+def _ranged_metrics(tokens_original: int, tokens_returned: int, *, from_cache: bool) -> ReadResult:
+    """Build a ReadResult so a ranged read records accurate token accounting.
+
+    A ranged read materializes the whole file to address lines but returns only
+    the requested slice, so the file's full token count is the original, the
+    slice is what was returned, and the difference is saved versus a naive full
+    read. Previously ranged reads recorded original == returned and zero saved,
+    billing a few lines as if the entire file had been sent.
+    """
+    return ReadResult(
+        content="",
+        from_cache=from_cache,
+        is_diff=False,
+        tokens_original=tokens_original,
+        tokens_returned=tokens_returned,
+        tokens_saved=max(0, tokens_original - tokens_returned),
+        truncated=False,
+        compression_ratio=(tokens_returned / tokens_original) if tokens_original else 1.0,
+    )
+
 
 # Global tool mutex: only one tool call executes at a time.
 # Prevents concurrent coroutines from interleaving executor tasks,
@@ -436,57 +460,87 @@ async def read(
     try:
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
-            # Hash-gated short-circuit: when the caller still holds this exact
-            # file (known_hash matches the cached hash) and disk hasn't changed,
-            # a ranged re-read is pointless. Confirm with a stat only — no byte
-            # read, no re-slice — and answer unchanged for the range.
-            if known_hash:
-                ranged_abs = str(Path(path).expanduser().resolve())
-                ranged_entry = await cache.get(ranged_abs)
-                if ranged_entry is not None and known_hash == ranged_entry.content_hash:
-                    try:
-                        ranged_st = await astat(Path(ranged_abs), cache._io_executor)
-                    except OSError:
-                        ranged_st = None
-                    if ranged_st is not None and ranged_entry.mtime >= ranged_st.st_mtime:
-                        ranged_text = await cache.get_content(ranged_entry)
-                        # Count lines the same way the literal ranged path does
-                        # (splitlines) so `lines.total` agrees for the same file,
-                        # including the empty-file edge case.
-                        total = len(ranged_text.splitlines(keepends=True))
-                        return _finalize_payload(
-                            {
-                                "ok": True,
-                                "tool": "read",
-                                "path": path,
-                                "unchanged": True,
-                                "content_hash": ranged_entry.content_hash,
-                                "lines": {"total": total},
-                            },
-                            max_response_tokens,
-                        )
-            result = await asyncio.wait_for(
-                smart_read(
-                    cache=cache,
-                    path=path,
-                    max_size=max_size,
-                    diff_mode=False,  # Line ranges bypass diff mode
-                    force_full=True,
-                    refresh_cache=False,
-                    summarize=False,  # Line ranges need literal lines, not a summary
-                ),
-                timeout=_TOOL_TIMEOUT,
+            ranged_abs = str(Path(path).expanduser().resolve())
+            ranged_entry = await cache.get(ranged_abs)
+            ranged_st = None
+            if ranged_entry is not None:
+                try:
+                    ranged_st = await astat(Path(ranged_abs), cache._io_executor)
+                except OSError:
+                    ranged_st = None
+            # Trust the cache when disk has not moved past it (mtime), the same
+            # freshness rule the rest of the read tool uses. A fresh entry lets us
+            # slice from cached bytes instead of re-reading the whole file off disk.
+            ranged_fresh = (
+                ranged_entry is not None
+                and ranged_st is not None
+                and ranged_entry.mtime >= ranged_st.st_mtime
             )
-            cache.metrics.record("read", result)
-            if result.is_binary:
-                return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
-            lines = result.content.splitlines(keepends=True)
+
+            # Hash-gated short-circuit: the caller still holds this exact file, so
+            # a ranged re-read is pointless. Confirm with a stat only (no byte
+            # read, no re-slice) and answer unchanged for the range. Recorded as a
+            # cache hit that saved the whole file.
+            if known_hash and ranged_fresh and known_hash == ranged_entry.content_hash:
+                ranged_text = await cache.get_content(ranged_entry)
+                # Count lines the same way the literal ranged path does
+                # (splitlines) so `lines.total` agrees for the same file,
+                # including the empty-file edge case.
+                total = len(ranged_text.splitlines(keepends=True))
+                cache.metrics.record(
+                    "read", _ranged_metrics(ranged_entry.tokens, 0, from_cache=True)
+                )
+                return _finalize_payload(
+                    {
+                        "ok": True,
+                        "tool": "read",
+                        "path": path,
+                        "unchanged": True,
+                        "content_hash": ranged_entry.content_hash,
+                        "lines": {"total": total},
+                    },
+                    max_response_tokens,
+                )
+
+            # Materialize the file to address specific lines. Serve from the cache
+            # when it is fresh (no disk read); only touch disk when the cache is
+            # missing or stale, in which case smart_read also refreshes it.
+            if ranged_fresh:
+                full_text = await cache.get_content(ranged_entry)
+                full_tokens = ranged_entry.tokens
+                ranged_from_cache = True
+                ranged_hash: str | None = ranged_entry.content_hash
+            else:
+                result = await asyncio.wait_for(
+                    smart_read(
+                        cache=cache,
+                        path=path,
+                        max_size=max_size,
+                        diff_mode=False,  # Line ranges bypass diff mode
+                        force_full=True,
+                        refresh_cache=False,  # smart_read still refreshes when stale
+                        summarize=False,  # Line ranges need literal lines, not a summary
+                    ),
+                    timeout=_TOOL_TIMEOUT,
+                )
+                if result.is_binary:
+                    cache.metrics.record("read", result)
+                    return _finalize_payload(
+                        _binary_read_payload(path, result), max_response_tokens
+                    )
+                full_text = result.content
+                full_tokens = result.tokens_original
+                ranged_from_cache = result.from_cache
+                refreshed = await cache.get(ranged_abs)
+                ranged_hash = refreshed.content_hash if refreshed is not None else None
+
+            lines = full_text.splitlines(keepends=True)
             start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
 
             # Format with line numbers like built-in Read tool. Generator
-            # expression avoids materializing the intermediate list — `selected`
+            # expression avoids materializing the intermediate list; `selected`
             # may be thousands of lines on partial reads of large files.
             content = "\n".join(
                 f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
@@ -498,6 +552,13 @@ async def read(
                 "end": min(end, len(lines)),
                 "total": len(lines),
             }
+            # Bill only the slice actually returned; the rest of the file is saved
+            # versus a naive full read.
+            ranged_returned = count_tokens(content)
+            cache.metrics.record(
+                "read",
+                _ranged_metrics(full_tokens, ranged_returned, from_cache=ranged_from_cache),
+            )
             payload: dict[str, Any] = {
                 "ok": True,
                 "tool": "read",
@@ -505,14 +566,13 @@ async def read(
                 "content": content,
                 "lines": line_info,
             }
-            ranged_entry2 = await cache.get(str(Path(path).expanduser().resolve()))
-            if ranged_entry2 is not None:
-                payload["content_hash"] = ranged_entry2.content_hash
+            if ranged_hash is not None:
+                payload["content_hash"] = ranged_hash
             if mode in _MODE_NORMAL:
-                payload["truncated"] = result.truncated
+                payload["truncated"] = False
             if mode == _MODE_DEBUG:
-                payload["from_cache"] = result.from_cache
-                payload["tokens_saved"] = result.tokens_saved
+                payload["from_cache"] = ranged_from_cache
+                payload["tokens_saved"] = max(0, full_tokens - ranged_returned)
 
             return _finalize_payload(payload, max_response_tokens)
 
@@ -1163,8 +1223,10 @@ async def write(
     `edit` or `batch_edit`. Status is `created` for a new path or `updated`
     for an existing one, and an update returns a unified diff against the
     previous content. Writing refreshes the cache so later reads, `grep`, and
-    `search` see the new text. Missing parent directories are created unless
-    `create_parents=false`.
+    `search` see the new text. The response carries the new `content_hash`;
+    pass it back as `read`'s `known_hash` to get `unchanged` instead of
+    re-reading the file you just wrote. Missing parent directories are created
+    unless `create_parents=false`.
 
     Args:
         path: File path to create or replace (absolute, or relative to root).
@@ -1207,6 +1269,11 @@ async def write(
             "status": "created" if result.created else "updated",
             "path": result.path,
         }
+        # Surface the new content_hash so the caller can echo it as known_hash on
+        # a later read and get `unchanged` instead of a re-send. Only when the
+        # write actually landed; a dry_run leaves disk and cache untouched.
+        if not result.dry_run:
+            payload["content_hash"] = result.content_hash
         if result.created:
             payload["diff_state"] = "none"
         else:
@@ -1225,7 +1292,6 @@ async def write(
             payload["bytes_written"] = result.bytes_written
             payload["tokens_written"] = result.tokens_written
             payload["diff_stats"] = result.diff_stats
-            payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
 
         return _finalize_payload(payload, max_response_tokens)
@@ -1335,6 +1401,11 @@ async def edit(
             "replaced": result.replacements_made,
             "line_numbers": result.line_numbers,
         }
+        # Surface the new content_hash so the caller can echo it as known_hash on
+        # a later read and skip re-reading the file it just edited. Skip on
+        # dry_run, which leaves disk and cache untouched.
+        if not dry_run:
+            payload["content_hash"] = result.content_hash
         _apply_mutation_diff(
             payload,
             diff_content=result.diff_content,
@@ -1345,7 +1416,6 @@ async def edit(
             payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["diff_stats"] = result.diff_stats
-            payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
             payload["params"] = {
                 "replace_all": replace_all,
@@ -1597,6 +1667,12 @@ async def batch_edit(
                 for o in result.outcomes
                 if not o.success
             ]
+        # Surface the new content_hash so the caller can echo it as known_hash on
+        # a later read and skip re-reading the file it just edited. Only when an
+        # edit actually applied (cache refreshed); dry_run and all-failed leave
+        # disk and cache untouched.
+        if not dry_run and result.succeeded > 0:
+            payload["content_hash"] = result.content_hash
         _apply_mutation_diff(
             payload,
             diff_content=result.diff_content,
@@ -1618,7 +1694,6 @@ async def batch_edit(
                 for o in result.outcomes
             ]
             payload["diff_stats"] = result.diff_stats
-            payload["content_hash"] = result.content_hash
             payload["from_cache"] = result.from_cache
             payload["params"] = {
                 "dry_run": dry_run,
