@@ -1,7 +1,7 @@
 """Tests for the TinyLFU in-memory eviction index.
 
 Covers the sketch's frequency tracking and aging, the index's
-recency-aware sample selection, and the integrated VectorStorage eviction
+recency-aware sample selection, and the integrated ContentStorage eviction
 path that should now keep frequently-accessed files alive while reclaiming
 cold ones.
 """
@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from semantic_cache_mcp.storage.vector import VectorStorage
-from semantic_cache_mcp.storage.vector._tinylfu import (
+from semantic_cache_mcp.storage.docstore import ContentStorage
+from semantic_cache_mcp.storage.docstore._tinylfu import (
     TinyLFUIndex,
     _CountMinSketch,
 )
@@ -239,13 +239,13 @@ class TestTinyLFUIndex:
         assert idx.doc_ids_for("bad.py") == [2]
 
 
-class TestVectorStorageEvictionUsesIndex:
+class TestContentStorageEvictionUsesIndex:
     """End-to-end: storage eviction goes through the TinyLFU index."""
 
     async def test_frequently_accessed_file_survives_eviction(self, tmp_path: Path) -> None:
         from semantic_cache_mcp import config as cfg
 
-        vs = VectorStorage(db_path=tmp_path / "vec.db")
+        vs = ContentStorage(db_path=tmp_path / "vec.db")
         original_cap = cfg.MAX_CACHE_ENTRIES
         try:
             # Tight cap so eviction fires after a handful of puts.
@@ -269,7 +269,7 @@ class TestVectorStorageEvictionUsesIndex:
 
     async def test_eviction_does_not_full_scan_when_under_cap(self, tmp_path: Path) -> None:
         """Under the cap, the index never bootstraps — first-put cost stays cheap."""
-        vs = VectorStorage(db_path=tmp_path / "vec.db")
+        vs = ContentStorage(db_path=tmp_path / "vec.db")
         try:
             for i in range(3):
                 await vs.put(f"/f{i}.txt", f"x {i}\n", mtime=float(i))
@@ -281,7 +281,7 @@ class TestVectorStorageEvictionUsesIndex:
         """Once the TinyLFU index is in memory, _evict_if_needed reads its
         exact total_paths() and must not re-issue a doc-count DB query.
         """
-        vs = VectorStorage(db_path=tmp_path / "vec.db")
+        vs = ContentStorage(db_path=tmp_path / "vec.db")
         try:
             for i in range(3):
                 await vs.put(f"/f{i}.txt", f"x {i}\n", mtime=float(i))

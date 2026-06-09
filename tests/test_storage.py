@@ -1,11 +1,11 @@
-"""Tests for VectorStorage backend."""
+"""Tests for ContentStorage backend."""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
 
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 
 
 class TestFileOperations:
@@ -13,7 +13,7 @@ class TestFileOperations:
 
     async def test_put_and_get_file(self, temp_dir: Path) -> None:
         """put and get should store and retrieve files."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         path = "/test/file.txt"
         content = "Test file content"
         mtime = time.time()
@@ -27,13 +27,13 @@ class TestFileOperations:
 
     async def test_get_nonexistent_returns_none(self, temp_dir: Path) -> None:
         """get on non-existent path should return None."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         entry = await storage.get("/nonexistent/path.txt")
         assert entry is None
 
     async def test_get_content_returns_original(self, temp_dir: Path) -> None:
         """get_content should return the original content."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         path = "/test/content.txt"
         content = "Original file content for testing"
         mtime = time.time()
@@ -47,7 +47,7 @@ class TestFileOperations:
 
     async def test_record_access_updates_history(self, temp_dir: Path) -> None:
         """record_access should add to access_history."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         path = "/test/access.txt"
         await storage.put(path, "Content", time.time())
 
@@ -62,7 +62,7 @@ class TestFileOperations:
 
     async def test_put_overwrites_existing(self, temp_dir: Path) -> None:
         """put should overwrite existing entry for same path."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         path = "/test/overwrite.txt"
 
         await storage.put(path, "Original", time.time())
@@ -79,7 +79,7 @@ class TestCacheEviction:
 
     async def test_lru_k_scoring(self, temp_dir: Path) -> None:
         """LRU-K should use k-th most recent access for scoring."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         path1 = "/test/frequently_accessed.txt"
         path2 = "/test/rarely_accessed.txt"
 
@@ -104,7 +104,7 @@ class TestStatisticsAndManagement:
 
     async def test_get_stats_returns_dict(self, temp_dir: Path) -> None:
         """get_stats should return dictionary with metrics."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         await storage.put("/test/file.txt", "Content", time.time())
         stats = await storage.get_stats()
 
@@ -116,7 +116,7 @@ class TestStatisticsAndManagement:
 
     async def test_get_stats_accurate_count(self, temp_dir: Path) -> None:
         """get_stats should report accurate file count."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         for i in range(5):
             await storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
 
@@ -125,7 +125,7 @@ class TestStatisticsAndManagement:
 
     async def test_clear_removes_all_entries(self, temp_dir: Path) -> None:
         """clear should remove all files."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         for i in range(3):
             await storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
 
@@ -137,7 +137,7 @@ class TestStatisticsAndManagement:
 
     async def test_clear_returns_count(self, temp_dir: Path) -> None:
         """clear should return number of documents cleared."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         await storage.put("/test/file1.txt", "Content 1", time.time())
         await storage.put("/test/file2.txt", "Content 2", time.time())
 
@@ -146,7 +146,7 @@ class TestStatisticsAndManagement:
 
     async def test_delete_path_removes_one_entry(self, temp_dir: Path) -> None:
         """delete_path should remove cached docs for only the requested path."""
-        storage = VectorStorage(temp_dir / "test.db")
+        storage = ContentStorage(temp_dir / "test.db")
         await storage.put("/test/file1.txt", "Content 1", time.time())
         await storage.put("/test/file2.txt", "Content 2", time.time())
 

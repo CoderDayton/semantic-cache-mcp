@@ -1,7 +1,7 @@
 """Tests for code fortification guards added during hardening passes.
 
 Covers:
-  - Idempotent close() on VectorStorage and SemanticCache
+  - Idempotent close() on ContentStorage and SemanticCache
   - ConnectionPool close_all() draining in-use connections
   - Grep parameter clamping
   - Diff context_lines clamping
@@ -18,17 +18,17 @@ from unittest.mock import patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# VectorStorage idempotent close
+# ContentStorage idempotent close
 # ---------------------------------------------------------------------------
 
 
-class TestVectorStorageIdempotentClose:
-    """VectorStorage.close() should be safe to call multiple times."""
+class TestContentStorageIdempotentClose:
+    """ContentStorage.close() should be safe to call multiple times."""
 
     def test_second_close_is_noop(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         vs.close(timeout=2)
         assert vs._closed is True
 
@@ -38,9 +38,9 @@ class TestVectorStorageIdempotentClose:
 
     def test_close_sets_flag_before_thread(self, tmp_path: Path) -> None:
         """_closed is set before the thread runs — prevents races."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         assert vs._closed is False
         vs.close(timeout=2)
         assert vs._closed is True
@@ -152,14 +152,14 @@ class TestConnectionPoolCloseAll:
 
 
 class TestGrepParamClamping:
-    """VectorStorage.grep() should clamp extreme parameter values."""
+    """ContentStorage.grep() should clamp extreme parameter values."""
 
     @pytest.mark.asyncio
     async def test_context_lines_clamped(self, tmp_path: Path) -> None:
         """context_lines > 20 is clamped to 20."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             # Should not crash with extreme context_lines
             results = await vs.grep("test", context_lines=99999)
@@ -170,9 +170,9 @@ class TestGrepParamClamping:
     @pytest.mark.asyncio
     async def test_negative_values_clamped(self, tmp_path: Path) -> None:
         """Negative max_matches/max_files are clamped to 1."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             results = await vs.grep("test", max_matches=-5, max_files=-3)
             assert isinstance(results, list)
@@ -233,9 +233,9 @@ class TestClearSync:
     """_clear_sync should work without an event loop."""
 
     def test_clear_sync_empty_db(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             count = vs._clear_sync()
             assert count == 0
@@ -245,9 +245,9 @@ class TestClearSync:
     @pytest.mark.asyncio
     async def test_clear_sync_matches_async_clear(self, tmp_path: Path) -> None:
         """_clear_sync and clear() should produce the same result."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             # Both should return 0 on empty DB
             sync_count = vs._clear_sync()
@@ -258,9 +258,9 @@ class TestClearSync:
 
     def test_clear_sync_callable_from_sync_context(self, tmp_path: Path) -> None:
         """_clear_sync works from plain sync code — no event loop needed."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             # This would fail with the old asyncio.get_event_loop().run_until_complete()
             # pattern if called when a loop is already running
@@ -276,26 +276,26 @@ class TestClearSync:
 
 
 # ---------------------------------------------------------------------------
-# VectorStorage health check
+# ContentStorage health check
 # ---------------------------------------------------------------------------
 
 
-class TestVectorStorageHealthCheck:
+class TestContentStorageHealthCheck:
     """is_healthy() should return True when the DB is usable, False otherwise."""
 
     async def test_healthy_after_init(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         try:
             assert await vs.is_healthy() is True
         finally:
             vs.close()
 
     async def test_unhealthy_after_close(self, tmp_path: Path) -> None:
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
         vs.close()
         assert await vs.is_healthy() is False
 

@@ -9,16 +9,16 @@ from pathlib import Path
 
 import semantic_cache_mcp.config as config_mod
 from semantic_cache_mcp.logger import configure_logging, get_log_dir, get_log_file_path
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 
 
 class TestThreadSafety:
-    """Tests for concurrent VectorStorage access via asyncio.gather."""
+    """Tests for concurrent ContentStorage access via asyncio.gather."""
 
     async def test_concurrent_thread_access(self, temp_dir: Path) -> None:
-        """Sequential writes to VectorStorage should not crash."""
+        """Sequential writes to ContentStorage should not crash."""
         db_path = temp_dir / "concurrent.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
 
         await storage.put("/test/a.txt", "content a", 1.0)
 
@@ -28,7 +28,7 @@ class TestThreadSafety:
     async def test_concurrent_reads(self, temp_dir: Path) -> None:
         """Concurrent reads should not corrupt data."""
         db_path = temp_dir / "reads.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         await storage.put("/test/file.txt", "test content", 1.0)
 
         results: list[str] = []

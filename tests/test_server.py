@@ -10,7 +10,7 @@ import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.server._mcp import _migrate_v2_to_v3
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 
 
 class TestFileNotFoundHandling:
@@ -161,7 +161,7 @@ class TestConcurrentAccess:
     async def test_concurrent_writes(self, temp_dir: Path) -> None:
         """Sequential writes should not corrupt database."""
         db_path = temp_dir / "concurrent.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
 
         for i in range(10):
             await storage.put(f"/test/file{i}.txt", f"Content {i}", time.time())
@@ -174,9 +174,9 @@ class TestCorruptedCacheRecovery:
     """Tests for corrupted cache scenarios."""
 
     async def test_empty_storage_stats(self, temp_dir: Path) -> None:
-        """Empty VectorStorage should return zero stats."""
+        """Empty ContentStorage should return zero stats."""
         db_path = temp_dir / "empty.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         stats = await storage.get_stats()
         assert stats["files_cached"] == 0
         assert stats["total_documents"] == 0
@@ -241,17 +241,17 @@ class TestDatabaseIntegrity:
     """Tests for database integrity."""
 
     async def test_storage_creation(self, temp_dir: Path) -> None:
-        """VectorStorage should initialize and create database file."""
+        """ContentStorage should initialize and create database file."""
         db_path = temp_dir / "new_db.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         assert db_path.exists()
         stats = await storage.get_stats()
         assert stats["files_cached"] == 0
 
     async def test_put_and_retrieve(self, temp_dir: Path) -> None:
-        """VectorStorage should store and retrieve content."""
+        """ContentStorage should store and retrieve content."""
         db_path = temp_dir / "integrity.db"
-        storage = VectorStorage(db_path)
+        storage = ContentStorage(db_path)
         await storage.put("/test/file.txt", "Test content", time.time())
         entry = await storage.get("/test/file.txt")
         assert entry is not None

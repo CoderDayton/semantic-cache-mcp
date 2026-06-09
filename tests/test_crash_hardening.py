@@ -1,4 +1,4 @@
-"""Tests for crash-hardening in VectorStorage (embed/usearch/save paths)."""
+"""Tests for crash-hardening in ContentStorage (embed/usearch/save paths)."""
 
 from __future__ import annotations
 
@@ -7,20 +7,20 @@ from pathlib import Path
 
 import pytest
 
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 
 
 @pytest.fixture
-def storage(tmp_path: Path) -> VectorStorage:
-    """Create a real VectorStorage with a tmp_path db."""
-    s = VectorStorage(tmp_path / "test.db")
+def storage(tmp_path: Path) -> ContentStorage:
+    """Create a real ContentStorage with a tmp_path db."""
+    s = ContentStorage(tmp_path / "test.db")
     return s
 
 
 class TestSaveSkipsWhenClosed:
     """Fix 3: save() silently returns when _closed is True."""
 
-    def test_save_skips_when_closed(self, storage: VectorStorage) -> None:
+    def test_save_skips_when_closed(self, storage: ContentStorage) -> None:
         """After close(), save() must not raise or touch the index."""
         storage.close()
         # Should be a no-op, not an exception.
@@ -31,7 +31,7 @@ class TestGetStatsHandlesDeletedDb:
     """Fix 6: get_stats() returns db_size_mb=0 when the file is gone."""
 
     @pytest.mark.asyncio
-    async def test_get_stats_handles_deleted_db_file(self, storage: VectorStorage) -> None:
+    async def test_get_stats_handles_deleted_db_file(self, storage: ContentStorage) -> None:
         """Deleting the db file must not crash get_stats()."""
         db_path = storage._db_path
         if db_path.exists():
@@ -47,8 +47,8 @@ class TestRebindExecutorOwnershipTransfer:
     """
 
     def test_rebind_shuts_down_previously_owned_executor(self, tmp_path: Path) -> None:
-        """When VectorStorage owned the executor, rebind shuts the old one down."""
-        vs = VectorStorage(tmp_path / "owned.db")
+        """When ContentStorage owned the executor, rebind shuts the old one down."""
+        vs = ContentStorage(tmp_path / "owned.db")
         assert vs._owns_executor is True
         old = vs._io_executor
 
@@ -69,23 +69,23 @@ class TestRebindExecutorOwnershipTransfer:
 
     def test_close_after_rebind_does_not_shutdown_replacement(self, tmp_path: Path) -> None:
         """close() must NOT shut down a caller-owned replacement executor."""
-        vs = VectorStorage(tmp_path / "owned2.db")
+        vs = ContentStorage(tmp_path / "owned2.db")
         replacement = ThreadPoolExecutor(max_workers=1, thread_name_prefix="keep")
         try:
             vs.rebind_executor(replacement)
             vs.close()
-            # Replacement should still accept work after VectorStorage.close().
+            # Replacement should still accept work after ContentStorage.close().
             assert replacement.submit(lambda: "alive").result(timeout=1) == "alive"
         finally:
             replacement.shutdown(wait=False)
 
     def test_rebind_with_injected_executor_does_not_shutdown(self, tmp_path: Path) -> None:
-        """If VectorStorage never owned its executor, rebind must not touch
+        """If ContentStorage never owned its executor, rebind must not touch
         the originally-injected one (the caller still owns it)."""
         injected = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inj")
         replacement = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rep")
         try:
-            vs = VectorStorage(tmp_path / "inj.db", executor=injected)
+            vs = ContentStorage(tmp_path / "inj.db", executor=injected)
             assert vs._owns_executor is False
             vs.rebind_executor(replacement)
             # Original injected executor must still be usable — we never owned it.

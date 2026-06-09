@@ -177,7 +177,7 @@ class TestSemanticCacheClose:
 
         cache = SemanticCache(tmp_path / "vec.db")
         # Just call close and verify it doesn't raise — the real close()
-        # exercises persist + VectorStorage.close + pool.close_all.
+        # exercises persist + ContentStorage.close + pool.close_all.
         cache.close()
 
     def test_close_continues_after_metrics_failure(self, tmp_path: Path) -> None:
@@ -197,26 +197,26 @@ class TestSemanticCacheClose:
 
         cache = SemanticCache(tmp_path / "vec.db")
         with patch(
-            "semantic_cache_mcp.storage.vector.VectorStorage.close",
+            "semantic_cache_mcp.storage.docstore.ContentStorage.close",
             side_effect=Exception("usearch hung"),
         ):
             cache.close()  # should not raise
 
 
 # ===========================================================================
-# storage/vector — close() with timeout
+# storage/docstore — close() with timeout
 # ===========================================================================
 
 
-class TestVectorStorageClose:
-    """Tests for VectorStorage.close() timeout behavior."""
+class TestContentStorageClose:
+    """Tests for ContentStorage.close() timeout behavior."""
 
     def test_close_timeout_does_not_block(self, tmp_path: Path) -> None:
         """A hung save times out within deadline, not at thread exit."""
 
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
 
         # Use a real daemon thread but with a short timeout — assert it
         # returns promptly even when save blocks. Use generous bound (10s)
@@ -234,9 +234,9 @@ class TestVectorStorageClose:
 
     def test_close_save_error_logged(self, tmp_path: Path) -> None:
         """An error in save is caught and logged."""
-        from semantic_cache_mcp.storage.vector import VectorStorage
+        from semantic_cache_mcp.storage.docstore import ContentStorage
 
-        vs = VectorStorage(tmp_path / "vec.db")
+        vs = ContentStorage(tmp_path / "vec.db")
 
         with patch.object(vs._db, "save", side_effect=RuntimeError("corrupt")):
             vs.close()  # should not raise

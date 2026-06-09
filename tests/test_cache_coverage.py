@@ -4,7 +4,7 @@ Targets:
   - cache/read.py  (78% → 90%+)
   - cache/write.py (78% → 90%+)
   - cache/store.py (82% → 92%+)
-  - storage/vector.py (81% → 90%+)
+  - storage/docstore (81% → 90%+)
   - cache/_helpers.py (83% → 92%+)
   - core/embeddings.py (52% → 70%+)
 """
@@ -26,7 +26,7 @@ from semantic_cache_mcp.cache._helpers import (
 from semantic_cache_mcp.cache.read import batch_smart_read, smart_read
 from semantic_cache_mcp.cache.store import SemanticCache
 from semantic_cache_mcp.cache.write import smart_batch_edit, smart_edit, smart_write
-from semantic_cache_mcp.storage.vector import VectorStorage
+from semantic_cache_mcp.storage.docstore import ContentStorage
 from tests.constants import TEST_EMBEDDING_DIM
 
 # ---------------------------------------------------------------------------
@@ -45,14 +45,14 @@ def _make_embedding() -> array.array:  # type: ignore[type-arg]
 
 def _make_cache(tmp_path: Path) -> SemanticCache:
     """Create a SemanticCache backed by tmp_path."""
-    db_path = tmp_path / "test_vecdb.db"
+    db_path = tmp_path / "test_docstore.db"
     return SemanticCache(db_path=db_path)
 
 
-def _make_vector_storage(tmp_path: Path) -> VectorStorage:
-    """Create a VectorStorage backed by tmp_path."""
+def _make_vector_storage(tmp_path: Path) -> ContentStorage:
+    """Create a ContentStorage backed by tmp_path."""
     db_path = tmp_path / "vec.db"
-    return VectorStorage(db_path=db_path)
+    return ContentStorage(db_path=db_path)
 
 
 # ===========================================================================
@@ -169,7 +169,7 @@ class TestFormatFile:
 
 
 class TestSemanticCacheStore:
-    """Lines 28, 30-61 — _get_rss_mb, lifespan, __del__ on VectorStorage."""
+    """Lines 28, 30-61 — _get_rss_mb, lifespan, __del__ on ContentStorage."""
 
     def test_get_rss_mb_returns_float_or_none(self) -> None:
         from semantic_cache_mcp.cache.store import _get_rss_mb
@@ -204,17 +204,17 @@ class TestSemanticCacheStore:
         assert "files_cached" in stats
 
     def test_vector_storage_close(self, tmp_path: Path) -> None:
-        """VectorStorage.close() saves and closes without raising."""
+        """ContentStorage.close() saves and closes without raising."""
         vs = _make_vector_storage(tmp_path)
         vs.close()  # should complete without error
 
 
 # ===========================================================================
-# storage/vector.py
+# storage/docstore
 # ===========================================================================
 
 
-class TestVectorStoragePutChunked:
+class TestContentStoragePutChunked:
     """Lines 81-82 (_put_chunked) — large file storage path."""
 
     async def test_put_large_file_chunked(self, tmp_path: Path) -> None:
@@ -231,7 +231,7 @@ class TestVectorStoragePutChunked:
         assert content == big_content
 
 
-class TestVectorStorageGrep:
+class TestContentStorageGrep:
     """Lines 255-311 — grep regex search on cached content."""
 
     async def test_grep_literal_match(self, tmp_path: Path) -> None:
@@ -300,7 +300,7 @@ class TestVectorStorageGrep:
         assert [r["path"] for r in results] == ["/repo/sim/finetune.py"]
 
 
-class TestVectorStorageGetStats:
+class TestContentStorageGetStats:
     """Lines 387-389, 434-441 — stats and eviction."""
 
     async def test_get_stats_empty_storage(self, tmp_path: Path) -> None:
@@ -334,7 +334,7 @@ class TestVectorStorageGetStats:
             cfg.MAX_CACHE_ENTRIES = original_max
 
 
-class TestVectorStorageSearchHybrid:
+class TestContentStorageSearchHybrid:
     """Lines 492, 494, 499 — search_hybrid and search_by_query."""
 
     async def test_search_by_query_returns_list(self, tmp_path: Path) -> None:
@@ -1043,8 +1043,8 @@ class TestBatchReadTokenBudgetFlush:
         assert any(s.est_tokens is not None and s.est_tokens > 0 for s in skipped)
 
 
-class TestVectorStorageSaveClose:
-    """Lines 717-726 in vector.py — save() and close() methods."""
+class TestContentStorageSaveClose:
+    """save() and close() methods of the doc store facade."""
 
     async def test_save_and_close(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
