@@ -1,4 +1,4 @@
-"""SemanticCache — orchestration facade over VectorStorage and SQLite metrics."""
+"""SemanticCache — orchestration facade over ContentStorage and SQLite metrics."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from typing import Any
 from ..config import CACHE_DIR, TOOL_TIMEOUT
 from ..core import count_tokens
 from ..logger import log_marker
-from ..storage import SQLiteStorage, VectorStorage
-from ..storage.vector import VECDB_PATH
+from ..storage import ContentStorage, SQLiteStorage
+from ..storage.docstore import CONTENT_DB_PATH
 from ..types import CacheEntry
 from ..utils import DetachedExecutor
 from .metrics import SessionMetrics
@@ -69,7 +69,7 @@ def _get_rss_mb() -> float | None:
 
 
 class SemanticCache:
-    """Facade over VectorStorage (simplevecdb) and SQLite metrics."""
+    """Facade over ContentStorage (SQLite + FTS5) and SQLite metrics."""
 
     __slots__ = (
         "_storage",
@@ -87,16 +87,16 @@ class SemanticCache:
     # Grace period for in-flight operations to finish during shutdown.
     _DRAIN_TIMEOUT: float = 8.0
 
-    def __init__(self, db_path: Path = VECDB_PATH) -> None:
+    def __init__(self, db_path: Path = CONTENT_DB_PATH) -> None:
         # Single-thread executor shared by ALL blocking operations:
-        # file I/O and vecdb index saves.
-        # MUST be single-threaded — usearch is not safe under concurrent
-        # access from different threads (heap corruption / segfaults).
-        # Passed to VectorStorage so simplevecdb's own operations
+        # file I/O and DocStore saves.
+        # MUST be single-threaded — the DocStore's SQLite connection
+        # transaction context is not safe under concurrent access.
+        # Passed to ContentStorage so its storage operations
         # (add_texts, keyword_search, etc.) also serialize on this thread
-        # via the AsyncVectorCollection wrapper VectorStorage builds.
+        # via the AsyncDocStore wrapper ContentStorage builds.
         self._io_executor: Executor = DetachedExecutor(thread_name_prefix="semantic-cache-io")
-        self._storage = VectorStorage(db_path, executor=self._io_executor)
+        self._storage = ContentStorage(db_path, executor=self._io_executor)
         metrics_db = CACHE_DIR / "metrics.db"
         self._metrics_storage = SQLiteStorage(metrics_db)
         self._metrics = SessionMetrics(self._metrics_storage._pool)
@@ -116,7 +116,7 @@ class SemanticCache:
 
         Abandons the stuck thread (it will be GC'd when its task completes or
         the process exits) and creates a new single-threaded executor. All
-        references on VectorStorage and simplevecdb are updated atomically.
+        references on ContentStorage and its store are updated atomically.
         """
         logger.warning("Resetting IO executor — previous thread may be stuck")
         old = self._io_executor
@@ -197,7 +197,7 @@ class SemanticCache:
         try:
             self._storage.close()
         except Exception as e:
-            logger.warning(f"Failed to close VectorStorage: {e}")
+            logger.warning(f"Failed to close ContentStorage: {e}")
 
         try:
             self._metrics_storage._pool.close_all()
@@ -205,9 +205,6 @@ class SemanticCache:
             logger.warning(f"Failed to close metrics pool: {e}")
 
         self._io_executor.shutdown(wait=False)
-
-        # Remove crash sentinel — signals clean shutdown.
-        VectorStorage._remove_sentinel()
 
     def close(self) -> None:
         """Synchronous close fallback (no drain wait).
@@ -228,7 +225,7 @@ class SemanticCache:
         try:
             self._storage.close()
         except Exception as e:
-            logger.warning(f"Failed to close VectorStorage: {e}")
+            logger.warning(f"Failed to close ContentStorage: {e}")
 
         try:
             self._metrics_storage._pool.close_all()
@@ -236,9 +233,6 @@ class SemanticCache:
             logger.warning(f"Failed to close metrics pool: {e}")
 
         self._io_executor.shutdown(wait=False)
-
-        # Remove crash sentinel — signals clean shutdown.
-        VectorStorage._remove_sentinel()
 
     # -------------------------------------------------------------------------
     # Delegated operations
@@ -359,7 +353,7 @@ class SemanticCache:
         ``max_bytes`` (UTF-8 bytes) caps how much is returned; truncation
         happens on a code-point boundary, so the result may be slightly
         shorter than the cap. ``None`` returns the full content. See
-        :meth:`VectorStorage.get_content` for the full contract.
+        :meth:`ContentStorage.get_content` for the full contract.
         """
         return await self._storage.get_content(entry, max_bytes=max_bytes)
 
@@ -367,7 +361,7 @@ class SemanticCache:
         await self._storage.record_access(path)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
-        """Update cached mtime without re-storing content or re-embedding."""
+        """Update cached mtime without re-storing content."""
         await self._storage.update_mtime(path, new_mtime)
         # Bump the search cache: the mtime change reflects an external write
         # whose content matched the cached hash. Even though the indexed

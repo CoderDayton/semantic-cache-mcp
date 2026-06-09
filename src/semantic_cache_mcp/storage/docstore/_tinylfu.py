@@ -1,4 +1,4 @@
-"""TinyLFU-inspired in-memory eviction index for VectorStorage.
+"""TinyLFU-inspired in-memory eviction index for ContentStorage.
 
 Replaces the per-put O(N) `get_documents()` scan in `_evict_if_needed`:
 tracks doc IDs per cached path, approximates per-path access frequency
@@ -168,13 +168,13 @@ class _Entry:
     history: list[float] = field(default_factory=list)
 
 
-# Shape of one document tuple from AsyncVectorCollection.get_documents():
+# Shape of one document tuple from the store's get_documents():
 # (doc_id, text, metadata). We only use doc_id and metadata.
 DocLoader = Callable[[], Awaitable[Iterable[tuple[int, str, dict]]]]
 
 
 class TinyLFUIndex:
-    """In-memory frequency+recency index used by VectorStorage eviction.
+    """In-memory frequency+recency index used by ContentStorage eviction.
 
     Concurrency model: methods that mutate the index are sync — under
     cooperative asyncio they run to completion without yielding the loop,

@@ -40,11 +40,6 @@ DB_PATH: Final = CACHE_DIR / "cache.db"
 LOG_DIR: Final = get_log_dir(CACHE_DIR, environ.get("LOG_DIR"))
 LOG_FILE_PATH: Final = get_log_file_path(LOG_DIR)
 
-# Crash sentinel — written on startup, removed on clean shutdown.
-# If present at next startup → previous run crashed → wipe vecdb to avoid
-# heap corruption from corrupted usearch index files.
-STARTUP_SENTINEL: Final = CACHE_DIR / ".startup.lock"
-
 
 # Logging configuration — explicit stderr handler to prevent stdout pollution
 # in stdio MCP transport, plus a dated file handler for post-mortem debugging.

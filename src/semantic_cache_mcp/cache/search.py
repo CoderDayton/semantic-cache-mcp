@@ -95,7 +95,7 @@ async def semantic_search(
     if directory:
         resolved_dir = Path(directory).expanduser().resolve()
 
-    # BM25 keyword search via VectorStorage.
+    # BM25 keyword search via ContentStorage.
     # Request extra results when directory filtering will reduce the set
     storage = cache._storage
     search_k = k * 3 if resolved_dir else k

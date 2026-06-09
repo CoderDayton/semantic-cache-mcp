@@ -1,11 +1,11 @@
-"""BM25 query search for :class:`VectorStorage`.
+"""BM25 query search for :class:`ContentStorage`.
 
 BM25 keyword search (``search_by_query``) over cached content — the ranked-score
 read side, sibling to the exact-match ``_grep`` subsystem.
 
-Split out of the ``VectorStorage`` god-module: each function takes the storage
+Split out of the ``ContentStorage`` god-module: each function takes the storage
 instance explicitly (``store``) instead of ``self``, so the whole search
-subsystem lives in one place. ``VectorStorage`` keeps a thin delegating method
+subsystem lives in one place. ``ContentStorage`` keeps a thin delegating method
 (``search_by_query``) for the symbol its callers and tests depend on.
 """
 
@@ -22,13 +22,13 @@ from . import (
 )
 
 if TYPE_CHECKING:
-    from . import VectorStorage
+    from . import ContentStorage
 
 logger = logging.getLogger(__name__)
 
 
 async def search_by_query(
-    store: VectorStorage,
+    store: ContentStorage,
     query: str,
     k: int = 5,
     filter: dict | None = None,

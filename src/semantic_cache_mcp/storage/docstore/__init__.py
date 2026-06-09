@@ -1,4 +1,4 @@
-"""simplevecdb-backed storage: raw text + HNSW embeddings, HyperCDC chunking for large files."""
+"""SQLite + FTS5 storage: raw text + HyperCDC chunking for large files."""
 
 from __future__ import annotations
 
@@ -11,30 +11,28 @@ import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 
-from simplevecdb import AsyncVectorCollection, VectorDB
-
 from ... import config
 from ...config import (
     ACCESS_HISTORY_SIZE,
     CACHE_DIR,
     CHUNK_MIN_SIZE,
     MAX_CACHE_ENTRIES,
-    STARTUP_SENTINEL,
 )
 from ...core.chunking import get_optimal_chunker
 from ...core.hashing import hash_content
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
 from ...types import CacheEntry
+from ._docstore import AsyncDocStore, DocStore
 from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CHUNK_THRESHOLD", "StorageMode", "VECDB_PATH", "VectorStorage"]
+__all__ = ["CHUNK_THRESHOLD", "StorageMode", "CONTENT_DB_PATH", "ContentStorage"]
 
-VECDB_PATH = CACHE_DIR / "vecdb.db"
+CONTENT_DB_PATH = CACHE_DIR / "docstore.db"
 
-# Metadata keys stored with each document in simplevecdb
+# Metadata keys stored with each document
 _META_PATH = "path"
 _META_CHUNK_INDEX = "chunk_index"
 _META_TOTAL_CHUNKS = "total_chunks"
@@ -52,11 +50,10 @@ _PREVIEW_CHARS = 200
 class StorageMode(enum.StrEnum):
     """How a file's content was stored. Surfaces retrieval-quality signals.
 
-    SINGLE_DOC          — file fits in one doc, embedding represents it well.
-    CHUNKED             — file split via CDC; per-chunk text + parent embedding.
+    SINGLE_DOC          — file fits in one doc.
+    CHUNKED             — file split via CDC into per-chunk child docs.
     SINGLE_DOC_FALLBACK — chunk count exceeded the cap; whole file stored as
-                          one doc with one embedding. Embedding quality and
-                          retrieval granularity are degraded vs CHUNKED.
+                          one doc. Retrieval granularity is degraded vs CHUNKED.
     """
 
     SINGLE_DOC = "single_doc"
@@ -65,25 +62,17 @@ class StorageMode(enum.StrEnum):
 
 
 # Files larger than this (bytes) are split via HyperCDC into multiple chunks,
-# each stored as a child document with its own vector. Smaller files are stored
-# as a single document. CHUNK_MIN_SIZE (2KB) is the CDC minimum chunk size.
+# each stored as a child document. Smaller files are stored as a single
+# document. CHUNK_MIN_SIZE (2KB) is the CDC minimum chunk size.
 CHUNK_THRESHOLD = CHUNK_MIN_SIZE * 4  # 8KB — files below this stay as one doc
 
 
-# Constant stub vector fed to simplevecdb on every write. The store is no
-# longer embedding-backed (search is BM25-only), but simplevecdb's add_texts
-# always requires a vector and indexes it. A fixed dim-1 vector keeps the write
-# path working with no model loaded; the usearch index is never queried.
-_STUB_VECTOR = [1.0]
-
-
-class VectorStorage:
-    """simplevecdb-backed storage for file content and embeddings.
+class ContentStorage:
+    """SQLite + FTS5 backed storage for file content.
 
     Architecture:
-    - Files stored as Documents with raw text (no compression)
-    - HNSW index for O(log N) semantic similarity search
-    - Metadata-based filtering for path lookups
+    - Files stored as documents with raw text (no compression)
+    - FTS5 BM25 keyword search + metadata filtering for path lookups
     - TinyLFU eviction (frequency + recency) backed by an in-memory index
       that bootstraps from access_history metadata on first need
     """
@@ -105,31 +94,28 @@ class VectorStorage:
 
     def __init__(
         self,
-        db_path: Path = VECDB_PATH,
+        db_path: Path = CONTENT_DB_PATH,
         *,
         executor: Executor | None = None,
     ) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
-        self._drop_legacy_vector_db(db_path)
-        self._recover_if_crashed(db_path)
-        # Use the sync VectorDB directly (not AsyncVectorDB) so we own the
-        # executor: ONNX/usearch require a single-threaded executor to avoid
-        # segfaults, and SemanticCache needs rebind_executor() to swap the
-        # IO executor after a hung worker. AsyncVectorDB manages its own
-        # internal pool and exposes neither hook. Async behavior is provided
-        # by wrapping the sync collection in AsyncVectorCollection below.
-        self._db = VectorDB(path=str(db_path))
+        self._migrate_legacy_db(db_path)
+        # Sync DocStore (SQLite + FTS5). Async behaviour is provided by wrapping
+        # it in AsyncDocStore (runs each call on the IO executor) below, so
+        # SemanticCache.rebind_executor() can swap the executor after a hung
+        # worker without recreating the store.
+        self._db = DocStore(db_path)
         self._closed = False
         # TTL cache keyed by path_filter for has_cached_paths_under (see
         # comment there). Initialized here so the slot is always present.
         self._has_cached_cache: dict[str, tuple[float, bool]] = {}
         # Mutex between save() (called from the IO executor during eviction)
-        # and the close() daemon thread's final save. usearch's save is not
-        # thread-safe, so the two cannot run concurrently.
+        # and the close() daemon thread's final save, so the two never run
+        # concurrently on the shared connection.
         self._save_lock = threading.Lock()
-        # Sync VectorDB has no executor, so we own one when none is injected.
-        # Single-thread by default — ONNX/usearch are not thread-safe, and
+        # DocStore has no executor, so we own one when none is injected.
+        # Single-thread by default — all storage I/O serializes through it, and
         # SemanticCache always passes its own DetachedExecutor in production.
         # Annotate explicitly so mypy widens to Executor — both branches must
         # be assignable, including the rebind_executor seam below.
@@ -150,26 +136,17 @@ class VectorStorage:
             capacity=MAX_CACHE_ENTRIES,
             history_size=ACCESS_HISTORY_SIZE,
         )
-        # Write sentinel — removed on clean shutdown by _remove_sentinel().
-        STARTUP_SENTINEL.touch()
-        logger.info(f"VectorStorage initialized at {db_path}")
+        logger.info(f"ContentStorage initialized at {db_path}")
 
     def _reset_collection_sync(self, *, reason: str) -> None:
-        """Drop and recreate the collection synchronously.
+        """Drop all documents and rebuild the async wrapper synchronously.
 
-        Uses ``delete_collection`` which atomically drops the SQLite tables,
-        FTS index, and usearch file in one call. The new wrapper for the
-        recreated collection is reattached to
-        ``self._collection`` so further async ops keep working. Safe to call
-        from sync startup paths — no event loop required.
+        Safe to call from sync startup paths — no event loop required.
         """
         try:
-            self._db.delete_collection(self._COLLECTION_NAME)
-        except KeyError:
-            # Collection didn't exist yet — nothing to drop.
-            pass
+            self._db.clear()
         except Exception as exc:
-            logger.warning(f"delete_collection failed during {reason}: {exc}")
+            logger.warning(f"clear failed during {reason}: {exc}")
         self._collection = self._build_collection()
         # Index may not be initialized yet on cold-path resets (constructor
         # calls _reset_collection_sync before assigning _index). Tolerate
@@ -183,10 +160,8 @@ class VectorStorage:
         """Swap the IO executor used by the async collection wrapper.
 
         Called by ``SemanticCache.reset_executor`` after a hung worker is
-        abandoned. Re-creates the AsyncVectorCollection wrapper around the
-        same sync collection so the new executor takes effect on subsequent
-        calls. Sync VectorDB has no executor of its own, so nothing else
-        needs to be touched.
+        abandoned. Re-creates the AsyncDocStore wrapper around the same
+        DocStore so the new executor takes effect on subsequent calls.
 
         Ownership transfers OUT: the caller passing a replacement executor
         owns its lifecycle. If we previously owned the executor (no executor
@@ -201,87 +176,55 @@ class VectorStorage:
                 logger.debug(f"Old owned executor shutdown failed: {exc}")
         self._io_executor = new_executor
         self._owns_executor = False
-        # Reuse the existing sync collection — we only need a fresh async
-        # wrapper bound to the new executor.
-        self._collection = AsyncVectorCollection(self._sync_collection, new_executor)
+        # Reuse the existing sync store — we only need a fresh async wrapper
+        # bound to the new executor.
+        self._collection = AsyncDocStore(self._sync_collection, new_executor)
 
-    def _build_collection(self) -> AsyncVectorCollection:
-        """Open the ``files`` collection text-only and wrap it for async use.
+    def _build_collection(self) -> AsyncDocStore:
+        """Wrap the DocStore for async use on the IO executor.
 
-        ``store_embeddings=False``: the store is BM25-only now, so vectors are
-        never read back. Stores a direct reference to the sync collection for
-        sync code paths (``save``, ``_clear_sync``) so they don't have to reach
-        through the async wrapper.
+        Stores a direct reference to the sync store for sync code paths
+        (``save``, ``_clear_sync``) so they don't reach through the async
+        wrapper.
         """
-        sync_coll = self._db.collection(
-            self._COLLECTION_NAME,
-            store_embeddings=False,
-        )
-        self._sync_collection = sync_coll
-        return AsyncVectorCollection(sync_coll, self._io_executor)
-
-    @staticmethod
-    def _remove_sentinel() -> None:
-        """Remove crash sentinel on clean shutdown."""
-        STARTUP_SENTINEL.unlink(missing_ok=True)
+        self._sync_collection = self._db
+        return AsyncDocStore(self._db, self._io_executor)
 
     @classmethod
-    def _recover_if_crashed(cls, db_path: Path) -> None:
-        """Wipe vecdb if the previous run crashed (sentinel still present).
+    def _migrate_legacy_db(cls, db_path: Path) -> None:
+        """One-time wipe of the legacy ``vecdb.db`` cache on upgrade.
 
-        A C-level crash (SIGABRT from malloc corruption, SIGSEGV) kills the
-        process before Python cleanup runs, leaving the sentinel behind.
-        On next startup we detect this and delete the potentially corrupted
-        usearch index + SQLite WAL so the DB rebuilds cleanly.
+        Earlier releases stored the cache in ``vecdb.db`` (simplevecdb + usearch,
+        then an interim FTS build). The current store is ``docstore.db`` with a
+        different schema, so delete any stale ``vecdb.db`` files once, guarded by
+        a sentinel. The cache is fully rebuildable and repopulates on demand;
+        new installs just create the sentinel with nothing to delete.
         """
-        if not STARTUP_SENTINEL.exists():
-            return
-
-        logger.warning(
-            "Crash sentinel detected — previous run did not shut down cleanly. "
-            "Clearing vecdb to prevent heap corruption from stale index files."
-        )
-        # Delete usearch index, SQLite DB, WAL, SHM, and metadata sidecar.
-        for pattern in (
-            f".{cls._COLLECTION_NAME}.usearch",
-            "",
-            "-wal",
-            "-shm",
-            ".meta.json",
-        ):
-            target = db_path.parent / (db_path.name + pattern) if pattern else db_path
-            if target.exists():
-                target.unlink()
-                logger.info(f"Deleted stale file: {target}")
-
-        STARTUP_SENTINEL.unlink(missing_ok=True)
-
-    @classmethod
-    def _drop_legacy_vector_db(cls, db_path: Path) -> None:
-        """One-time wipe of a pre-0.6 embedding-backed cache.
-
-        Old caches stored real per-file embeddings and a fixed-dimension usearch
-        index. The store is now BM25-only (a constant stub vector per doc), so an
-        old on-disk index is incompatible. Delete the legacy DB files once,
-        guarded by a sentinel; the cache is fully rebuildable and repopulates on
-        demand. New installs simply create the sentinel with nothing to delete.
-        """
-        marker = db_path.parent / ".vectors_removed"
+        marker = db_path.parent / ".docstore_v1"
         if marker.exists():
             return
-        for pattern in (f".{cls._COLLECTION_NAME}.usearch", "", "-wal", "-shm", ".meta.json"):
-            target = db_path.parent / (db_path.name + pattern) if pattern else db_path
+        legacy_db = db_path.parent / "vecdb.db"
+        legacy = [
+            legacy_db,
+            legacy_db.with_name("vecdb.db-wal"),
+            legacy_db.with_name("vecdb.db-shm"),
+            legacy_db.with_name(f"vecdb.db.{cls._COLLECTION_NAME}.usearch"),
+            legacy_db.with_name("vecdb.db.meta.json"),
+            db_path.parent / ".vectors_removed",
+            db_path.parent / ".fts_store_v1",
+        ]
+        for target in legacy:
             if target.exists():
                 target.unlink()
-                logger.info(f"Migration: deleted legacy vector file {target}")
+                logger.info(f"Migration: deleted legacy storage file {target}")
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("embeddings removed in 0.6.0\n")
+        marker.write_text("docstore v1\n")
 
     def close(self, *, timeout: float = 5.0) -> None:
         """Save and close the database with a deadline.
 
-        Uses a background thread so a hung usearch/SQLite save cannot block
-        the asyncio event loop or delay process exit past *timeout* seconds.
+        Uses a background thread so a hung SQLite save cannot block the
+        asyncio event loop or delay process exit past *timeout* seconds.
         Idempotent — safe to call multiple times.
         """
         if self._closed:
@@ -308,13 +251,13 @@ class VectorStorage:
 
         if t.is_alive():
             logger.warning(
-                f"VectorStorage close timed out after {timeout}s — "
+                f"ContentStorage close timed out after {timeout}s — "
                 "index may need recovery on next startup"
             )
         elif close_error is not None:
-            logger.warning(f"VectorStorage close error: {close_error}")
+            logger.warning(f"ContentStorage close error: {close_error}")
         else:
-            logger.debug("VectorStorage closed cleanly")
+            logger.debug("ContentStorage closed cleanly")
 
         # Shut down the executor only when we own it. SemanticCache injects
         # its own DetachedExecutor and manages its lifecycle separately.
@@ -373,7 +316,7 @@ class VectorStorage:
 
         log_marker(
             logger,
-            "vector.put.begin",
+            "docstore.put.begin",
             path=path,
             tokens=tokens,
             bytes=len(content_bytes),
@@ -395,17 +338,17 @@ class VectorStorage:
 
         # Remove old entry for this path
         delete_started = time.perf_counter()
-        log_marker(logger, "vector.put.delete.begin", path=path)
+        log_marker(logger, "docstore.put.delete.begin", path=path)
         await self._delete_by_path(path)
         log_marker(
             logger,
-            "vector.put.delete.end",
+            "docstore.put.delete.end",
             path=path,
             elapsed_ms=round((time.perf_counter() - delete_started) * 1000, 1),
         )
 
         add_started = time.perf_counter()
-        log_marker(logger, "vector.put.add.begin", path=path, chunked=chunked)
+        log_marker(logger, "docstore.put.add.begin", path=path, chunked=chunked)
         new_doc_ids: list[int] = []
         if not chunked:
             # Small file: single document
@@ -418,7 +361,6 @@ class VectorStorage:
             ids = await self._collection.add_texts(
                 texts=[content],
                 metadatas=[meta],
-                embeddings=[_STUB_VECTOR],
             )
             new_doc_ids = list(ids) if ids else []
             logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
@@ -435,7 +377,6 @@ class VectorStorage:
                 ids = await self._collection.add_texts(
                     texts=[content],
                     metadatas=[meta],
-                    embeddings=[_STUB_VECTOR],
                 )
                 new_doc_ids = list(ids) if ids else []
                 logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
@@ -449,24 +390,24 @@ class VectorStorage:
             self._index.upsert(path, new_doc_ids, now)
         log_marker(
             logger,
-            "vector.put.add.end",
+            "docstore.put.add.end",
             path=path,
             chunked=chunked,
             elapsed_ms=round((time.perf_counter() - add_started) * 1000, 1),
         )
 
         evict_started = time.perf_counter()
-        log_marker(logger, "vector.put.evict.begin", path=path)
+        log_marker(logger, "docstore.put.evict.begin", path=path)
         await self._evict_if_needed()
         log_marker(
             logger,
-            "vector.put.evict.end",
+            "docstore.put.evict.end",
             path=path,
             elapsed_ms=round((time.perf_counter() - evict_started) * 1000, 1),
         )
         log_marker(
             logger,
-            "vector.put.end",
+            "docstore.put.end",
             path=path,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
@@ -536,7 +477,7 @@ class VectorStorage:
                 running += est
             chunk_token_estimates.append(est)
 
-        # Store parent document (holds file-level metadata, searchable by file embedding)
+        # Store parent document (holds file-level metadata; children hold text)
         parent_meta = {
             **base_meta,
             _META_IS_PARENT: True,
@@ -547,13 +488,10 @@ class VectorStorage:
         parent_ids = await self._collection.add_texts(
             texts=[""],  # Parent has no content — children hold raw text
             metadatas=[parent_meta],
-            embeddings=[_STUB_VECTOR],
         )
         parent_id = parent_ids[0]
 
         # Store children — each chunk is a child of the parent.
-        # AsyncVectorCollection.add_texts does not expose parent_ids, so we call
-        # the underlying sync collection directly via run_in_executor.
         child_metas: list[dict] = []
 
         for i, _text in enumerate(chunk_texts):
@@ -574,7 +512,6 @@ class VectorStorage:
         child_ids = await self._collection.add_texts(
             texts=chunk_texts,
             metadatas=child_metas,
-            embeddings=[_STUB_VECTOR] * total_chunks,
             parent_ids=[parent_id] * total_chunks,
         )
 
@@ -585,7 +522,7 @@ class VectorStorage:
         return [parent_id, *(list(child_ids) if child_ids else [])]
 
     async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
-        """Reassemble full text from simplevecdb chunks (sorted by chunk_index).
+        """Reassemble full text from stored chunks (sorted by chunk_index).
 
         Args:
             entry: Cache entry whose path identifies the stored content.
@@ -679,7 +616,7 @@ class VectorStorage:
             self._index.add_access(path, now)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
-        """Update cached mtime without re-storing content or re-embedding.
+        """Update cached mtime without re-storing content.
 
         Used when content hash matches but mtime changed (touch, git checkout).
         Prevents repeated hash checks on subsequent reads.
@@ -880,23 +817,13 @@ class VectorStorage:
     async def clear(self) -> int:
         """Clear all cache entries. Returns count of documents removed.
 
-        Uses ``delete_collection`` to atomically drop the SQLite tables, FTS
-        index, and usearch file in one call, then rebuilds
-        an empty collection. Faster and safer than the previous per-id loop.
-        Runs the (sync) ``delete_collection`` on the shared IO executor so it
-        does not block the event loop.
+        Deletes all rows from the doc store (text + FTS) on the shared IO
+        executor so it does not block the event loop.
         """
-        import contextlib  # noqa: PLC0415
-
         count = await self._collection.count()
         if count > 0:
             loop = asyncio.get_running_loop()
-            with contextlib.suppress(KeyError):
-                await loop.run_in_executor(
-                    self._io_executor,
-                    lambda: self._db.delete_collection(self._COLLECTION_NAME),
-                )
-            self._collection = self._build_collection()
+            await loop.run_in_executor(self._io_executor, self._db.clear)
         self._index.clear()
         return count
 
@@ -971,7 +898,7 @@ class VectorStorage:
             if await self._collection.count() <= cap:
                 return
             # Lazy bootstrap. Captures the executor closure here so the index
-            # module stays decoupled from AsyncVectorCollection's exact API.
+            # module stays decoupled from the async store's exact API.
             await self._index.ensure_loaded(self._collection.get_documents)
 
         if self._index.total_paths() <= cap:
@@ -1011,18 +938,16 @@ class VectorStorage:
         )
 
     def save(self) -> None:
-        """Persist index to disk.
+        """Commit + checkpoint the store to disk.
 
-        Guarded by `_save_lock` against the close() daemon thread's final
-        save: usearch's save is not thread-safe, and a concurrent save from
-        eviction (running on the IO executor) racing with close() would
-        corrupt the heap. The lock also covers a re-check of `_closed` so
-        we never write after close() has begun tearing down the DB.
+        Guarded by `_save_lock` against the close() daemon thread's final save
+        so an eviction-triggered save (on the IO executor) never races close().
+        The lock also covers a re-check of `_closed` so we never write after
+        close() has begun tearing down the connection.
         """
         with self._save_lock:
             if self._closed:
                 return
-            self._sync_collection.save()
             self._db.save()
 
 

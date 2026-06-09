@@ -1,12 +1,12 @@
-"""Grep capability for :class:`VectorStorage`.
+"""Grep capability for :class:`ContentStorage`.
 
 Exact, ripgrep-style pattern matching over cached file content, including the
 sound BM25 prefilter that narrows the candidate set without sacrificing
 completeness.
 
-Split out of the ``VectorStorage`` god-module: each function takes the storage
+Split out of the ``ContentStorage`` god-module: each function takes the storage
 instance explicitly (``store``) instead of ``self``, so the whole grep
-subsystem lives in one place. ``VectorStorage`` keeps thin delegating methods
+subsystem lives in one place. ``ContentStorage`` keeps thin delegating methods
 for the symbols its callers and tests depend on (``grep``,
 ``_grep_required_tokens``, ``_grep_sound_candidates``).
 """
@@ -17,14 +17,14 @@ import asyncio
 import fnmatch
 import logging
 import re
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import _META_CHUNK_INDEX, _META_IS_PARENT, _META_PATH
 
 if TYPE_CHECKING:
-    from . import VectorStorage
+    from . import ContentStorage
+    from ._docstore import DocStore
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ GREP_UNSAFE_REGEX_CHARS = frozenset("|?*{[")
 
 
 async def grep(
-    store: VectorStorage,
+    store: ContentStorage,
     pattern: str,
     *,
     path: str | None = None,
@@ -170,52 +170,58 @@ def required_tokens(pattern: str, *, fixed_string: bool) -> list[str] | None:
 
 
 def vocab_expand(
-    conn: sqlite3.Connection,
+    store: DocStore,
     tokens: list[str],
     term_cap: int,
 ) -> list[list[str]] | None:
     """Expand each token to the FTS5 vocabulary terms containing it.
 
-    Runs on the IO executor (blocking sqlite calls). Returns one term list per
-    token — an empty inner list means the token is absent from the index
-    entirely. Returns ``None`` when the vocabulary cannot be queried or a token
-    expands past ``term_cap`` (too broad to prefilter soundly). Uses an
+    Runs on the IO executor (blocking sqlite calls), under the store lock so the
+    raw-connection access never races other DocStore operations. Returns one
+    term list per token — an empty inner list means the token is absent from the
+    index entirely. Returns ``None`` when the vocabulary cannot be queried or a
+    token expands past ``term_cap`` (too broad to prefilter soundly). Uses an
     ``fts5vocab`` table in the connection-local ``temp`` schema, so it never
-    touches the persistent simplevecdb schema.
+    touches the persistent doc-store schema.
     """
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%' LIMIT 1"
-    ).fetchone()
-    if row is None:
-        return None
-    fts_table = row[0]
-    # Validate before interpolating — table names cannot be bound params.
-    if not re.fullmatch(r"[A-Za-z0-9_]+", fts_table):
-        return None
+    with store._lock:
+        conn = store.conn
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%' LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        fts_table = row[0]
+        # Validate before interpolating — table names cannot be bound params.
+        if not re.fullmatch(r"[A-Za-z0-9_]+", fts_table):
+            return None
 
-    vocab = "scmcp_grep_vocab"
-    conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
-    # The 'main' schema argument is required: fts5vocab otherwise looks
-    # for the FTS table in the vocab table's own schema (temp), where it
-    # does not exist.
-    conn.execute(f"CREATE VIRTUAL TABLE temp.{vocab} USING fts5vocab('main', '{fts_table}', 'row')")
-    try:
-        per_token: list[list[str]] = []
-        for token in tokens:
-            rows = conn.execute(
-                f"SELECT DISTINCT term FROM temp.{vocab} WHERE term LIKE '%' || ? || '%' LIMIT ?",
-                (token.lower(), term_cap + 1),
-            ).fetchall()
-            if len(rows) > term_cap:
-                return None  # token too broad for a bounded MATCH query
-            per_token.append([r[0] for r in rows])
-        return per_token
-    finally:
+        vocab = "scmcp_grep_vocab"
         conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
+        # The 'main' schema argument is required: fts5vocab otherwise looks
+        # for the FTS table in the vocab table's own schema (temp), where it
+        # does not exist.
+        conn.execute(
+            f"CREATE VIRTUAL TABLE temp.{vocab} USING fts5vocab('main', '{fts_table}', 'row')"
+        )
+        try:
+            per_token: list[list[str]] = []
+            for token in tokens:
+                rows = conn.execute(
+                    f"SELECT DISTINCT term FROM temp.{vocab} "
+                    f"WHERE term LIKE '%' || ? || '%' LIMIT ?",
+                    (token.lower(), term_cap + 1),
+                ).fetchall()
+                if len(rows) > term_cap:
+                    return None  # token too broad for a bounded MATCH query
+                per_token.append([r[0] for r in rows])
+            return per_token
+        finally:
+            conn.execute(f"DROP TABLE IF EXISTS temp.{vocab}")
 
 
 async def sound_candidates(
-    store: VectorStorage,
+    store: ContentStorage,
     pattern: str,
     *,
     fixed_string: bool,
@@ -243,7 +249,7 @@ async def sound_candidates(
         per_token_terms = await loop.run_in_executor(
             store._io_executor,
             vocab_expand,
-            store._sync_collection.conn,
+            store._sync_collection,
             tokens,
             GREP_VOCAB_TERM_CAP,
         )
@@ -284,12 +290,12 @@ async def sound_candidates(
 
 
 async def load_files(
-    store: VectorStorage,
+    store: ContentStorage,
     paths: list[str],
 ) -> dict[str, list[tuple[int, str]]]:
     """Load chunk text for a set of paths in a single batched lookup.
 
-    Uses simplevecdb's list-value filter, which compiles to
+    Uses the doc store's list-value filter, which compiles to
     ``json_extract(metadata, '$.path') IN (?, ?, ...)`` — one round trip
     through the executor instead of N. Falls back to per-path lookups only if
     the batch query itself errors.

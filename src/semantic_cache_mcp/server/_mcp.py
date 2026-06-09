@@ -21,7 +21,7 @@ def _migrate_v2_to_v3() -> None:
     """Remove legacy v0.2.0 SQLite cache on first v0.3.0 startup.
 
     v0.3.0 switched from SQLiteStorage (cache.db with chunks/files/lsh_index tables)
-    to VectorStorage (vecdb.db). The old database is incompatible and just wastes disk.
+    to ContentStorage (docstore.db). The old database is incompatible and just wastes disk.
     """
     if not DB_PATH.exists():
         return
