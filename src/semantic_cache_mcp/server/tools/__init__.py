@@ -36,7 +36,6 @@ from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
 from .._mcp import mcp
-from .._read_session import get_tracker as _get_read_session_tracker
 from .._tool_models import (
     BatchEditResponse,
     BatchReadResponse,
@@ -62,8 +61,6 @@ from ..response import (
     _response_mode,
     _response_token_cap,
 )
-
-_read_session_tracker = _get_read_session_tracker()
 
 logger = logging.getLogger(__name__)
 
@@ -531,27 +528,21 @@ async def read(
         if result.is_binary:
             return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
 
-        # Detect unchanged files: from_cache=True + is_diff=False means the
-        # cached file matches the on-disk file. This is a cache fact, not proof
-        # that the current client already has the file text in context — we
-        # also gate on the per-session tracker so the first read of a session
-        # always returns content even when the cache already has it.
+        # `unchanged` is driven entirely by the caller asserting freshness: it
+        # passes back the content_hash it already holds. If that matches the
+        # cached hash and the file is cache-fresh (disk == cache), the caller
+        # provably has the current bytes, so we skip re-sending. cache_fresh
+        # still gates this, so a stale known_hash can never mask a real change.
+        # With no known_hash the server makes no assumption and sends content.
         cache_fresh = result.from_cache and not result.is_diff
         abs_path = str(Path(path).expanduser().resolve())
-        session_id = getattr(ctx, "session_id", None) or getattr(ctx, "client_id", None)
-        already_seen = _read_session_tracker.seen(session_id, abs_path)
-        # Fetch the entry once: used both for hash-driven freshness and to stamp
-        # content_hash onto whatever payload we return.
+        # Fetch the entry once: used for the hash check and to stamp content_hash
+        # onto whatever payload we return.
         entry = await cache.get(abs_path)
-        # Hash-driven freshness: the caller echoes the content_hash it already
-        # holds. If it matches the cached hash and the file is cache-fresh
-        # (disk == cache), the caller provably has the current bytes, so answer
-        # unchanged without relying on the per-session tracker. cache_fresh still
-        # gates this, so a stale known_hash can't mask a real change.
         caller_has_current = (
             bool(known_hash) and entry is not None and known_hash == entry.content_hash
         )
-        unchanged = cache_fresh and (already_seen or caller_has_current)
+        unchanged = cache_fresh and caller_has_current
 
         payload = {
             "ok": True,
@@ -576,36 +567,27 @@ async def read(
                         0 if cached_text.endswith("\n") else 1
                     )
         else:
-            # `result.content` is real bytes only for new/changed/small-cached
-            # files. For a file already warm in the cache, smart_read returns
-            # the "// File unchanged" marker (tokens_returned < tokens_original);
-            # the first read of a session must still deliver actual content, so
-            # re-fetch it from the cache.
+            # `result.content` is real bytes for new/changed/small-cached files.
+            # For a file already warm in the cache, smart_read may return the
+            # "// File unchanged" marker instead of content, so re-fetch the real
+            # bytes from the cache before delivering.
             content_text = result.content
-            delivered_full = (
+            has_full_content = (
                 not result.is_diff
                 and not result.truncated
                 and result.tokens_returned >= result.tokens_original > 0
             )
             if (
-                not delivered_full
+                not has_full_content
                 and not result.is_diff
                 and not result.truncated
                 and result.from_cache
+                and entry is not None
             ):
-                entry = await cache.get(abs_path)
-                if entry is not None:
-                    fetched = await cache.get_content(entry)
-                    if fetched:
-                        content_text = fetched
-                        delivered_full = True
+                fetched = await cache.get_content(entry)
+                if fetched:
+                    content_text = fetched
             payload["content"] = content_text
-            # Mark as "seen" only when the model received the complete file.
-            # A diff carries only the delta and a truncated read only a
-            # non-contiguous summary — marking either would later answer
-            # unchanged:true for a file the model never saw in full.
-            if delivered_full:
-                _read_session_tracker.mark(session_id, abs_path)
         # Always surface the current content_hash so the caller can echo it back
         # as known_hash on its next read and skip a re-send.
         if entry is not None and "content_hash" not in payload:
@@ -1052,7 +1034,6 @@ async def clear(
 
     count = await cache.clear()
     cache.metrics.record("clear", None)
-    _read_session_tracker.clear()
     payload: dict[str, Any] = {"ok": True, "tool": "clear", "status": "cleared", "count": count}
     if mode == _MODE_DEBUG:
         payload["output_mode"] = mode
@@ -1126,7 +1107,6 @@ async def delete(
             cache_removed_count += await cache.delete_path(candidate)
 
         cache.metrics.record("delete", None)
-        _read_session_tracker.invalidate(str(Path(path).expanduser().resolve()))
         payload = {
             "ok": True,
             "tool": "delete",
@@ -1219,7 +1199,6 @@ async def write(
             ),
         )
         cache.metrics.record("write", result)
-        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -1345,7 +1324,6 @@ async def edit(
             ),
         )
         cache.metrics.record("edit", result)
-        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -1593,7 +1571,6 @@ async def batch_edit(
             ),
         )
         cache.metrics.record("batch_edit", result)
-        _read_session_tracker.invalidate(str(Path(result.path).expanduser().resolve()))
 
         status = (
             "edited"

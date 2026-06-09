@@ -209,28 +209,22 @@ class TestReadTool:
         d = _parse(await read(ctx, str(sample_file)))
         assert "line1" in d["content"]
 
-    async def test_second_read_returns_unchanged_metadata(
+    async def test_known_hash_returns_unchanged_metadata(
         self, ctx: MagicMock, sample_file: Path
     ) -> None:
-        """Per item 7: second read in a session returns the unchanged marker plus hash/total_lines, no content body."""
-        from semantic_cache_mcp.server._read_session import get_tracker
-
-        get_tracker().clear()
-        await read(ctx, str(sample_file))
-        d = _parse(await read(ctx, str(sample_file)))
+        """A re-read that echoes the prior content_hash returns the unchanged marker plus hash/total_lines, no content body."""
+        d1 = _parse(await read(ctx, str(sample_file)))
+        d = _parse(await read(ctx, str(sample_file), known_hash=d1["content_hash"]))
         assert "path" in d
         assert d["unchanged"] is True
         assert "content" not in d
         assert "content_hash" in d
         assert d.get("total_lines", 0) > 0
 
-    async def test_warm_cache_first_read_still_returns_content(
+    async def test_warm_cache_read_without_known_hash_returns_content(
         self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
     ) -> None:
-        """Warming the cache via smart_read does NOT mark the session — the first read in the session must still send content."""
-        from semantic_cache_mcp.server._read_session import get_tracker
-
-        get_tracker().clear()
+        """Warming the cache via smart_read then reading without known_hash still sends full content."""
         await smart_read(tmp_cache, str(sample_file))
         d = _parse(await read(ctx, str(sample_file)))
         assert "content" in d

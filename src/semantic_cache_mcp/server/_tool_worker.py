@@ -53,7 +53,7 @@ class ToolProcessSupervisor:
         self,
         *,
         worker_target: Any | None = None,
-        startup_timeout: float = 120.0,
+        startup_timeout: float = 30.0,
         shutdown_timeout: float = 8.0,
     ) -> None:
         self._ctx = multiprocessing.get_context("spawn")
@@ -118,9 +118,9 @@ class ToolProcessSupervisor:
                 )
                 logger.warning(f"{tool} timed out after {timeout}s in worker process")
                 # Drop the wedged worker immediately so the timeout stays bounded.
-                # Starting a replacement worker can trigger tokenizer/model init and
-                # GPU warmup, which would otherwise make a "30s" timeout take far
-                # longer before the caller sees the error.
+                # Starting a replacement worker re-inits the tokenizer and opens the
+                # cache, which would otherwise make a "30s" timeout take longer before
+                # the caller sees the error.
                 await asyncio.to_thread(self._invalidate_worker_blocking, f"{tool} timeout")
                 raise
             except Exception as exc:
