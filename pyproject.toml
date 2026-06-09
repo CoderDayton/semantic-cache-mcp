@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "blake3>=1.0.8",
-    "fastmcp>=3.0.0b1",
+    "fastmcp>=3.2",
     "numpy>=1.26",
 ]
 

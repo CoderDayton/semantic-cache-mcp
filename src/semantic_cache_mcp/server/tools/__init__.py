@@ -386,24 +386,32 @@ async def read(
     limit: int | None = None,
     known_hash: str | None = None,
 ) -> dict[str, Any]:
-    """Read a file with token-efficient caching. For 2+ files, use `batch_read`.
+    """Read a file, returning as few tokens as possible. For 2+ files, use `batch_read`.
 
-    Returns full content on first read, `"unchanged": true` on re-read of an
-    unchanged file (content already in your context — do NOT re-read), or a
-    unified diff when modified. Use `offset`/`limit` to recover line ranges
-    after truncation.
+    The first read returns the full numbered content plus a `content_hash`.
+    A later read of an unchanged file returns `"unchanged": true` with no body
+    (you already have it); a changed file returns a unified diff. Reading also
+    caches the file so `grep`, `search`, and `batch_read` can see it.
+
+    Pass `known_hash` (the `content_hash` from your last read) to assert you
+    still hold the file, letting the server skip re-sending unchanged bytes.
+    Use `offset`/`limit` to read or recover an exact line range — for example
+    after a large file was summarized. A binary file returns metadata
+    (`is_binary`, `size`, `mime`) instead of content; for images use
+    `read_image`. Missing or non-regular paths raise an error.
 
     Args:
-        path: File path (absolute or relative to project root). Use absolute
-            paths for files outside the current project root.
-        max_size: Maximum content size to return before summarization.
-        offset: 1-based starting line number for targeted reads. `0` is
-            treated as "from the start" (equivalent to omitting).
-        limit: Number of lines to return from `offset`.
-        known_hash: The `content_hash` returned by a prior read. Pass it to
-            assert you still hold the file; the server replies `"unchanged":
-            true` when it matches and the file is unchanged, skipping the
-            re-send. Omit it to fall back to per-session tracking.
+        path: File path (absolute, or relative to the project root). Use an
+            absolute path for files outside the project root.
+        max_size: Byte threshold above which the file is semantically
+            summarized; recover exact lines afterward with `offset`/`limit`.
+        offset: 1-based first line for a ranged read. `0` means from the start
+            (same as omitting).
+        limit: Number of lines to return starting at `offset`.
+        known_hash: The `content_hash` from a prior read. Pass it to assert you
+            still hold the file; the server replies `"unchanged": true` when it
+            matches and the file is unchanged, otherwise it sends content. Omit
+            to fall back to per-session tracking.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -709,18 +717,21 @@ async def read_image(
     ctx: Context,
     path: str,
 ) -> ToolResult:
-    """Read an image file and pass the bytes through to the model.
+    """Read an image file so the model can see it.
 
-    Returns an MCP image content block (base64-encoded with mime type) plus a
-    JSON metadata sidecar. Use this when the model needs to actually see the
-    image; for any other file type use `read`.
+    Returns an MCP image block (base64 data + mime type) plus a small JSON
+    metadata sidecar (`size`, `mime`). Use this only when the model needs to
+    view the image; for text or any other file type use `read`.
 
-    Images are NOT cached — every call re-reads from disk. Cap is
-    `SCMCP_MAX_IMAGE_BYTES` (default 5 MiB) to protect both the response
-    budget and Anthropic's ~5 MB upload limit.
+    The format is detected from the file's magic bytes, not its extension, so
+    a mis-named image still works and a non-image (e.g. text saved as `.png`)
+    is rejected. Supports PNG, JPEG, GIF, TIFF, BMP, and WebP. Images are
+    never cached — every call re-reads from disk. Oversized images are
+    rejected before encoding; the cap is `SCMCP_MAX_IMAGE_BYTES` (default
+    5 MiB), bounded by Anthropic's ~5 MB upload limit.
 
     Args:
-        path: Image file path (absolute or relative to project root).
+        path: Image file path (absolute, or relative to the project root).
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -841,13 +852,12 @@ async def read_image(
 async def stats(
     ctx: Context,
 ) -> ToolResult:
-    """Inspect cache health, token savings, and runtime diagnostics.
+    """Report cache health, token savings, and runtime diagnostics.
 
-    Use this for debugging or measurement, not as a normal step in routine
-    read/edit loops.
-
-    Returns cache occupancy, hit rates, token savings, tool-call counts,
-    and process memory usage.
+    Returns storage occupancy (files, tokens, documents, DB size), session and
+    lifetime token savings and cache hit rates, per-tool call counts, and
+    process memory. Use it to measure or debug — not as a routine step in
+    read/edit loops. Takes no arguments.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -1022,13 +1032,13 @@ async def stats(
 async def clear(
     ctx: Context,
 ) -> dict[str, Any]:
-    """Clear the semantic cache only; does not modify project files.
+    """Empty the cache. Does not touch any project file.
 
-    Use this rarely, mainly to recover from stale cache state or to force cold
-    re-seeding. Prefer normal `read`/`batch_read` refresh behavior when
-    possible.
-
-    Returns the number of cached entries removed.
+    Removes every cached file entry and returns how many were dropped; the
+    next `read`/`batch_read` re-seeds from disk. Use rarely — only to recover
+    from stale cache state or force a cold re-seed. Normal reads already
+    refresh changed files on their own, so this is seldom needed. Takes no
+    arguments.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -1056,24 +1066,19 @@ async def delete(
     path: str,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Delete one file or one symlink path and evict cache entries for that path.
+    """Delete one file or symlink and evict its cache entries.
 
-    Use this for explicit single-path removal instead of shelling out.
+    Use this for explicit single-path removal instead of shelling out. A
+    missing path is reported as status `not_found`, not an error.
 
-    Normal statuses:
-    - `deleted`: file or symlink path was removed
-    - `would_delete`: dry-run preview only
-    - `not_found`: path did not exist; this is not an error
-
-    Constraints:
-    - No globs
-    - No recursive delete
-    - No real-directory delete
-    - If `path` is a symlink, deletes the link itself, not the target
+    Statuses: `deleted` (removed), `would_delete` (dry-run preview only),
+    `not_found` (nothing was there). Constraints: one path only — no globs,
+    no recursion, no real-directory deletes. A symlink path deletes the link
+    itself, never its target.
 
     Args:
-        path: File or symlink path (absolute or relative to project root).
-        dry_run: Preview without deleting or evicting cache.
+        path: File or symlink path (absolute, or relative to the project root).
+        dry_run: Preview the outcome without deleting or evicting the cache.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1171,21 +1176,23 @@ async def write(
     show_diff: bool = False,
     append: bool = False,
 ) -> dict[str, Any]:
-    """Create or replace a file. Prefer `edit`/`batch_edit` for localized changes.
+    """Create a file or replace its entire contents.
 
-    Overwrites the whole file, or appends with `append=true`. Reports status
-    `created` for a new path or `updated` for an existing one; an update also
-    returns a unified diff against the previous content.
+    Use this for new files or full rewrites; for localized changes prefer
+    `edit` or `batch_edit`. Status is `created` for a new path or `updated`
+    for an existing one, and an update returns a unified diff against the
+    previous content. Writing refreshes the cache so later reads, `grep`, and
+    `search` see the new text. Missing parent directories are created unless
+    `create_parents=false`.
 
     Args:
-        path: File path to create or replace.
-        content: Full content to write, or appended content when
-            `append=true`.
-        create_parents: Create missing parent directories when needed.
-        dry_run: Preview without writing.
-        auto_format: Run formatter after write.
-        show_diff: Return the diff explicitly even for deterministic writes.
-        append: Append instead of overwrite.
+        path: File path to create or replace (absolute, or relative to root).
+        content: Full file content, or the text to append when `append=true`.
+        create_parents: Create any missing parent directories.
+        dry_run: Preview the result without writing.
+        auto_format: Run the formatter after writing.
+        show_diff: Return the unified diff even on a deterministic write.
+        append: Append `content` to the end of the file instead of overwriting.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1284,25 +1291,30 @@ async def edit(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> dict[str, Any]:
-    """Edit one file via exact replacement.
+    """Edit one file by exact text replacement.
 
-    For multiple edits to the same file, use `batch_edit` (single response,
-    atomic, faster). For full rewrites, use `write`.
+    Three modes:
+    - find/replace: `old_string` + `new_string` (the default).
+    - scoped: add `start_line`/`end_line` to confine the search to a range.
+    - line-range: omit `old_string` and give both lines to replace them wholesale.
 
-    Modes: find/replace (`old_string`+`new_string`), scoped (add `start_line`/`end_line`),
-    or line-range (omit `old_string`, provide both lines). Keep `old_string` short
-    and unique; add line bounds when ambiguous.
+    `old_string` must match exactly — whitespace and indentation included —
+    and, unless `replace_all=true`, must be unique, or the edit fails. Use
+    `edit_preview` first if you're unsure an anchor is unique. Returns the
+    replacement count, affected line numbers, and a unified diff, and refreshes
+    the cache. For several edits to one file use `batch_edit`; for a full
+    rewrite use `write`.
 
     Args:
-        path: File path to modify.
-        old_string: Exact text to find. Omit only for line-range replacement.
-        new_string: Replacement text.
-        replace_all: Replace all matches instead of requiring uniqueness.
+        path: File path to modify (absolute, or relative to root).
+        old_string: Exact text to find. Omit only for a line-range replacement.
+        new_string: Replacement text (an empty string deletes the match).
+        replace_all: Replace every occurrence instead of requiring a unique match.
         dry_run: Preview without writing.
-        auto_format: Run formatter after editing.
-        show_diff: Return the diff explicitly for successful deterministic edits.
-        start_line: 1-based inclusive start line for scoped or line-range edit.
-        end_line: 1-based inclusive end line for scoped or line-range edit.
+        auto_format: Run the formatter after editing.
+        show_diff: Return the diff even on a deterministic edit.
+        start_line: 1-based inclusive start line for a scoped or line-range edit.
+        end_line: 1-based inclusive end line for a scoped or line-range edit.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1400,16 +1412,17 @@ async def edit_preview(
     path: str,
     old_string: str,
 ) -> dict[str, Any]:
-    """Preview where `old_string` matches in a file without modifying it.
+    """Show where `old_string` would match in a file, without editing it.
 
-    Returns match count, 1-based line numbers, and small snippets so the
-    caller can confirm an anchor is unique before committing to `edit`.
-    Read-only and intentionally cheap — under ~200 tokens — so it can be
-    called freely as a probe.
+    Returns the match count, 1-based line numbers, and short snippets so you
+    can confirm an anchor is unique before calling `edit`. Read-only and cheap
+    (kept under ~200 tokens), so use it freely as a probe. Raises an error on
+    a binary file or an empty `old_string`.
 
     Args:
-        path: File path to search.
-        old_string: Anchor text. Must match exactly (whitespace, indentation).
+        path: File path to search (absolute, or relative to root).
+        old_string: Anchor text to locate. Must match exactly, including
+            whitespace and indentation. Cannot be empty.
     """
     state = await _tool_call_state(ctx)
     # Resolve against the client root *before* forwarding, like read/edit/write:
@@ -1498,31 +1511,29 @@ async def batch_edit(
     auto_format: bool = False,
     show_diff: bool = False,
 ) -> dict[str, Any]:
-    """Apply multiple exact edits to one file in a single call.
+    """Apply many exact edits to one file in a single atomic call.
 
-    Preferred over repeated `edit` calls on the same file: single response,
-    atomic across all edits, and faster on large files. For cross-file work,
-    call the relevant tools per file instead of trying to batch across files.
+    Preferred over repeated `edit` calls on the same file: one response,
+    applied atomically, faster on large files. Partial success is allowed —
+    any failed edits are returned with their reason so you can retry just the
+    misses (status is `edited` when all apply, `partial` when some fail,
+    `no_changes` when none do). For edits across different files, call the
+    tool once per file.
 
-    Supported entry forms:
-    - `[old, new]` for full-file exact replacement
-    - `[old, new, start_line, end_line]` for scoped replacement
-    - `[null, new, start_line, end_line]` for line-range replacement
-    - `{"old": ..., "new": ..., "start_line": ..., "end_line": ...}`
+    `edits` is a JSON array; each entry is one of:
+    - `[old, new]` — exact find/replace.
+    - `[old, new, start_line, end_line]` — find/replace confined to a range.
+    - `[null, new, start_line, end_line]` — replace that line range wholesale.
+    - `{"old": ..., "new": ..., "start_line": ..., "end_line": ...}` — object form.
 
-    Behavior:
-    - Partial success is allowed.
-    - Failed edits are returned so you can retry only the misses.
-    - Prefer line-range entries when you already have line numbers from `read`.
-    - Deterministic all-success batches omit full diffs unless `show_diff=true`
-      or debug mode is enabled.
+    Prefer line-range entries when you already have line numbers from `read`.
 
     Args:
-        path: File path to modify.
-        edits: JSON array of edit entries for that file.
+        path: File path to modify (absolute, or relative to root).
+        edits: JSON array of edit entries, in any of the forms above.
         dry_run: Preview without writing.
-        auto_format: Run formatter after edits.
-        show_diff: Return the diff explicitly for successful deterministic batches.
+        auto_format: Run the formatter after all edits.
+        show_diff: Return the full diff even on a deterministic all-success batch.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1674,22 +1685,22 @@ async def search(
     directory: str | None = None,
     show_preview: bool = False,
 ) -> dict[str, Any]:
-    """Find code by meaning when you don't know the exact name to grep for.
+    """Find cached files by keyword relevance (BM25 ranking).
 
-    Use this first for concept-level questions — "where is rate limiting
-    handled", "what validates the config", "code that retries failed
-    requests" — where you have intent but not a literal string or symbol.
-    Once you know the exact token, `grep` is the faster, exact follow-up.
-
-    Ranks cached files by semantic similarity to the query. Operates on
-    files already seeded via `read`/`batch_read`; if results look thin,
-    seed more of the repo with `batch_read` and retry.
+    Searches only files already in the cache — seed them first with
+    `read`/`batch_read` (thin results usually mean too few files are cached).
+    Ranks by BM25 term relevance, so multi-word and keyword queries work
+    well; matching is lexical, not embedding-based, so synonyms won't match a
+    word that isn't present. For an exact string or regex use `grep`; to pull
+    more of the repo into the cache use `batch_read`. Returns matches with a
+    normalized 0–1 relevance score (best match = 1.0) and a short preview.
 
     Args:
-        query: Natural-language query, keywords, or a mixture of both.
+        query: Keywords to rank by. Natural-language phrasing is fine, but
+            ranking is on the individual words.
         k: Maximum number of matches to return.
-        directory: Optional directory filter applied after retrieval.
-        show_preview: Include match previews explicitly.
+        directory: Restrict matches to files under this directory.
+        show_preview: Include a short preview line for each match.
     """
     state = await _tool_call_state(ctx)
     directory = state.resolve(directory) if directory else None
@@ -1755,17 +1766,20 @@ async def batch_read(
     max_total_tokens: int = 50000,
     priority: str = "",
 ) -> dict[str, Any]:
-    """Read multiple files under a token budget.
+    """Read several files at once under a shared token budget.
 
-    Use to seed cache before `search`/`grep`; prefer over repeated `read`
-    calls. Returns diffs for modified files, full content for new ones;
-    large files skipped when budget exhausted (use `read` with
-    `offset`/`limit` to recover).
+    The efficient way to seed the cache before `search`/`grep`, and cheaper
+    than many single `read` calls. New files return full content, changed
+    files return a diff, and files already in your context are reported as
+    `unchanged` with no body. Smallest files are read first; once the budget
+    is spent the rest are listed under `skipped` — recover them with `read`
+    using `offset`/`limit`.
 
     Args:
-        paths: Comma-separated paths, JSON array, or glob patterns.
-        max_total_tokens: Token budget across the batch.
-        priority: Optional paths to read first before the remaining files.
+        paths: The files to read — a comma-separated list, a JSON array, or
+            glob patterns (expanded for you).
+        max_total_tokens: Total token budget shared across the whole batch.
+        priority: Optional paths to read first, ahead of the remaining files.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -1886,15 +1900,17 @@ async def glob(
     directory: str = ".",
     cached_only: bool = False,
 ) -> dict[str, Any]:
-    """Discover files by glob and show which are already cached.
+    """List files matching a glob and show which are already cached.
 
-    Use before `batch_read`/`search`/`grep`. `cached_only=true` shows what
-    search/grep can see without more reads.
+    Use it to discover files and see what `search`/`grep` can already access
+    before you spend reads. Each match carries a `cached` flag; set
+    `cached_only=true` to list only files already in the cache. Pair it with
+    `batch_read` to pull in whatever isn't cached yet.
 
     Args:
-        pattern: Glob pattern to expand.
-        directory: Base directory for the glob.
-        cached_only: Restrict results to already cached files.
+        pattern: Glob pattern to match (e.g. `src/**/*.py`).
+        directory: Base directory the pattern is evaluated from.
+        cached_only: Return only files that are already cached.
     """
     state = await _tool_call_state(ctx)
     directory = state.resolve(directory)
@@ -1964,19 +1980,22 @@ async def grep(
     max_matches: int = 100,
     max_files: int = 50,
 ) -> dict[str, Any]:
-    """Cache-only ripgrep: exact string/regex with line numbers.
+    """Search cached file contents for an exact string or regex.
 
-    Use `search` for semantic intent. Seed files with `batch_read` first;
-    empty results often mean files not cached.
+    Fast, exact, line-numbered matching over files already in the cache — it
+    does NOT touch disk, so seed files first with `batch_read`/`read` (empty
+    results usually mean the files aren't cached). For concept-level questions
+    where you don't know the exact term, use `search` instead.
 
     Args:
-        pattern: Regex pattern, or a literal if `fixed_string=true`.
-        path: Optional exact path, suffix, or glob filter.
-        fixed_string: Treat `pattern` as a literal instead of regex.
-        case_sensitive: Whether matching is case-sensitive.
-        context_lines: Number of context lines to include around matches.
-        max_matches: Maximum total matches across all files.
-        max_files: Maximum number of files to return.
+        pattern: A regular expression, or a literal string when
+            `fixed_string=true`.
+        path: Optional filter — an exact path, a path suffix, or a glob.
+        fixed_string: Match `pattern` literally instead of as a regex.
+        case_sensitive: Match case-sensitively.
+        context_lines: Lines of surrounding context to include per match.
+        max_matches: Cap on total matches returned across all files.
+        max_files: Cap on the number of files returned.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
