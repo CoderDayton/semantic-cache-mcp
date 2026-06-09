@@ -6,13 +6,11 @@ import array
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from semantic_cache_mcp.cache import SemanticCache
 from semantic_cache_mcp.storage.sqlite import SQLiteStorage
-from semantic_cache_mcp.types import EmbeddingVector
 from tests.constants import TEST_EMBEDDING_DIM
 
 
@@ -45,26 +43,20 @@ def semantic_cache(temp_dir: Path) -> Generator[SemanticCache, None, None]:
 
 @pytest.fixture
 def semantic_cache_no_embeddings(temp_dir: Path) -> Generator[SemanticCache, None, None]:
-    """Create a SemanticCache with embeddings disabled via mock."""
+    """Create a SemanticCache (alias kept for legacy tests; store is BM25-only)."""
     db_path = temp_dir / "semantic_cache_no_emb.db"
-
-    # Mock the embed function to return None (simulating no embeddings)
-    with patch("semantic_cache_mcp.cache.embed", return_value=None):
-        cache = SemanticCache(db_path=db_path)
-        yield cache
+    cache = SemanticCache(db_path=db_path)
+    yield cache
 
 
 @pytest.fixture
 def semantic_cache_with_embeddings(
-    temp_dir: Path, mock_embeddings: EmbeddingVector
+    temp_dir: Path,
 ) -> Generator[SemanticCache, None, None]:
-    """Create a SemanticCache with mocked embeddings."""
+    """Create a SemanticCache (alias kept for legacy tests; store is BM25-only)."""
     db_path = temp_dir / "semantic_cache_emb.db"
-
-    # Mock the embed function to return consistent embeddings
-    with patch("semantic_cache_mcp.cache.embed", return_value=mock_embeddings):
-        cache = SemanticCache(db_path=db_path)
-        yield cache
+    cache = SemanticCache(db_path=db_path)
+    yield cache
 
 
 @pytest.fixture
@@ -129,7 +121,7 @@ class Calculator:
 
 
 @pytest.fixture
-def mock_embeddings() -> EmbeddingVector:
+def mock_embeddings() -> array.array:
     """Create a mock embedding vector (normalized, TEST_EMBEDDING_DIM dimensions)."""
     import math
 
@@ -140,7 +132,7 @@ def mock_embeddings() -> EmbeddingVector:
 
 
 @pytest.fixture
-def mock_embeddings_similar() -> EmbeddingVector:
+def mock_embeddings_similar() -> array.array:
     """Create a mock embedding vector similar to mock_embeddings."""
     import math
 
@@ -154,7 +146,7 @@ def mock_embeddings_similar() -> EmbeddingVector:
 
 
 @pytest.fixture
-def mock_embeddings_different() -> EmbeddingVector:
+def mock_embeddings_different() -> array.array:
     """Create a mock embedding vector different from mock_embeddings."""
     import math
 

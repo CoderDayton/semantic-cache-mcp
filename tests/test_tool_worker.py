@@ -14,7 +14,6 @@ from fastmcp.exceptions import ToolError
 from semantic_cache_mcp.server import tools as tools_mod
 from semantic_cache_mcp.server._tool_worker import (
     ToolProcessSupervisor,
-    _tool_worker_main_async,
     _worker_result,
 )
 from semantic_cache_mcp.server.tools import batch_read, read
@@ -277,35 +276,6 @@ async def test_tool_process_supervisor_restarts_after_protocol_error(tmp_path: P
 def test_worker_result_rejects_non_mapping_protocol_frames() -> None:
     with pytest.raises(RuntimeError, match="expected dict response"):
         _worker_result("bad-frame")
-
-
-@pytest.mark.asyncio
-async def test_tool_worker_startup_uses_embedding_metadata_without_warmup() -> None:
-    conn = MagicMock()
-    conn.recv.side_effect = [{"op": "shutdown"}]
-    cache = MagicMock()
-    cache._storage.clear_if_model_changed = MagicMock()
-    cache.async_close = AsyncMock()
-
-    with (
-        patch("semantic_cache_mcp.server._tool_worker.get_tokenizer"),
-        patch("semantic_cache_mcp.server._tool_worker.SemanticCache", return_value=cache),
-        patch("semantic_cache_mcp.server._tool_worker.get_embedding_dim", return_value=768),
-        patch(
-            "semantic_cache_mcp.server._tool_worker.get_model_info",
-            return_value={
-                "model": "test-model",
-                "dim": 0,
-                "cache_dir": "/tmp/cache",
-                "provider": "unknown",
-                "ready": False,
-            },
-        ),
-    ):
-        await _tool_worker_main_async(conn)
-
-    cache._storage.clear_if_model_changed.assert_called_once_with("test-model", 768)
-    conn.send.assert_any_call({"op": "ready"})
 
 
 @pytest.mark.asyncio

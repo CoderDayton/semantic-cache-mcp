@@ -1310,7 +1310,6 @@ class TestStatsTool:
         assert "```json" in md
         d = json.loads(md.split("```json\n")[1].split("\n```")[0])
         assert "files_cached" in d
-        assert "embedding" in d
         assert result.structured_content is not None
         assert result.structured_content["mode"] == "debug"
 

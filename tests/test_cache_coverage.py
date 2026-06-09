@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
 import pytest
 
 from semantic_cache_mcp.cache._helpers import (
@@ -47,8 +46,7 @@ def _make_embedding() -> array.array:  # type: ignore[type-arg]
 def _make_cache(tmp_path: Path) -> SemanticCache:
     """Create a SemanticCache backed by tmp_path."""
     db_path = tmp_path / "test_vecdb.db"
-    with patch("semantic_cache_mcp.cache.embed", return_value=None):
-        return SemanticCache(db_path=db_path)
+    return SemanticCache(db_path=db_path)
 
 
 def _make_vector_storage(tmp_path: Path) -> VectorStorage:
@@ -166,138 +164,6 @@ class TestFormatFile:
 
 
 # ===========================================================================
-# core/embeddings.py
-# ===========================================================================
-
-
-class TestEmbeddingsPublicAPI:
-    """Lines 37-54, 108, 114, 119-126, 189-196 via mocked fastembed."""
-
-    def test_embed_returns_array_on_success(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed
-
-        mock_model = MagicMock()
-        fake_vec = np.zeros(384, dtype=np.float32)
-        mock_model.embed.return_value = iter([fake_vec])
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            result = embed("hello world")
-
-        assert result is not None
-        assert len(result) == 384
-
-    def test_embed_returns_none_on_exception(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed
-
-        mock_model = MagicMock()
-        mock_model.embed.side_effect = RuntimeError("model broken")
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            result = embed("hello")
-
-        assert result is None
-
-    def test_embed_batch_success(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed_batch
-
-        mock_model = MagicMock()
-        fake_vecs = [np.zeros(384, dtype=np.float32)] * 3
-        mock_model.embed.return_value = iter(fake_vecs)
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            results = embed_batch(["a", "b", "c"])
-
-        assert len(results) == 3
-        assert all(r is not None for r in results)
-
-    def test_embed_batch_empty_input(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed_batch
-
-        result = embed_batch([])
-        assert result == []
-
-    def test_embed_batch_exception_returns_nones(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed_batch
-
-        mock_model = MagicMock()
-        mock_model.embed.side_effect = RuntimeError("batch failed")
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            results = embed_batch(["a", "b"])
-
-        assert results == [None, None]
-
-    def test_embed_query_applies_prefix(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed_query
-
-        mock_model = MagicMock()
-        fake_vec = np.zeros(384, dtype=np.float32)
-        captured: list[list[str]] = []
-
-        def capture_embed(texts: list[str]):
-            captured.append(texts)
-            return iter([fake_vec])
-
-        mock_model.embed.side_effect = capture_embed
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            embed_query("search term")
-
-        assert captured
-        assert "Represent this sentence" in captured[0][0]
-
-    def test_embed_query_returns_none_on_exception(self) -> None:
-        from semantic_cache_mcp.core.embeddings import embed_query
-
-        mock_model = MagicMock()
-        mock_model.embed.side_effect = Exception("fail")
-
-        with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-            result = embed_query("query")
-
-        assert result is None
-
-    def test_warmup_skips_if_already_ready(self) -> None:
-        from semantic_cache_mcp.core.embeddings import _model as _emb_model
-        from semantic_cache_mcp.core.embeddings import warmup
-
-        original = _emb_model._model_ready
-        try:
-            _emb_model._model_ready = True
-            mock_model = MagicMock()
-            with patch("semantic_cache_mcp.core.embeddings._model._embedding_model", mock_model):
-                warmup()
-            # embed should NOT have been called since already ready
-            mock_model.embed.assert_not_called()
-        finally:
-            _emb_model._model_ready = original
-
-    def test_get_model_info_returns_dict(self) -> None:
-        from semantic_cache_mcp.core.embeddings import get_model_info
-
-        info = get_model_info()
-        assert "model" in info
-        assert "dim" in info
-        assert "provider" in info
-        assert "ready" in info
-
-    def test_get_embedding_dim_returns_int(self) -> None:
-        from semantic_cache_mcp.core.embeddings import get_embedding_dim
-
-        dim = get_embedding_dim()
-        assert isinstance(dim, int)
-        assert dim >= 0
-
-    def test_cuda_provider_check_no_onnxruntime(self) -> None:
-        from semantic_cache_mcp.core.embeddings import _cuda_provider_is_available
-
-        with patch.dict("sys.modules", {"onnxruntime": None}):
-            # Should return False without raising
-            result = _cuda_provider_is_available()
-            assert isinstance(result, bool)
-
-
-# ===========================================================================
 # cache/store.py
 # ===========================================================================
 
@@ -316,7 +182,6 @@ class TestSemanticCacheStore:
         stats = await cache.get_stats()
         assert "files_cached" in stats
         assert "total_tokens_cached" in stats
-        assert "embedding_ready" in stats
         assert "session" in stats
 
     async def test_get_stats_with_process_rss(self, tmp_path: Path) -> None:
@@ -343,13 +208,6 @@ class TestSemanticCacheStore:
         vs = _make_vector_storage(tmp_path)
         vs.close()  # should complete without error
 
-    async def test_get_embeddings_batch(self, tmp_path: Path) -> None:
-        """get_embeddings_batch returns list of same length as input."""
-        cache = _make_cache(tmp_path)
-        with patch("semantic_cache_mcp.cache.embed_batch", return_value=[None, None]):
-            results = await cache.get_embeddings_batch([("/a.py", "x"), ("/b.py", "y")])
-        assert len(results) == 2
-
 
 # ===========================================================================
 # storage/vector.py
@@ -363,7 +221,7 @@ class TestVectorStoragePutChunked:
         vs = _make_vector_storage(tmp_path)
         # CHUNK_THRESHOLD = 8192 bytes; create content above that
         big_content = ("abcdefghij" * 1000) + "\n"  # ~10KB
-        await vs.put("/large/file.txt", big_content, mtime=1.0, embedding=None)
+        await vs.put("/large/file.txt", big_content, mtime=1.0)
 
         entry = await vs.get("/large/file.txt")
         assert entry is not None
@@ -371,15 +229,6 @@ class TestVectorStoragePutChunked:
 
         content = await vs.get_content(entry)
         assert content == big_content
-
-    async def test_put_chunked_with_embedding(self, tmp_path: Path) -> None:
-        vs = _make_vector_storage(tmp_path)
-        emb = _make_embedding()
-        big_content = ("xyz " * 3000) + "\n"
-        await vs.put("/chunked/emb.txt", big_content, mtime=2.0, embedding=emb)
-
-        entry = await vs.get("/chunked/emb.txt")
-        assert entry is not None
 
 
 class TestVectorStorageGrep:
@@ -495,38 +344,12 @@ class TestVectorStorageSearchHybrid:
         # May be empty if FTS not indexed yet, but must return list
         assert isinstance(results, list)
 
-    async def test_search_hybrid_no_embedding(self, tmp_path: Path) -> None:
-        vs = _make_vector_storage(tmp_path)
-        await vs.put("/search/doc2.py", "class Foo: pass\n", mtime=1.0)
-        results = await vs.search_hybrid("Foo", embedding=None)
-        assert isinstance(results, list)
-
-    async def test_search_hybrid_with_embedding(self, tmp_path: Path) -> None:
-        vs = _make_vector_storage(tmp_path)
-        await vs.put("/search/doc3.py", "import os\n", mtime=1.0)
-        emb = _make_embedding()
-        results = await vs.search_hybrid("import", embedding=emb)
-        assert isinstance(results, list)
-
     async def test_search_by_query_keyword_search_exception(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
         # Patch the underlying collection to raise
         vs._collection.keyword_search = MagicMock(side_effect=Exception("fts error"))
         results = await vs.search_by_query("anything")
         assert results == []
-
-    async def test_search_hybrid_exception(self, tmp_path: Path) -> None:
-        vs = _make_vector_storage(tmp_path)
-        vs._collection.hybrid_search = MagicMock(side_effect=Exception("hybrid error"))
-        results = await vs.search_hybrid("anything")
-        assert results == []
-
-    async def test_find_similar_multi(self, tmp_path: Path) -> None:
-        vs = _make_vector_storage(tmp_path)
-        emb = _make_embedding()
-        await vs.put("/sim/a.txt", "hello", mtime=1.0, embedding=emb)
-        results = await vs.find_similar_multi(emb, k=3)
-        assert isinstance(results, list)
 
 
 # ===========================================================================

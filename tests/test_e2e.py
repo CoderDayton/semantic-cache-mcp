@@ -9,12 +9,10 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
-from semantic_cache_mcp.types import EmbeddingVector
 
 
 class TestFullCacheLifecycle:
@@ -118,43 +116,6 @@ class TestFullCacheLifecycle:
 
         assert result.is_diff is False
         assert "def hello():" in result.content
-
-
-class TestSemanticSimilarity:
-    """Test semantic similarity detection between files."""
-
-    async def test_similar_file_detected(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """Similar files should be detected via embeddings."""
-        db_path = temp_dir / "cache.db"
-
-        # Create two similar files
-        file1 = temp_dir / "utils.py"
-        file1.write_text("def process_data(x):\n    return x * 2\n")
-
-        file2 = temp_dir / "helpers.py"
-        file2.write_text("def transform_data(x):\n    return x * 3\n")
-
-        # Mock embeddings to return similar vectors
-        call_count = [0]
-
-        def mock_embed(text: str) -> EmbeddingVector:
-            call_count[0] += 1
-            # Return same embedding for both files (simulating similarity)
-            return mock_embeddings
-
-        with patch("semantic_cache_mcp.cache.embed", side_effect=mock_embed):
-            cache = SemanticCache(db_path=db_path)
-
-            # Cache first file
-            await smart_read(cache, str(file1))
-
-            # Read second file - should detect similarity
-            result = await smart_read(cache, str(file2))
-
-            # Embeddings should have been generated
-            assert call_count[0] >= 2
 
 
 class TestStatsAndClear:

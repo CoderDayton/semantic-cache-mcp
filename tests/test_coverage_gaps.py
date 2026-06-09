@@ -308,16 +308,6 @@ class TestConfigValidation:
         ):
             config._validate_config()
 
-    def test_validate_config_catches_bad_embedding_device(self) -> None:
-        """Invalid EMBEDDING_DEVICE should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "EMBEDDING_DEVICE", "tpu"),
-            pytest.raises(ValueError, match="EMBEDDING_DEVICE"),
-        ):
-            config._validate_config()
-
     def test_validate_config_catches_bad_similarity_threshold(self) -> None:
         """SIMILARITY_THRESHOLD outside (0, 1) should raise."""
         from semantic_cache_mcp import config

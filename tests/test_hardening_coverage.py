@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import array
 import os
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -16,14 +14,7 @@ from semantic_cache_mcp.cache import SemanticCache, compare_files, glob_with_cac
 from semantic_cache_mcp.cache._helpers import _format_file
 from semantic_cache_mcp.cache.search import semantic_search
 from semantic_cache_mcp.cache.write import _atomic_write, smart_edit
-from semantic_cache_mcp.core.similarity._cosine import (
-    _select_pruning_dims,
-    cosine_similarity_batch,
-    cosine_similarity_batch_matrix,
-    top_k_similarities,
-)
 from semantic_cache_mcp.storage.sqlite import ConnectionPool
-from tests.constants import TEST_EMBEDDING_DIM
 
 # ---------------------------------------------------------------------------
 # _helpers.py — special file rejection in _format_file
@@ -54,102 +45,6 @@ class TestFormatFileSpecialFileRejection:
         result = await _format_file(py_file)
         # Result depends on whether ruff is installed; we just verify no crash
         assert isinstance(result, bool)
-
-
-# ---------------------------------------------------------------------------
-# _cosine.py — np.partition pruning, pre-alloc, top_k_similarities
-# ---------------------------------------------------------------------------
-
-
-class TestPruningDimsPartition:
-    """Cover lines 258-262: np.partition pruning path."""
-
-    def test_adaptive_pruning_with_partition(self) -> None:
-        """fraction < 1.0 and adaptive=True triggers np.partition."""
-        query = np.array([0.1, 0.5, 0.01, 0.8, 0.3, 0.02, 0.9, 0.4], dtype=np.float32)
-        mask = _select_pruning_dims(query, fraction=0.5, adaptive=True)
-        assert mask.dtype == bool
-        assert mask.sum() > 0
-        # Should keep the high-magnitude dimensions
-        assert mask[6]  # 0.9
-
-    def test_adaptive_pruning_fallback_to_ones(self) -> None:
-        """prune_count == 0 (fraction ~1.0) falls through to np.ones."""
-        query = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
-        mask = _select_pruning_dims(query, fraction=0.99, adaptive=True)
-        assert mask.all()
-
-
-class TestPreAllocatedMatrices:
-    """Cover pre-allocated matrix paths in cosine_similarity_batch[_matrix]."""
-
-    def test_batch_with_array_array(self) -> None:
-        """cosine_similarity_batch with array.array inputs uses pre-alloc."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(5)
-        ]
-        result = cosine_similarity_batch(query, vectors, use_pruning=False)
-        assert len(result) == 5
-        assert all(isinstance(s, float) for s in result)
-
-    def test_batch_matrix_with_array_array(self) -> None:
-        """cosine_similarity_batch_matrix with array.array uses pre-alloc."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(5)
-        ]
-        result = cosine_similarity_batch_matrix(query, vectors)
-        assert len(result) == 5
-
-
-class TestTopKSimilarities:
-    """Cover argpartition paths in top_k_similarities."""
-
-    def test_top_k_similarities_k_less_than_n(self) -> None:
-        """top_k_similarities uses argpartition when k < len(vectors)."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-            for _ in range(20)
-        ]
-        results = top_k_similarities(query, vectors, k=3)
-        assert len(results) == 3
-        sims = [s for _, s in results]
-        assert sims == sorted(sims, reverse=True)
-
-    def test_top_k_similarities_k_equals_n(self) -> None:
-        """top_k_similarities falls back to argsort when k == n."""
-        dim = 16
-        rng = np.random.default_rng(42)
-        query = array.array("f", rng.standard_normal(dim).astype(np.float32).tolist())
-        vectors = [
-            array.array("f", rng.standard_normal(dim).astype(np.float32).tolist()) for _ in range(3)
-        ]
-        results = top_k_similarities(query, vectors, k=3)
-        assert len(results) == 3
-
-    def test_top_k_returns_exactly_k(self) -> None:
-        """top_k_similarities must return exactly k results when k < n."""
-        rng = np.random.default_rng(42)
-        query = rng.standard_normal(64).astype(np.float32)
-        query /= np.linalg.norm(query)
-        embeddings = rng.standard_normal((20, 64)).astype(np.float32)
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings /= np.where(norms > 0, norms, 1.0)
-
-        for k in (1, 3, 5, 10):
-            results = top_k_similarities(query, embeddings, k=k)
-            assert len(results) == k
-            # Must be sorted descending by similarity
-            sims = [s for _, s in results]
-            assert sims == sorted(sims, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +200,7 @@ class TestDirectoryFilterBypass:
         await smart_read(semantic_cache, str(project / "good.py"), max_size=100000)
         await smart_read(semantic_cache, str(project_evil / "evil.py"), max_size=100000)
 
-        with patch(
-            "semantic_cache_mcp.cache.search.embed_query",
-            return_value=array.array("f", [0.1] * TEST_EMBEDDING_DIM),
-        ):
-            result = await semantic_search(
-                semantic_cache, query="test", k=10, directory=str(project)
-            )
+        result = await semantic_search(semantic_cache, query="test", k=10, directory=str(project))
 
         paths = [m.path for m in result.matches]
         for p in paths:
@@ -387,11 +276,7 @@ class TestSearchKValidation:
 
     async def test_k_zero_clamped(self, semantic_cache: SemanticCache) -> None:
         """k=0 clamped to 1 instead of returning empty."""
-        with patch(
-            "semantic_cache_mcp.cache.search.embed_query",
-            return_value=array.array("f", [0.1] * TEST_EMBEDDING_DIM),
-        ):
-            result = await semantic_search(semantic_cache, query="test", k=0)
+        result = await semantic_search(semantic_cache, query="test", k=0)
         assert result.matches is not None
 
 
@@ -815,31 +700,28 @@ class TestSemanticSearchDirectoryFilter:
         """Files outside the directory filter should be excluded."""
         from concurrent.futures import ThreadPoolExecutor
 
-        with patch("semantic_cache_mcp.cache.search.embed_query") as mock_embed:
-            mock_embed.return_value = list(np.zeros(64, dtype=np.float32))
+        mock_cache = MagicMock()
+        mock_cache._io_executor = ThreadPoolExecutor(max_workers=1)
+        mock_storage = MagicMock()
+        mock_cache._storage = mock_storage
 
-            mock_cache = MagicMock()
-            mock_cache._io_executor = ThreadPoolExecutor(max_workers=1)
-            mock_storage = MagicMock()
-            mock_cache._storage = mock_storage
+        # Return files in different directories; all outside /nonexistent/dir
+        mock_storage.search_by_query = AsyncMock(
+            return_value=[
+                ("/home/user/project/a.py", "preview a", 0.9),
+                ("/other/path/b.py", "preview b", 0.8),
+            ]
+        )
+        mock_storage.get_stats = AsyncMock(return_value={"files_cached": 2})
 
-            # Return files in different directories; all outside /nonexistent/dir
-            mock_storage.search_hybrid = AsyncMock(
-                return_value=[
-                    ("/home/user/project/a.py", "preview a", 0.9),
-                    ("/other/path/b.py", "preview b", 0.8),
-                ]
-            )
-            mock_storage.get_stats = AsyncMock(return_value={"files_cached": 2})
-
-            # All filtered out → empty result
-            result = await semantic_search(
-                mock_cache,
-                query="test",
-                k=5,
-                directory="/nonexistent/dir",
-            )
-            assert len(result.matches) == 0
+        # All filtered out → empty result
+        result = await semantic_search(
+            mock_cache,
+            query="test",
+            k=5,
+            directory="/nonexistent/dir",
+        )
+        assert len(result.matches) == 0
 
 
 class TestMcpCacheNoneGuard:

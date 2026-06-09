@@ -257,7 +257,6 @@ class TestRecordDiff:
             diff_content="diff",
             diff_stats={"insertions": 1},
             tokens_saved=300,
-            similarity=0.85,
             from_cache=(True, False),
         )
         metrics.record("diff", result)

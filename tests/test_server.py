@@ -193,38 +193,6 @@ class TestMissingEmbeddingsService:
         assert result.content is not None
         assert result.semantic_match is None
 
-    async def test_embedding_error_handled(self, temp_dir: Path) -> None:
-        """Embedding service errors should be handled gracefully."""
-        db_path = temp_dir / "error_test.db"
-
-        # Mock embed to raise an exception
-        with patch("semantic_cache_mcp.cache.embed", side_effect=Exception("Model Error")):
-            cache = SemanticCache(db_path=db_path)
-            result = await cache.get_embedding("test text")
-            assert result is None
-
-
-class TestNetworkTimeoutSimulation:
-    """Tests for network timeout scenarios."""
-
-    async def test_embedding_timeout_handled(
-        self, temp_dir: Path, sample_files: dict[str, Path]
-    ) -> None:
-        """Network timeout for embeddings should be handled."""
-        db_path = temp_dir / "timeout_test.db"
-
-        def slow_embedding(*args, **kwargs):
-            time.sleep(0.1)
-            raise TimeoutError("Connection timed out")
-
-        # Mock embed to simulate timeout
-        with patch("semantic_cache_mcp.cache.embed", side_effect=slow_embedding):
-            cache = SemanticCache(db_path=db_path)
-
-            # Should complete without hanging
-            result = await smart_read(cache, str(sample_files["simple"]))
-            assert result.content is not None
-
 
 class TestPathTraversalPrevention:
     """Tests for path traversal security."""

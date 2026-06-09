@@ -6,7 +6,6 @@ import array
 import math
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -83,17 +82,11 @@ class TestSemanticSearch:
 
     async def test_search_finds_cached_files(self, cache: SemanticCache, sample_files: dict):
         """Search finds files after they're cached."""
-        mock_emb = _make_embedding()
-        with (
-            patch("semantic_cache_mcp.cache.embed", return_value=mock_emb),
-            patch("semantic_cache_mcp.cache.search.embed_query", return_value=mock_emb),
-        ):
-            # Cache files first (with mocked embeddings)
-            await smart_read(cache, str(sample_files["py"]))
-            await smart_read(cache, str(sample_files["txt"]))
+        await smart_read(cache, str(sample_files["py"]))
+        await smart_read(cache, str(sample_files["txt"]))
 
-            result = await semantic_search(cache, "function definition", k=5)
-            assert result.cached_files >= 1
+        result = await semantic_search(cache, "function definition", k=5)
+        assert result.cached_files >= 1
 
     async def test_search_respects_k_limit(self, cache: SemanticCache, sample_files: dict):
         """Search respects k parameter."""
@@ -149,11 +142,6 @@ class TestCompareFiles:
 
         result = await compare_files(cache, str(sample_files["py"]), str(sample_files["py2"]))
         assert result.from_cache == (True, True)
-
-    async def test_diff_computes_similarity(self, cache: SemanticCache, sample_files: dict):
-        """Diff computes semantic similarity."""
-        result = await compare_files(cache, str(sample_files["py"]), str(sample_files["py2"]))
-        assert 0.0 <= result.similarity <= 1.0
 
     async def test_diff_touched_file_still_uses_cache(self, cache: SemanticCache, temp_dir: Path):
         """Touch-only mtime changes should not drop a cache hit."""

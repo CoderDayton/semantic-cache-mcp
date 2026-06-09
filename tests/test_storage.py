@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import array
 import time
 from pathlib import Path
 
 from semantic_cache_mcp.storage.vector import VectorStorage
-from semantic_cache_mcp.types import EmbeddingVector
-from tests.constants import TEST_EMBEDDING_DIM
 
 
 class TestFileOperations:
@@ -47,21 +44,6 @@ class TestFileOperations:
 
         retrieved = await storage.get_content(entry)
         assert retrieved == content
-
-    async def test_put_with_embedding(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """put with embedding should store the file with embedding."""
-        storage = VectorStorage(temp_dir / "test.db")
-        path = "/test/embedded.txt"
-        content = "Content with embedding"
-        mtime = time.time()
-
-        await storage.put(path, content, mtime, embedding=mock_embeddings)
-        entry = await storage.get(path)
-
-        assert entry is not None
-        assert entry.path == path
 
     async def test_record_access_updates_history(self, temp_dir: Path) -> None:
         """record_access should add to access_history."""
@@ -115,43 +97,6 @@ class TestCacheEviction:
         assert entry1 is not None
         assert entry2 is not None
         assert len(entry1.access_history) > len(entry2.access_history)
-
-
-class TestSemanticSearch:
-    """Tests for semantic similarity search."""
-
-    async def test_find_similar_returns_best_match(
-        self,
-        temp_dir: Path,
-        mock_embeddings: EmbeddingVector,
-        mock_embeddings_similar: EmbeddingVector,
-    ) -> None:
-        """find_similar should return the most similar file."""
-        storage = VectorStorage(temp_dir / "test.db")
-        await storage.put("/test/reference.txt", "Reference content", time.time(), mock_embeddings)
-
-        result = await storage.find_similar(mock_embeddings_similar)
-        assert result == "/test/reference.txt"
-
-    async def test_find_similar_excludes_path(
-        self, temp_dir: Path, mock_embeddings: EmbeddingVector
-    ) -> None:
-        """find_similar should exclude specified path."""
-        storage = VectorStorage(temp_dir / "test.db")
-        await storage.put("/test/file1.txt", "Content 1", time.time(), mock_embeddings)
-        await storage.put("/test/file2.txt", "Content 2", time.time(), mock_embeddings)
-
-        result = await storage.find_similar(mock_embeddings, exclude_path="/test/file1.txt")
-        assert result == "/test/file2.txt"
-
-    async def test_find_similar_no_embeddings(self, temp_dir: Path) -> None:
-        """find_similar should return None when no files have embeddings."""
-        storage = VectorStorage(temp_dir / "test.db")
-        await storage.put("/test/file.txt", "Content", time.time())  # No embedding
-
-        mock_emb = array.array("f", [0.1] * TEST_EMBEDDING_DIM)
-        result = await storage.find_similar(mock_emb)
-        assert result is None
 
 
 class TestStatisticsAndManagement:
