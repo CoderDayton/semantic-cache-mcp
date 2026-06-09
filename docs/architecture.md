@@ -6,7 +6,7 @@
 src/semantic_cache_mcp/
 ├── config.py               # Constants and environment-variable configuration
 ├── types.py                # All shared data models (ReadResult, WriteResult, etc.)
-├── cache/                  # Orchestration facade — coordinates all components
+├── cache/                  # Orchestration facade, coordinates all components
 │   ├── __init__.py         # Public API re-exports
 │   ├── store.py            # SemanticCache class: storage and metrics coordination
 │   ├── read.py             # smart_read, batch_smart_read
@@ -14,12 +14,12 @@ src/semantic_cache_mcp/
 │   ├── search.py           # semantic_search, glob_with_cache_status, compare_files
 │   ├── metrics.py          # SessionMetrics: per-session and lifetime metric tracking
 │   └── _helpers.py         # Internal utilities: _suppress_large_diff, formatter dispatch
-├── server/                 # MCP interface — thin translation layer only
+├── server/                 # MCP interface, thin translation layer only
 │   ├── __init__.py
 │   ├── _mcp.py             # FastMCP app instance, lifespan, startup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
 │   └── tools/              # All 13 MCP tool definitions + _shielded_write helper
-├── core/                   # Pure algorithms — stateless, zero I/O
+├── core/                   # Pure algorithms, stateless, zero I/O
 │   ├── __init__.py         # Flat re-exports from all sub-packages
 │   ├── chunking/           # Content-defined chunking (used for large file splitting)
 │   │   ├── __init__.py
@@ -35,32 +35,32 @@ src/semantic_cache_mcp/
 │   └���─ tokenizer.py        # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
-    ├── vector/             # VectorStorage: simplevecdb (SQLite + FTS5 keyword store)
+    ├── docstore/           # ContentStorage: vendored SQLite + FTS5 keyword store
     └── sqlite.py           # SQLiteStorage: session metrics persistence only
 ```
 
 ## Design Principles
 
-- **Separation of concerns** — `core/` is stateless pure algorithms; `storage/` is persistence only; `cache/` orchestrates; `server/` translates MCP ↔ Python
-- **Dependency injection** — storage and config passed explicitly; no hidden globals
-- **Facade pattern** — `cache/` exposes a clean API; callers never touch `storage/` directly
-- **Performance first in hot paths** — hashing, chunking, and tokenization are optimized; everything else prioritizes clarity
+- **Separation of concerns.** `core/` is stateless pure algorithms, `storage/` is persistence only, `cache/` orchestrates, and `server/` translates between MCP and Python
+- **Dependency injection.** Storage and config are passed explicitly, with no hidden globals
+- **Facade pattern.** `cache/` exposes a clean API, and callers never touch `storage/` directly
+- **Performance first in hot paths.** Hashing, chunking, and tokenization are optimized, and everything else favors clarity
 
 ---
 
-## Storage (`storage/vector/`)
+## Storage (`storage/docstore/`)
 
-### VectorStorage (simplevecdb)
+### ContentStorage (vendored SQLite + FTS5)
 
-The primary storage backend uses [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB) as a text + metadata store:
+The storage backend is a small SQLite store with FTS5, vendored into the package as `DocStore`. It holds text and metadata only:
 
-- **FTS5 full-text search** — BM25 keyword search powering `search` and grep
-- **Raw text storage** — File contents stored as plain text in `page_content` (no compression)
-- **Metadata filtering** — path/chunk lookups via the SQLite catalog
+- **FTS5 full-text search.** BM25 keyword ranking powers `search` and `grep`
+- **Raw text storage.** File contents are stored as plain text in `page_content`, with no compression
+- **Metadata filtering.** Path and chunk lookups go through JSON metadata columns
 
 ### Document Model
 
-Files are stored as simplevecdb `Document` objects:
+Files are stored as `Document` rows:
 
 ```
 Small file (< 8KB):
@@ -88,17 +88,18 @@ Each document carries metadata for cache management:
 | `tokens` | `int` | Token count (BPE o200k_base) |
 | `chunk_index` | `int` | Chunk ordering (-1 for parent) |
 | `total_chunks` | `int` | Number of chunks (1 for small files) |
-| `access_history` | `JSON` | Last 5 access timestamps (LRU-K) |
+| `access_history` | `JSON` | Recent access timestamps, used by W-TinyLFU eviction |
 | `is_parent` | `bool` | Parent document marker (large files only) |
 | `preview` | `str` | First ~200 chars of file content, pre-stored at index time so search results don't re-slice chunked `page_content` at query time |
 
-### LRU-K Eviction (K=2)
+### W-TinyLFU Eviction
 
-When `MAX_CACHE_ENTRIES` is exceeded, eviction uses the **K-th most recent** access time rather than the most recent:
+When `MAX_CACHE_ENTRIES` is exceeded, eviction uses W-TinyLFU, the policy Caffeine uses, which scores entries by both frequency and recency:
 
-- A file accessed only once has no second access time → evicted first
-- A file accessed regularly has a recent second access time → retained
-- This correctly handles large one-time reads (e.g., grepping) without polluting the cache
+- Frequency comes from a small 4-bit Count-Min sketch that ages over time, so a file read many times is kept even when it was not the most recent
+- Recency keeps a freshly read file from being dropped before it has a chance to prove useful
+- The in-memory index bootstraps from each entry's `access_history` metadata on first need, so it survives a restart without a separate table
+- This keeps a large one-time read (for example a wide grep seed) from pushing out the files you actually work on
 
 ### Session Metrics (`storage/sqlite.py`)
 
@@ -110,7 +111,7 @@ Separate SQLite database for token savings, cache hits/misses, and tool call cou
 
 ### Chunking (`core/chunking/`)
 
-#### Serial HyperCDC — `_gear.py`
+#### Serial HyperCDC (`_gear.py`)
 
 Content-defined chunking using a Gear hash rolling window:
 
@@ -122,7 +123,7 @@ Content-defined chunking using a Gear hash rolling window:
 
 Key property: similar files produce identical chunks even when bytes shift position, enabling efficient re-chunking on file changes.
 
-#### SIMD Parallel CDC — `_simd.py`
+#### SIMD Parallel CDC (`_simd.py`)
 
 Faster chunking via CPU-core-level parallelism:
 
@@ -138,9 +139,9 @@ Faster chunking via CPU-core-level parallelism:
 
 BLAKE3 primary, BLAKE2b fallback. LRU-cached to avoid re-hashing identical data.
 
-- **Content hash freshness** — detects mtime changes with identical content (touch, git checkout)
-- **Deduplication** — `DeduplicateIndex` for fingerprint-based dedup
-- **Change detection** — cached vs current content hash
+- **Content hash freshness.** Detects mtime changes with identical content (touch, git checkout)
+- **Deduplication.** `DeduplicateIndex` for fingerprint-based dedup
+- **Change detection.** Cached versus current content hash
 
 ---
 
@@ -157,28 +158,28 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 
 ### Text (`core/text/`)
 
-#### `_diff.py` — Diff and Delta Compression
+#### `_diff.py`: Diff and Delta Compression
 
 - Unified diffs via Python `difflib` with diff statistics (insertions, deletions, modifications)
-- Delta compression: store only changed lines (10–100× smaller for small edits to large files)
+- Delta compression: store only changed lines (10 to 100x smaller for small edits to large files)
 - `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow
 
-#### `_summarize.py` — Semantic Summarization
+#### `_summarize.py`: Semantic Summarization
 
 Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files exceed the size budget:
 
 **Algorithm:**
 1. Split file at semantic boundaries (function/class definitions, paragraphs)
 2. Score each segment:
-   - **Position score**: U-shaped curve — highest at start and end, lowest in middle
+   - **Position score**: U-shaped curve, highest at the start and end, lowest in the middle
    - **Density score**: unique token ratio + syntax character density + non-whitespace ratio
 3. Greedily select highest-scoring segments that fit the budget
 4. Always preserve the first segment (docstrings, imports, module header)
 5. Reassemble selected segments in original order; `# ... [N lines omitted] ...` markers
    are emitted only when `SummarizationConfig.include_markers=True` (default `False`
-   since 0.4.6 — markers added no LLM-visible value and consumed token budget)
+   since 0.4.6, because markers added no LLM-visible value and consumed token budget)
 
-**Result:** 50–80% token savings on large files vs simple truncation, while preserving code skeleton and intent.
+**Result:** 50 to 80% token savings on large files versus simple truncation, while preserving the code skeleton and intent.
 
 ---
 
@@ -190,24 +191,24 @@ The server runs a single asyncio event loop. Blocking operations are offloaded t
 
 | Executor | Workers | Used for |
 |----------|---------|----------|
-| **IO executor** | 1 | `VectorStorage` catalog ops + `sync_coll.save()` — single-threaded because usearch is not safe under concurrent access |
+| **IO executor** | 1 | All `ContentStorage` reads and writes. Single-threaded so the one SQLite connection is never touched concurrently |
 | **Default executor** | N (OS-dependent) | `summarize_semantic()` and other CPU-bound work |
-| **Async subprocess** | — | `_format_file()` (ruff, prettier, etc.) |
+| **Async subprocess** | n/a | `_format_file()` (ruff, prettier, etc.) |
 
-Storage operations run on a dedicated single-thread executor because usearch (simplevecdb's index) is not safe under concurrent access from multiple threads.
+Storage operations run on a dedicated single-thread executor so the single SQLite connection is only ever used from one thread, which keeps writes serialized and safe.
 
 ### Graceful Shutdown
 
 On SIGTERM/SIGINT:
 
-1. `cache.request_shutdown()` — sets `_shutting_down` flag, new `begin_operation()` calls return `False`
-2. Signal handler cancels all asyncio tasks — `CancelledError` propagates, running `finally` blocks
-3. Write/edit tool handlers use `asyncio.shield()` via `_shielded_write()` — the inner task completes even if the outer handler is cancelled
+1. `cache.request_shutdown()` sets the `_shutting_down` flag, and new `begin_operation()` calls return `False`
+2. The signal handler cancels all asyncio tasks, so `CancelledError` propagates and runs `finally` blocks
+3. Write and edit tool handlers use `asyncio.shield()` via `_shielded_write()`, so the inner task completes even if the outer handler is cancelled
 4. Lifespan `finally` calls `async_close()`:
    - Waits up to 8 seconds for in-flight operations to drain (`_drained` event)
    - Catches `CancelledError` during drain so close always proceeds
-   - Persists session metrics → closes VectorStorage → closes SQLite pool → shuts down IO executor
-5. All `VectorStorage` async methods guard `_closed` — return safe defaults instead of crashing
+   - Persists session metrics, then closes ContentStorage, then the SQLite pool, then the IO executor
+5. All `ContentStorage` async methods guard `_closed` and return safe defaults instead of crashing
 6. Second signal forces `os._exit()` for hard termination
 
 ---
@@ -275,7 +276,7 @@ Client ──→ smart_write(path, content)
         ▼                  ▼
    write to disk      update cache
         │                  │
-        │             store in VectorStorage
+        │             store in ContentStorage
         │
    return diff (not full content)
 ```
@@ -287,10 +288,10 @@ query ──→ semantic_search(cache, query, k, directory)
               │
        ┌──────┴──────────────────────────┐
        ▼                                 ▼
- in-session result cache hit?      MISS — BM25 retrieve
+ in-session result cache hit?      MISS, BM25 retrieve
  (LRU keyed on q,k,dir)                  │
    YES → return immediately       BM25 keyword search (FTS5 full-text)
-   (< 0.01 ms — 2,000×+ faster            │
+   (< 0.01 ms, 2,000×+ faster            │
     than a cold search)            deduplicate by path
                                          │
                                   store in result LRU
@@ -300,7 +301,7 @@ query ──→ semantic_search(cache, query, k, directory)
 ```
 
 The in-session result LRU lives on `SemanticCache._search_cache` (32-entry
-`OrderedDict`). It is invalidated on every cache mutation — `put`, `clear`,
+`OrderedDict`). It is invalidated on every cache mutation: `put`, `clear`,
 `delete_path`, and `update_mtime` all call `_bump_search_cache()`, which
 clears the LRU. So callers never see a result that predates a write.
 

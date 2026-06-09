@@ -5,45 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-06-09
+## [0.5.0] - 2026-06-09: Biggest release yet, a near-complete rewrite
 
-Removes the embedding/vector layer entirely. `search` is now BM25 keyword-only.
-Every token-saving feature — chunking, chunk reassembly, the content/metadata
-cache, grep, glob, diff, and semantic summarization — is unchanged. The process
-no longer loads an ONNX embedding model (~400 MB lighter) and ships fewer
-dependencies.
+This is the biggest release so far. The embedding and vector search code is gone,
+the third-party vector database is replaced by a small SQLite + FTS5 store we
+vendor ourselves, the storage package is renamed, reads get a new hash check that
+lets the cache skip work, all the tool descriptions are rewritten, and the MCP
+framework is bumped. Nothing that saves tokens was lost: chunking, chunk
+reassembly, the content cache, `grep`, `glob`, `diff`, and summarization all work
+the same as before. The server uses about 400 MB less memory now that it never
+loads an ONNX model, it starts faster, and it depends on only three packages at
+runtime.
 
-### Removed
+### Added
 
-- **Embedding/vector search.** Deleted `core/embeddings/` (FastEmbed/ONNX, the
-  OpenAI-compatible provider, and the HuggingFace model registry) and
-  `core/similarity/` (cosine). `search` now always uses BM25; vector similarity
-  (`find_similar`, `search_hybrid`, per-file embeddings) is gone. The `diff`
-  tool keeps its textual diff but no longer reports a `similarity` score.
-- **Dependencies.** Dropped `fastembed`, `openai`, and the `[gpu]` extra
-  (`fastembed-gpu` / `onnxruntime`). `simplevecdb` and `numpy` are retained.
-- **Config.** Removed `EMBEDDING_DEVICE`, `EMBEDDING_MODEL`,
-  `OPENAI_EMBEDDINGS_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
-  `OPENAI_EMBEDDING_MODEL`, and `OPENAI_EMBEDDING_DIMENSIONS`.
-- **Stats.** The `embedding` block (`model` / `provider` / `ready`) is gone from
-  the `stats` payload; process RSS is still reported.
+- Hash-driven read freshness. Every `read` returns a `content_hash`, and `read`
+  takes an optional `known_hash`. Send back the hash you already have and the
+  server answers `unchanged: true` instead of resending the file. The caller
+  knows that hash for sure, so there is no guessing about what was sent earlier
+  in the session. Ranged reads with `offset`/`limit` do the same thing with just
+  a stat and no file read when the hash matches and the file has not changed.
 
 ### Changed
 
-- **Storage is text-only.** The simplevecdb collection now opens with
-  `store_embeddings=False`; documents are written with a constant stub vector and
-  no model is loaded. BM25 `keyword_search`, `get_documents`, chunking, and
-  parent/child reassembly are unchanged.
-- **Bumped `simplevecdb` minimum to 2.6.2.** Picks up storage-layer correctness
-  fixes: a catalog write-lock leak that could deadlock the database,
-  `rebuild_index` no longer bricking a collection on a failed rebuild, and
-  catalog read paths serializing on the connection lock for thread-safety.
+- `search` is BM25 keyword only. It ranks cached files by how well their words
+  match the query and returns a score from 0 to 1, where the best match is 1.0.
+  It matches on words, not meaning, so use `grep` for exact strings and
+  `batch_read` to pull more files into the cache.
+- A small SQLite + FTS5 store replaces `simplevecdb`. A focused `DocStore` and
+  `AsyncDocStore` now back storage, using FTS5 `bm25()` ranking and JSON metadata
+  filters copied straight from the old catalog code. There is no embedding
+  column, no stub vector, no usearch index, and no crash-recovery sidecar files,
+  since SQLite WAL handles crash safety on its own.
+- The storage package was renamed. `storage/vector` is now `storage/docstore`,
+  `VectorStorage` is now `ContentStorage`, `VECDB_PATH` is now `CONTENT_DB_PATH`,
+  and the cache file `vecdb.db` is now `docstore.db`.
+- Diffs do more of the work now. The `read` diff gate went from 0.6 to 0.9, with
+  a floor at 200 tokens, so a small edit to a medium or large file comes back as
+  a diff with the changed line numbers instead of the whole file. Tiny files
+  still come back in full.
+- All 13 tool descriptions were rewritten so they read as one workflow: `glob` to
+  find files, `batch_read` to cache them, `search` or `grep` to look inside,
+  `read` to open, then `edit` or `write` to change. They share the same wording
+  for errors and statuses, and they describe what the tools actually do,
+  including the BM25 fix for `search`.
+- `fastmcp` was upgraded to 3.2 or newer (3.4.2). Parameter docs now show up as
+  real per-argument descriptions instead of one long blob.
+
+### Removed
+
+- Embedding and vector search. Deleted `core/embeddings` (FastEmbed/ONNX, the
+  OpenAI-compatible provider, and the HuggingFace model registry) and
+  `core/similarity` (cosine). Vector similarity (`find_similar`, `search_hybrid`,
+  per-file embeddings) is gone, and `diff` no longer reports a similarity score.
+- Dependencies. Dropped `fastembed`, `openai`, the gpu extra (`fastembed-gpu` and
+  `onnxruntime`), and now `simplevecdb`, `usearch`, and `sqlcipher3-binary` too.
+  The runtime now needs only `blake3`, `fastmcp`, and `numpy`.
+- Config. Removed `EMBEDDING_DEVICE`, `EMBEDDING_MODEL`,
+  `OPENAI_EMBEDDINGS_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+  `OPENAI_EMBEDDING_MODEL`, and `OPENAI_EMBEDDING_DIMENSIONS`.
+- Stats. The embedding block (`model`, `provider`, `ready`) is gone from the
+  `stats` payload. Process RSS is still reported.
 
 ### Migration
 
-- On first start after upgrade, a one-time wipe deletes the legacy
-  embedding-backed `vecdb.db` (and its sidecars) and writes a `.vectors_removed`
-  sentinel. The cache is fully rebuildable and repopulates on demand.
+- The first time you start after upgrading, the cache runs a one-time cleanup
+  that deletes the old `vecdb.db` files (simplevecdb plus usearch, and the
+  short-lived FTS build) and their sidecars, guarded by a `.docstore_v1` marker.
+  The cache rebuilds itself on demand into `docstore.db`.
 
 ## [0.4.9] - 2026-05-30
 

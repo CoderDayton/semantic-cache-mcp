@@ -24,7 +24,7 @@
     <img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" />
   </a>
   <a href="https://github.com/modelcontextprotocol/python-sdk">
-    <img src="https://img.shields.io/badge/FastMCP-3.0-00A67E?style=for-the-badge" alt="FastMCP 3.0" />
+    <img src="https://img.shields.io/badge/FastMCP-3.2%2B-00A67E?style=for-the-badge" alt="FastMCP 3.2+" />
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" />
@@ -33,15 +33,15 @@
 
 ---
 
-**Cut your MCP client's token usage by 98% on cached reads. Respond in milliseconds.**
+**Cut your MCP client's token usage by about 98% on cached reads, and get answers back in milliseconds.**
 
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that replaces redundant full-file reads with marker hits, unified diffs, and semantic summaries. Thirteen tools (read, read_image, batch_read, write, edit, edit_preview, batch_edit, search, grep, glob, delete, clear, stats) route every file operation through one cache-aware layer, so an MCP-capable agent skips files it has already seen.
+Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that puts every file operation behind one cache. The first read of a file seeds the cache and returns a content hash. After that, an unchanged file comes back as a short `unchanged` reply instead of the whole file, a changed file comes back as a unified diff, and a file that is too large is summarized down to its structure. Search and grep run over the same cached files, so the agent searches what it already read instead of going back to disk. Thirteen tools (`read`, `read_image`, `batch_read`, `write`, `edit`, `edit_preview`, `batch_edit`, `search`, `grep`, `glob`, `delete`, `clear`, `stats`) share that one cache-aware layer.
 
 ---
 
 ## Why this exists
 
-**1. Reads stop costing tokens.** The first read seeds the cache. Re-reads of unchanged files return a 5-token marker (`mtime` match, no disk I/O). Modified files return a unified diff. Files larger than the budget collapse to a semantic skeleton that preserves structure rather than slicing at a byte offset.
+**1. Reads stop costing tokens.** The first read seeds the cache and hands back a `content_hash`. Send that hash back on the next read (as `known_hash`) and the server replies `unchanged` without resending the file. A modified file returns a unified diff with the changed line numbers. A file larger than the budget collapses to a structure-preserving summary instead of a blind cut at a byte offset.
 
 **2. Search and grep run on the cache, not the disk.** Keyword search (BM25), glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
 
@@ -53,7 +53,7 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 Add to Claude Code settings (`~/.claude.json`):
 
-**Option 1** — `uvx` (always runs latest version):
+**Option 1**: `uvx` (always runs the latest version):
 
 ```json
 {
@@ -66,7 +66,7 @@ Add to Claude Code settings (`~/.claude.json`):
 }
 ```
 
-**Option 2** — `uv tool install`:
+**Option 2**: `uv tool install`:
 
 ```bash
 uv tool install semantic-cache-mcp
@@ -88,7 +88,7 @@ Restart Claude Code.
 
 Disable the client's built-in file tools so all file I/O routes through semantic-cache.
 
-**Claude Code** — add to `~/.claude/settings.json`:
+**Claude Code**: add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -98,7 +98,7 @@ Disable the client's built-in file tools so all file I/O routes through semantic
 }
 ```
 
-**OpenCode** — add to `~/.config/opencode/opencode.json`:
+**OpenCode**: add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -128,8 +128,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Single-file cache-aware read. Returns full content on first read, unchanged markers on cache hits, diffs on modifications, and supports `offset`/`limit` for targeted recovery. |
-| `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP) — not by extension. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
+| `read` | Single-file cache-aware read. Returns full content plus a `content_hash` on the first read, a short `unchanged` reply when you pass back a matching `known_hash`, and a diff when the file changed. Supports `offset`/`limit` for targeted line recovery. |
+| `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not by extension. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
 | `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. For multiple edits to the same file, prefer `batch_edit`. |
@@ -140,7 +140,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `search` | Cache-only BM25 keyword search — rank cached files by relevance to a query. Seed likely files first with `batch_read`. |
+| `search` | Cache-only BM25 keyword search that ranks cached files by relevance to a query. Seed likely files first with `batch_read`. |
 | `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
 | `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
 | `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
@@ -159,25 +159,25 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 The table above is the authoritative tool map. This section only shows the common call shapes.
 
 <details>
-<summary><strong>read</strong> — Single file, automatic caching</summary>
+<summary><strong>read</strong>: single file, automatic caching</summary>
 
 ```
 read path="/src/app.py"                        # automatic: full, unchanged, or diff
-read path="/src/app.py" offset=120 limit=80    # lines 120–199 only
+read path="/src/app.py" offset=120 limit=80    # lines 120 to 199 only
 ```
 
-**Automatic three states:**
+**Three states, picked for you:**
 
 | State | Response | Token cost |
 |-------|----------|------------|
-| First read | Full content + cached | Normal |
-| Unchanged | `"File unchanged (1,234 tokens cached)"` | ~5 tokens |
-| Modified | Unified diff only | 5–20% of original |
+| First read | Full content plus a `content_hash` | Normal |
+| Unchanged | `unchanged: true`, returned when you pass back a matching `known_hash` | A few tokens |
+| Modified | Unified diff only | 5 to 20% of original |
 
 </details>
 
 <details>
-<summary><strong>write</strong> — Create or overwrite files</summary>
+<summary><strong>write</strong>: create or overwrite files</summary>
 
 ```
 write path="/src/new.py" content="..."
@@ -189,17 +189,17 @@ write path="/src/large.py" content="...chunk2..." append=true    # subsequent ch
 </details>
 
 <details>
-<summary><strong>edit</strong> — Find/replace with three modes</summary>
+<summary><strong>edit</strong>: find/replace with three modes</summary>
 
 ```
-# Mode A — find/replace: searches entire file
+# Mode A: find/replace, searches the entire file
 edit path="/src/app.py" old_string="def foo():" new_string="def foo(x: int):"
 edit path="/src/app.py" old_string="..." new_string="..." replace_all=true auto_format=true
 
-# Mode B — scoped find/replace: search only within line range (shorter old_string suffices)
+# Mode B: scoped find/replace, searches only within the line range (a shorter old_string works)
 edit path="/src/app.py" old_string="pass" new_string="return x" start_line=42 end_line=42
 
-# Mode C — line replace: replace entire range, no old_string needed (maximum token savings)
+# Mode C: line replace, swaps the whole range with no old_string needed (most token savings)
 edit path="/src/app.py" new_string="    return result\n" start_line=80 end_line=83
 ```
 
@@ -214,16 +214,16 @@ edit path="/src/app.py" new_string="    return result\n" start_line=80 end_line=
 </details>
 
 <details>
-<summary><strong>batch_edit</strong> — Multiple edits in one call</summary>
+<summary><strong>batch_edit</strong>: multiple edits in one call</summary>
 
 ```
-# Mode A — find/replace: [old, new]
+# Mode A: find/replace, [old, new]
 batch_edit path="/src/app.py" edits='[["old1","new1"],["old2","new2"]]'
 
-# Mode B — scoped: [old, new, start_line, end_line]
+# Mode B: scoped, [old, new, start_line, end_line]
 batch_edit path="/src/app.py" edits='[["pass","return x",42,42]]'
 
-# Mode C — line replace: [null, new, start_line, end_line]
+# Mode C: line replace, [null, new, start_line, end_line]
 batch_edit path="/src/app.py" edits='[[null,"    return result\n",80,83]]'
 
 # Mixed modes in one call (object syntax also supported)
@@ -237,7 +237,7 @@ batch_edit path="/src/app.py" edits='[
 </details>
 
 <details>
-<summary><strong>batch_read</strong> — Multiple files with token budget</summary>
+<summary><strong>batch_read</strong>: multiple files with a token budget</summary>
 
 ```
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
@@ -251,7 +251,7 @@ batch_read paths="/src/*.py" max_total_tokens=30000
 </details>
 
 <details>
-<summary><strong>discovery</strong> — Search, glob, grep</summary>
+<summary><strong>discovery</strong>: search, glob, grep</summary>
 
 ```
 search query="authentication middleware logic" k=5
@@ -274,7 +274,7 @@ grep pattern="class Cache" path="src/**/*.py"
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
 | `TOOL_TIMEOUT` | `30` | Seconds before tool call times out (auto-resets executor) |
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
-| `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
+| `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before W-TinyLFU eviction |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 
 See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, model selection guidance, and examples.
@@ -331,6 +331,10 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
  └──────────┘    └──────────┘
 ```
 
+Every read also returns a `content_hash`. Hand it back as `known_hash` on your
+next read and the server answers `unchanged` from that fact alone, with no guess
+about what it already sent you.
+
 `search` works the same way. An in-session LRU keyed on `(query, k, directory)`
 returns warm hits in ~10 µs; misses fall through to BM25 keyword search. Every
 cache mutation (`put`, `clear`, `delete_path`, `update_mtime`) bumps the LRU, so
@@ -342,19 +346,19 @@ callers never see a result that predates a write.
 
 Measured on this project's 40 source files (**170,381 tokens**), i9-13900K. Reproducible via `--json` output for CI diffing.
 
-### Token savings — **98.9%** overall (phases 2–6)
+### Token savings: **98.9%** overall (phases 2 to 6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| **Overall (cached, phases 2–6)** | **Aggregate token reduction** | **98.9%** |
-| Unchanged re-read | mtime match — fast path skips disk I/O | 99.1% |
+| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.9%** |
+| Unchanged re-read | mtime match, fast path skips disk I/O | 99.1% |
 | Content hash | mtime drifted, BLAKE3 still matches | 99.1% |
 | Batch read | All files via `batch_read`, 200K budget | 99.1% |
 | Search previews | 5 queries × k=5, previews vs full reads | 100.0% |
 | Small edits | Real ~5% line changes in 30% of files | 97.5% |
 | Cold read | First read, no cache (baseline) | 0% |
 
-### Latency — **unchanged reads ~0.9 ms; repeat searches < 0.01 ms**
+### Latency: **unchanged reads ~0.9 ms; repeat searches < 0.01 ms**
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
@@ -367,7 +371,7 @@ Measured on this project's 40 source files (**170,381 tokens**), i9-13900K. Repr
 | Grep (regex) | 7.5 ms | regex compiled once |
 | Batch read (40 files, diff mode) | 26.0 ms | chunk + tokenize new/changed files |
 | Unchanged re-read (40 files) | 31.4 ms | whole-corpus pass |
-| Cold read (40 files, total) | 125 ms | no embedding model — pure disk I/O + tokenisation |
+| Cold read (40 files, total) | 125 ms | no embedding model, pure disk I/O plus tokenisation |
 | Write (200-line file) | 1.8 ms | creates + caches (no embed) |
 
 Run benchmarks yourself:
@@ -409,15 +413,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks,
 
 ## License
 
-[MIT License](LICENSE) — use freely in personal and commercial projects.
+[MIT License](LICENSE). Use it freely in personal and commercial projects.
 
 ---
 
 ## Credits
 
-Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and:
+Built with [FastMCP 3.2+](https://github.com/jlowin/fastmcp) and:
 
-- [SimpleVecDB ≥ 2.6.2](https://github.com/CoderDayton/SimpleVecDB) — SQLite + FTS5 keyword (BM25) storage with atomic `delete_collection`
+- SQLite with FTS5 for keyword (BM25) full-text search, vendored as a small built-in store
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
 - BLAKE3 cryptographic hashing for content freshness
-- LRU-K frequency-aware cache eviction
+- W-TinyLFU frequency-aware cache eviction

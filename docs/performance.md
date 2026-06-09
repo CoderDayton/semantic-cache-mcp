@@ -2,8 +2,8 @@
 
 Two benchmark suites characterise the cache:
 
-- [`benchmarks/benchmark_token_savings.py`](../benchmarks/benchmark_token_savings.py) — measures the **token reduction** delivered by each cache hit path.
-- [`benchmarks/benchmark_performance.py`](../benchmarks/benchmark_performance.py) — measures the **wall-clock latency** of every core operation, reporting p50 / p95 / p99.
+- [`benchmarks/benchmark_token_savings.py`](../benchmarks/benchmark_token_savings.py): measures the **token reduction** delivered by each cache hit path.
+- [`benchmarks/benchmark_performance.py`](../benchmarks/benchmark_performance.py): measures the **wall-clock latency** of every core operation, reporting p50 / p95 / p99.
 
 Both write a JSON report (`--json <path>`) for diffing across runs and produce reproducible results from a deterministic seed.
 
@@ -13,7 +13,7 @@ The numbers below were captured on:
 |---|---|
 | **CPU** | Intel Core i9-13900K (32 cores) |
 | **Python** | 3.12 |
-| **Search** | BM25 keyword (FTS5) — no embedding model |
+| **Search** | BM25 keyword (FTS5), no embedding model |
 | **Corpus** | 40 source files, **170,381 tokens** |
 | **Commit** | `65c21c3` |
 
@@ -33,7 +33,7 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
 | 1 | Cold read | First read, no cache (baseline) | 170,381 | 170,381 | 0.0% |
-| 2 | Unchanged re-read | mtime match — **fast path skips disk I/O** | 1,573 | 170,381 | **99.1%** |
+| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,573 | 170,381 | **99.1%** |
 | 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,573 | 170,381 | **99.1%** |
 | 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 4,310 | 170,653 | **97.5%** |
 | 4a |  → changed files only | Returned as unified diff | 3,215 | 105,092 | 96.9% |
@@ -41,7 +41,7 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 | 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,572 | 170,653 | **99.1%** |
 | 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 0 | 106,475 | **100.0%** |
 
-**Aggregate (phases 2–6): 98.9% token reduction.**
+**Aggregate (phases 2 to 6): 98.9% token reduction.**
 
 The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_token_savings.py) asserts ≥ 80% overall as a regression gate.
 
@@ -49,11 +49,11 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 
 | Strategy | Savings | Trigger |
 |----------|--------:|---------|
-| Unchanged (mtime) | ~99% | `cached.mtime >= file.mtime` — disk read skipped entirely |
+| Unchanged (mtime) | ~99% | `cached.mtime >= file.mtime`, disk read skipped entirely |
 | Content hash | ~99% | mtime drifted but BLAKE3 hash still matches |
-| Diff (changed) | 80–95% | File modified since last cache; emitted as unified diff |
+| Diff (changed) | 80 to 95% | File modified since last cache; emitted as unified diff |
 | Search previews | ~100% | `search` returns 200-char previews, never full files |
-| Summarised | 50–80% | File exceeds `MAX_CONTENT_SIZE`; semantic skeleton retained |
+| Summarised | 50 to 80% | File exceeds `MAX_CONTENT_SIZE`; semantic skeleton retained |
 
 ---
 
@@ -68,7 +68,7 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 | Single unchanged read (fast path) | **0.9 ms** | 1.0 ms | mtime check + cache hit; **no disk I/O** |
 | Single diff read (changed file) | 0.7 ms | 0.8 ms | Hash check + unified diff |
 | Unchanged re-read (40 files) | 31.4 ms | 69.4 ms | Whole-corpus pass |
-| Cold read (40 files, total) | — | — | 125 ms one-shot (~3.1 ms/file avg) |
+| Cold read (40 files, total) | n/a | n/a | 125 ms one-shot (~3.1 ms/file avg) |
 
 ### Batch read
 
@@ -95,7 +95,7 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Search k=5 (cache **miss**) | 5.1 ms | — | BM25 keyword search (FTS5) |
+| Search k=5 (cache **miss**) | 5.1 ms | n/a | BM25 keyword search (FTS5) |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | < 0.01 ms | In-session result LRU |
 | Search k=10 (cache hit) | < 0.01 ms | < 0.01 ms | |
 
@@ -128,9 +128,9 @@ The in-session search cache delivers a **hundreds-fold speedup** on repeated que
 
 ## Why these numbers
 
-Removing the embedding/vector layer made the write and cold-read paths dramatically
-cheaper — no ONNX inference on the hot path — while the cache's token savings are
-unchanged. The optimisations below still land directly in the table above:
+Removing the embedding and vector layer made the write and cold-read paths much
+cheaper, with no ONNX inference on the hot path, while the cache's token savings
+stayed the same. The optimisations below still land directly in the table above:
 
 | Optimisation | Where it lands | Visible effect |
 |--------------|----------------|----------------|
@@ -140,7 +140,7 @@ unchanged. The optimisations below still land directly in the table above:
 | Drop `// Stats:` line from diff content | `cache/read.py` | ~15 tokens trimmed per changed file in phase 4 |
 | Char/4 fast-exit in `_finalize_payload` | `server/response.py` | Response shaping is sub-microsecond on small payloads |
 | Char-budget grep truncation | `server/tools/__init__.py` | Large grep results stay under the response cap |
-| Pre-stored search previews | `storage/vector/__init__.py` | No re-slicing of chunked content at query time |
+| Pre-stored search previews | `storage/docstore/__init__.py` | No re-slicing of chunked content at query time |
 | `include_markers=False` default | `core/text/_summarize.py` | Summarisation no longer wastes tokens on `[N lines omitted]` markers |
 
 ---
@@ -149,7 +149,7 @@ unchanged. The optimisations below still land directly in the table above:
 
 | Decision | Effect |
 |----------|--------|
-| Single-thread `DetachedExecutor` for usearch | Required: usearch segfaults under multi-threaded access. All blocking storage I/O routes through this one thread. |
+| Single-thread `DetachedExecutor` for storage I/O | All blocking storage I/O (SQLite reads and writes) routes through one thread, so the single connection is never touched concurrently. |
 | `asyncio.gather()` in `batch_smart_read` | Cache lookups and stat pre-fetch run in parallel; smart-read calls themselves serialise on the single executor. |
 | Cache-aware short-circuit in `smart_read` | Skips `aread_bytes` and `count_tokens` on the unchanged fast path. |
 | Async subprocess for formatters | `_format_file` doesn't freeze the event loop. |

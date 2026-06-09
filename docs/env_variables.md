@@ -7,7 +7,7 @@ All environment variables are optional. Defaults are tuned for typical usage.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SEMANTIC_CACHE_DIR` | Platform-specific\* | Override cache/database directory path. All data (database, models, metrics) lives under this directory. |
-| `MAX_CACHE_ENTRIES` | `10000` | Maximum cached file entries before LRU-K eviction kicks in. Higher values use more memory and disk. |
+| `MAX_CACHE_ENTRIES` | `10000` | Maximum cached file entries before W-TinyLFU eviction kicks in. Higher values use more memory and disk. |
 | `MAX_CONTENT_SIZE` | `100000` | Maximum bytes returned by a single read operation. Files larger than this are truncated with a hint to use `offset`/`limit`. |
 
 \* Linux: `~/.cache/semantic-cache-mcp/`, macOS: `~/Library/Caches/semantic-cache-mcp/`, Windows: `%LOCALAPPDATA%\semantic-cache-mcp\`
