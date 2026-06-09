@@ -7,16 +7,16 @@ src/semantic_cache_mcp/
 ├── config.py               # Constants and environment-variable configuration
 ├── types.py                # All shared data models (ReadResult, WriteResult, etc.)
 ├── cache/                  # Orchestration facade — coordinates all components
-│   ├── __init__.py         # Public API re-exports (including embed_batch)
-│   ├── store.py            # SemanticCache class: embedding, storage, metrics coordination
-│   ├── read.py             # smart_read, batch_smart_read (batch pre-scan + embed)
+│   ├── __init__.py         # Public API re-exports
+│   ├── store.py            # SemanticCache class: storage and metrics coordination
+│   ├── read.py             # smart_read, batch_smart_read
 │   ├── write.py            # smart_write, smart_edit, smart_batch_edit
 │   ├── search.py           # semantic_search, glob_with_cache_status, compare_files
 │   ├── metrics.py          # SessionMetrics: per-session and lifetime metric tracking
 │   └── _helpers.py         # Internal utilities: _suppress_large_diff, formatter dispatch
 ├── server/                 # MCP interface — thin translation layer only
 │   ├── __init__.py
-│   ├── _mcp.py             # FastMCP app instance, lifespan, startup warmup
+│   ├── _mcp.py             # FastMCP app instance, lifespan, startup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
 │   └── tools/              # All 13 MCP tool definitions + _shielded_write helper
 ├── core/                   # Pure algorithms — stateless, zero I/O
@@ -25,19 +25,17 @@ src/semantic_cache_mcp/
 │   │   ├── __init__.py
 │   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
 │   │   └── _simd.py        # SIMD-accelerated parallel CDC
-│   ├── embeddings/         # FastEmbed local embeddings (embed, embed_batch, embed_query)
+
 │   ├── hashing/            # BLAKE3/BLAKE2b content hashing, DeduplicateIndex
-│   ├── similarity/         # Cosine similarity utilities
-│   │   ├── __init__.py
-│   │   └���─ _cosine.py      # cosine_similarity, batch operations
+
 │   ├── text/               # Diff generation and semantic summarization
 │   │   ├── __init__.py
 │   │   ├── _diff.py        # generate_diff, compute_delta, diff_stats
-│   │   └── _summarize.py   # summarize_semantic (TCRA-LLM based)
-│   └── tokenizer.py        # BPE token counting (o200k_base)
+│   │   └���─ _summarize.py   # summarize_semantic (TCRA-LLM based)
+│   └���─ tokenizer.py        # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
-    ├── vector/             # VectorStorage: simplevecdb with HNSW + FTS5
+    ├── vector/             # VectorStorage: simplevecdb (SQLite + FTS5 keyword store)
     └── sqlite.py           # SQLiteStorage: session metrics persistence only
 ```
 
@@ -46,7 +44,7 @@ src/semantic_cache_mcp/
 - **Separation of concerns** — `core/` is stateless pure algorithms; `storage/` is persistence only; `cache/` orchestrates; `server/` translates MCP ↔ Python
 - **Dependency injection** — storage and config passed explicitly; no hidden globals
 - **Facade pattern** — `cache/` exposes a clean API; callers never touch `storage/` directly
-- **Performance first in hot paths** — embedding, hashing, similarity, and tokenization are optimized; everything else prioritizes clarity
+- **Performance first in hot paths** — hashing, chunking, and tokenization are optimized; everything else prioritizes clarity
 
 ---
 
@@ -54,13 +52,11 @@ src/semantic_cache_mcp/
 
 ### VectorStorage (simplevecdb)
 
-The primary storage backend uses [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB):
+The primary storage backend uses [SimpleVecDB](https://github.com/CoderDayton/SimpleVecDB) as a text + metadata store:
 
-- **HNSW index** — O(log N) approximate nearest neighbor search for semantic similarity
-- **FTS5 full-text search** — BM25 keyword search for grep and hybrid queries
-- **Hybrid search** — Reciprocal Rank Fusion (RRF) combines HNSW + BM25 results
+- **FTS5 full-text search** — BM25 keyword search powering `search` and grep
 - **Raw text storage** — File contents stored as plain text in `page_content` (no compression)
-- **INT8 quantization** — 4× smaller vectors in the HNSW index with negligible quality loss
+- **Metadata filtering** — path/chunk lookups via the SQLite catalog
 
 ### Document Model
 
@@ -68,17 +64,17 @@ Files are stored as simplevecdb `Document` objects:
 
 ```
 Small file (< 8KB):
-  └── Single document: page_content=full_text, embedding=file_vector
+  └── Single document: page_content=full_text
 
 Large file (≥ 8KB):
-  ├── Parent document: page_content="", embedding=file_vector, is_parent=True
+  ├── Parent document: page_content="", is_parent=True
   └���─ Child documents (per CDC chunk):
-      ├── page_content=chunk_text, embedding=zero_vector, chunk_index=0
-      ├── page_content=chunk_text, embedding=zero_vector, chunk_index=1
+      ├── page_content=chunk_text, chunk_index=0
+      ├── page_content=chunk_text, chunk_index=1
       └── ...
 ```
 
-Large files are split via HyperCDC (content-defined chunking) into multiple child documents. The parent holds the file-level embedding for semantic search; children hold raw text for content retrieval and grep. Child documents use zero embeddings — per-chunk embedding would require N model calls.
+Large files are split via HyperCDC (content-defined chunking) into multiple child documents. The parent holds file-level metadata; children hold raw text for content retrieval, search, and grep.
 
 ### Metadata
 
@@ -94,7 +90,6 @@ Each document carries metadata for cache management:
 | `total_chunks` | `int` | Number of chunks (1 for small files) |
 | `access_history` | `JSON` | Last 5 access timestamps (LRU-K) |
 | `is_parent` | `bool` | Parent document marker (large files only) |
-| `has_embedding` | `bool` | Whether the document carries a non-zero embedding |
 | `preview` | `str` | First ~200 chars of file content, pre-stored at index time so search results don't re-slice chunked `page_content` at query time |
 
 ### LRU-K Eviction (K=2)
@@ -160,32 +155,6 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 
 ---
 
-### Embeddings (`core/embeddings.py`)
-
-Local text embeddings via FastEmbed (configurable model, default `BAAI/bge-small-en-v1.5`).
-
-- **384-dimensional** (default), 33M parameters, 512 token context window
-- Runs via ONNX Runtime — `cpu` by default, `cuda` when configured
-- Singleton model instance — loaded once, reused across all calls
-- Dedicated single-thread `ThreadPoolExecutor` — ONNX serializes inference internally, so embedding calls don't starve the default thread pool
-- Warmup pass at server startup (in `asyncio.to_thread`) for predictable first-request latency
-- `"Represent this sentence for searching relevant passages:"` prefix for query embedding
-- File-type semantic labels prepended to document content before embedding (e.g., `"python source file: ..."`)
-
-#### Batch Embedding
-
-`embed_batch(texts)` amortizes ONNX Runtime overhead across N texts in a single model call.
-
-**Pre-scan flow in `batch_smart_read`:**
-1. Before reading any file, scan all requested paths for new or changed files (mtime check)
-2. Collect their content and apply the same file-type label prefix used by single-file embedding
-3. Call `embed_batch()` once with all texts — a single ONNX inference pass
-4. Store prefetched embeddings; `smart_read` picks them up instead of calling the model individually
-
-This reduces N model calls (one per new file) to exactly 1, regardless of batch size.
-
----
-
 ### Text (`core/text/`)
 
 #### `_diff.py` — Diff and Delta Compression
@@ -203,7 +172,6 @@ Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files 
 2. Score each segment:
    - **Position score**: U-shaped curve — highest at start and end, lowest in middle
    - **Density score**: unique token ratio + syntax character density + non-whitespace ratio
-   - **Diversity penalty**: cosine similarity to already-selected segments (avoids redundancy)
 3. Greedily select highest-scoring segments that fit the budget
 4. Always preserve the first segment (docstrings, imports, module header)
 5. Reassemble selected segments in original order; `# ... [N lines omitted] ...` markers
@@ -222,11 +190,11 @@ The server runs a single asyncio event loop. Blocking operations are offloaded t
 
 | Executor | Workers | Used for |
 |----------|---------|----------|
-| **Embed executor** | 1 | ONNX `model.embed()` — serialized because ONNX Runtime holds a session lock |
-| **Default executor** | N (OS-dependent) | `VectorStorage` catalog ops, `sync_coll.save()`, `summarize_semantic()` |
+| **IO executor** | 1 | `VectorStorage` catalog ops + `sync_coll.save()` — single-threaded because usearch is not safe under concurrent access |
+| **Default executor** | N (OS-dependent) | `summarize_semantic()` and other CPU-bound work |
 | **Async subprocess** | — | `_format_file()` (ruff, prettier, etc.) |
 
-Embedding uses a dedicated single-thread executor so concurrent ONNX calls don't consume default pool slots. Storage I/O runs on the default pool and is never blocked by embedding work.
+Storage operations run on a dedicated single-thread executor because usearch (simplevecdb's index) is not safe under concurrent access from multiple threads.
 
 ### Graceful Shutdown
 
@@ -238,7 +206,7 @@ On SIGTERM/SIGINT:
 4. Lifespan `finally` calls `async_close()`:
    - Waits up to 8 seconds for in-flight operations to drain (`_drained` event)
    - Catches `CancelledError` during drain so close always proceeds
-   - Persists session metrics → closes VectorStorage → closes SQLite pool → shuts down embed executor
+   - Persists session metrics → closes VectorStorage → closes SQLite pool → shuts down IO executor
 5. All `VectorStorage` async methods guard `_closed` — return safe defaults instead of crashing
 6. Second signal forces `os._exit()` for hard termination
 
@@ -269,7 +237,7 @@ Client ──→ smart_read(path, diff_mode=True)
                   (99% savings)          (80-95% savings)
                                                 │
                                         not cached at all
-                                          read full + embed
+                                          read full
                                           + return full
 ```
 
@@ -287,14 +255,11 @@ Client ──→ batch_smart_read(paths, diff_mode=True)
                 │
          1. Gather all cache.get() in parallel (asyncio.gather)
                 │
-         2. Pre-scan: filter new/changed paths (mtime check, reuses gathered entries)
+         2. Pre-fetch stat results in parallel (asyncio.gather)
                 │
-         3. embed_batch([...all new/changed texts...])
-            ── single ONNX inference call ──
+         3. smart_read() per file (reuses the gathered entries)
                 │
-         4. smart_read() per file (embedding prefetched, no model call)
-                │
-         5. Return BatchReadResult with per-file status
+         4. Return BatchReadResult with per-file status
 ```
 
 ### Write / Edit
@@ -310,32 +275,23 @@ Client ──→ smart_write(path, content)
         ▼                  ▼
    write to disk      update cache
         │                  │
-        │             embed new content
         │             store in VectorStorage
         │
    return diff (not full content)
 ```
 
-### Semantic Search
+### Search (BM25)
 
 ```
 query ──→ semantic_search(cache, query, k, directory)
               │
        ┌──────┴──────────────────────────┐
        ▼                                 ▼
- in-session result cache hit?      MISS — embed + retrieve
+ in-session result cache hit?      MISS — BM25 retrieve
  (LRU keyed on q,k,dir)                  │
-   YES → return immediately       embed_query() → query_vec (384D)
+   YES → return immediately       BM25 keyword search (FTS5 full-text)
    (< 0.01 ms — 2,000×+ faster            │
-    than a cold search)         ┌─────────┴──────────────┐
-                                ▼                        ▼
-                         BM25 keyword search      HNSW vector search
-                         (FTS5 full-text)         (simplevecdb)
-                                │                        │
-                                └────────┬───────────────┘
-                                         │
-                                  Reciprocal Rank Fusion
-                                  (combine + deduplicate)
+    than a cold search)            deduplicate by path
                                          │
                                   store in result LRU
                                          │

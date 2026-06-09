@@ -41,13 +41,11 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 ## Why this exists
 
-In order of impact:
-
 **1. Reads stop costing tokens.** The first read seeds the cache. Re-reads of unchanged files return a 5-token marker (`mtime` match, no disk I/O). Modified files return a unified diff. Files larger than the budget collapse to a semantic skeleton that preserves structure rather than slicing at a byte offset.
 
-**2. Search and grep run on the cache, not the disk.** Semantic search (hybrid BM25 + HNSW), glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
+**2. Search and grep run on the cache, not the disk.** Keyword search (BM25), glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
 
-**3. Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, support `dry_run`, can run formatters, and refresh the cache atomically. Local FastEmbed is the default embedding provider; OpenAI-compatible endpoints are opt-in.
+**3. Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, support `dry_run`, can run formatters, and refresh the cache atomically.
 
 ---
 
@@ -85,44 +83,6 @@ uv tool install semantic-cache-mcp
 ```
 
 Restart Claude Code.
-
-### GPU Acceleration (Optional)
-
-For NVIDIA GPU acceleration, install with the `gpu` extra:
-
-```bash
-uv tool install "semantic-cache-mcp[gpu]"
-# or with uvx: uvx "semantic-cache-mcp[gpu]"
-```
-
-Then set `EMBEDDING_DEVICE=gpu` in your MCP config env block. Falls back to CPU automatically if CUDA is unavailable.
-
-### Custom Embedding Models
-
-Any HuggingFace model with an ONNX export works — set `EMBEDDING_MODEL` in your env config:
-
-```json
-"env": {
-  "EMBEDDING_MODEL": "Snowflake/snowflake-arctic-embed-m-v2.0"
-}
-```
-
-If the model isn't in fastembed's built-in list, it's automatically downloaded and registered from HuggingFace Hub on first startup (ONNX file integrity is verified via SHA256). See [env_variables.md](docs/env_variables.md) for model recommendations.
-
-### OpenAI-Compatible Embeddings
-
-Local FastEmbed remains the default. To route embeddings through an OpenAI-compatible provider instead, enable it in the MCP env block. Defaults target Ollama:
-
-```json
-"env": {
-  "OPENAI_EMBEDDINGS_ENABLED": "true",
-  "OPENAI_BASE_URL": "http://localhost:11434/v1",
-  "OPENAI_API_KEY": "ollama",
-  "OPENAI_EMBEDDING_MODEL": "nomic-embed-text"
-}
-```
-
-Run `ollama pull nomic-embed-text` first if the model is not installed. For hosted OpenAI, set `OPENAI_BASE_URL=https://api.openai.com/v1`, use a real `OPENAI_API_KEY`, and choose an embedding model such as `text-embedding-3-small`. `OPENAI_EMBEDDING_DIMENSIONS` is optional; leave it unset to infer the returned vector size.
 
 ### Block Native File Tools (Recommended)
 
@@ -180,7 +140,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `search` | Cache-only semantic search — find code by meaning when you don't know the exact symbol to grep for. Seed likely files first with `batch_read`. |
+| `search` | Cache-only BM25 keyword search — rank cached files by relevance to a query. Seed likely files first with `batch_read`. |
 | `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
 | `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
 | `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
@@ -315,13 +275,6 @@ grep pattern="class Cache" path="src/**/*.py"
 | `TOOL_TIMEOUT` | `30` | Seconds before tool call times out (auto-resets executor) |
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before LRU-K eviction |
-| `EMBEDDING_DEVICE` | `cpu` | Embedding hardware: `cpu`, `cuda` (GPU), `auto` (detect) |
-| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model for search/similarity ([options](https://qdrant.github.io/fastembed/examples/Supported_Models/)) |
-| `OPENAI_EMBEDDINGS_ENABLED` | `false` | Use OpenAI-compatible remote embeddings instead of local FastEmbed |
-| `OPENAI_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL; default targets Ollama |
-| `OPENAI_API_KEY` | `ollama` | API key for the remote embedding provider |
-| `OPENAI_EMBEDDING_MODEL` | `nomic-embed-text` | Remote embedding model name |
-| `OPENAI_EMBEDDING_DIMENSIONS` | *(inferred)* | Optional requested/expected remote embedding dimension |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 
 See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, model selection guidance, and examples.
@@ -345,9 +298,7 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
       "env": {
         "LOG_LEVEL": "INFO",
         "TOOL_OUTPUT_MODE": "compact",
-        "MAX_CONTENT_SIZE": "100000",
-        "EMBEDDING_DEVICE": "cpu",
-        "EMBEDDING_MODEL": "BAAI/bge-small-en-v1.5"
+        "MAX_CONTENT_SIZE": "100000"
       }
     }
   }
@@ -381,7 +332,7 @@ See [docs/env_variables.md](docs/env_variables.md) for detailed descriptions, mo
 ```
 
 `search` works the same way. An in-session LRU keyed on `(query, k, directory)`
-returns warm hits in ~10 µs; misses fall through to embed + BM25 + HNSW. Every
+returns warm hits in ~10 µs; misses fall through to BM25 keyword search. Every
 cache mutation (`put`, `clear`, `delete_path`, `update_mtime`) bumps the LRU, so
 callers never see a result that predates a write.
 
@@ -389,37 +340,35 @@ callers never see a result that predates a write.
 
 ## Performance
 
-Measured on this project's 43 source files (**168,614 tokens**), CPU embeddings, i9-13900K, commit `5cd7100`. Reproducible via `--json` output for CI diffing.
+Measured on this project's 40 source files (**170,381 tokens**), i9-13900K. Reproducible via `--json` output for CI diffing.
 
-### Token savings — **98.5%** overall (phases 2–6)
+### Token savings — **98.9%** overall (phases 2–6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| **Overall (cached, phases 2–6)** | **Aggregate token reduction** | **98.5%** |
-| Unchanged re-read | mtime match — fast path skips disk I/O | 98.9% |
-| Content hash | mtime drifted, BLAKE3 still matches | 98.9% |
-| Batch read | All files via `batch_read`, 200K budget | 98.9% |
-| Search previews | 5 queries × k=5, previews vs full reads | 98.3% |
-| Small edits | Real ~5% line changes in 30% of files | 97.3% |
+| **Overall (cached, phases 2–6)** | **Aggregate token reduction** | **98.9%** |
+| Unchanged re-read | mtime match — fast path skips disk I/O | 99.1% |
+| Content hash | mtime drifted, BLAKE3 still matches | 99.1% |
+| Batch read | All files via `batch_read`, 200K budget | 99.1% |
+| Search previews | 5 queries × k=5, previews vs full reads | 100.0% |
+| Small edits | Real ~5% line changes in 30% of files | 97.5% |
 | Cold read | First read, no cache (baseline) | 0% |
 
-### Latency — **unchanged reads ~1 ms; repeat searches ~10 µs**
+### Latency — **unchanged reads ~0.9 ms; repeat searches < 0.01 ms**
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Single unchanged read (fast path) | **1.1 ms** | mtime + cache hit; no disk I/O |
-| Single diff read (changed file) | 1.0 ms | hash check + unified diff |
-| Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; **2,000×+ vs cold** |
-| Search k=5 (cache **miss**) | 5.6 ms | embed query + hybrid BM25/HNSW |
-| Edit (scoped find/replace) | 3.3 ms | uses cached content |
-| Grep (literal `def `) | 1.4 ms | FTS5 over cached corpus |
-| Grep (regex) | 2.1 ms | regex compiled once |
-| Batch read (43 files, diff mode) | 40.2 ms | one ONNX inference for all new/changed files |
-| Unchanged re-read (43 files) | 26.9 ms | whole-corpus pass |
-| Cold read (43 files, total) | 1,990 ms | includes disk I/O, tokenisation, embedding |
-| Write (200-line file) | 49.1 ms | creates + caches + embeds |
-| Single embedding (largest file) | 47 ms | ONNX, single thread |
-| Model warmup (one-time) | 195 ms | startup only |
+| Single unchanged read (fast path) | **0.9 ms** | mtime + cache hit; no disk I/O |
+| Single diff read (changed file) | 0.7 ms | hash check + unified diff |
+| Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; hundreds× vs cold |
+| Search k=5 (cache **miss**) | 5.1 ms | BM25 keyword search |
+| Edit (scoped find/replace) | 2.9 ms | uses cached content |
+| Grep (literal `def `) | 5.5 ms | FTS5 over cached corpus |
+| Grep (regex) | 7.5 ms | regex compiled once |
+| Batch read (40 files, diff mode) | 26.0 ms | chunk + tokenize new/changed files |
+| Unchanged re-read (40 files) | 31.4 ms | whole-corpus pass |
+| Cold read (40 files, total) | 125 ms | no embedding model — pure disk I/O + tokenisation |
+| Write (200-line file) | 1.8 ms | creates + caches (no embed) |
 
 Run benchmarks yourself:
 
@@ -468,8 +417,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks,
 
 Built with [FastMCP 3.0](https://github.com/modelcontextprotocol/python-sdk) and:
 
-- [FastEmbed](https://github.com/qdrant/fastembed) — local ONNX embeddings (configurable, default BAAI/bge-small-en-v1.5)
-- [SimpleVecDB ≥ 2.6.2](https://github.com/CoderDayton/SimpleVecDB) — HNSW vector storage with FTS5 keyword search, atomic `delete_collection`, and opt-in embedding persistence (`store_embeddings=True`)
+- [SimpleVecDB ≥ 2.6.2](https://github.com/CoderDayton/SimpleVecDB) — SQLite + FTS5 keyword (BM25) storage with atomic `delete_collection`
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
 - BLAKE3 cryptographic hashing for content freshness
 - LRU-K frequency-aware cache eviction

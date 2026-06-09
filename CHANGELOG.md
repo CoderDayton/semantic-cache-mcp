@@ -7,16 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0] - 2026-06-09
 
-Dependency maintenance release. Updates the vector-storage backend to pick up
-upstream correctness and thread-safety fixes. No public API or behavior changes.
+Removes the embedding/vector layer entirely. `search` is now BM25 keyword-only.
+Every token-saving feature — chunking, chunk reassembly, the content/metadata
+cache, grep, glob, diff, and semantic summarization — is unchanged. The process
+no longer loads an ONNX embedding model (~400 MB lighter) and ships fewer
+dependencies.
+
+### Removed
+
+- **Embedding/vector search.** Deleted `core/embeddings/` (FastEmbed/ONNX, the
+  OpenAI-compatible provider, and the HuggingFace model registry) and
+  `core/similarity/` (cosine). `search` now always uses BM25; vector similarity
+  (`find_similar`, `search_hybrid`, per-file embeddings) is gone. The `diff`
+  tool keeps its textual diff but no longer reports a `similarity` score.
+- **Dependencies.** Dropped `fastembed`, `openai`, and the `[gpu]` extra
+  (`fastembed-gpu` / `onnxruntime`). `simplevecdb` and `numpy` are retained.
+- **Config.** Removed `EMBEDDING_DEVICE`, `EMBEDDING_MODEL`,
+  `OPENAI_EMBEDDINGS_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+  `OPENAI_EMBEDDING_MODEL`, and `OPENAI_EMBEDDING_DIMENSIONS`.
+- **Stats.** The `embedding` block (`model` / `provider` / `ready`) is gone from
+  the `stats` payload; process RSS is still reported.
 
 ### Changed
 
+- **Storage is text-only.** The simplevecdb collection now opens with
+  `store_embeddings=False`; documents are written with a constant stub vector and
+  no model is loaded. BM25 `keyword_search`, `get_documents`, chunking, and
+  parent/child reassembly are unchanged.
 - **Bumped `simplevecdb` minimum to 2.6.2.** Picks up storage-layer correctness
-  fixes: a catalog write-lock leak that could deadlock the database on a
-  connection error, `rebuild_index` no longer bricking a collection if the
-  rebuild fails, and catalog read paths serializing on the connection lock for
-  thread-safety under the IO executor. No API or behavior changes on our side.
+  fixes: a catalog write-lock leak that could deadlock the database,
+  `rebuild_index` no longer bricking a collection on a failed rebuild, and
+  catalog read paths serializing on the connection lock for thread-safety.
+
+### Migration
+
+- On first start after upgrade, a one-time wipe deletes the legacy
+  embedding-backed `vecdb.db` (and its sidecars) and writes a `.vectors_removed`
+  sentinel. The cache is fully rebuildable and repopulates on demand.
 
 ## [0.4.9] - 2026-05-30
 
