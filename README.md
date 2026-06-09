@@ -344,17 +344,17 @@ callers never see a result that predates a write.
 
 ## Performance
 
-Measured on this project's 40 source files (**170,381 tokens**), i9-13900K. Reproducible via `--json` output for CI diffing.
+Measured on this project's 40 source files (**177,509 tokens**), i9-13900K, with the corpus held fixed across all phases. Reproducible via `--json` output for CI diffing.
 
-### Token savings: **98.9%** overall (phases 2 to 6)
+### Token savings: **98.8%** overall (phases 2 to 6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.9%** |
+| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.8%** |
 | Unchanged re-read | mtime match, fast path skips disk I/O | 99.1% |
 | Content hash | mtime drifted, BLAKE3 still matches | 99.1% |
 | Batch read | All files via `batch_read`, 200K budget | 99.1% |
-| Search previews | 5 queries × k=5, previews vs full reads | 100.0% |
+| Search previews | 5 queries × k=5, previews vs full reads | 99.7% |
 | Small edits | Real ~5% line changes in 30% of files | 97.5% |
 | Cold read | First read, no cache (baseline) | 0% |
 
@@ -365,12 +365,12 @@ Measured on this project's 40 source files (**170,381 tokens**), i9-13900K. Repr
 | Single unchanged read (fast path) | **0.9 ms** | mtime + cache hit; no disk I/O |
 | Single diff read (changed file) | 0.7 ms | hash check + unified diff |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; hundreds× vs cold |
-| Search k=5 (cache **miss**) | 5.1 ms | BM25 keyword search |
-| Edit (scoped find/replace) | 2.9 ms | uses cached content |
-| Grep (literal `def `) | 5.5 ms | FTS5 over cached corpus |
-| Grep (regex) | 7.5 ms | regex compiled once |
+| Search k=5 (cache **miss**) | 1.5 ms | BM25 keyword search |
+| Edit (scoped find/replace) | 2.4 ms | uses cached content |
+| Grep (literal `def `) | 1.3 ms | FTS5 over cached corpus |
+| Grep (regex) | 3.7 ms | regex compiled once |
 | Batch read (40 files, diff mode) | 26.0 ms | chunk + tokenize new/changed files |
-| Unchanged re-read (40 files) | 31.4 ms | whole-corpus pass |
+| Unchanged re-read (40 files) | 18 ms | whole-corpus pass |
 | Cold read (40 files, total) | 125 ms | no embedding model, pure disk I/O plus tokenisation |
 | Write (200-line file) | 1.8 ms | creates + caches (no embed) |
 

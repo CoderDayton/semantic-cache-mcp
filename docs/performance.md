@@ -14,8 +14,8 @@ The numbers below were captured on:
 | **CPU** | Intel Core i9-13900K (32 cores) |
 | **Python** | 3.12 |
 | **Search** | BM25 keyword (FTS5), no embedding model |
-| **Corpus** | 40 source files, **170,381 tokens** |
-| **Commit** | `65c21c3` |
+| **Corpus** | 40 source files, **177,509 tokens**, 213 documents |
+| **Commit** | `71252b3` |
 
 Reproduce with:
 
@@ -32,16 +32,16 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
-| 1 | Cold read | First read, no cache (baseline) | 170,381 | 170,381 | 0.0% |
-| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,573 | 170,381 | **99.1%** |
-| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,573 | 170,381 | **99.1%** |
-| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 4,310 | 170,653 | **97.5%** |
-| 4a |  → changed files only | Returned as unified diff | 3,215 | 105,092 | 96.9% |
-| 4b |  → unchanged files | Fast path | 1,095 | 65,561 | 98.3% |
-| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,572 | 170,653 | **99.1%** |
-| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 0 | 106,475 | **100.0%** |
+| 1 | Cold read | First read, no cache (baseline) | 177,509 | 177,509 | 0.0% |
+| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,580 | 177,509 | **99.1%** |
+| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,580 | 177,509 | **99.1%** |
+| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 4,456 | 177,750 | **97.5%** |
+| 4a |  → changed files only | Returned as unified diff | 3,357 | 108,993 | 96.9% |
+| 4b |  → unchanged files | Fast path | 1,099 | 68,757 | 98.4% |
+| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,578 | 177,750 | **99.1%** |
+| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 301 | 110,925 | **99.7%** |
 
-**Aggregate (phases 2 to 6): 98.9% token reduction.**
+**Aggregate (phases 2 to 6): 98.8% token reduction.**
 
 The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_token_savings.py) asserts ≥ 80% overall as a regression gate.
 
@@ -59,7 +59,7 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 
 ## Latency
 
-All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw output. Cold-read totals include disk I/O and tokenisation for the entire corpus.
+All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw output. Cold-read totals include disk I/O and tokenisation for the entire corpus. Every phase, including search and grep, runs against the same fixed 40-file corpus, so scan latency does not grow with the benchmark's iteration count.
 
 ### Cache read
 
@@ -67,7 +67,7 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 |-----------|----:|----:|-------|
 | Single unchanged read (fast path) | **0.9 ms** | 1.0 ms | mtime check + cache hit; **no disk I/O** |
 | Single diff read (changed file) | 0.7 ms | 0.8 ms | Hash check + unified diff |
-| Unchanged re-read (40 files) | 31.4 ms | 69.4 ms | Whole-corpus pass |
+| Unchanged re-read (40 files) | 18 ms | 30 ms | Whole-corpus pass |
 | Cold read (40 files, total) | n/a | n/a | 125 ms one-shot (~3.1 ms/file avg) |
 
 ### Batch read
@@ -81,32 +81,32 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 | Operation | p50 | p95 |
 |-----------|----:|----:|
 | Write (200-line file) | 1.8 ms | 11.3 ms |
-| Edit (scoped find/replace) | 2.9 ms | 3.0 ms |
+| Edit (scoped find/replace) | 2.4 ms | 2.5 ms |
 
 ### Chunked write (large files, CDC-split)
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Chunked write (72 KB, ~25 chunks) | 6.3 ms | 20.6 ms |
-| Chunked write (360 KB, ~125 chunks) | 45.3 ms | 59.0 ms |
-| Chunked re-read (72 KB, record_access fan-out) | 3.2 ms | 3.6 ms |
+| Chunked write (72 KB, ~25 chunks) | 4.2 ms | 19.0 ms |
+| Chunked write (360 KB, ~125 chunks) | 21 ms | 28.5 ms |
+| Chunked re-read (72 KB, record_access fan-out) | 1.4 ms | 1.6 ms |
 
 ### Search
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Search k=5 (cache **miss**) | 5.1 ms | n/a | BM25 keyword search (FTS5) |
+| Search k=5 (cache **miss**) | 1.5 ms | n/a | BM25 keyword search (FTS5) |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | < 0.01 ms | In-session result LRU |
 | Search k=10 (cache hit) | < 0.01 ms | < 0.01 ms | |
 
-The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm < 0.01 ms vs. cold ~3.6 ms over 5 queries).
+The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm < 0.01 ms vs. cold ~4.6 ms over 5 queries).
 
 ### Grep
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Literal (`def `) | 5.5 ms | 5.9 ms |
-| Regex (`class\s+\w+`) | 7.5 ms | 8.1 ms |
+| Literal (`def `) | 1.3 ms | 1.4 ms |
+| Regex (`class\s+\w+`) | 3.7 ms | 3.9 ms |
 
 ### Response shaping
 

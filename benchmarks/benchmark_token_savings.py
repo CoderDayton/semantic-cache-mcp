@@ -267,8 +267,13 @@ async def run_benchmark(
 
         # Phase 1: Cold
         p1_ret, p1_orig = await phase_cold_read(cache, files)
+        # Every later phase re-reads or edits these same files in place, so the
+        # corpus never grows; capture its size once for transparency.
+        corpus_stats = await cache._storage.get_stats()
+        corpus_docs = int(corpus_stats.get("total_documents", 0))
         if not quiet:
-            print(f"Total original tokens: {p1_orig:,}\n")
+            print(f"Total original tokens: {p1_orig:,}")
+            print(f"Corpus: {len(files)} files / {corpus_docs} docs (fixed across all phases)\n")
             print("Phase 1: Cold Read")
             print(_fmt_row("First read", p1_ret, p1_orig))
 
@@ -345,6 +350,7 @@ async def run_benchmark(
 
         report.measurements = {
             "total_files": len(files),
+            "corpus_docs": corpus_docs,
             "original_tokens": p1_orig,
             "modified_files": len(modified),
             "phases": {

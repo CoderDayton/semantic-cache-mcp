@@ -6,10 +6,17 @@ Reports p50 / p95 / p99 across all core operations:
   - Tokenizer (BPE)
   - Cache read (cold, unchanged-fast-path, diff)
   - Batch read
-  - Write + edit
   - Search (cold + warm via in-session cache)
   - Grep (literal + regex)
+  - Write + edit
+  - Chunked write + re-read
   - Response shaping (`_finalize_payload`)
+
+Methodology: every operation is measured against a fixed corpus of the
+project's own source files. The read-only scan phases (search, grep) run before
+the mutation phases, and each mutation phase evicts the temp documents it
+creates, so corpus size, and therefore scan latency, never grows with
+`--iterations`. The measured corpus size is printed and recorded.
 
 Usage:
     uv run python benchmarks/benchmark_performance.py
@@ -66,6 +73,16 @@ def _copy_to_tmp(files: list[Path], src_root: Path, tmp: Path) -> list[Path]:
         shutil.copy2(f, dest)
         copies.append(dest)
     return copies
+
+
+async def _corpus_size(cache: SemanticCache) -> tuple[int, int]:
+    """Current (files_cached, total_documents) in the cache.
+
+    Printed at the scan phase so the corpus the search/grep ops run against is
+    visible and verifiable, and any future accumulation regression is obvious.
+    """
+    stats = await cache._storage.get_stats()
+    return int(stats.get("files_cached", 0)), int(stats.get("total_documents", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +151,9 @@ async def bench_cache_read(
     report.add_timing(stats)
     print(stats.render())
     target.write_text(original)
+    # Resync the cache to the restored content so the read-only phases that
+    # follow see the pristine baseline corpus, not the transient edit.
+    await smart_read(cache, str(target))
 
 
 async def bench_batch_read(
@@ -186,6 +206,9 @@ async def bench_write_edit(
     report.add_timing(stats)
     print(stats.render())
 
+    # Keep the corpus at the seeded baseline: drop the temp file we created.
+    await cache.delete_path(str(test_file))
+
 
 async def bench_chunked_write(
     report: BenchmarkReport, cache: SemanticCache, tmp: Path, iters: int
@@ -197,49 +220,24 @@ async def bench_chunked_write(
     code paths most affected by the chunked-write hot path and is
     therefore where any future regression would surface first.
     """
-    # ~50 KB → ~25 chunks at CHUNK_MIN_SIZE=2048.
+    # ~50 KB -> ~25 chunks at CHUNK_MIN_SIZE=2048.
     medium_text = "".join(f"def func_{i}():\n    return {i} * 2\n\n" for i in range(2000))
 
-    # ~250 KB → ~125 chunks; stresses the per-chunk fan-out paths.
+    # ~250 KB -> ~125 chunks; stresses the per-chunk fan-out paths.
     big_text = medium_text * 5
 
     medium_kb = len(medium_text.encode("utf-8")) // 1024
     big_kb = len(big_text.encode("utf-8")) // 1024
 
-    # Each timed write targets a fresh path so every iteration measures a
-    # cold chunked ingest — writing one fixed path would have iterations 2+
-    # hit the warm overwrite/diff path and report misleadingly fast.
-    medium_counter = itertools.count()
-    big_counter = itertools.count()
+    # Every temp path created in this phase; evicted at the end so they never
+    # inflate a later phase's corpus.
+    created: list[str] = []
 
-    async def _write_medium() -> None:
-        path = tmp / f"bench_chunked_medium_{next(medium_counter)}.py"
-        await smart_write(cache, str(path), medium_text)
-
-    _, stats = await time_async(
-        f"Chunked write ({medium_kb} KB, ~25 chunks)",
-        _write_medium,
-        iterations=max(3, iters // 2),
-    )
-    report.add_timing(stats)
-    print(stats.render())
-
-    async def _write_big() -> None:
-        path = tmp / f"bench_chunked_big_{next(big_counter)}.py"
-        await smart_write(cache, str(path), big_text)
-
-    _, stats = await time_async(
-        f"Chunked write ({big_kb} KB, ~125 chunks)",
-        _write_big,
-        iterations=max(3, iters // 2),
-    )
-    report.add_timing(stats)
-    print(stats.render())
-
-    # Re-read of a chunked file goes through record_access, which now does
-    # one json round-trip total instead of N (one per chunk). Seed a fixed
-    # path so the re-read measures a genuine cache hit.
+    # Chunked re-read measured first, on the seeded baseline corpus, so its
+    # record_access path-lookup cost reflects a fixed corpus and not the
+    # throughput writes accumulated below.
     reread_path = tmp / "bench_chunked_reread.py"
+    created.append(str(reread_path))
     await smart_write(cache, str(reread_path), medium_text)
     await smart_read(cache, str(reread_path))
 
@@ -254,8 +252,48 @@ async def bench_chunked_write(
     report.add_timing(stats)
     print(stats.render())
 
+    # Chunked write throughput: each iteration targets a fresh path so it
+    # measures a cold CDC ingest, not a warm overwrite.
+    medium_counter = itertools.count()
+    big_counter = itertools.count()
+
+    async def _write_medium() -> None:
+        path = tmp / f"bench_chunked_medium_{next(medium_counter)}.py"
+        created.append(str(path))
+        await smart_write(cache, str(path), medium_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({medium_kb} KB, ~25 chunks)",
+        _write_medium,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    async def _write_big() -> None:
+        path = tmp / f"bench_chunked_big_{next(big_counter)}.py"
+        created.append(str(path))
+        await smart_write(cache, str(path), big_text)
+
+    _, stats = await time_async(
+        f"Chunked write ({big_kb} KB, ~125 chunks)",
+        _write_big,
+        iterations=max(3, iters // 2),
+    )
+    report.add_timing(stats)
+    print(stats.render())
+
+    # Restore the seeded baseline: evict every temp doc created in this phase.
+    for path_str in created:
+        await cache.delete_path(path_str)
+
 
 async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int) -> None:
+    files_cached, total_docs = await _corpus_size(cache)
+    print(f"  {'corpus (fixed)':<42s}  {files_cached} files / {total_docs} docs")
+    report.measurements["search_corpus_files"] = files_cached
+    report.measurements["search_corpus_docs"] = total_docs
+
     query = "content storage docstore"
 
     # Cold search: each iteration evicts the cache by mutating the store.
@@ -379,14 +417,8 @@ async def main() -> int:
             print("\n--- Batch Read ---")
         await bench_batch_read(report, cache, files, iters)
 
-        if not args.quiet:
-            print("\n--- Write + Edit ---")
-        await bench_write_edit(report, cache, tmp, iters)
-
-        if not args.quiet:
-            print("\n--- Chunked Write ---")
-        await bench_chunked_write(report, cache, tmp, iters)
-
+        # Read-only scan phases run on the pristine seeded corpus, before any
+        # mutation phase below can add documents to the store.
         if not args.quiet:
             print("\n--- Search ---")
         await bench_search(report, cache, iters)
@@ -394,6 +426,14 @@ async def main() -> int:
         if not args.quiet:
             print("\n--- Grep ---")
         await bench_grep(report, cache, iters)
+
+        if not args.quiet:
+            print("\n--- Write + Edit ---")
+        await bench_write_edit(report, cache, tmp, iters)
+
+        if not args.quiet:
+            print("\n--- Chunked Write ---")
+        await bench_chunked_write(report, cache, tmp, iters)
 
         if not args.quiet:
             print("\n--- Response Shaping ---")
