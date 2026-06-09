@@ -4,12 +4,10 @@
 Reports p50 / p95 / p99 across all core operations:
 
   - Tokenizer (BPE)
-  - Embedding (single + batch + warmup)
   - Cache read (cold, unchanged-fast-path, diff)
   - Batch read
   - Write + edit
   - Search (cold + warm via in-session cache)
-  - Similarity lookup
   - Grep (literal + regex)
   - Response shaping (`_finalize_payload`)
 
@@ -44,13 +42,11 @@ from _bench_lib import (  # noqa: E402
 from semantic_cache_mcp.cache import (  # noqa: E402, I001
     SemanticCache,
     batch_smart_read,
-    find_similar_files,
     semantic_search,
     smart_edit,
     smart_read,
     smart_write,
 )
-from semantic_cache_mcp.core.embeddings import embed, embed_batch, warmup  # noqa: E402
 from semantic_cache_mcp.core.tokenizer import count_tokens  # noqa: E402
 from semantic_cache_mcp.server.response import _finalize_payload  # noqa: E402
 
@@ -87,24 +83,6 @@ def bench_tokenizer(report: BenchmarkReport, files: list[Path], iters: int) -> N
     _, t = time_sync(
         f"count_tokens ({len(big)} chars, all)", count_tokens, big, iterations=max(3, iters // 4)
     )
-    report.add_timing(t)
-    print(t.render())
-
-
-def bench_embedding(report: BenchmarkReport, files: list[Path], iters: int) -> None:
-    text = files[0].read_text()
-    _, t = time_sync("Single embed (largest file)", embed, text, iterations=iters)
-    report.add_timing(t)
-    print(t.render())
-
-    texts = [f.read_text() for f in files[:10]]
-    _, t = time_sync(
-        f"Batch embed ({len(texts)} files)", embed_batch, texts, iterations=max(3, iters // 4)
-    )
-    report.add_timing(t)
-    print(t.render())
-
-    _, t = time_sync("Single embed (short string)", embed, "def hello(): pass", iterations=iters)
     report.add_timing(t)
     print(t.render())
 
@@ -215,7 +193,7 @@ async def bench_chunked_write(
     """Files >= CHUNK_THRESHOLD (8 KB) are CDC-chunked on write.
 
     The chunked path does N per-chunk operations (BPE token counts, JSON
-    history fan-out, zero-embedding allocations). This case exercises the
+    history fan-out, stub-vector allocations). This case exercises the
     code paths most affected by 0.4.7's hot-path optimisations and is
     therefore where any future regression would surface first.
     """
@@ -315,32 +293,6 @@ async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int
     print(stats.render())
 
 
-async def bench_similar(
-    report: BenchmarkReport, cache: SemanticCache, files: list[Path], iters: int
-) -> None:
-    _, stats = await time_async(
-        "Find similar k=3",
-        find_similar_files,
-        cache,
-        str(files[0]),
-        k=3,
-        iterations=max(3, iters // 2),
-    )
-    report.add_timing(stats)
-    print(stats.render())
-
-    _, stats = await time_async(
-        "Find similar k=10",
-        find_similar_files,
-        cache,
-        str(files[0]),
-        k=10,
-        iterations=max(3, iters // 2),
-    )
-    report.add_timing(stats)
-    print(stats.render())
-
-
 async def bench_grep(report: BenchmarkReport, cache: SemanticCache, iters: int) -> None:
     storage = cache._storage
 
@@ -408,15 +360,6 @@ async def main() -> int:
     if not args.quiet:
         print(f"  files: {len(source_files)}    iterations: {iters}\n")
 
-    if not args.quiet:
-        print("--- Embedding warmup ---")
-    t0 = time.perf_counter()
-    warmup()
-    warmup_ms = (time.perf_counter() - t0) * 1000.0
-    if not args.quiet:
-        print(f"  {'Model warmup':<42s}  {warmup_ms:>7.2f} ms")
-    report.measurements["model_warmup_ms"] = warmup_ms
-
     with tempfile.TemporaryDirectory(prefix="scmcp_perf_") as tmp_str:
         tmp = Path(tmp_str)
         work_dir = tmp / "src"
@@ -427,10 +370,6 @@ async def main() -> int:
         if not args.quiet:
             print("\n--- Tokenizer ---")
         bench_tokenizer(report, files, iters)
-
-        if not args.quiet:
-            print("\n--- Embedding ---")
-        bench_embedding(report, files, iters)
 
         if not args.quiet:
             print("\n--- Cache Read ---")
@@ -451,10 +390,6 @@ async def main() -> int:
         if not args.quiet:
             print("\n--- Search ---")
         await bench_search(report, cache, iters)
-
-        if not args.quiet:
-            print("\n--- Similar ---")
-        await bench_similar(report, cache, files, iters)
 
         if not args.quiet:
             print("\n--- Grep ---")
