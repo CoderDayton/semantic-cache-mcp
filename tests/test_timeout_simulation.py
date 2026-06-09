@@ -2,7 +2,7 @@
 
 Proves that tool timeouts fire correctly, reset the executor, release the
 lock, and allow subsequent tools to proceed — the exact scenario that was
-broken when concurrent ONNX inference blocked the single-threaded executor.
+broken when concurrent blocking I/O stalled the single-threaded executor.
 
 Test matrix:
 - read tool timeout via asyncio.wait_for
@@ -81,7 +81,6 @@ async def _fast_result(*args: Any, **kwargs: Any) -> MagicMock:
     result.tokens_saved = 0
     result.tokens_original = 5
     result.tokens_returned = 5
-    result.semantic_match = None
     result.path = "/tmp/test.txt"
     result.created = True
     result.diff_content = ""

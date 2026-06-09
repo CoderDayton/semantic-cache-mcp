@@ -70,7 +70,7 @@ _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 
 # Global tool mutex: only one tool call executes at a time.
 # Prevents concurrent coroutines from interleaving executor tasks,
-# catalog reads, and ONNX calls — the root cause of hangs when
+# catalog reads, and blocking I/O, the root cause of hangs when
 # multiple subagents fire tool calls simultaneously.
 #
 # We bind the lock to the running event loop so that test runners which
@@ -390,12 +390,14 @@ async def read(
     (you already have it); a changed file returns a unified diff. Reading also
     caches the file so `grep`, `search`, and `batch_read` can see it.
 
-    Pass `known_hash` (the `content_hash` from your last read) to assert you
-    still hold the file, letting the server skip re-sending unchanged bytes.
-    Use `offset`/`limit` to read or recover an exact line range — for example
-    after a large file was summarized. A binary file returns metadata
-    (`is_binary`, `size`, `mime`) instead of content; for images use
-    `read_image`. Missing or non-regular paths raise an error.
+    Whenever you re-read a file you have read before, pass back `known_hash`
+    (the `content_hash` from your last read of it). It is the server's only
+    proof that you still hold the content, so use it every time you can; the
+    server then skips re-sending unchanged bytes. Use `offset`/`limit` to read
+    or recover an exact line range, for example after a large file was
+    summarized. A binary file returns metadata (`is_binary`, `size`, `mime`)
+    instead of content; for images use `read_image`. Missing or non-regular
+    paths raise an error.
 
     Args:
         path: File path (absolute, or relative to the project root). Use an
@@ -405,10 +407,11 @@ async def read(
         offset: 1-based first line for a ranged read. `0` means from the start
             (same as omitting).
         limit: Number of lines to return starting at `offset`.
-        known_hash: The `content_hash` from a prior read. Pass it to assert you
-            still hold the file; the server replies `"unchanged": true` when it
-            matches and the file is unchanged, otherwise it sends content. Omit
-            to fall back to per-session tracking.
+        known_hash: The `content_hash` from your most recent read of this file.
+            Always pass it back when re-reading a file you have already read; it
+            is what lets the server answer `"unchanged": true` instead of
+            re-sending the content. Only omit it when you genuinely do not have
+            the hash, such as a first read or after your context was trimmed.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -597,8 +600,6 @@ async def read(
                 payload["is_diff"] = True
             if result.truncated:
                 payload["truncated"] = True
-            if result.semantic_match:
-                payload["semantic_match"] = result.semantic_match
             if result.truncated:
                 # Truncated reads use semantic summarization — the returned
                 # content is non-contiguous, so line numbers don't map to the
@@ -685,7 +686,7 @@ _MAX_ENCODED_IMAGE_BYTES: int = _parse_max_encoded_image_bytes()
 
 
 # read_image deliberately omits @_serialized: it never touches the cache or
-# the ONNX worker executor (it reads bytes via the default loop executor),
+# the serialized SQLite executor (it reads bytes via the default loop executor),
 # so it has nothing to serialize against and need not queue behind other tools.
 @mcp.tool(
     output_schema=output_schema(ReadImageResponse),
@@ -722,7 +723,7 @@ async def read_image(
     # Image reads bypass the cache (and the worker process). They use the
     # default loop executor — aread_bytes/astat accept `None` and fall back
     # to asyncio's default ThreadPoolExecutor, which is the right thing in
-    # the server process (no GIL contention with the worker's ONNX thread).
+    # the server process (no contention with the worker's SQLite IO thread).
     file_path = Path(path).expanduser().resolve()
     if not file_path.exists():
         _raise_tool_error("read_image", f"File not found: {path}", max_response_tokens)

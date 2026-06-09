@@ -1,4 +1,4 @@
-"""Semantic search and similarity operations."""
+"""Keyword (BM25) search and file comparison operations."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ async def compare_files(
     path2: str,
     context_lines: int = 3,
 ) -> DiffResult:
-    """Compare two files using cache. Returns diff and semantic similarity score."""
+    """Compare two files using the cache. Returns a unified diff."""
     # Cap context_lines to prevent excessive diff output
     context_lines = max(0, min(context_lines, 50))
 

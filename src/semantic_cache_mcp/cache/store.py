@@ -257,7 +257,7 @@ class SemanticCache:
         return path in self._stale_paths
 
     def _compute_refresh_timeout(self) -> float:
-        """Timeout for refresh_path(): a single chunk + store write, no embedding."""
+        """Timeout for refresh_path(): a single chunk plus store write."""
         return min(max(1.0, TOOL_TIMEOUT * 0.1), 2.0)
 
     async def put(

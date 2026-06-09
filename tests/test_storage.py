@@ -75,10 +75,10 @@ class TestFileOperations:
 
 
 class TestCacheEviction:
-    """Tests for LRU-K eviction."""
+    """Tests for W-TinyLFU eviction."""
 
     async def test_lru_k_scoring(self, temp_dir: Path) -> None:
-        """LRU-K should use k-th most recent access for scoring."""
+        """W-TinyLFU tracks access history for frequency scoring."""
         storage = ContentStorage(temp_dir / "test.db")
         path1 = "/test/frequently_accessed.txt"
         path2 = "/test/rarely_accessed.txt"

@@ -111,7 +111,7 @@ class TestSmartReadNoDuplicateFetch:
         assert "+line 2 modified" in result.content
 
     async def test_force_full_cached_read_skips_refresh(self, tmp_path: Path) -> None:
-        """Line-range/full-force reads should not rewrite vecdb when cache is already fresh."""
+        """Line-range/full-force reads should not rewrite the cache store when it is already fresh."""
         cache = _make_cache(tmp_path)
         f = tmp_path / "range_read.txt"
         f.write_text("alpha\nbeta\ngamma\n")
@@ -135,10 +135,10 @@ class TestSmartReadNoDuplicateFetch:
 
 
 class TestCompareFilesNoRefresh:
-    """compare_files should avoid vecdb rewrite when direct computation is enough."""
+    """compare_files should avoid a cache-store rewrite when direct computation is enough."""
 
     async def test_uncached_compare_skips_refresh_path(self, tmp_path: Path) -> None:
-        """Comparing two uncached files should not rewrite vecdb for either side."""
+        """Comparing two uncached files should not rewrite the cache store for either side."""
         cache = _make_cache(tmp_path)
         file1 = tmp_path / "one.txt"
         file2 = tmp_path / "two.txt"

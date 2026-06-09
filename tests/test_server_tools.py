@@ -67,7 +67,7 @@ def _tool_text(result: ToolResult) -> str:
 
 @pytest.fixture()
 def tmp_cache(tmp_path: Path) -> SemanticCache:
-    """Fresh SemanticCache per test, no real embeddings needed."""
+    """Fresh SemanticCache per test (BM25-only store)."""
     return SemanticCache(db_path=tmp_path / "cache.db")
 
 

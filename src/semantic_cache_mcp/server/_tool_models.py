@@ -34,7 +34,6 @@ class ReadResponse(ToolResponseModel):
     lines: ReadLineRange | None = None
     unchanged: bool | None = None
     is_diff: bool | None = None
-    semantic_match: str | None = None
     total_tokens: int | None = None
     hint: str | None = None
     from_cache: bool | None = None

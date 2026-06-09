@@ -4,7 +4,6 @@ Targets:
 - core/text/_diff.py      (49% → 85%+)
 - core/hashing.py         (49% → 85%+)
 - core/chunking/_gear.py  (35% → 75%+)
-- core/similarity/_cosine.py (73% → 90%+)
 - server/response.py      (63% → 95%+)
 """
 

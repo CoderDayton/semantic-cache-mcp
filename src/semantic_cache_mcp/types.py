@@ -32,7 +32,6 @@ class ReadResult:
     tokens_saved: int
     truncated: bool
     compression_ratio: float
-    semantic_match: str | None = None
     # Binary fallback: set when the file is not text. `content` is empty
     # in that case; the read tool surfaces these fields as structured
     # metadata instead of raising.

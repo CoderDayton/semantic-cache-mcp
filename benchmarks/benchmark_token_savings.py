@@ -166,7 +166,7 @@ async def phase_search_previews(
 ) -> tuple[int, int, float]:
     """Return (returned, original, elapsed_s) for the first (cold) pass."""
     queries = [
-        "embedding model configuration",
+        "content storage docstore",
         "file caching and diff logic",
         "semantic search implementation",
         "token counting and BPE",
@@ -190,7 +190,7 @@ async def phase_search_cache_hit(cache: SemanticCache) -> tuple[float, float]:
     Returns (cold_elapsed_s, warm_elapsed_s).
     """
     queries = [
-        "embedding model configuration",
+        "content storage docstore",
         "file caching and diff logic",
         "semantic search implementation",
         "token counting and BPE",

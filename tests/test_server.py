@@ -182,16 +182,14 @@ class TestCorruptedCacheRecovery:
         assert stats["total_documents"] == 0
 
 
-class TestMissingEmbeddingsService:
-    """Tests for missing embeddings service."""
+class TestBasicSmartRead:
+    """smart_read works on a fresh BM25-only cache."""
 
-    async def test_graceful_without_embeddings(
+    async def test_read_returns_content(
         self, semantic_cache_no_embeddings: SemanticCache, sample_files: dict[str, Path]
     ) -> None:
-        """Cache should work without embeddings service."""
         result = await smart_read(semantic_cache_no_embeddings, str(sample_files["python"]))
         assert result.content is not None
-        assert result.semantic_match is None
 
 
 class TestPathTraversalPrevention:

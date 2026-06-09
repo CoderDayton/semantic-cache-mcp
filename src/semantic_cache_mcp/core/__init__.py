@@ -1,21 +1,14 @@
-from .chunking import (
-    get_optimal_chunker,
-    hypercdc_chunks,
-    hypercdc_simd_boundaries,
-    hypercdc_simd_chunks,
-)
+from .chunking import get_optimal_chunker, hypercdc_chunks
 from .hashing import (
     DeduplicateIndex,
     HierarchicalHasher,
     StreamingHasher,
-    get_hash_stats,
     hash_chunk,
     hash_chunk_binary,
     hash_content,
 )
 from .text import (
     DEFAULT_SUMMARIZATION_CONFIG,
-    DiffDelta,
     Segment,
     SummarizationConfig,
     compute_delta,
@@ -32,8 +25,6 @@ from .tokenizer import BPETokenizer, count_tokens, get_tokenizer
 
 __all__ = [
     "hypercdc_chunks",
-    "hypercdc_simd_chunks",
-    "hypercdc_simd_boundaries",
     "get_optimal_chunker",
     "hash_chunk",
     "hash_content",
@@ -41,14 +32,12 @@ __all__ = [
     "DeduplicateIndex",
     "HierarchicalHasher",
     "StreamingHasher",
-    "get_hash_stats",
     "count_tokens",
     "generate_diff",
     "truncate_smart",
     "truncate_semantic",
     "compute_delta",
     "diff_stats",
-    "DiffDelta",
     "BPETokenizer",
     "get_tokenizer",
     # Semantic summarization

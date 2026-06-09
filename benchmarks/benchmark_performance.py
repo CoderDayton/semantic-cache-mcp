@@ -193,8 +193,8 @@ async def bench_chunked_write(
     """Files >= CHUNK_THRESHOLD (8 KB) are CDC-chunked on write.
 
     The chunked path does N per-chunk operations (BPE token counts, JSON
-    history fan-out, stub-vector allocations). This case exercises the
-    code paths most affected by 0.4.7's hot-path optimisations and is
+    history fan-out, per-chunk FTS5 inserts). This case exercises the
+    code paths most affected by the chunked-write hot path and is
     therefore where any future regression would surface first.
     """
     # ~50 KB → ~25 chunks at CHUNK_MIN_SIZE=2048.
@@ -256,7 +256,7 @@ async def bench_chunked_write(
 
 
 async def bench_search(report: BenchmarkReport, cache: SemanticCache, iters: int) -> None:
-    query = "embedding model configuration"
+    query = "content storage docstore"
 
     # Cold search: each iteration evicts the cache by mutating the store.
     miss_samples: list[float] = []

@@ -3,9 +3,9 @@
 Prevents synchronous file operations from blocking the asyncio event loop
 when multiple concurrent MCP tool calls are in flight.
 
-All operations are routed through a single-threaded executor to prevent
-segfaults from ONNX Runtime / usearch allocator conflicts when blocking
-operations run on different threads concurrently.
+All operations are routed through a single-threaded executor so blocking
+file I/O stays serialized with the rest of the storage layer instead of
+racing across threads.
 """
 
 from __future__ import annotations

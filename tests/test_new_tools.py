@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import array
-import math
 import tempfile
 from pathlib import Path
 
@@ -18,14 +16,6 @@ from semantic_cache_mcp.cache import (
     smart_batch_edit,
     smart_read,
 )
-from tests.constants import TEST_EMBEDDING_DIM
-
-
-def _make_embedding(seed: float = 0.1) -> array.array:
-    """Create a normalized mock embedding vector."""
-    raw = [seed] * TEST_EMBEDDING_DIM
-    magnitude = math.sqrt(sum(x * x for x in raw))
-    return array.array("f", [x / magnitude for x in raw])
 
 
 @pytest.fixture

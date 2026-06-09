@@ -11,7 +11,6 @@ Targets:
 
 from __future__ import annotations
 
-import array
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,20 +26,10 @@ from semantic_cache_mcp.cache.read import batch_smart_read, smart_read
 from semantic_cache_mcp.cache.store import SemanticCache
 from semantic_cache_mcp.cache.write import smart_batch_edit, smart_edit, smart_write
 from semantic_cache_mcp.storage.docstore import ContentStorage
-from tests.constants import TEST_EMBEDDING_DIM
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-def _make_embedding() -> array.array:  # type: ignore[type-arg]
-    """Return a normalized 384-dim float32 embedding."""
-    import math
-
-    raw = [0.1] * TEST_EMBEDDING_DIM
-    mag = math.sqrt(sum(x * x for x in raw))
-    return array.array("f", [x / mag for x in raw])
 
 
 def _make_cache(tmp_path: Path) -> SemanticCache:
@@ -203,7 +192,7 @@ class TestSemanticCacheStore:
             stats = await cache.get_stats()
         assert "files_cached" in stats
 
-    def test_vector_storage_close(self, tmp_path: Path) -> None:
+    def test_content_storage_close(self, tmp_path: Path) -> None:
         """ContentStorage.close() saves and closes without raising."""
         vs = _make_vector_storage(tmp_path)
         vs.close()  # should complete without error
@@ -335,7 +324,7 @@ class TestContentStorageGetStats:
 
 
 class TestContentStorageSearchHybrid:
-    """Lines 492, 494, 499 — search_hybrid and search_by_query."""
+    """Lines 492, 494, 499 — search_by_query."""
 
     async def test_search_by_query_returns_list(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)

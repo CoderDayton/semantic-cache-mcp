@@ -72,6 +72,5 @@ skips = [
     "B310",  # urllib.urlretrieve - we use known hardcoded URL
     "B311",  # random - used for deterministic Gear hash table, not security
     "B608",  # SQL injection - false positive, we use parameterized placeholders
-    "B615",  # HF Hub download without revision pin - we verify SHA256 post-download
     "B110",  # try/except/pass - intentional for optional config files (pooling)
 ]

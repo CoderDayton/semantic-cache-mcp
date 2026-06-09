@@ -6,7 +6,6 @@ Targets:
   - cache/store.py close() (79% → 85%+)
   - config.py validation (82% → 90%+)
   - storage/sqlite.py pool (85% → 90%+)
-  - core/embeddings/_model.py (71% → 80%+)
 """
 
 from __future__ import annotations
@@ -198,7 +197,7 @@ class TestSemanticCacheClose:
         cache = SemanticCache(tmp_path / "vec.db")
         with patch(
             "semantic_cache_mcp.storage.docstore.ContentStorage.close",
-            side_effect=Exception("usearch hung"),
+            side_effect=Exception("storage hung"),
         ):
             cache.close()  # should not raise
 
@@ -305,37 +304,6 @@ class TestConfigValidation:
         with (
             patch.object(config, "TOOL_MAX_RESPONSE_TOKENS", -5),
             pytest.raises(ValueError, match="TOOL_MAX_RESPONSE_TOKENS"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_bad_similarity_threshold(self) -> None:
-        """SIMILARITY_THRESHOLD outside (0, 1) should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "SIMILARITY_THRESHOLD", 1.5),
-            pytest.raises(ValueError, match="SIMILARITY_THRESHOLD"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_bad_near_duplicate_threshold(self) -> None:
-        """NEAR_DUPLICATE_THRESHOLD outside (0, 1] should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "NEAR_DUPLICATE_THRESHOLD", 0),
-            pytest.raises(ValueError, match="NEAR_DUPLICATE_THRESHOLD"),
-        ):
-            config._validate_config()
-
-    def test_validate_config_catches_near_dup_below_similarity(self) -> None:
-        """NEAR_DUPLICATE_THRESHOLD < SIMILARITY_THRESHOLD should raise."""
-        from semantic_cache_mcp import config
-
-        with (
-            patch.object(config, "SIMILARITY_THRESHOLD", 0.8),
-            patch.object(config, "NEAR_DUPLICATE_THRESHOLD", 0.5),
-            pytest.raises(ValueError, match="NEAR_DUPLICATE_THRESHOLD.*SIMILARITY_THRESHOLD"),
         ):
             config._validate_config()
 

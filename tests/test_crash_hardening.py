@@ -1,4 +1,4 @@
-"""Tests for crash-hardening in ContentStorage (embed/usearch/save paths)."""
+"""Tests for crash-hardening in ContentStorage (put/save/close paths)."""
 
 from __future__ import annotations
 

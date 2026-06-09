@@ -1009,7 +1009,7 @@ class TestSmartBatchEditLineRange:
 
 
 class TestBestEffortCacheRefresh:
-    """Mutation tools should still succeed when vecdb refresh degrades."""
+    """Mutation tools should still succeed when the cache-store refresh degrades."""
 
     async def test_write_succeeds_when_refresh_fails(
         self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
