@@ -162,6 +162,12 @@ def hypercdc_boundaries_turbo(
 
     Throughput: ~14+ MB/s on Python 3.12
     """
+    if min_size <= 0 or max_size <= 0 or min_size > max_size:
+        raise ValueError(
+            f"require 0 < min_size <= max_size (got min_size={min_size}, max_size={max_size})"
+        )
+    if not 0 < mask_bits <= 63:
+        raise ValueError(f"require 0 < mask_bits <= 63 (got mask_bits={mask_bits})")
     n = len(content)
     if n == 0:
         return
@@ -296,9 +302,14 @@ def hypercdc_chunks(
     content: bytes,
     min_size: int = 2048,
     max_size: int = 65536,
+    mask_bits: int = 13,
 ) -> Iterator[bytes]:
-    """Yield HyperCDC chunks as byte strings (~13 MB/s via turbo path)."""
-    for start, end in hypercdc_boundaries_turbo(content, min_size, max_size):
+    """Yield HyperCDC chunks as byte strings (~13 MB/s via turbo path).
+
+    Note: boundaries differ from the SIMD chunker; do not mix the two on the
+    same content (see ``get_optimal_chunker``).
+    """
+    for start, end in hypercdc_boundaries_turbo(content, min_size, max_size, mask_bits):
         yield content[start:end]
 
 

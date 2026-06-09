@@ -7,9 +7,11 @@ position-independent fingerprints with sliding window XOR:
 1. Map each byte through 64-bit fingerprint lookup table (SIMD vectorized)
 2. Combine 4-byte windows using XOR for 2^32 unique fingerprints (SIMD)
 3. Check boundary condition: (fingerprint & mask) == 0 (SIMD)
-4. Greedy selection respecting min/max size constraints
+4. Greedy selection respecting min_size
+5. Enforce max_size constraints (sequential)
 
-All boundary detection is fully parallelized - no sequential dependencies.
+Steps 1-3 are fully vectorized; the greedy min_size/max_size selection in
+steps 4-5 is a sequential pass over the (sparse) boundary candidates.
 """
 
 from __future__ import annotations
@@ -55,9 +57,21 @@ def _parallel_cdc_boundaries(
     Returns:
         List of boundary positions (exclusive end indices)
     """
+    if min_size <= 0 or max_size <= 0 or min_size > max_size:
+        raise ValueError(
+            f"require 0 < min_size <= max_size (got min_size={min_size}, max_size={max_size})"
+        )
+    if not 0 < mask_bits <= 63:
+        raise ValueError(f"require 0 < mask_bits <= 63 (got mask_bits={mask_bits})")
+
     n = len(data)
     if n <= min_size:
         return [n] if n > 0 else [0]
+
+    window = 4
+    if n < window:
+        # Sub-window inputs can't form a 4-byte fingerprint window; emit one chunk.
+        return [n]
 
     # Step 1: Map bytes to 64-bit fingerprints (fully vectorized, SIMD)
     fp = _FINGERPRINT_TABLE[data]
@@ -65,17 +79,15 @@ def _parallel_cdc_boundaries(
     # Step 2: Combine 4-byte windows using XOR (SIMD)
     # combined[i] = fp[i] ^ fp[i+1] ^ fp[i+2] ^ fp[i+3]
     # This gives 256^4 = 4B unique values for good mask distribution
-    window = 4
-    if n >= window:
-        combined = fp[: -window + 1].copy()
-        for offset in range(1, window):
-            combined ^= fp[offset : n - window + 1 + offset]
-    else:
-        combined = fp
+    combined = fp[: -window + 1].copy()
+    for offset in range(1, window):
+        combined ^= fp[offset : n - window + 1 + offset]
+    del fp  # free the n-element uint64 array before the mask pass
 
     # Step 3: Find boundary candidates (SIMD)
     mask = np.uint64((1 << mask_bits) - 1)
-    is_boundary = (combined & mask) == 0
+    combined &= mask
+    is_boundary = combined == 0
     candidates = np.nonzero(is_boundary)[0] + window  # Boundary at end of window
 
     # Step 4: Greedy selection respecting min_size
@@ -97,13 +109,10 @@ def _parallel_cdc_boundaries(
     for b in boundaries:
         while b - prev > max_size:
             forced = prev + max_size
-            if b - forced >= min_size:
-                result.append(forced)
-                prev = forced
-            else:
-                # Forced cut would create small chunk - use it anyway, skip natural
-                result.append(forced)
-                prev = forced
+            result.append(forced)
+            prev = forced
+            if b - forced < min_size:
+                # Remaining slice too small to keep b as a natural cut; absorb it.
                 break
         else:
             if b - prev >= min_size:
@@ -153,19 +162,7 @@ def hypercdc_simd_chunks(
         yield content[start:end]
 
 
-def get_optimal_chunker(prefer_simd: bool = True):
-    """Return the fastest available chunker (SIMD if numpy present, Gear hash otherwise)."""
-    if prefer_simd:
-        return hypercdc_simd_chunks
-
-    from ._gear import hypercdc_chunks  # noqa: PLC0415
-
-    return hypercdc_chunks
-
-
 __all__ = [
     "hypercdc_simd_boundaries",
     "hypercdc_simd_chunks",
-    "get_optimal_chunker",
-    "_parallel_cdc_boundaries",
 ]

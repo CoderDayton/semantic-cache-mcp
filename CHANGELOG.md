@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-09
+
+Dependency maintenance release. Updates the vector-storage backend to pick up
+upstream correctness and thread-safety fixes. No public API or behavior changes.
+
+### Changed
+
+- **Bumped `simplevecdb` minimum to 2.6.2.** Picks up storage-layer correctness
+  fixes: a catalog write-lock leak that could deadlock the database on a
+  connection error, `rebuild_index` no longer bricking a collection if the
+  rebuild fails, and catalog read paths serializing on the connection lock for
+  thread-safety under the IO executor. No API or behavior changes on our side.
+
 ## [0.4.9] - 2026-05-30
 
 Fixes a correctness bug in line-addressed reads that made fresh-but-summarized

@@ -2050,12 +2050,13 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.4.9"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
     { name = "fastembed" },
     { name = "fastmcp" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "simplevecdb" },
 ]
@@ -2080,11 +2081,12 @@ requires-dist = [
     { name = "fastembed-gpu", marker = "extra == 'gpu'", specifier = ">=0.5.1" },
     { name = "fastmcp", specifier = ">=3.0.0b1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "openai", specifier = ">=2.33.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
-    { name = "simplevecdb", specifier = ">=2.6.0" },
+    { name = "simplevecdb", specifier = ">=2.6.2" },
 ]
 provides-extras = ["gpu", "dev"]
 
@@ -2099,7 +2101,7 @@ wheels = [
 
 [[package]]
 name = "simplevecdb"
-version = "2.6.0"
+version = "2.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -2108,12 +2110,11 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "scikit-learn" },
     { name = "sqlcipher3-binary", marker = "sys_platform == 'linux'" },
-    { name = "sqlite-vec" },
     { name = "usearch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2f/5e/0da24a312ddfd5d53aa9fed977f65a1889f8d00422e2d30c4d2d5494dc97/simplevecdb-2.6.0.tar.gz", hash = "sha256:5912a02e87a4bbe7e00f428b4beef5976f2918b90e3ff340b285c0830cfd8282", size = 596661, upload-time = "2026-05-06T09:09:31.837Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/89/6b/1ba14bf658ab3c1b28c567063775a33a179f77e67a4fe375499fa1cf604a/simplevecdb-2.6.2.tar.gz", hash = "sha256:d810586561ff01b3232f14e60a4997f382e23c83157ceced028b1102382f9e41", size = 645511, upload-time = "2026-06-07T18:34:43.532Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/23/390e75765cace3e46e3c160102d77f394fccfd25d47f925f84c7d9bcd483/simplevecdb-2.6.0-py3-none-any.whl", hash = "sha256:2fa0175a5217782ea4fc7b699767b33ecb8467a0044f73c39e0a5551b93da149", size = 96454, upload-time = "2026-05-06T09:09:33.443Z" },
+    { url = "https://files.pythonhosted.org/packages/36/98/1d613ac866303ac28365eaa5858084b8b74a2298e516a88006c1b14dd8b4/simplevecdb-2.6.2-py3-none-any.whl", hash = "sha256:d545c5c4d131d4b9f00c277a47a6c059eee4be6e8f56a3165b7593bde8607848", size = 119977, upload-time = "2026-06-07T18:34:42.276Z" },
 ]
 
 [[package]]
@@ -2187,18 +2188,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/ff/de25662f378f0a5cedef2a5c1d9479db5a9bf7b6bff4fdb8e413869548ac/sqlcipher3_binary-0.6.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c8a7076a18b4f6fc9b580b0f24aa526d6a47605b1e3e6491ee3e9f2977940d8e", size = 3247275, upload-time = "2025-12-31T16:40:31.593Z" },
     { url = "https://files.pythonhosted.org/packages/6d/ce/48fabcff1a441e1bc7d91aab00fc1ec398571238b7cf131a4fa73d6eebd2/sqlcipher3_binary-0.6.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8a6afbdef7cbbb33b1228ce96edc1bfe7f15bdf2a5e8bdab87261ab52e4111e6", size = 3246980, upload-time = "2025-12-31T16:40:36.653Z" },
     { url = "https://files.pythonhosted.org/packages/ab/ce/fbe8da71656eefd5fd4db70cb6d7b5911ba34279985ee3c11476a1f8550d/sqlcipher3_binary-0.6.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f9bccb9e942a04bbf920714940c8f9e00134cd655b11ba4c6f1306bcc3504d6c", size = 3246791, upload-time = "2025-12-31T16:40:41.484Z" },
-]
-
-[[package]]
-name = "sqlite-vec"
-version = "0.1.6"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/ed/aabc328f29ee6814033d008ec43e44f2c595447d9cccd5f2aabe60df2933/sqlite_vec-0.1.6-py3-none-macosx_10_6_x86_64.whl", hash = "sha256:77491bcaa6d496f2acb5cc0d0ff0b8964434f141523c121e313f9a7d8088dee3", size = 164075, upload-time = "2024-11-20T16:40:29.847Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/57/05604e509a129b22e303758bfa062c19afb020557d5e19b008c64016704e/sqlite_vec-0.1.6-py3-none-macosx_11_0_arm64.whl", hash = "sha256:fdca35f7ee3243668a055255d4dee4dea7eed5a06da8cad409f89facf4595361", size = 165242, upload-time = "2024-11-20T16:40:31.206Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/48/dbb2cc4e5bad88c89c7bb296e2d0a8df58aab9edc75853728c361eefc24f/sqlite_vec-0.1.6-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7b0519d9cd96164cd2e08e8eed225197f9cd2f0be82cb04567692a0a4be02da3", size = 103704, upload-time = "2024-11-20T16:40:33.729Z" },
-    { url = "https://files.pythonhosted.org/packages/80/76/97f33b1a2446f6ae55e59b33869bed4eafaf59b7f4c662c8d9491b6a714a/sqlite_vec-0.1.6-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux1_x86_64.whl", hash = "sha256:823b0493add80d7fe82ab0fe25df7c0703f4752941aee1c7b2b02cec9656cb24", size = 151556, upload-time = "2024-11-20T16:40:35.387Z" },
-    { url = "https://files.pythonhosted.org/packages/6a/98/e8bc58b178266eae2fcf4c9c7a8303a8d41164d781b32d71097924a6bebe/sqlite_vec-0.1.6-py3-none-win_amd64.whl", hash = "sha256:c65bcfd90fa2f41f9000052bcb8bb75d38240b2dae49225389eca6c3136d3f0c", size = 281540, upload-time = "2024-11-20T16:40:37.296Z" },
 ]
 
 [[package]]
