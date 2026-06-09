@@ -46,7 +46,10 @@ from semantic_cache_mcp.cache import (  # noqa: E402, I001
     semantic_search,
     smart_read,
 )
+from semantic_cache_mcp.core.chunking import get_optimal_chunker  # noqa: E402
+from semantic_cache_mcp.core.hashing import hash_chunk  # noqa: E402
 from semantic_cache_mcp.core.tokenizer import count_tokens  # noqa: E402
+from semantic_cache_mcp.storage.docstore import CHUNK_THRESHOLD  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,6 +107,61 @@ def _apply_small_edits(files: list[Path], fraction: float = 0.3, seed: int = 42)
         fpath.write_text("".join(lines), encoding="utf-8")
 
     return to_modify
+
+
+def _file_chunks(data: bytes) -> list[bytes]:
+    """Chunk `data` exactly as storage would: one doc below the threshold,
+    HyperCDC chunks at or above it (mirrors ContentStorage.put)."""
+    if len(data) < CHUNK_THRESHOLD:
+        return [data]
+    return list(get_optimal_chunker(prefer_simd=True)(data))
+
+
+def measure_chunk_economics(
+    v1: dict[str, bytes], v2: dict[str, bytes]
+) -> dict[str, float | int]:
+    """Quantify whether chunk-level content addressing would pay off here.
+
+    `v1` maps every corpus path to its original bytes; `v2` maps the edited
+    subset to its post-edit bytes. Reports three decision inputs:
+      * granularity   — do files even split into >1 chunk? (gates the whole idea)
+      * corpus dedup  — unique vs total chunks at one instant (cross-file reuse)
+      * write amp.    — per edit, chunks the current arch re-inserts (all of them)
+                        vs chunks a content-addressed store would insert (only the
+                        ones whose BLAKE3 changed). The gap is the CDC resync win.
+    """
+    per_file = {p: _file_chunks(b) for p, b in v1.items()}
+    counts = [len(c) for c in per_file.values()]
+    chunked = [n for n in counts if n > 1]
+    total_logical = sum(counts)
+
+    hashes_v1 = [hash_chunk(c) for chunks in per_file.values() for c in chunks]
+    unique_v1 = len(set(hashes_v1))
+
+    amp_total = amp_new = 0
+    for path, b2 in v2.items():
+        old = {hash_chunk(c) for c in per_file[path]}
+        new_hashes = [hash_chunk(c) for c in _file_chunks(b2)]
+        amp_total += len(new_hashes)  # current arch re-inserts every chunk
+        amp_new += sum(1 for h in new_hashes if h not in old)  # CAS inserts only new
+
+    n_files = len(v1)
+    return {
+        "files": n_files,
+        "chunked_files": len(chunked),
+        "single_doc_files": n_files - len(chunked),
+        "total_logical_chunks": total_logical,
+        "max_chunks_per_file": max(counts) if counts else 0,
+        "mean_chunks_per_chunked_file": (sum(chunked) / len(chunked)) if chunked else 0.0,
+        "unique_chunks": unique_v1,
+        "corpus_dup_ratio": (1 - unique_v1 / total_logical) if total_logical else 0.0,
+        "edited_files": len(v2),
+        "edit_chunks_reinserted": amp_total,
+        "edit_chunks_new": amp_new,
+        "edit_amplification_avoidable": (1 - amp_new / amp_total) if amp_total else 0.0,
+        "mean_chunks_per_edit": (amp_total / len(v2)) if v2 else 0.0,
+        "mean_delta_per_edit": (amp_new / len(v2)) if v2 else 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +347,12 @@ async def run_benchmark(
             print("\nPhase 3: Content Hash (mtime drift, BLAKE3 match)")
             print(_fmt_row("Content hash hit", p3_ret, p3_orig))
 
-        # Phase 4: Small edits
+        # Phase 4: Small edits.  Snapshot bytes around the edit so chunk
+        # economics can compare each file's pre/post chunking faithfully.
+        v1_bytes = {str(f): f.read_bytes() for f in files}
         modified = _apply_small_edits(files, fraction=0.3, seed=seed)
+        v2_bytes = {str(f): f.read_bytes() for f in modified}
+        chunk_econ = measure_chunk_economics(v1_bytes, v2_bytes)
         p4 = await phase_small_modifications(cache, files, modified)
         p4c_ret, p4c_orig = p4["combined"]
         if not quiet:
@@ -300,6 +362,32 @@ async def run_benchmark(
             print(_fmt_row(f"Changed ({len(modified)})", ch_ret, ch_orig))
             print(_fmt_row(f"Unchanged ({len(files) - len(modified)})", unch_ret, unch_orig))
             print(_fmt_row("Combined", p4c_ret, p4c_orig))
+
+        if not quiet:
+            ce = chunk_econ
+            print("\nChunk economics (storage granularity — gates chunk-level CAS)")
+            print(
+                f"  {'Granularity':<26s}  {ce['chunked_files']}/{ce['files']} files split >1 doc; "
+                f"{ce['single_doc_files']} stay single-doc"
+            )
+            print(
+                f"  {'Logical chunks':<26s}  {ce['total_logical_chunks']:,} total, "
+                f"max {ce['max_chunks_per_file']}/file, "
+                f"mean {ce['mean_chunks_per_chunked_file']:.1f}/chunked-file"
+            )
+            print(
+                f"  {'Corpus storage dedup':<26s}  {ce['unique_chunks']:,} unique of "
+                f"{ce['total_logical_chunks']:,} ({ce['corpus_dup_ratio']:.1%} duplicate)"
+            )
+            print(
+                f"  {'Edit write-amp':<26s}  re-inserts {ce['edit_chunks_reinserted']} chunks; "
+                f"CAS inserts {ce['edit_chunks_new']} "
+                f"({ce['edit_amplification_avoidable']:.1%} avoidable)"
+            )
+            print(
+                f"  {'Per edited file':<26s}  {ce['mean_chunks_per_edit']:.1f} re-inserted "
+                f"vs {ce['mean_delta_per_edit']:.2f} actually new"
+            )
 
         # Phase 5: Batch
         p5_ret, p5_orig = await phase_batch_read(cache, files)
@@ -371,6 +459,7 @@ async def run_benchmark(
                 },
             },
             "ratios": {k: v for k, v in results.items() if not k.startswith("search_")},
+            "chunk_economics": chunk_econ,
         }
 
         if json_path is not None:

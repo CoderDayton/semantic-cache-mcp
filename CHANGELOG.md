@@ -19,6 +19,18 @@ runtime.
 
 ### Added
 
+- Incremental chunk updates. Editing a large file now rewrites only the chunks
+  that actually changed instead of re-chunking and re-storing the whole file.
+  Each chunk carries its own BLAKE3 hash and the file keeps a manifest of those
+  hashes, so on a re-write the cache keeps every chunk whose bytes are unchanged
+  — no row rewrite, no search re-index — and writes only the few that differ. A
+  one-line edit to a file that splits into 43 chunks now touches about 2 of them.
+  It stays crash-safe by ordering: the file's `content_hash` is written last, so
+  a write that fails partway is caught by the next read's freshness check and
+  re-stored, and the eviction index rebuilds itself from disk on failure. The
+  token-savings benchmark now reports chunk economics — how many files chunk,
+  how much chunk content repeats, and the share of per-edit chunk writes this
+  avoids — so the win is measured, not assumed.
 - Hash-driven read freshness. Every `read` returns a `content_hash`, and `read`
   takes an optional `known_hash`. Send back the hash you already have and the
   server answers `unchanged: true` instead of resending the file. The caller
@@ -81,6 +93,9 @@ runtime.
   that deletes the old `vecdb.db` files (simplevecdb plus usearch, and the
   short-lived FTS build) and their sidecars, guarded by a `.docstore_v1` marker.
   The cache rebuilds itself on demand into `docstore.db`.
+- Upgrading to chunk-level content addressing clears any existing `docstore.db`
+  the first time you start, so the cache repopulates in the new chunk format.
+  This runs once, guarded by a `.docstore_manifest_v1` marker.
 
 ## [0.4.9] - 2026-05-30
 
