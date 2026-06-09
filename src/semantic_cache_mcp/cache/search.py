@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -28,6 +29,54 @@ MAX_SEARCH_K = 100
 MAX_SEARCH_QUERY_LEN = 8000
 MAX_GLOB_MATCHES = 1000
 GLOB_TIMEOUT_SECONDS = 5
+
+# FTS5 reads -, *, :, ^, parentheses and the barewords AND/OR/NOT/NEAR as query
+# operators. The user-facing search tool takes plain keywords, so a token like
+# "in-flight" parses as `in NOT flight` and a stray "*" raises a syntax error —
+# both surfacing as an empty result. Reduce each token to its word runs and
+# quote them, turning every term into an FTS5 string literal that can never be
+# read as an operator.
+_FTS_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Turn a free-text query into a safe FTS5 ``MATCH`` expression.
+
+    Each whitespace-separated chunk is reduced to its ``\\w+`` runs and
+    re-emitted as a double-quoted FTS5 string. A chunk that splits into several
+    runs (``in-flight`` -> ``in``, ``flight``) becomes an adjacency phrase
+    ``"in flight"`` so the compound still matches the source text; a single run
+    becomes a plain quoted term. Quoting makes every term a string literal, so
+    no input reaches the FTS5 parser as an operator. Returns ``""`` when the
+    query has no indexable characters (the caller then yields no matches).
+    """
+    chunks: list[str] = []
+    for raw in query.split():
+        words = _FTS_WORD_RE.findall(raw)
+        if words:
+            chunks.append('"' + " ".join(words) + '"')
+    return " ".join(chunks)
+
+
+def _normalize_relevance(scores: list[float]) -> list[float]:
+    """Map FTS5 ``bm25()`` scores to a 0-1 relevance, best = 1.0.
+
+    FTS5 ``bm25()`` returns *negative* numbers where the most relevant row is
+    the most negative — the search SQL sorts ascending, so ``scores[0]`` is the
+    best. A row's relevance is its magnitude relative to that best score:
+    dividing two negatives yields a value in ``(0, 1]`` for well-ordered input.
+    Results are clamped to ``[0, 1]`` to absorb a degenerate ordering or a
+    non-negative score, and a zero or empty best maps everything to 0.0.
+
+    The previous code guarded on ``max_score > 0``; bm25 scores are negative, so
+    that branch forced every similarity to 0.0.
+    """
+    if not scores:
+        return []
+    best = scores[0]
+    if best == 0:
+        return [0.0] * len(scores)
+    return [max(0.0, min(1.0, round(score / best, 4))) for score in scores]
 
 
 async def _read_text_file(cache: SemanticCache, file_path: Path, display_path: str) -> str:
@@ -99,8 +148,11 @@ async def semantic_search(
     # Request extra results when directory filtering will reduce the set
     storage = cache._storage
     search_k = k * 3 if resolved_dir else k
+    # User queries are free-text keywords, not the FTS5 query DSL; sanitize so
+    # operator characters are matched literally instead of returning nothing or
+    # raising (see _sanitize_fts_query). An empty sanitized query yields no rows.
     results = await storage.search_by_query(
-        query=query,
+        query=_sanitize_fts_query(query),
         k=search_k,
     )
 
@@ -121,23 +173,22 @@ async def semantic_search(
             continue
         filtered.append((path, preview, score))
 
-    # Normalize scores to 0–1 range (best result = 1.0) so LLMs can
-    # judge relevance without knowing RRF score internals.
-    max_score = filtered[0][2] if filtered else 1.0
+    # Map raw bm25() scores to a 0-1 relevance (best result = 1.0) so callers
+    # can judge matches without knowing FTS5 score internals.
+    relevances = _normalize_relevance([score for _, _, score in filtered])
 
     filtered_paths = [path for path, _, _ in filtered]
     entries = await asyncio.gather(*(cache.get(p) for p in filtered_paths))
     entry_map = dict(zip(filtered_paths, entries, strict=False))
 
     matches: list[SearchMatch] = []
-    for path, preview, score in filtered:
+    for (path, preview, _score), similarity in zip(filtered, relevances, strict=True):
         entry = entry_map[path]
         tokens = entry.tokens if entry else 0
-        normalized = round(score / max_score, 4) if max_score > 0 else 0.0
         matches.append(
             SearchMatch(
                 path=path,
-                similarity=normalized,
+                similarity=similarity,
                 tokens=tokens,
                 preview=preview.replace("\n", " "),
             )
