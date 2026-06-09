@@ -96,6 +96,15 @@ logger = logging.getLogger(__name__)
 MAX_BATCH_FILES = 50
 MAX_BATCH_TOKENS = 200_000
 
+# Diff gate: emit a unified diff instead of full content when the diff is at
+# least this much smaller than the file. Raised from 0.6 so small real edits to
+# mid/large files still diff (the diff carries the changed line numbers, which is
+# what the agent needs after an edit) instead of falling through to a full read.
+_DIFF_MAX_RATIO = 0.9
+# Below this size a diff's @@-header overhead isn't worth it — return full
+# content instead. Tiny files are cheap, and a diff just adds noise.
+_DIFF_MIN_TOKENS = 200
+
 
 async def smart_read(
     cache: SemanticCache,
@@ -252,7 +261,10 @@ async def smart_read(
             diff_content = generate_diff(old_content, content)
             diff_tokens = count_tokens(diff_content)
 
-            if diff_tokens < tokens_original * 0.6:
+            if (
+                tokens_original >= _DIFF_MIN_TOKENS
+                and diff_tokens < tokens_original * _DIFF_MAX_RATIO
+            ):
                 result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
                 await cache.refresh_path(
                     str(file_path),

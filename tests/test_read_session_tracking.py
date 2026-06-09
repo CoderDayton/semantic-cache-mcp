@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -9,6 +11,7 @@ import pytest
 from fastmcp import Context
 
 from semantic_cache_mcp.cache import SemanticCache
+from semantic_cache_mcp.cache.read import smart_read
 from semantic_cache_mcp.server._read_session import _ReadSessionTracker, get_tracker
 from semantic_cache_mcp.server.tools import edit, read
 
@@ -217,3 +220,140 @@ async def test_truncated_read_does_not_block_reread(ctx: MagicMock, tmp_path: Pa
     d2 = _parse(await read(ctx, str(big), max_size=200))
     assert d2.get("unchanged") is not True
     assert "content" in d2
+
+
+# ---------------------------------------------------------------------------
+# A: hash-driven freshness — the caller asserts it still holds the file
+# ---------------------------------------------------------------------------
+
+
+def _new_ctx(tmp_cache: SemanticCache, session: str) -> MagicMock:
+    c = MagicMock(spec=Context)
+    c.lifespan_context = {"cache": tmp_cache}
+    c.session_id = session
+    c.client_id = session
+    return c
+
+
+async def test_full_read_returns_content_hash(ctx: MagicMock, sample_file: Path) -> None:
+    """Enabler: every full read surfaces content_hash so the caller can echo it."""
+    d = _parse(await read(ctx, str(sample_file)))
+    assert "content" in d
+    assert d.get("content_hash")
+
+
+async def test_known_hash_returns_unchanged_without_session_seen(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    f = tmp_path / "hashed.py"
+    f.write_text("\n".join(f"v_{i} = {i}" for i in range(60)) + "\n")
+
+    # Session A populates the cache and learns the hash.
+    d1 = _parse(await read(ctx, str(f)))
+    h = d1["content_hash"]
+
+    # Session B has never seen the file, but asserts the hash it holds.
+    ctx_b = _new_ctx(tmp_cache, "session_b")
+    d = _parse(await read(ctx_b, str(f), known_hash=h))
+    assert d.get("unchanged") is True
+    assert d["content_hash"] == h
+    assert "content" not in d
+
+
+async def test_wrong_known_hash_returns_full_content(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    f = tmp_path / "hashed2.py"
+    f.write_text("\n".join(f"v_{i} = {i}" for i in range(60)) + "\n")
+    await read(ctx, str(f))
+
+    ctx_b = _new_ctx(tmp_cache, "session_b")
+    d = _parse(await read(ctx_b, str(f), known_hash="deadbeefdeadbeef"))
+    assert d.get("unchanged") is not True
+    assert "content" in d
+
+
+async def test_known_hash_stale_after_change_never_false_unchanged(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    """A matching-but-stale hash must never mask a real on-disk change."""
+    f = tmp_path / "changed.py"
+    f.write_text("\n".join(f"v_{i} = {i}" for i in range(120)) + "\n")
+    d1 = _parse(await read(ctx, str(f)))
+    h = d1["content_hash"]
+
+    # Change the file on disk; the caller still holds the OLD hash.
+    f.write_text("\n".join(f"v_{i} = {i + 1}" for i in range(120)) + "\n")
+    ctx_b = _new_ctx(tmp_cache, "session_b")
+    d = _parse(await read(ctx_b, str(f), known_hash=h))
+    assert d.get("unchanged") is not True
+    assert "content" in d
+
+
+# ---------------------------------------------------------------------------
+# B: diff gate — small real changes to mid/large files still diff; tiny files
+# return full content (a diff's @@-header overhead isn't worth it)
+# ---------------------------------------------------------------------------
+
+
+async def test_small_change_to_midsize_file_returns_diff(
+    tmp_cache: SemanticCache, tmp_path: Path
+) -> None:
+    f = tmp_path / "mid.py"
+    f.write_text("\n".join(f"item_{i} = {i}" for i in range(150)) + "\n")
+    await smart_read(tmp_cache, str(f))  # cache it
+
+    body = f.read_text().replace("item_0 = 0", "item_0 = 999")
+    f.write_text(body)
+    r = await smart_read(tmp_cache, str(f))
+    assert r.is_diff is True
+
+
+async def test_small_change_to_tiny_file_returns_full(
+    tmp_cache: SemanticCache, tmp_path: Path
+) -> None:
+    f = tmp_path / "tiny.py"
+    f.write_text("a = 1\nb = 2\n")
+    await smart_read(tmp_cache, str(f))
+
+    f.write_text("a = 1\nb = 3\n")
+    r = await smart_read(tmp_cache, str(f))
+    assert r.is_diff is False
+    assert "b = 3" in r.content
+
+
+# ---------------------------------------------------------------------------
+# C: cache-aware ranged reads — known_hash short-circuits a ranged re-read
+# ---------------------------------------------------------------------------
+
+
+async def test_ranged_read_known_hash_short_circuits(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    f = tmp_path / "ranged.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(40)) + "\n")
+    d1 = _parse(await read(ctx, str(f)))
+    h = d1["content_hash"]
+
+    d = _parse(await read(ctx, str(f), offset=2, limit=3, known_hash=h))
+    assert d.get("unchanged") is True
+    assert d["content_hash"] == h
+    assert "content" not in d
+    assert d["lines"]["total"] == 40
+
+
+async def test_ranged_read_known_hash_mtime_bump_falls_through(
+    ctx: MagicMock, tmp_path: Path
+) -> None:
+    """An mtime bump (even with identical content) must defeat the
+    short-circuit and return literal lines, never a false unchanged."""
+    f = tmp_path / "ranged2.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(40)) + "\n")
+    d1 = _parse(await read(ctx, str(f)))
+    h = d1["content_hash"]
+
+    future = time.time() + 60
+    os.utime(f, (future, future))
+    d = _parse(await read(ctx, str(f), offset=1, limit=3, known_hash=h))
+    assert d.get("unchanged") is not True
+    assert "content" in d

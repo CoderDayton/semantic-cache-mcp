@@ -384,6 +384,7 @@ async def read(
     max_size: int = MAX_CONTENT_SIZE,
     offset: int | None = None,
     limit: int | None = None,
+    known_hash: str | None = None,
 ) -> dict[str, Any]:
     """Read a file with token-efficient caching. For 2+ files, use `batch_read`.
 
@@ -399,6 +400,10 @@ async def read(
         offset: 1-based starting line number for targeted reads. `0` is
             treated as "from the start" (equivalent to omitting).
         limit: Number of lines to return from `offset`.
+        known_hash: The `content_hash` returned by a prior read. Pass it to
+            assert you still hold the file; the server replies `"unchanged":
+            true` when it matches and the file is unchanged, skipping the
+            re-send. Omit it to fall back to per-session tracking.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -423,6 +428,35 @@ async def read(
     try:
         # If offset/limit specified, read specific lines (still caches full file)
         if offset is not None or limit is not None:
+            # Hash-gated short-circuit: when the caller still holds this exact
+            # file (known_hash matches the cached hash) and disk hasn't changed,
+            # a ranged re-read is pointless. Confirm with a stat only — no byte
+            # read, no re-slice — and answer unchanged for the range.
+            if known_hash:
+                ranged_abs = str(Path(path).expanduser().resolve())
+                ranged_entry = await cache.get(ranged_abs)
+                if ranged_entry is not None and known_hash == ranged_entry.content_hash:
+                    try:
+                        ranged_st = await astat(Path(ranged_abs), cache._io_executor)
+                    except OSError:
+                        ranged_st = None
+                    if ranged_st is not None and ranged_entry.mtime >= ranged_st.st_mtime:
+                        ranged_text = await cache.get_content(ranged_entry)
+                        # Count lines the same way the literal ranged path does
+                        # (splitlines) so `lines.total` agrees for the same file,
+                        # including the empty-file edge case.
+                        total = len(ranged_text.splitlines(keepends=True))
+                        return _finalize_payload(
+                            {
+                                "ok": True,
+                                "tool": "read",
+                                "path": path,
+                                "unchanged": True,
+                                "content_hash": ranged_entry.content_hash,
+                                "lines": {"total": total},
+                            },
+                            max_response_tokens,
+                        )
             result = await asyncio.wait_for(
                 smart_read(
                     cache=cache,
@@ -463,6 +497,9 @@ async def read(
                 "content": content,
                 "lines": line_info,
             }
+            ranged_entry2 = await cache.get(str(Path(path).expanduser().resolve()))
+            if ranged_entry2 is not None:
+                payload["content_hash"] = ranged_entry2.content_hash
             if mode in _MODE_NORMAL:
                 payload["truncated"] = result.truncated
             if mode == _MODE_DEBUG:
@@ -495,7 +532,18 @@ async def read(
         abs_path = str(Path(path).expanduser().resolve())
         session_id = getattr(ctx, "session_id", None) or getattr(ctx, "client_id", None)
         already_seen = _read_session_tracker.seen(session_id, abs_path)
-        unchanged = cache_fresh and already_seen
+        # Fetch the entry once: used both for hash-driven freshness and to stamp
+        # content_hash onto whatever payload we return.
+        entry = await cache.get(abs_path)
+        # Hash-driven freshness: the caller echoes the content_hash it already
+        # holds. If it matches the cached hash and the file is cache-fresh
+        # (disk == cache), the caller provably has the current bytes, so answer
+        # unchanged without relying on the per-session tracker. cache_fresh still
+        # gates this, so a stale known_hash can't mask a real change.
+        caller_has_current = (
+            bool(known_hash) and entry is not None and known_hash == entry.content_hash
+        )
+        unchanged = cache_fresh and (already_seen or caller_has_current)
 
         payload = {
             "ok": True,
@@ -506,7 +554,6 @@ async def read(
             # Skip sending content; give the model enough metadata to decide
             # locally whether a ranged re-read is worth it.
             payload["unchanged"] = True
-            entry = await cache.get(abs_path)
             if entry is not None:
                 payload["content_hash"] = entry.content_hash
                 # smart_read returns either the full content (small files) or
@@ -551,6 +598,10 @@ async def read(
             # unchanged:true for a file the model never saw in full.
             if delivered_full:
                 _read_session_tracker.mark(session_id, abs_path)
+        # Always surface the current content_hash so the caller can echo it back
+        # as known_hash on its next read and skip a re-send.
+        if entry is not None and "content_hash" not in payload:
+            payload["content_hash"] = entry.content_hash
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True
