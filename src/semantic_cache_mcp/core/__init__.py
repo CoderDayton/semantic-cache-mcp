@@ -4,8 +4,6 @@ from .chunking import (
     hypercdc_simd_boundaries,
     hypercdc_simd_chunks,
 )
-from .embeddings import embed, embed_batch, embed_query, get_model_info
-from .embeddings import warmup as warmup_embeddings
 from .hashing import (
     DeduplicateIndex,
     HierarchicalHasher,
@@ -14,12 +12,6 @@ from .hashing import (
     hash_chunk,
     hash_chunk_binary,
     hash_content,
-)
-from .similarity import (
-    cosine_similarity,
-    cosine_similarity_batch,
-    cosine_similarity_batch_matrix,
-    top_k_similarities,
 )
 from .text import (
     DEFAULT_SUMMARIZATION_CONFIG,
@@ -50,10 +42,6 @@ __all__ = [
     "HierarchicalHasher",
     "StreamingHasher",
     "get_hash_stats",
-    "cosine_similarity",
-    "cosine_similarity_batch",
-    "cosine_similarity_batch_matrix",
-    "top_k_similarities",
     "count_tokens",
     "generate_diff",
     "truncate_smart",
@@ -63,11 +51,6 @@ __all__ = [
     "DiffDelta",
     "BPETokenizer",
     "get_tokenizer",
-    "embed",
-    "embed_batch",
-    "embed_query",
-    "warmup_embeddings",
-    "get_model_info",
     # Semantic summarization
     "SummarizationConfig",
     "DEFAULT_SUMMARIZATION_CONFIG",

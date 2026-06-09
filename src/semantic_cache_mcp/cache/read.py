@@ -5,18 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import stat as stat_module
 import time
 from pathlib import Path
-
-import numpy as np
 
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
 from ..logger import log_marker
-from ..types import BatchReadResult, EmbeddingVector, FileReadSummary, ReadResult
-from ..utils import aread_bytes, aread_text, astat
+from ..types import BatchReadResult, FileReadSummary, ReadResult
+from ..utils import aread_bytes, astat
 from ._helpers import _is_binary_content
 from .store import SemanticCache
 
@@ -108,16 +105,14 @@ async def smart_read(
     force_full: bool = False,
     refresh_cache: bool = True,
     summarize: bool = True,
-    _embedding: EmbeddingVector | None = None,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
 
     Strategies (in order of token savings):
     1. File unchanged (mtime match) -> "// No changes" (99% reduction)
     2. File changed -> unified diff (80-95% reduction)
-    3. Similar file in cache -> reference + diff (70-90% reduction)
-    4. Large file -> smart truncation (50-80% reduction)
-    5. New file -> full content with caching for future reads
+    3. Large file -> smart truncation (50-80% reduction)
+    4. New file -> full content with caching for future reads
     """
     file_path = Path(path).expanduser().resolve()
 
@@ -192,7 +187,6 @@ async def smart_read(
         logger.warning(f"File {path} contains non-UTF-8 characters, using replacement")
 
     tokens_original = count_tokens(content)
-    computed_embedding = _embedding
 
     cache_is_fresh = False
     if cached and force_full:
@@ -260,14 +254,10 @@ async def smart_read(
 
             if diff_tokens < tokens_original * 0.6:
                 result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
-                if computed_embedding is None:
-                    computed_embedding = await cache.get_embedding(content, path)
                 await cache.refresh_path(
                     str(file_path),
                     content,
                     mtime,
-                    computed_embedding,
-                    embedding_path=path,
                 )
 
                 tokens_returned = count_tokens(result_content)
@@ -282,46 +272,7 @@ async def smart_read(
                     compression_ratio=len(result_content) / len(content),
                 )
 
-    # Strategy 3: Semantic similarity
-    if not cached and diff_mode and not force_full:
-        if computed_embedding is None:
-            computed_embedding = await cache.get_embedding(content, path)
-        if computed_embedding:
-            similar_path = await cache.find_similar(computed_embedding, str(file_path))
-            if similar_path:
-                similar_entry = await cache.get(similar_path)
-                if similar_entry:
-                    similar_content = await cache.get_content(similar_entry)
-                    diff_content = generate_diff(similar_content, content)
-                    diff_tokens = count_tokens(diff_content)
-
-                    if diff_tokens < tokens_original * 0.7:
-                        result_content = (
-                            f"// Similar to cached: {similar_path}\n"
-                            f"// Diff from similar file:\n{diff_content}"
-                        )
-                        await cache.refresh_path(
-                            str(file_path),
-                            content,
-                            mtime,
-                            computed_embedding,
-                            embedding_path=path,
-                        )
-
-                        tokens_returned = count_tokens(result_content)
-                        return ReadResult(
-                            content=result_content,
-                            from_cache=True,
-                            is_diff=True,
-                            tokens_original=tokens_original,
-                            tokens_returned=tokens_returned,
-                            tokens_saved=tokens_original - tokens_returned,
-                            truncated=False,
-                            compression_ratio=len(result_content) / len(content),
-                            semantic_match=similar_path,
-                        )
-
-    # Strategy 4 & 5: Full read (semantic summarization if large; uses pre-fetched embedding)
+    # Strategy 3 & 4: Full read (semantic summarization if large)
     truncated = False
     final_content = content
 
@@ -329,24 +280,15 @@ async def smart_read(
     # literal disk lines, so summarizing here would fabricate line numbers and a
     # false total. Full-file reads keep summarization for large files.
     if summarize and len(content) > max_size:
-        # Use semantic summarization to preserve important content.
-        # The entire summarize_semantic call (including its embed_fn callback)
-        # MUST run in the executor — ONNX is not thread-safe and embed_fn
-        # calls it synchronously.
+        # Use semantic summarization to preserve important content. Runs in the
+        # executor — summarizing a large file is CPU-heavy and would otherwise
+        # block the event loop.
         try:
             started = time.perf_counter()
             log_marker(logger, "summarize.begin", path=path, chars=len(content))
 
             def _summarize() -> str:
-                from . import embed as _sync_embed  # noqa: PLC0415
-
-                def embed_fn(text: str):
-                    emb = _sync_embed(text)
-                    if emb is None:
-                        return None
-                    return np.asarray(emb, dtype=np.float32)
-
-                return summarize_semantic(content, max_size, embed_fn=embed_fn)
+                return summarize_semantic(content, max_size, embed_fn=None)
 
             loop = asyncio.get_running_loop()
             final_content = await loop.run_in_executor(cache._io_executor, _summarize)
@@ -371,8 +313,6 @@ async def smart_read(
             str(file_path),
             content,
             mtime,
-            computed_embedding,
-            embedding_path=path,
         )
 
     tokens_returned = count_tokens(final_content)
@@ -452,53 +392,6 @@ async def batch_smart_read(
     else:
         paths_sorted = sorted(paths, key=lambda p: token_estimates[p])
 
-    # Pre-scan: batch embed all new/changed files in a single model call.
-    # This amortizes ONNX Runtime inference overhead from N calls → 1.
-    # Files that are unchanged (cached + mtime match) are skipped since
-    # smart_read won't need an embedding for them.
-    _to_embed: list[tuple[str, str, str]] = []  # (original_path, resolved_str, content)
-    for _path in paths_sorted:
-        # Reuse the already-resolved path from resolved_map instead of a third
-        # expanduser().resolve() syscall per file on the event loop.
-        _resolved_str = resolved_map[_path]
-        _resolved = Path(_resolved_str)
-        _cached = _cache_map.get(_resolved_str)
-        # Reuse the stat result from the prefetch gather above instead of
-        # making a fresh blocking stat() call in the event loop.
-        _stat = _stat_map.get(_resolved_str)
-        if _cached and _stat is not None:
-            _file_mtime = _stat.st_mtime
-            if _cached.mtime >= _file_mtime:
-                continue  # unchanged — no embedding needed
-            # Check content hash before assuming changed
-            try:
-                _raw_text = await aread_text(_resolved, executor=cache._io_executor)
-                if hash_content(_raw_text) == _cached.content_hash:
-                    await cache.update_mtime(_resolved_str, _file_mtime)
-                    continue  # content unchanged — no embedding needed
-            except Exception:  # nosec B110
-                pass
-        if _stat is None or not stat_module.S_ISREG(_stat.st_mode):
-            continue  # will error in smart_read, skip pre-scan
-        # Pre-scan is best-effort; smart_read handles real errors.
-        try:
-            _raw = await aread_bytes(_resolved, cache._io_executor)
-            if _is_binary_content(_raw):
-                continue  # binary file — smart_read returns is_binary=True; batch skips it below
-            _content = _raw.decode("utf-8")
-            _to_embed.append((_path, _resolved_str, _content))
-        except Exception:  # nosec B112 — best-effort pre-scan; smart_read handles real errors
-            continue
-
-    # Batch embed all candidates; fall back to per-file if anything fails
-    _prefetched: dict[str, EmbeddingVector] = {}
-    if _to_embed:
-        _pairs = [(_rpath, _cnt) for _, _rpath, _cnt in _to_embed]
-        _results = await cache.get_embeddings_batch(_pairs)
-        for (_opath, _rpath, _), _emb in zip(_to_embed, _results, strict=False):
-            if _emb is not None:
-                _prefetched[_rpath] = _emb
-
     files: list[FileReadSummary] = []
     contents: dict[str, str] = {}
     unchanged_paths: list[str] = []
@@ -527,13 +420,11 @@ async def batch_smart_read(
             break
 
         try:
-            _resolved_key = resolved_map[path]
             result = await smart_read(
                 cache,
                 path,
                 diff_mode=diff_mode,
                 force_full=False,
-                _embedding=_prefetched.get(_resolved_key),
             )
 
             if result.is_binary:

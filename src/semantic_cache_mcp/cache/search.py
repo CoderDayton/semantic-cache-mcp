@@ -8,14 +8,10 @@ import time
 from pathlib import Path
 
 from ..core import count_tokens, diff_stats, generate_diff
-from ..core.embeddings import embed_query
 from ..core.hashing import hash_content
-from ..core.similarity import cosine_similarity
-from ..logger import log_marker
 from ..types import (
     CacheEntry,
     DiffResult,
-    EmbeddingVector,
     GlobMatch,
     GlobResult,
     SearchMatch,
@@ -40,8 +36,7 @@ async def _read_text_file(cache: SemanticCache, file_path: Path, display_path: s
     raw_bytes = await aread_bytes(file_path, cache._io_executor)
     if _is_binary_content(raw_bytes):
         raise ValueError(
-            "Binary file not supported: "
-            f"{display_path}. Similarity search only works with text files."
+            f"Binary file not supported: {display_path}. Search only works with text files."
         )
     try:
         return raw_bytes.decode("utf-8")
@@ -51,24 +46,23 @@ async def _read_text_file(cache: SemanticCache, file_path: Path, display_path: s
 
 async def _load_diff_input(
     cache: SemanticCache, file_path: Path, display_path: str
-) -> tuple[CacheEntry | None, str, EmbeddingVector | None, bool]:
+) -> tuple[CacheEntry | None, str, bool]:
     """Load diff input, reusing cache on mtime or content-hash matches."""
 
     cached = await cache.get(str(file_path))
     if cached is not None:
         file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
         if cached.mtime >= file_mtime:
-            return cached, await cache.get_content(cached), None, True
+            return cached, await cache.get_content(cached), True
 
     content = await _read_text_file(cache, file_path, display_path)
     if cached is not None:
         file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
         if hash_content(content) == cached.content_hash:
             await cache.update_mtime(str(file_path), file_mtime)
-            return cached, content, None, True
+            return cached, content, True
 
-    embedding = await cache.get_embedding(content, str(file_path))
-    return cached, content, embedding, False
+    return cached, content, False
 
 
 _SEARCH_CACHE_MAX_ENTRIES = 32
@@ -80,13 +74,13 @@ async def semantic_search(
     k: int = 10,
     directory: str | None = None,
 ) -> SearchResult:
-    """Search cached files by semantic meaning using hybrid BM25+vector search."""
+    """Search cached files by keyword relevance using BM25 search."""
     # DoS protection
     k = max(1, min(k, MAX_SEARCH_K))
     query = query[:MAX_SEARCH_QUERY_LEN]
 
     # In-session result cache: identical (query, k, directory) tuples in
-    # the same session skip the full embed + BM25 + vector round-trip.
+    # the same session skip the full BM25 round-trip.
     # Invalidated on every cache mutation via SemanticCache._bump_search_cache.
     cache_key = (query, k, directory)
     cached_result = cache._search_cache.get(cache_key)
@@ -95,32 +89,18 @@ async def semantic_search(
         cache.metrics.record("search_cache_hit", None)
         return cached_result
 
-    # Embed query for vector component of hybrid search.
-    # MUST go through executor — ONNX is not thread-safe.
-    loop = asyncio.get_running_loop()
-    started = time.perf_counter()
-    log_marker(logger, "embed.query.begin", chars=len(query))
-    query_embedding = await loop.run_in_executor(cache._io_executor, embed_query, query)
-    log_marker(
-        logger,
-        "embed.query.end",
-        ok=query_embedding is not None,
-        elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
-    )
-
     # Resolve directory for post-search filtering (is_relative_to is secure
     # against prefix attacks like /project vs /project_evil)
     resolved_dir: Path | None = None
     if directory:
         resolved_dir = Path(directory).expanduser().resolve()
 
-    # Use hybrid search (BM25 + vector) via VectorStorage
+    # BM25 keyword search via VectorStorage.
     # Request extra results when directory filtering will reduce the set
     storage = cache._storage
     search_k = k * 3 if resolved_dir else k
-    results = await storage.search_hybrid(
+    results = await storage.search_by_query(
         query=query,
-        embedding=query_embedding,
         k=search_k,
     )
 
@@ -210,36 +190,20 @@ async def compare_files(
     # Get content for both files (from cache or disk)
     content1: str
     content2: str
-    emb1 = None
-    emb2 = None
     from_cache1 = False
     from_cache2 = False
 
     # File 1
-    cached1, content1, emb1, from_cache1 = await _load_diff_input(cache, file1, path1)
+    cached1, content1, from_cache1 = await _load_diff_input(cache, file1, path1)
 
     # File 2
-    cached2, content2, emb2, from_cache2 = await _load_diff_input(cache, file2, path2)
+    cached2, content2, from_cache2 = await _load_diff_input(cache, file2, path2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
     diff_content = generate_diff(content1, content2, context_lines=context_lines)
     stats = diff_stats(content1, content2)
     full_tokens = count_tokens(content1) + count_tokens(content2)
     diff_content = _suppress_large_diff(diff_content, full_tokens) or ""
-
-    # Compute semantic similarity between embeddings (normalized)
-    similarity = 0.0
-    sim_embedding1 = cached1.embedding if cached1 and cached1.embedding else None
-    sim_embedding2 = cached2.embedding if cached2 and cached2.embedding else None
-    if not sim_embedding1 and not from_cache1:
-        sim_embedding1 = emb1
-    if not sim_embedding2 and not from_cache2:
-        sim_embedding2 = emb2
-    if sim_embedding1 and sim_embedding2:
-        # Normalize to proper cosine similarity in [0, 1] range
-        raw_sim = cosine_similarity(sim_embedding1, sim_embedding2)
-        # Embeddings from nomic are normalized, but clamp just in case
-        similarity = max(0.0, min(1.0, float(raw_sim)))
 
     # Token savings: sum of cached file tokens
     tokens_saved = 0
@@ -254,7 +218,6 @@ async def compare_files(
         diff_content=diff_content,
         diff_stats=stats,
         tokens_saved=tokens_saved,
-        similarity=round(similarity, 4),
         from_cache=(from_cache1, from_cache2),
     )
 

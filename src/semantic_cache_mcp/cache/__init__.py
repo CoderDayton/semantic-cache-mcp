@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from ..core.embeddings import embed, embed_batch, embed_query
 from ._helpers import (
     MAX_DIFF_TO_FULL_RATIO,
     MAX_EDIT_SIZE,
@@ -57,10 +56,6 @@ __all__ = [
     "MAX_SEARCH_K",
     "MAX_SEARCH_QUERY_LEN",
     "MAX_GLOB_MATCHES",
-    # Core embeddings re-exported so tests can patch semantic_cache_mcp.cache.embed
-    "embed",
-    "embed_batch",
-    "embed_query",
     # Helpers (some used by tests)
     "_suppress_large_diff",
     "_is_binary_content",

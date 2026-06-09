@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import array
 import asyncio
 import enum
 import json
 import logging
 import threading
 import time
-from collections.abc import Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 
-from simplevecdb import AsyncVectorCollection, DistanceStrategy, Quantization, VectorDB
+from simplevecdb import AsyncVectorCollection, VectorDB
 
 from ... import config
 from ...config import (
@@ -27,7 +25,7 @@ from ...core.chunking import get_optimal_chunker
 from ...core.hashing import hash_content
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
-from ...types import CacheEntry, EmbeddingVector
+from ...types import CacheEntry
 from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
@@ -46,7 +44,6 @@ _META_TOKENS = "tokens"
 _META_CREATED_AT = "created_at"
 _META_ACCESS_HISTORY = "access_history"
 _META_IS_PARENT = "is_parent"
-_META_HAS_EMBEDDING = "has_embedding"
 _META_PREVIEW = "preview"
 _META_STORAGE_MODE = "storage_mode"
 _PREVIEW_CHARS = 200
@@ -73,20 +70,11 @@ class StorageMode(enum.StrEnum):
 CHUNK_THRESHOLD = CHUNK_MIN_SIZE * 4  # 8KB — files below this stay as one doc
 
 
-# Per-dimension cached zero embeddings used by chunk children (which carry no
-# real embedding — similarity uses the parent's vector). Populating this once
-# avoids re-allocating `[0.0] * dim` on every chunked write.
-_ZERO_EMB_CACHE: dict[int, list[float]] = {}
-
-
-def _zero_embedding(dim: int) -> list[float]:
-    # Returns a shared list — callers MUST NOT mutate. simplevecdb copies via
-    # np.asarray on ingest, so the cache stays clean in practice.
-    cached = _ZERO_EMB_CACHE.get(dim)
-    if cached is None:
-        cached = [0.0] * dim
-        _ZERO_EMB_CACHE[dim] = cached
-    return cached
+# Constant stub vector fed to simplevecdb on every write. The store is no
+# longer embedding-backed (search is BM25-only), but simplevecdb's add_texts
+# always requires a vector and indexes it. A fixed dim-1 vector keeps the write
+# path working with no model loaded; the usearch index is never queried.
+_STUB_VECTOR = [1.0]
 
 
 class VectorStorage:
@@ -113,8 +101,6 @@ class VectorStorage:
         "_has_cached_cache",
     )
 
-    # Quantization currently in use — stored in sidecar to detect future changes.
-    _QUANTIZATION = Quantization.INT8
     _COLLECTION_NAME = "files"
 
     def __init__(
@@ -125,7 +111,7 @@ class VectorStorage:
     ) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
-        self._clear_if_quantization_changed(db_path)
+        self._drop_legacy_vector_db(db_path)
         self._recover_if_crashed(db_path)
         # Use the sync VectorDB directly (not AsyncVectorDB) so we own the
         # executor: ONNX/usearch require a single-threaded executor to avoid
@@ -133,11 +119,7 @@ class VectorStorage:
         # IO executor after a hung worker. AsyncVectorDB manages its own
         # internal pool and exposes neither hook. Async behavior is provided
         # by wrapping the sync collection in AsyncVectorCollection below.
-        self._db = VectorDB(
-            path=str(db_path),
-            distance_strategy=DistanceStrategy.COSINE,
-            quantization=self._QUANTIZATION,
-        )
+        self._db = VectorDB(path=str(db_path))
         self._closed = False
         # TTL cache keyed by path_filter for has_cached_paths_under (see
         # comment there). Initialized here so the slot is always present.
@@ -224,21 +206,16 @@ class VectorStorage:
         self._collection = AsyncVectorCollection(self._sync_collection, new_executor)
 
     def _build_collection(self) -> AsyncVectorCollection:
-        """Open the ``files`` collection with ``store_embeddings=True`` and
-        wrap it for async use.
+        """Open the ``files`` collection text-only and wrap it for async use.
 
-        ``store_embeddings=True`` is required so ``get_embeddings_by_ids``
-        can return the vectors used by ``SemanticCache.get()`` /
-        ``compare_files()``. simplevecdb defaults this to False.
-        Stores a direct reference to the sync collection for sync code paths
-        (``save``, ``_clear_sync``) so they don't have to reach through the
-        async wrapper.
+        ``store_embeddings=False``: the store is BM25-only now, so vectors are
+        never read back. Stores a direct reference to the sync collection for
+        sync code paths (``save``, ``_clear_sync``) so they don't have to reach
+        through the async wrapper.
         """
         sync_coll = self._db.collection(
             self._COLLECTION_NAME,
-            distance_strategy=DistanceStrategy.COSINE,
-            quantization=self._QUANTIZATION,
-            store_embeddings=True,
+            store_embeddings=False,
         )
         self._sync_collection = sync_coll
         return AsyncVectorCollection(sync_coll, self._io_executor)
@@ -280,77 +257,25 @@ class VectorStorage:
         STARTUP_SENTINEL.unlink(missing_ok=True)
 
     @classmethod
-    def _clear_if_quantization_changed(cls, db_path: Path) -> None:
-        """Delete stale usearch index when quantization setting changes.
+    def _drop_legacy_vector_db(cls, db_path: Path) -> None:
+        """One-time wipe of a pre-0.6 embedding-backed cache.
 
-        Opening a usearch index built with one quantization type (e.g. FLOAT16)
-        using a different type (e.g. INT8) causes heap corruption (free():
-        corrupted unsorted chunks). We track the active quantization in a JSON
-        sidecar and wipe the index files on mismatch so usearch rebuilds clean.
+        Old caches stored real per-file embeddings and a fixed-dimension usearch
+        index. The store is now BM25-only (a constant stub vector per doc), so an
+        old on-disk index is incompatible. Delete the legacy DB files once,
+        guarded by a sentinel; the cache is fully rebuildable and repopulates on
+        demand. New installs simply create the sentinel with nothing to delete.
         """
-        meta_path = db_path.with_suffix(".meta.json")
-        current_quant = cls._QUANTIZATION.value
-        stored_quant: str | None = None
-
-        import contextlib
-
-        if meta_path.exists():
-            with contextlib.suppress(Exception):
-                stored_quant = json.loads(meta_path.read_text()).get("quantization")
-
-        if stored_quant != current_quant:
-            if stored_quant is not None:
-                logger.warning(
-                    f"Quantization changed {stored_quant!r} → {current_quant!r}; "
-                    "clearing stale usearch index (cache content preserved in SQLite)"
-                )
-            # Delete usearch index files so VectorDB rebuilds with correct quantization.
-            # Pattern: {db_path}.{collection}.usearch
-            for suffix in (f".{cls._COLLECTION_NAME}.usearch",):
-                stale = db_path.parent / (db_path.name + suffix)
-                if stale.exists():
-                    stale.unlink()
-                    logger.info(f"Deleted stale index: {stale}")
-            meta_path.write_text(json.dumps({"quantization": current_quant}))
-
-    def clear_if_model_changed(self, model_name: str, dim: int) -> None:
-        """Wipe vector index and stored embeddings when the embedding model changes.
-
-        Different models produce incompatible embeddings (different dimensions,
-        different vector spaces). Detect via sidecar metadata and rebuild clean.
-        """
-        meta_path = self._db_path.with_suffix(".meta.json")
-        meta: dict = {}
-
-        import contextlib
-
-        if meta_path.exists():
-            with contextlib.suppress(Exception):
-                meta = json.loads(meta_path.read_text())
-
-        stored_model = meta.get("embedding_model")
-        if stored_model is not None and stored_model != model_name:
-            logger.warning(
-                f"Embedding model changed {stored_model!r} -> {model_name!r} "
-                f"(dim {meta.get('embedding_dim', '?')} -> {dim}); "
-                "rebuilding vector index and clearing cached embeddings"
-            )
-            self._reset_collection_sync(reason="embedding model change")
-
-        # Runtime dim check: even if the sidecar matches, verify the live
-        # index dimension agrees with the current model. A stale or missing
-        # sidecar could leave a dim-mismatched index that segfaults on add.
-        index_dim = self._collection.dim
-        if index_dim is not None and index_dim > 0 and index_dim != dim:
-            logger.warning(
-                f"Index dimension {index_dim} != model dimension {dim}; "
-                "clearing index to prevent usearch segfault"
-            )
-            self._reset_collection_sync(reason="dimension mismatch")
-
-        meta["embedding_model"] = model_name
-        meta["embedding_dim"] = dim
-        meta_path.write_text(json.dumps(meta))
+        marker = db_path.parent / ".vectors_removed"
+        if marker.exists():
+            return
+        for pattern in (f".{cls._COLLECTION_NAME}.usearch", "", "-wal", "-shm", ".meta.json"):
+            target = db_path.parent / (db_path.name + pattern) if pattern else db_path
+            if target.exists():
+                target.unlink()
+                logger.info(f"Migration: deleted legacy vector file {target}")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("embeddings removed in 0.6.0\n")
 
     def close(self, *, timeout: float = 5.0) -> None:
         """Save and close the database with a deadline.
@@ -413,34 +338,19 @@ class VectorStorage:
 
         # Prefer parent doc metadata (has file-level tokens, hash, etc.)
         # For single-doc files there is no parent, so use the only doc.
-        selected_id = results[0][0]
         meta = results[0][1]
-        for doc_id, m, _text in results:
+        for _doc_id, m, _text in results:
             if m.get(_META_IS_PARENT, False):
-                selected_id = doc_id
                 meta = m
                 break
 
         access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
-
-        # Retrieve embedding from catalog so compare_files() can compute similarity.
-        # Must run in executor — catalog is not thread-safe.
-        embedding: EmbeddingVector | None = None
-        # Best-effort embedding retrieval — a miss just leaves embedding None.
-        try:
-            emb_map = await self._collection.get_embeddings_by_ids([selected_id])
-            raw = emb_map.get(selected_id)
-            if raw is not None:
-                embedding = array.array("f", raw)
-        except Exception:  # nosec B110
-            pass
 
         return CacheEntry(
             path=meta[_META_PATH],
             content_hash=meta[_META_CONTENT_HASH],
             mtime=meta[_META_MTIME],
             tokens=meta[_META_TOKENS],
-            embedding=embedding,
             created_at=meta[_META_CREATED_AT],
             access_history=access_history,
         )
@@ -450,9 +360,8 @@ class VectorStorage:
         path: str,
         content: str,
         mtime: float,
-        embedding: EmbeddingVector | None = None,
     ) -> None:
-        """Store file as raw text + embedding. Large files (>8KB) are HyperCDC-chunked."""
+        """Store file as raw text. Large files (>8KB) are HyperCDC-chunked."""
         if self._closed:
             return
         started = time.perf_counter()
@@ -462,8 +371,6 @@ class VectorStorage:
         now = time.time()
         chunked = len(content_bytes) >= CHUNK_THRESHOLD
 
-        emb_list = self._resolve_embedding(embedding)
-        has_embedding = embedding is not None
         log_marker(
             logger,
             "vector.put.begin",
@@ -471,7 +378,6 @@ class VectorStorage:
             tokens=tokens,
             bytes=len(content_bytes),
             chunked=chunked,
-            has_embedding=has_embedding,
         )
 
         # Pre-compute a stable preview from the start of the file so that
@@ -484,7 +390,6 @@ class VectorStorage:
             _META_TOKENS: tokens,
             _META_CREATED_AT: now,
             _META_ACCESS_HISTORY: json.dumps([now]),
-            _META_HAS_EMBEDDING: has_embedding,
             _META_PREVIEW: content[:_PREVIEW_CHARS],
         }
 
@@ -513,13 +418,13 @@ class VectorStorage:
             ids = await self._collection.add_texts(
                 texts=[content],
                 metadatas=[meta],
-                embeddings=[emb_list],
+                embeddings=[_STUB_VECTOR],
             )
             new_doc_ids = list(ids) if ids else []
             logger.debug(f"Stored {path} as single doc ({tokens} tokens)")
         else:
             # Large file: try chunked storage, fall back to single-doc if too many chunks
-            stored_ids = await self._put_chunked(path, content, content_bytes, base_meta, emb_list)
+            stored_ids = await self._put_chunked(path, content, content_bytes, base_meta)
             if not stored_ids:
                 meta = {
                     **base_meta,
@@ -530,7 +435,7 @@ class VectorStorage:
                 ids = await self._collection.add_texts(
                     texts=[content],
                     metadatas=[meta],
-                    embeddings=[emb_list],
+                    embeddings=[_STUB_VECTOR],
                 )
                 new_doc_ids = list(ids) if ids else []
                 logger.debug(f"Stored {path} as single doc (chunk fallback, {tokens} tokens)")
@@ -572,7 +477,6 @@ class VectorStorage:
         content: str,
         content_bytes: bytes,
         base_meta: dict,
-        file_embedding: Sequence[float],
     ) -> list[int]:
         """Store large file as parent doc + CDC-chunked children.
 
@@ -643,7 +547,7 @@ class VectorStorage:
         parent_ids = await self._collection.add_texts(
             texts=[""],  # Parent has no content — children hold raw text
             metadatas=[parent_meta],
-            embeddings=[file_embedding],
+            embeddings=[_STUB_VECTOR],
         )
         parent_id = parent_ids[0]
 
@@ -651,10 +555,6 @@ class VectorStorage:
         # AsyncVectorCollection.add_texts does not expose parent_ids, so we call
         # the underlying sync collection directly via run_in_executor.
         child_metas: list[dict] = []
-        child_embeddings: list[Sequence[float]] = []
-        # Module-level cache; same list object is shared across all child
-        # rows. add_texts does not mutate, so this is safe.
-        zero_emb = self._resolve_embedding(None)
 
         for i, _text in enumerate(chunk_texts):
             child_meta = {
@@ -670,15 +570,11 @@ class VectorStorage:
                 "line_start": chunk_line_starts[i],
             }
             child_metas.append(child_meta)
-            # Chunks use zero embedding — similarity search uses the parent's
-            # file-level embedding. Per-chunk embeddings would require N model
-            # calls which is too expensive for the cache hot path.
-            child_embeddings.append(zero_emb)
 
         child_ids = await self._collection.add_texts(
             texts=chunk_texts,
             metadatas=child_metas,
-            embeddings=child_embeddings,
+            embeddings=[_STUB_VECTOR] * total_chunks,
             parent_ids=[parent_id] * total_chunks,
         )
 
@@ -687,42 +583,6 @@ class VectorStorage:
             f"(parent_id={parent_id}, {base_meta[_META_TOKENS]} tokens)"
         )
         return [parent_id, *(list(child_ids) if child_ids else [])]
-
-    def _expected_dim(self) -> int:
-        """Return the expected embedding dimension, querying the model if needed."""
-        dim = self._collection.dim
-        if dim is not None and dim > 0:
-            return dim
-        from ...core.embeddings import get_embedding_dim  # noqa: PLC0415
-
-        dim = get_embedding_dim()
-        if dim == 0:
-            raise RuntimeError(
-                "Cannot determine embedding dimension — model not loaded yet. "
-                "Ensure warmup() completes before storing documents."
-            )
-        return dim
-
-    def _resolve_embedding(self, embedding: EmbeddingVector | None) -> Sequence[float]:
-        """Validate dim and return a Sequence[float] suitable for simplevecdb.
-
-        Skips the defensive ``list(embedding)`` copy: simplevecdb's
-        ``add_texts`` / ``similarity_search`` accept any ``Sequence[float]``,
-        and the call sites do not mutate the buffer. For the zero-vector path
-        (``embedding is None``), the result is reused from a module-level
-        per-dim cache to avoid re-allocating ``[0.0] * dim`` on every chunked
-        write or unembedded put.
-        """
-        expected = self._expected_dim()
-        if embedding is not None:
-            actual = len(embedding)
-            if actual != expected:
-                raise ValueError(
-                    f"Embedding dimension mismatch: got {actual}, expected {expected}. "
-                    "This usually means the embedding model changed mid-session."
-                )
-            return embedding
-        return _zero_embedding(expected)
 
     async def get_content(self, entry: CacheEntry, *, max_bytes: int | None = None) -> str:
         """Reassemble full text from simplevecdb chunks (sorted by chunk_index).
@@ -838,31 +698,6 @@ class VectorStorage:
             await self._collection.update_metadata(updates)
 
     # -------------------------------------------------------------------------
-    # Similarity search
-    # -------------------------------------------------------------------------
-
-    async def find_similar(
-        self, embedding: EmbeddingVector, exclude_path: str | None = None
-    ) -> str | None:
-        """Return the most similar cached file path above SIMILARITY_THRESHOLD, or None.
-
-        Implementation lives in ``_search`` to keep this module from becoming a god-object.
-        """
-        return await _search.find_similar(self, embedding, exclude_path)
-
-    async def find_similar_multi(
-        self,
-        embedding: EmbeddingVector,
-        exclude_path: str | None = None,
-        k: int = 5,
-        threshold: float | None = None,
-    ) -> list[tuple[str, float]]:
-        """Return up to k (path, similarity) tuples above threshold."""
-        return await _search.find_similar_multi(
-            self, embedding, exclude_path, k=k, threshold=threshold
-        )
-
-    # -------------------------------------------------------------------------
     # Query-based search
     # -------------------------------------------------------------------------
 
@@ -874,19 +709,6 @@ class VectorStorage:
     ) -> list[tuple[str, str, float]]:
         """BM25 keyword search over cached content. FTS5 syntax supported."""
         return await _search.search_by_query(self, query, k=k, filter=filter)
-
-    async def search_hybrid(
-        self,
-        query: str,
-        embedding: EmbeddingVector | None = None,
-        k: int = 5,
-        filter: dict | None = None,
-    ) -> list[tuple[str, str, float]]:
-        """Hybrid BM25 + vector search with RRF fusion.
-
-        Falls back to keyword-only if no embedding provided.
-        """
-        return await _search.search_hybrid(self, query, embedding, k=k, filter=filter)
 
     # -------------------------------------------------------------------------
     # Grep — regex/literal content search across cached files
@@ -950,7 +772,7 @@ class VectorStorage:
     ) -> list[dict]:
         """Exact pattern matching across cached files — like ripgrep on the cache.
 
-        Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
+        Unlike search, returns line numbers and context, not ranked scores.
         Implementation lives in ``_grep`` to keep this module from becoming a god-object.
         """
         return await _grep.grep(

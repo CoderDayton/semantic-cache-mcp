@@ -66,7 +66,7 @@ async def grep(
 ) -> list[dict]:
     """Exact pattern matching across cached files — like ripgrep on the cache.
 
-    Unlike search/search_hybrid, returns line numbers and context, not ranked scores.
+    Unlike search, returns line numbers and context, not ranked scores.
     """
     if store._closed:
         return []

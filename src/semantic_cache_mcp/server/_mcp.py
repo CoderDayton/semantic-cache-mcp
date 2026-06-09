@@ -56,14 +56,14 @@ def _migrate_v2_to_v3() -> None:
 
 @lifespan
 async def app_lifespan(server: FastMCP):
-    """Initialize cache and embedding model on startup."""
+    """Initialize cache on startup."""
     logger.info("Semantic cache MCP server starting...")
 
     cache: ToolProcessSupervisor | None = None
 
     # Redirect stdout → stderr during initialization to prevent third-party
-    # libraries (fastembed, onnxruntime) from printing to stdout and corrupting
-    # the stdio MCP transport. The lifespan runs BEFORE stdio_server() captures
+    # libraries from printing to stdout and corrupting the stdio MCP
+    # transport. The lifespan runs BEFORE stdio_server() captures
     # sys.stdout.buffer, so we must restore before yielding.
     with contextlib.redirect_stdout(sys.stderr):
         try:

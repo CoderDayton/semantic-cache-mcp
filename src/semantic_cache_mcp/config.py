@@ -102,22 +102,6 @@ def _env_bool(name: str, default: bool) -> bool:
 MAX_CONTENT_SIZE: Final = _env_int("MAX_CONTENT_SIZE", 100_000)  # 100KB default max return size
 MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # LRU-K eviction limit
 
-# Embedding device: "cpu" (default), "gpu"/"cuda" (NVIDIA GPU), "auto" (detect)
-_raw_device = environ.get("EMBEDDING_DEVICE", "cpu").strip().lower()
-EMBEDDING_DEVICE: Final = "cuda" if _raw_device == "gpu" else _raw_device
-
-# Embedding model: any FastEmbed-supported model name
-EMBEDDING_MODEL: Final = environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip()
-
-# OpenAI-compatible embedding provider. Disabled by default so local FastEmbed
-# remains the zero-config path. Defaults target Ollama's OpenAI-compatible API.
-OPENAI_EMBEDDINGS_ENABLED: Final = _env_bool("OPENAI_EMBEDDINGS_ENABLED", False)
-OPENAI_BASE_URL: Final = environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1").strip()
-OPENAI_API_KEY: Final = environ.get("OPENAI_API_KEY", "ollama").strip()
-OPENAI_EMBEDDING_MODEL: Final = environ.get("OPENAI_EMBEDDING_MODEL", "nomic-embed-text").strip()
-OPENAI_EMBEDDING_DIMENSIONS_RAW: Final = environ.get("OPENAI_EMBEDDING_DIMENSIONS")
-OPENAI_EMBEDDING_DIMENSIONS: Final = _env_optional_int("OPENAI_EMBEDDING_DIMENSIONS")
-
 # Tool response policy (global, not model-selected per call)
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)
@@ -178,27 +162,6 @@ def _validate_config() -> None:
 
     if TOOL_TIMEOUT <= 0:
         errors.append(f"TOOL_TIMEOUT ({TOOL_TIMEOUT}) must be > 0")
-
-    if EMBEDDING_DEVICE not in {"cpu", "cuda", "auto"}:
-        errors.append(f"EMBEDDING_DEVICE ({EMBEDDING_DEVICE}) must be one of: cpu, gpu, cuda, auto")
-
-    if OPENAI_EMBEDDINGS_ENABLED:
-        if not OPENAI_BASE_URL:
-            errors.append("OPENAI_BASE_URL must not be empty when OPENAI_EMBEDDINGS_ENABLED=true")
-        if not OPENAI_API_KEY:
-            errors.append("OPENAI_API_KEY must not be empty when OPENAI_EMBEDDINGS_ENABLED=true")
-        if not OPENAI_EMBEDDING_MODEL:
-            errors.append(
-                "OPENAI_EMBEDDING_MODEL must not be empty when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
-        if OPENAI_EMBEDDING_DIMENSIONS_RAW is not None and OPENAI_EMBEDDING_DIMENSIONS is None:
-            errors.append(
-                "OPENAI_EMBEDDING_DIMENSIONS must be an integer when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
-        elif OPENAI_EMBEDDING_DIMENSIONS is not None and OPENAI_EMBEDDING_DIMENSIONS <= 0:
-            errors.append(
-                "OPENAI_EMBEDDING_DIMENSIONS must be > 0 when OPENAI_EMBEDDINGS_ENABLED=true"
-            )
 
     if not 0 < SIMILARITY_THRESHOLD < 1:
         errors.append(f"SIMILARITY_THRESHOLD ({SIMILARITY_THRESHOLD}) must be between 0 and 1")

@@ -33,7 +33,6 @@ from ...cache import (
 from ...cache._helpers import _PhaseTimer
 from ...cache.read import _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
-from ...core.embeddings import get_model_info
 from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
 from .._mcp import mcp
@@ -797,7 +796,7 @@ async def stats(
     read/edit loops.
 
     Returns cache occupancy, hit rates, token savings, tool-call counts,
-    embedding model info, and process memory usage.
+    and process memory usage.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -809,7 +808,6 @@ async def stats(
         return remote_result
 
     cache_stats = await cache.get_stats()
-    model_info = get_model_info()
 
     session = cache_stats.get("session", {})
     lifetime = cache_stats.get("lifetime", {})
@@ -848,11 +846,6 @@ async def stats(
             return f"{s // 60}m {s % 60}s"
         return f"{s // 3600}h {(s % 3600) // 60}m"
 
-    model_name = str(model_info.get("model", "unknown"))
-    provider = str(cache_stats.get("embedding_provider", "CPU"))
-    ready = model_info.get("ready", False)
-    provider_str = f"{provider} ✓" if ready else f"{provider} ✗"
-
     structured_payload: dict[str, Any] = {
         "mode": mode,
         "storage": {
@@ -887,12 +880,7 @@ async def stats(
             "files_written": lifetime.get("files_written", 0),
             "files_edited": lifetime.get("files_edited", 0),
         },
-        "embedding": {
-            "model": model_name,
-            "provider": provider,
-            "ready": ready,
-            "process_rss_mb": cache_stats.get("process_rss_mb"),
-        },
+        "process_rss_mb": cache_stats.get("process_rss_mb"),
     }
 
     if mode == "compact":
@@ -906,10 +894,7 @@ async def stats(
             f"Session: {_n(s_saved)} saved ({s_pct}%) · {s_hit_pct}% hit",
             f"Lifetime: {_n(lt_saved)} saved ({lt_pct}%) · {lt_hit_pct}% hit",
             "",
-            (
-                f"*{lt_sessions} completed session"
-                f"{'s' if lt_sessions != 1 else ''} · {model_name} · {provider_str}*"
-            ),
+            (f"*{lt_sessions} completed session{'s' if lt_sessions != 1 else ''}*"),
         ]
         return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
@@ -970,13 +955,13 @@ async def stats(
             ),
             "",
             "## System",
-            f"`{model_name}` · {provider_str} · {mem_str}",
+            f"{mem_str}",
         ]
         return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
     # debug — full raw dump
     return ToolResult(
-        content=f"```json\n{json.dumps(cache_stats | {'embedding': model_info}, indent=2)}\n```",
+        content=f"```json\n{json.dumps(cache_stats, indent=2)}\n```",
         structured_content=structured_payload,
     )
 
