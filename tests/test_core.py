@@ -143,6 +143,18 @@ class TestDiffGeneration:
         result = generate_diff(old, new, context_lines=1)
         assert "Line 2" in result or "Line 4" in result
 
+    def test_diff_omits_file_headers_keeps_hunk_header(self) -> None:
+        """The diff drops difflib's `--- `/`+++ ` file headers (pure token
+        overhead) but keeps the `@@` hunk header that carries line numbers."""
+        old = "Line 1\nLine 2\nLine 3\n"
+        new = "Line 1\nLine 2 changed\nLine 3\n"
+        result = generate_diff(old, new)
+        assert "@@" in result  # line-number anchor preserved
+        assert not result.startswith("--- ")
+        assert "+++ " not in result
+        assert "-Line 2\n" in result
+        assert "+Line 2 changed\n" in result
+
 
 class TestSmartTruncation:
     """Tests for smart truncation."""

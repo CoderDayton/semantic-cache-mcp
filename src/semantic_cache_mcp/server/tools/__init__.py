@@ -392,11 +392,7 @@ def _binary_read_payload(path: str, result: Any) -> dict[str, Any]:
 
 @mcp.tool(
     output_schema=output_schema(ReadResponse),
-    meta={
-        "version": _pkg_version("semantic-cache-mcp"),
-        "author": "Dayton Dunbar",
-        "github": "https://github.com/CoderDayton/semantic-cache-mcp",
-    },
+    meta={"version": _pkg_version("semantic-cache-mcp")},
 )
 @_serialized
 async def read(
@@ -419,9 +415,8 @@ async def read(
     proof that you still hold the content, so use it every time you can; the
     server then skips re-sending unchanged bytes. Use `offset`/`limit` to read
     or recover an exact line range, for example after a large file was
-    summarized. A binary file returns metadata (`is_binary`, `size`, `mime`)
-    instead of content; for images use `read_image`. Missing or non-regular
-    paths raise an error.
+    summarized. A binary file returns metadata instead of content; for images
+    use `read_image`.
 
     Args:
         path: File path (absolute, or relative to the project root). Use an
@@ -431,11 +426,9 @@ async def read(
         offset: 1-based first line for a ranged read. `0` means from the start
             (same as omitting).
         limit: Number of lines to return starting at `offset`.
-        known_hash: The `content_hash` from your most recent read of this file.
-            Always pass it back when re-reading a file you have already read; it
-            is what lets the server answer `"unchanged": true` instead of
-            re-sending the content. Only omit it when you genuinely do not have
-            the hash, such as a first read or after your context was trimmed.
+        known_hash: The `content_hash` from your last read of this file; pass it
+            back to get `"unchanged"` instead of the content re-sent. Omit only
+            on a first read or when you no longer hold the hash.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -750,11 +743,7 @@ _MAX_ENCODED_IMAGE_BYTES: int = _parse_max_encoded_image_bytes()
 # so it has nothing to serialize against and need not queue behind other tools.
 @mcp.tool(
     output_schema=output_schema(ReadImageResponse),
-    meta={
-        "version": _pkg_version("semantic-cache-mcp"),
-        "author": "Dayton Dunbar",
-        "github": "https://github.com/CoderDayton/semantic-cache-mcp",
-    },
+    meta={"version": _pkg_version("semantic-cache-mcp")},
 )
 async def read_image(
     ctx: Context,

@@ -49,7 +49,9 @@ runtime.
 - Diffs do more of the work now. The `read` diff gate went from 0.6 to 0.9, with
   a floor at 200 tokens, so a small edit to a medium or large file comes back as
   a diff with the changed line numbers instead of the whole file. Tiny files
-  still come back in full.
+  still come back in full. The diff itself is leaner too: it drops the
+  `--- old`/`+++ new` file headers and the prose prefix and keeps just the `@@`
+  hunks, which already carry the line numbers.
 - All 13 tool descriptions were rewritten so they read as one workflow: `glob` to
   find files, `batch_read` to cache them, `search` or `grep` to look inside,
   `read` to open, then `edit` or `write` to change. They share the same wording

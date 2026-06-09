@@ -35,13 +35,13 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 | 1 | Cold read | First read, no cache (baseline) | 177,509 | 177,509 | 0.0% |
 | 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,580 | 177,509 | **99.1%** |
 | 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,580 | 177,509 | **99.1%** |
-| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 4,456 | 177,750 | **97.5%** |
-| 4a |  → changed files only | Returned as unified diff | 3,357 | 108,993 | 96.9% |
-| 4b |  → unchanged files | Fast path | 1,099 | 68,757 | 98.4% |
-| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,578 | 177,750 | **99.1%** |
+| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 3,921 | 177,747 | **97.8%** |
+| 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 2,850 | 108,783 | 97.4% |
+| 4b |  → unchanged files | Fast path | 1,071 | 68,964 | 98.4% |
+| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,537 | 177,747 | **99.1%** |
 | 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 301 | 110,925 | **99.7%** |
 
-**Aggregate (phases 2 to 6): 98.8% token reduction.**
+**Aggregate (phases 2 to 6): 98.9% token reduction.**
 
 The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_token_savings.py) asserts ≥ 80% overall as a regression gate.
 

@@ -265,7 +265,10 @@ async def smart_read(
                 tokens_original >= _DIFF_MIN_TOKENS
                 and diff_tokens < tokens_original * _DIFF_MAX_RATIO
             ):
-                result_content = f"// Diff for {path} (changed since cache):\n{diff_content}"
+                # Bare diff: the `is_diff`/`diff_state` fields and the `@@` hunk
+                # headers already mark it as a diff, so a prose prefix would just
+                # cost tokens.
+                result_content = diff_content
                 await cache.refresh_path(
                     str(file_path),
                     content,

@@ -346,16 +346,16 @@ callers never see a result that predates a write.
 
 Measured on this project's 40 source files (**177,509 tokens**), i9-13900K, with the corpus held fixed across all phases. Reproducible via `--json` output for CI diffing.
 
-### Token savings: **98.8%** overall (phases 2 to 6)
+### Token savings: **98.9%** overall (phases 2 to 6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.8%** |
+| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.9%** |
 | Unchanged re-read | mtime match, fast path skips disk I/O | 99.1% |
 | Content hash | mtime drifted, BLAKE3 still matches | 99.1% |
 | Batch read | All files via `batch_read`, 200K budget | 99.1% |
 | Search previews | 5 queries × k=5, previews vs full reads | 99.7% |
-| Small edits | Real ~5% line changes in 30% of files | 97.5% |
+| Small edits | Real ~5% line changes in 30% of files | 97.8% |
 | Cold read | First read, no cache (baseline) | 0% |
 
 ### Latency: **unchanged reads ~0.9 ms; repeat searches < 0.01 ms**

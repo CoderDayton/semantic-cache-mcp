@@ -207,6 +207,9 @@ async def test_small_change_to_midsize_file_returns_diff(
     f.write_text(body)
     r = await smart_read(tmp_cache, str(f))
     assert r.is_diff is True
+    # Bare diff: no prose prefix, just the @@-anchored hunks.
+    assert not r.content.startswith("// Diff for")
+    assert "@@" in r.content
 
 
 async def test_small_change_to_tiny_file_returns_full(
