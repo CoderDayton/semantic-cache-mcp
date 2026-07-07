@@ -38,6 +38,10 @@ class ReadResult:
     is_binary: bool = False
     size: int | None = None
     mime: str | None = None
+    # Hash of the content this result reflects, when known — lets tool
+    # callers surface it without an extra cache-entry lookup. None for
+    # binary fallbacks.
+    content_hash: ContentHash | None = None
 
 
 @dataclass(slots=True)

@@ -722,24 +722,3 @@ class TestSemanticSearchDirectoryFilter:
             directory="/nonexistent/dir",
         )
         assert len(result.matches) == 0
-
-
-class TestMcpCacheNoneGuard:
-    """Cover line 54-55 in _mcp.py — cache is None after lifespan block."""
-
-    @pytest.mark.asyncio
-    async def test_cache_none_raises(self) -> None:
-        """If cache is somehow None after init block, RuntimeError raised."""
-        with (
-            patch("semantic_cache_mcp.server._mcp.get_tokenizer"),
-            patch(
-                "semantic_cache_mcp.server._mcp.ToolProcessSupervisor",
-                return_value=None,
-            ),
-        ):
-            from semantic_cache_mcp.server._mcp import app_lifespan
-
-            server = MagicMock()
-            with pytest.raises(RuntimeError, match="Cache failed to initialize"):
-                async with app_lifespan(server) as context:
-                    pass

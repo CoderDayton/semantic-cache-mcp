@@ -69,6 +69,13 @@ class ParamHintsMiddleware(Middleware):
         try:
             tool = await fastmcp_ctx.fastmcp.get_tool(tool_name)
         except Exception:
+            # Proceeding without the rewrite is safe (downstream validation
+            # still runs); log so a broken hint lookup isn't invisible.
+            logger.debug(
+                "param-hints: get_tool(%r) failed; skipping alias rewrite",
+                tool_name,
+                exc_info=True,
+            )
             return await call_next(context)
 
         known = _tool_param_names(tool)

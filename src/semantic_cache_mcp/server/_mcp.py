@@ -59,8 +59,6 @@ async def app_lifespan(server: FastMCP):
     """Initialize cache on startup."""
     logger.info("Semantic cache MCP server starting...")
 
-    cache: ToolProcessSupervisor | None = None
-
     # Redirect stdout → stderr during initialization to prevent third-party
     # libraries from printing to stdout and corrupting the stdio MCP
     # transport. The lifespan runs BEFORE stdio_server() captures
@@ -73,16 +71,11 @@ async def app_lifespan(server: FastMCP):
             _migrate_v2_to_v3()
             logger.info("Starting tool worker...")
             cache = ToolProcessSupervisor()
-            if cache is None:
-                raise RuntimeError("Cache failed to initialize")
             await cache.start()
             logger.info("Semantic cache MCP server started")
         except Exception:
             logger.exception("Failed to initialize semantic cache")
             raise
-
-    if cache is None:
-        raise RuntimeError("Cache failed to initialize")
 
     try:
         yield {"cache": cache}
