@@ -189,7 +189,22 @@ def extract_segments(
 
         for i in range(len(para_boundaries) - 1):
             start = para_boundaries[i]
-            end = min(para_boundaries[i + 1], start + config.max_segment_lines)
+            end = para_boundaries[i + 1]
+
+            # Chunk paragraphs longer than max_segment_lines so the lines
+            # between the truncation point and the next boundary are not
+            # silently dropped (same pattern as the boundary-based path).
+            while end - start > config.max_segment_lines:
+                seg_end = start + config.max_segment_lines
+                segments.append(
+                    Segment(
+                        start_line=start,
+                        end_line=seg_end,
+                        content="".join(lines[start:seg_end]),
+                    )
+                )
+                start = seg_end
+
             if end > start:
                 seg_content = "".join(lines[start:end])
                 segments.append(Segment(start_line=start, end_line=end, content=seg_content))

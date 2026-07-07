@@ -616,9 +616,13 @@ async def smart_batch_edit(
             from_cache = True
         else:
             # mtime changed — check content hash before falling back to disk
-            disk_content = await aread_text(
-                file_path, errors="replace", executor=cache._io_executor
-            )
+            try:
+                disk_content = await aread_text(file_path, executor=cache._io_executor)
+            except UnicodeDecodeError:
+                disk_content = await aread_text(
+                    file_path, errors="replace", executor=cache._io_executor
+                )
+                logger.warning(f"File {path} contains non-UTF-8 characters")
             if hash_content(disk_content) == cached.content_hash:
                 await cache.update_mtime(str(file_path), mtime)
                 content = await cache.get_content(cached)
@@ -626,7 +630,12 @@ async def smart_batch_edit(
             else:
                 content = disk_content
     else:
-        content = await aread_text(file_path, executor=cache._io_executor)
+        # No cache entry, read from disk
+        try:
+            content = await aread_text(file_path, executor=cache._io_executor)
+        except UnicodeDecodeError:
+            content = await aread_text(file_path, errors="replace", executor=cache._io_executor)
+            logger.warning(f"File {path} contains non-UTF-8 characters")
 
     original_content = content
 
@@ -640,8 +649,9 @@ async def smart_batch_edit(
 
     # Process each edit independently — validate and collect results
     outcomes: list[SingleEditOutcome] = []
-    # Successful edits: (old | None, new, sort_line, start_line | None, end_line | None)
-    successful_edits: list[tuple[str | None, str, int, int | None, int | None]] = []
+    # Successful edits: (old | None, new, sort_line, start_line | None,
+    # end_line | None, outcome_index)
+    successful_edits: list[tuple[str | None, str, int, int | None, int | None, int]] = []
 
     for old_string, new_string, sl, el in normalized:
         try:
@@ -666,7 +676,9 @@ async def smart_batch_edit(
                             error=None,
                         )
                     )
-                    successful_edits.append((None, new_string, sort_line, sl, el))
+                    successful_edits.append(
+                        (None, new_string, sort_line, sl, el, len(outcomes) - 1)
+                    )
 
             elif not old_string:
                 raise ValueError("old_string cannot be empty")
@@ -692,7 +704,9 @@ async def smart_batch_edit(
                         error=None,
                     )
                 )
-                successful_edits.append((old_string, new_string, abs_line, sl, el))
+                successful_edits.append(
+                    (old_string, new_string, abs_line, sl, el, len(outcomes) - 1)
+                )
 
             else:
                 # Mode A: full-file search
@@ -708,7 +722,9 @@ async def smart_batch_edit(
                         error=None,
                     )
                 )
-                successful_edits.append((old_string, new_string, line_numbers[0], None, None))
+                successful_edits.append(
+                    (old_string, new_string, line_numbers[0], None, None, len(outcomes) - 1)
+                )
 
         except ValueError as exc:
             outcomes.append(
@@ -721,12 +737,30 @@ async def smart_batch_edit(
                 )
             )
 
+    # Ranged edits (Mode B/C) splice by character offsets re-derived from the
+    # progressively-mutated content, so two edits over overlapping line ranges
+    # would corrupt each other. Fail the later-listed one instead of applying.
+    accepted_ranges: list[tuple[int, int]] = []
+    surviving: list[tuple[str | None, str, int, int | None, int | None, int]] = []
+    for entry in successful_edits:
+        sl, el, outcome_idx = entry[3], entry[4], entry[5]
+        if sl is not None and el is not None:
+            if any(sl <= hi and lo <= el for lo, hi in accepted_ranges):
+                outcome = outcomes[outcome_idx]
+                outcome.success = False
+                outcome.line_number = None
+                outcome.error = f"line range {sl}-{el} overlaps another edit in this batch"
+                continue
+            accepted_ranges.append((sl, el))
+        surviving.append(entry)
+    successful_edits = surviving
+
     # Apply successful edits (sort by line number descending to preserve positions)
     new_content = content
     if successful_edits:
         successful_edits.sort(key=lambda x: x[2], reverse=True)
 
-        for old_str, new_str, _sort_line, sl, el in successful_edits:
+        for old_str, new_str, _sort_line, sl, el, _outcome_idx in successful_edits:
             if old_str is None and sl is not None and el is not None:
                 # Mode C: splice by line range
                 _sub, cs, ce = _extract_line_range(new_content, sl, el)

@@ -435,19 +435,21 @@ async def read(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
-    )
-    if remote_result is not None:
-        return remote_result
 
-    # Validate bounds. `offset=0` is accepted and treated as from-start.
+    # Validate bounds locally before any remote forwarding. `offset=0` is
+    # accepted and treated as from-start.
     if offset is not None and offset < 0:
         _raise_tool_error(
             "read", "offset must be >= 0 (1-based; 0 is from start)", max_response_tokens
         )
     if limit is not None and limit < 1:
         _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
+
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:

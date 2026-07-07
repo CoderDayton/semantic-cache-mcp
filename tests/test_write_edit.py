@@ -1007,6 +1007,43 @@ class TestSmartBatchEditLineRange:
         assert result.succeeded == 2
         assert file_path.read_text() == "aaa\nXXX\nYYY\nddd\n"
 
+    async def test_overlapping_ranges_fail_later_edit(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Overlapping line-range edits: the first applies, the later one fails."""
+        file_path = temp_dir / "batch_overlap.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\neee\n")
+
+        result = await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [(None, "X\n", 2, 3), (None, "Y\n", 3, 4)],
+        )
+
+        assert result.succeeded == 1
+        assert result.failed == 1
+        assert result.outcomes[0].success is True
+        assert result.outcomes[1].success is False
+        assert "overlap" in (result.outcomes[1].error or "")
+        # Exactly what the surviving edit alone would produce.
+        assert file_path.read_text() == "aaa\nX\nddd\neee\n"
+
+    async def test_batch_edit_invalid_utf8_uncached(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Invalid UTF-8 without a cache entry degrades instead of raising."""
+        file_path = temp_dir / "batch_bad_utf8.txt"
+        file_path.write_bytes(b"hello \x80\x81 world\n")
+
+        result = await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [("hello", "goodbye", None, None)],
+        )
+
+        assert result.succeeded == 1
+        assert "goodbye" in file_path.read_text(errors="replace")
+
 
 class TestBestEffortCacheRefresh:
     """Mutation tools should still succeed when the cache-store refresh degrades."""
