@@ -19,6 +19,7 @@ import _thread
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from concurrent.futures import Executor, Future
 from typing import Any
 
@@ -39,17 +40,15 @@ class DetachedExecutor(Executor):
         self._work_queue: queue.Queue[_WorkItem | None] = queue.Queue()
         self._shutdown = False
         self._shutdown_lock = threading.Lock()
-        self._worker_ident: int | None = None
         self._worker_stopped = threading.Event()
         self._worker_started = threading.Event()
         self._worker_name = f"{thread_name_prefix}_0"
-        self._worker_ident = _thread.start_new_thread(self._worker_entry, ())
-        if self._worker_ident is None:
-            raise RuntimeError("failed to start detached worker thread")
+        # start_new_thread returns the thread ident or raises — never None.
+        self._worker_ident: int = _thread.start_new_thread(self._worker_entry, ())
         if not self._worker_started.wait(1.0):
             raise RuntimeError("detached worker thread did not start")
 
-    def submit(self, fn, /, *args, **kwargs):
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
         with self._shutdown_lock:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")

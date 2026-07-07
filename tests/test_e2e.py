@@ -7,8 +7,16 @@ Verifies the full system works correctly in realistic scenarios.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
+
+
+def _bump_mtime(path: Path) -> None:
+    """Deterministically advance a file's mtime past any cached value."""
+    st = path.stat()
+    os.utime(path, (st.st_atime, st.st_mtime + 1))
+
 
 import pytest
 
@@ -108,8 +116,8 @@ class TestFullCacheLifecycle:
         await smart_read(semantic_cache, str(test_file))
 
         # Modify file
-        time.sleep(0.01)
         test_file.write_text("def hello():\n    return 'universe'\n")
+        _bump_mtime(test_file)
 
         # Read with diff_mode=False
         result = await smart_read(semantic_cache, str(test_file), diff_mode=False)
@@ -330,8 +338,8 @@ class TestTokenSavings:
         original_tokens = result1.tokens_original
 
         # Small modification
-        time.sleep(0.01)
         test_file.write_text("def func():\n    return 1\n" + "def func():\n    pass\n" * 49)
+        _bump_mtime(test_file)
 
         # Second read - diff
         result2 = await smart_read(semantic_cache, str(test_file))

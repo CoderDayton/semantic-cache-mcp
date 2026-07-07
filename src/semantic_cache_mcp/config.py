@@ -43,7 +43,11 @@ LOG_FILE_PATH: Final = get_log_file_path(LOG_DIR)
 
 # Logging configuration — explicit stderr handler to prevent stdout pollution
 # in stdio MCP transport, plus a dated file handler for post-mortem debugging.
-LOG_LEVEL: Final = environ.get("LOG_LEVEL", "INFO").upper()
+# An unknown LOG_LEVEL falls back to INFO instead of letting setLevel() raise
+# during import (same lenient policy as _env_int/_env_float below).
+_VALID_LOG_LEVELS: Final = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_raw_log_level = environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL: Final = _raw_log_level if _raw_log_level in _VALID_LOG_LEVELS else "INFO"
 LOG_FORMAT: Final = DEFAULT_LOG_FORMAT
 
 configure_logging(LOG_DIR, LOG_FILE_PATH, log_level=LOG_LEVEL, log_format=LOG_FORMAT)
@@ -122,6 +126,9 @@ def _validate_config() -> None:
 
     if TOOL_TIMEOUT <= 0:
         errors.append(f"TOOL_TIMEOUT ({TOOL_TIMEOUT}) must be > 0")
+
+    if ACCESS_HISTORY_SIZE <= 0:
+        errors.append(f"ACCESS_HISTORY_SIZE ({ACCESS_HISTORY_SIZE}) must be > 0")
 
     if errors:
         raise ValueError("Configuration errors:\n  " + "\n  ".join(errors))
