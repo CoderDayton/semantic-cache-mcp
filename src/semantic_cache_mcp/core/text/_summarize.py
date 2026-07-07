@@ -16,12 +16,15 @@ This preserves the "skeleton" of the file - the most informative parts.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -373,7 +376,11 @@ def summarize_semantic(
                     raw.append(emb / norm if norm > 0 else emb)
                 else:
                     raw.append(None)
-            except Exception:
+            except (ValueError, RuntimeError) as exc:
+                # Embedding legitimately failed for this segment — fall back
+                # to a zero vector, but leave a trace. Anything else (e.g. a
+                # TypeError from a broken embed_fn) propagates as a real bug.
+                logger.debug(f"embed_fn failed for segment: {exc}")
                 raw.append(None)
 
         # Backfill failures with zero vectors of the correct dimension

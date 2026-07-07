@@ -69,7 +69,9 @@ class BPETokenizer:
         self.special_tokens: dict[str, int] = {}
         self._pat: re.Pattern[str] | None = None
 
-        # LRU merge cache: caps memory at ~100KB for 4096 entries
+        # LRU merge cache: bounded by entry count (4096, least recently
+        # used evicted), not by bytes — entries hold token byte sequences
+        # of arbitrary length, so actual memory scales with token sizes.
         self._merge_cache: OrderedDict[bytes, list[bytes]] = OrderedDict()
         self._merge_cache_maxsize: int = 4096
 
