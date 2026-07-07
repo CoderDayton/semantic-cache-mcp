@@ -6,7 +6,7 @@ import logging
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from ..core import count_tokens, diff_stats, generate_diff
+from ..core import count_tokens, diff_with_stats
 from ..core.hashing import hash_content
 from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
 from ..utils import aread_bytes, aread_text, astat, awrite_atomic
@@ -17,6 +17,7 @@ from ._helpers import (
     MAX_EDIT_SIZE,
     MAX_MATCHES,
     MAX_WRITE_SIZE,
+    _diff_context_lines,
     _extract_line_range,
     _find_match_line_numbers,
     _format_file,
@@ -146,8 +147,9 @@ async def smart_write(
     tokens_saved = 0
 
     if old_content is not None and old_content != content:
-        diff_content = generate_diff(old_content, content)
-        diff_stats_result = diff_stats(old_content, content)
+        diff_content, diff_stats_result = diff_with_stats(
+            old_content, content, context_lines=_diff_context_lines(old_content)
+        )
         diff_content = _suppress_large_diff(diff_content, tokens_written)
         # Token savings: diff vs full content in response
         diff_tokens = count_tokens(diff_content) if diff_content else 0
@@ -174,8 +176,9 @@ async def smart_write(
 
                 # Re-compute diff against original (before format)
                 if old_content is not None and old_content != content:
-                    diff_content = generate_diff(old_content, content)
-                    diff_stats_result = diff_stats(old_content, content)
+                    diff_content, diff_stats_result = diff_with_stats(
+                        old_content, content, context_lines=_diff_context_lines(old_content)
+                    )
                     diff_content = _suppress_large_diff(diff_content, tokens_written)
                     diff_tokens = count_tokens(diff_content) if diff_content else 0
                     tokens_saved = max(0, tokens_written - diff_tokens)
@@ -490,8 +493,9 @@ async def smart_edit(
     # Generate diff
     if timer is not None:
         timer.enter("diff_gen")
-    diff_content = generate_diff(content, new_content)
-    diff_stats_result = diff_stats(content, new_content)
+    diff_content, diff_stats_result = diff_with_stats(
+        content, new_content, context_lines=_diff_context_lines(content)
+    )
     content_tokens = count_tokens(content)
     diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
@@ -523,8 +527,9 @@ async def smart_edit(
                 content_hash = hash_content(new_content.encode("utf-8"))
 
                 # Re-compute diff against original (before format)
-                diff_content = generate_diff(content, new_content)
-                diff_stats_result = diff_stats(content, new_content)
+                diff_content, diff_stats_result = diff_with_stats(
+                    content, new_content, context_lines=_diff_context_lines(content)
+                )
                 diff_content = _suppress_large_diff(diff_content, content_tokens) or ""
 
         # Update cache with final content.
@@ -777,8 +782,9 @@ async def smart_batch_edit(
                 new_content = new_content.replace(old_str, new_str, 1)
 
     # Generate combined diff
-    diff_content = generate_diff(original_content, new_content)
-    stats = diff_stats(original_content, new_content)
+    diff_content, stats = diff_with_stats(
+        original_content, new_content, context_lines=_diff_context_lines(original_content)
+    )
     original_tokens = count_tokens(original_content)
     diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
@@ -808,8 +814,11 @@ async def smart_batch_edit(
                 content_hash = hash_content(new_content.encode("utf-8"))
 
                 # Re-compute diff against original (before format)
-                diff_content = generate_diff(original_content, new_content)
-                stats = diff_stats(original_content, new_content)
+                diff_content, stats = diff_with_stats(
+                    original_content,
+                    new_content,
+                    context_lines=_diff_context_lines(original_content),
+                )
                 diff_content = _suppress_large_diff(diff_content, original_tokens) or ""
 
         # Update cache with final content.

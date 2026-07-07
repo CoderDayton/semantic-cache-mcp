@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
+
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
 from semantic_cache_mcp.core.hashing import hash_chunk, hash_content
-from semantic_cache_mcp.core.text import generate_diff, truncate_smart
+from semantic_cache_mcp.core.text import (
+    diff_stats,
+    diff_with_stats,
+    generate_diff,
+    truncate_smart,
+)
 
 
 class TestContentDefinedChunking:
@@ -154,6 +161,40 @@ class TestDiffGeneration:
         assert "+++ " not in result
         assert "-Line 2\n" in result
         assert "+Line 2 changed\n" in result
+
+
+class TestDiffWithStats:
+    """diff_with_stats must be bit-identical to the two separate calls."""
+
+    CASES = [
+        ("identical", "a\nb\nc\n", "a\nb\nc\n"),
+        ("both empty", "", ""),
+        ("insert only", "a\nb\n", "a\nx\nb\n"),
+        ("delete only", "a\nx\nb\n", "a\nb\n"),
+        ("equal-length replace", "a\nb\nc\n", "a\nB\nc\n"),
+        ("unequal replace", "a\nb\nc\nd\n", "a\nX\nd\n"),
+        ("no trailing newline", "a\nb", "a\nc"),
+        ("from empty", "", "new\nlines\n"),
+        ("to empty", "old\nlines\n", ""),
+        (
+            "multiple hunks",
+            "\n".join(f"line {i}" for i in range(40)) + "\n",
+            "\n".join("CHANGED" if i in (3, 30) else f"line {i}" for i in range(40)) + "\n",
+        ),
+    ]
+
+    @pytest.mark.parametrize("label,old,new", CASES, ids=[c[0] for c in CASES])
+    def test_matches_separate_calls(self, label: str, old: str, new: str) -> None:
+        diff, stats = diff_with_stats(old, new)
+        assert diff == generate_diff(old, new)
+        assert stats == diff_stats(old, new)
+
+    @pytest.mark.parametrize("context", [0, 1, 2, 3])
+    def test_matches_at_all_context_widths(self, context: int) -> None:
+        old = "\n".join(f"line {i}" for i in range(30)) + "\n"
+        new = old.replace("line 12", "changed 12")
+        diff, _ = diff_with_stats(old, new, context_lines=context)
+        assert diff == generate_diff(old, new, context_lines=context)
 
 
 class TestSmartTruncation:

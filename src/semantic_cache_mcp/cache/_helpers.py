@@ -276,8 +276,28 @@ def _choose_min_token_content(options: dict[str, str]) -> tuple[str, str, int]:
     return best_kind, best_content, best_tokens or 0
 
 
+# Small files get 2 lines of unified-diff context instead of 3: per-hunk
+# context is a large fraction of the whole payload there, and 2 lines still
+# anchor the hunk unambiguously. Larger files keep the conventional 3.
+_SMALL_FILE_DIFF_LINES = 100
+
+
+def _diff_context_lines(old_content: str) -> int:
+    """Adaptive unified-diff context width based on the file's size."""
+    return 2 if old_content.count("\n") < _SMALL_FILE_DIFF_LINES else 3
+
+
+# When a diff is suppressed, keep up to this many per-hunk header lines in
+# the summary (middle tier). Beyond this, even headers get noisy — fall back
+# to the bare one-line count summary.
+_SUPPRESSED_DIFF_MAX_HUNK_HEADERS = 24
+
+
 def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | None:
-    """Return diff unchanged, a summary for diffs exceeding the token cap, or None if empty."""
+    """Return the diff unchanged, a hunk-header summary when it exceeds the
+    token cap, or a bare count summary when even the headers would be noisy.
+    None if the diff is empty.
+    """
     if not diff_content:
         return None
 
@@ -292,20 +312,38 @@ def _suppress_large_diff(diff_content: str | None, full_tokens: int) -> str | No
         full_tokens * MAX_DIFF_TO_FULL_RATIO
     )
     if should_suppress:
-        # Count added/removed lines and hunks from unified diff
+        # Count added/removed lines, totals and per-hunk, in one pass.
         added = 0
         removed = 0
-        hunks = 0
+        headers: list[str] = []
+        hunk_added: list[int] = []
+        hunk_removed: list[int] = []
         for line in diff_content.splitlines():
-            if line.startswith("+") and not line.startswith("+++"):
+            if line.startswith("@@"):
+                headers.append(line)
+                hunk_added.append(0)
+                hunk_removed.append(0)
+            elif line.startswith("+") and not line.startswith("+++"):
                 added += 1
+                if headers:
+                    hunk_added[-1] += 1
             elif line.startswith("-") and not line.startswith("---"):
                 removed += 1
-            elif line.startswith("@@"):
-                hunks += 1
-        return (
+                if headers:
+                    hunk_removed[-1] += 1
+        summary = (
             f"[diff suppressed: {diff_tokens} tokens > cap] "
-            f"+{added} -{removed} lines across {hunks} hunks"
+            f"+{added} -{removed} lines across {len(headers)} hunks"
         )
+        # Middle tier: bodies are too big to send, but the hunk headers
+        # (which line ranges changed, and by how much) are cheap and let
+        # the caller pull specifics with a ranged read instead of paying
+        # for a full re-read.
+        if 0 < len(headers) <= _SUPPRESSED_DIFF_MAX_HUNK_HEADERS:
+            hunk_lines = "\n".join(
+                f"{h} +{a} -{r}" for h, a, r in zip(headers, hunk_added, hunk_removed, strict=True)
+            )
+            return f"{summary}\n{hunk_lines}"
+        return summary
 
     return diff_content

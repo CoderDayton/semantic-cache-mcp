@@ -8,7 +8,7 @@ import re
 import time
 from pathlib import Path
 
-from ..core import count_tokens, diff_stats, generate_diff
+from ..core import count_tokens, diff_with_stats
 from ..core.hashing import hash_content
 from ..types import (
     CacheEntry,
@@ -251,8 +251,7 @@ async def compare_files(
     cached2, content2, from_cache2 = await _load_diff_input(cache, file2, path2)
 
     # Generate diff (suppress if very large to avoid blowing up response tokens)
-    diff_content = generate_diff(content1, content2, context_lines=context_lines)
-    stats = diff_stats(content1, content2)
+    diff_content, stats = diff_with_stats(content1, content2, context_lines=context_lines)
     full_tokens = count_tokens(content1) + count_tokens(content2)
     diff_content = _suppress_large_diff(diff_content, full_tokens) or ""
 

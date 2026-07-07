@@ -487,6 +487,44 @@ class TestSuppressLargeDiff:
         """None input returns None."""
         assert _suppress_large_diff(None, full_tokens=100) is None
 
+    async def test_suppressed_diff_keeps_hunk_headers(self) -> None:
+        """Middle tier: a suppressed diff with few hunks keeps per-hunk
+        header lines so the caller can target a ranged read."""
+        lines = ["@@ -1,2000 +1,2000 @@"]
+        for i in range(2000):
+            lines.append(f"-old line {i}")
+            lines.append(f"+new line {i}")
+        lines.append("@@ -5000,10 +5000,12 @@")
+        lines.append("+extra one")
+        lines.append("+extra two")
+        diff = "\n".join(lines)
+
+        result = _suppress_large_diff(diff, full_tokens=50000)
+
+        assert result is not None
+        assert result.startswith("[diff suppressed:")
+        assert "2 hunks" in result
+        assert "@@ -1,2000 +1,2000 @@ +2000 -2000" in result
+        assert "@@ -5000,10 +5000,12 @@ +2 -0" in result
+        # Bodies must not survive suppression.
+        assert "old line 5" not in result
+
+    async def test_suppressed_diff_many_hunks_falls_back_to_bare_summary(self) -> None:
+        """Beyond the hunk-header cap, only the one-line summary is returned."""
+        lines = []
+        for h in range(40):
+            lines.append(f"@@ -{h * 100 + 1},50 +{h * 100 + 1},50 @@")
+            for i in range(200):
+                lines.append(f"-old {h}/{i}")
+                lines.append(f"+new {h}/{i}")
+        diff = "\n".join(lines)
+
+        result = _suppress_large_diff(diff, full_tokens=100000)
+
+        assert result is not None
+        assert "40 hunks" in result
+        assert "\n" not in result  # bare summary only, no header lines
+
     async def test_small_file_preserves_diff(self) -> None:
         """Files <=200 tokens always get full diff regardless of ratio."""
         # This diff is larger than the "file" (ratio > 0.9) but file is small

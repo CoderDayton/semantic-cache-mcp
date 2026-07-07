@@ -14,7 +14,7 @@ from ..core.hashing import hash_content
 from ..logger import log_marker
 from ..types import BatchReadResult, FileReadSummary, ReadResult
 from ..utils import aread_bytes, astat
-from ._helpers import _is_binary_content
+from ._helpers import _diff_context_lines, _is_binary_content
 from .store import SemanticCache
 
 # Magic-byte prefixes for cheap mime sniffing when extension lookup fails.
@@ -273,7 +273,9 @@ async def smart_read(
         # File changed - generate diff with stats
         if cached is not None:
             old_content = await cache.get_content(cached)
-            diff_content = generate_diff(old_content, content)
+            diff_content = generate_diff(
+                old_content, content, context_lines=_diff_context_lines(old_content)
+            )
             diff_tokens = count_tokens(diff_content)
 
             if (
