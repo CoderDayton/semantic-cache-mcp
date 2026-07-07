@@ -150,11 +150,12 @@ class _CountMinSketch:
         row = self._table[cursor]
         row[:] = row.translate(_HALVE_TABLE)
         self._halve_cursor = (cursor + 1) % self._DEPTH
-        # Subtract phase quantum (don't lose extra events accumulated past
-        # the trigger threshold) so the next trigger fires after exactly
-        # another _phase_size events.
+        # Subtract the phase quantum so the next trigger fires after exactly
+        # another _phase_size events. increment() adds 1 and checks the
+        # threshold on every increment, so this always leaves 0 today; the
+        # subtraction (rather than a reset) keeps any surplus if increments
+        # ever become batched.
         self._events -= self._phase_size
-        self._events //= 2
 
     @property
     def events(self) -> int:
@@ -179,9 +180,11 @@ class TinyLFUIndex:
     Concurrency model: methods that mutate the index are sync — under
     cooperative asyncio they run to completion without yielding the loop,
     so dict mutations are safe. The async `ensure_loaded()` uses a lock to
-    serialize concurrent first-time bootstraps. A `remove()` that lands
-    while a bootstrap is awaiting its loader is recorded and replayed onto
-    the rebuilt index so a concurrently deleted path is not resurrected.
+    serialize concurrent first-time bootstraps. A `remove()` or `upsert()`
+    that lands while a bootstrap is awaiting its loader is recorded and
+    reconciled onto the rebuilt index, so a concurrently deleted path is
+    not resurrected and a concurrently re-written path does not have stale
+    snapshot doc_ids merged into its fresh entry.
     """
 
     __slots__ = (
@@ -195,6 +198,7 @@ class TinyLFUIndex:
         "_dirty",
         "_loading",
         "_pending_removals",
+        "_pending_upserts",
     )
 
     # When sampling LRU candidates for eviction, look at this multiple of
@@ -212,6 +216,7 @@ class TinyLFUIndex:
         self._dirty = False
         self._loading = False
         self._pending_removals: set[str] = set()
+        self._pending_upserts: set[str] = set()
 
     @staticmethod
     def _hash(path: str) -> int:
@@ -263,6 +268,7 @@ class TinyLFUIndex:
             # delete committed.
             self._loading = True
             self._pending_removals.clear()
+            self._pending_upserts.clear()
             try:
                 self._entries.clear()
                 self._lru.clear()
@@ -270,6 +276,12 @@ class TinyLFUIndex:
                 for doc_id, _text, meta in await load_all():
                     path = meta.get("path", "")
                     if not path:
+                        continue
+                    if path in self._pending_upserts:
+                        # A live upsert landed while the loader was awaited;
+                        # it is newer than this snapshot row. Merging the
+                        # snapshot's doc_ids would attach stale rowids (which
+                        # SQLite may have reused) to the fresh entry.
                         continue
                     entry = self._entries.get(path)
                     if entry is None:
@@ -298,6 +310,7 @@ class TinyLFUIndex:
             finally:
                 self._loading = False
                 self._pending_removals.clear()
+                self._pending_upserts.clear()
             logger.debug(f"TinyLFUIndex bootstrap: {len(self._entries)} paths loaded")
 
     @staticmethod
@@ -324,6 +337,13 @@ class TinyLFUIndex:
         """Register or replace doc_ids for a path; record an access at `ts`."""
         if not path:
             return
+        if self._loading:
+            # A bootstrap is awaiting its loader and cannot see this upsert.
+            # Record the path so the rebuild skips the loader's (older)
+            # snapshot rows for it; this write also supersedes any removal
+            # recorded earlier in the same window.
+            self._pending_upserts.add(path)
+            self._pending_removals.discard(path)
         existing = self._entries.get(path)
         if existing is not None:
             history = existing.history

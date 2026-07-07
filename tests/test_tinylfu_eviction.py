@@ -8,6 +8,7 @@ cold ones.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -301,3 +302,41 @@ class TestContentStorageEvictionUsesIndex:
             assert calls["n"] == 0, "doc-count DB query ran despite a loaded index"
         finally:
             vs.close()
+
+
+class TestBootstrapUpsertRace:
+    async def test_upsert_during_rebootstrap_wins_over_snapshot(self) -> None:
+        """A live upsert during a dirty re-bootstrap keeps its fresh doc_ids.
+
+        The rebuild must skip the loader's (older) snapshot rows for a path
+        that was re-written while the loader was awaited — merging them would
+        attach stale rowids to the fresh entry.
+        """
+        idx = TinyLFUIndex(capacity=16, history_size=4)
+
+        async def initial_loader():
+            return [(1, "", {"path": "/a", "access_history": "[1.0]"})]
+
+        await idx.ensure_loaded(initial_loader)
+        assert idx.doc_ids_for("/a") == [1]
+
+        idx.mark_dirty()
+        gate = asyncio.Event()
+
+        async def slow_stale_loader():
+            await gate.wait()
+            # Snapshot predates the concurrent upsert: still shows doc 1.
+            return [(1, "", {"path": "/a", "access_history": "[1.0]"})]
+
+        task = asyncio.create_task(idx.ensure_loaded(slow_stale_loader))
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if idx._loading:
+                break
+        assert idx._loading, "bootstrap did not reach its loader await"
+
+        idx.upsert("/a", [2], ts=2.0)  # concurrent re-write with a new doc id
+        gate.set()
+        await task
+
+        assert idx.doc_ids_for("/a") == [2]
