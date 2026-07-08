@@ -254,6 +254,13 @@ class DocStore:
         if not filter_dict:
             return "", []
 
+        # metadata_column is interpolated into the SQL below (identifiers
+        # cannot be bound parameters). Every call site passes a fixed literal
+        # ("metadata" / "ti.metadata"); this allowlist keeps the seam safe if
+        # a caller-supplied value ever reaches it.
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", metadata_column):
+            raise ValueError(f"Invalid metadata column identifier: {metadata_column!r}")
+
         clauses: list[str] = []
         params: list[Any] = []
         for key, value in filter_dict.items():

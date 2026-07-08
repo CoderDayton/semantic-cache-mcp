@@ -13,6 +13,7 @@ from .text import (
     SummarizationConfig,
     compute_delta,
     diff_stats,
+    diff_with_stats,
     extract_segments,
     generate_diff,
     score_segments,
@@ -38,6 +39,7 @@ __all__ = [
     "truncate_semantic",
     "compute_delta",
     "diff_stats",
+    "diff_with_stats",
     "BPETokenizer",
     "get_tokenizer",
     # Semantic summarization

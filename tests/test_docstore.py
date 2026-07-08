@@ -118,6 +118,11 @@ class TestFilter:
         with pytest.raises(ValueError, match="double-quote"):
             s.build_filter_clause({'bad"key': "x"})
 
+    def test_bad_metadata_column_rejected(self, tmp_path: Path) -> None:
+        s = _store(tmp_path)
+        with pytest.raises(ValueError, match="identifier"):
+            s.build_filter_clause({"path": "/a"}, metadata_column="metadata; DROP TABLE x --")
+
     def test_keyword_search_honors_filter(self, tmp_path: Path) -> None:
         s = _store(tmp_path)
         s.add_texts(["shared term", "shared term"], [{"path": "/keep"}, {"path": "/drop"}])

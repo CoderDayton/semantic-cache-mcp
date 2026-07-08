@@ -228,6 +228,85 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _format_range_unified(start: int, stop: int) -> str:
+    """Format a unified-diff hunk range (mirrors difflib's private helper)."""
+    beginning = start + 1
+    length = stop - start
+    if length == 1:
+        return str(beginning)
+    if not length:
+        beginning -= 1
+    return f"{beginning},{length}"
+
+
+def diff_with_stats(old: str, new: str, context_lines: int = 3) -> tuple[str, dict]:
+    """Compute ``generate_diff()`` and ``diff_stats()`` in one matcher pass.
+
+    Call sites that need both previously ran the (quadratic) SequenceMatcher
+    twice over the same inputs; this shares the memoized opcodes. Output is
+    identical to calling the two functions separately.
+    """
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+
+    sm = SequenceMatcher(None, old_lines, new_lines)
+
+    # Stats: the same accounting as compute_delta, counts and sizes only.
+    insertions = deletions = modifications = 0
+    content_bytes = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace":
+            if i2 - i1 == j2 - j1:
+                modifications += i2 - i1
+                content_bytes += sum(len(s.rstrip()) for s in old_lines[i1:i2])
+                content_bytes += sum(len(s.rstrip()) for s in new_lines[j1:j2])
+            else:
+                deletions += i2 - i1
+                insertions += j2 - j1
+                content_bytes += sum(len(s) for s in old_lines[i1:i2])
+                content_bytes += sum(len(s) for s in new_lines[j1:j2])
+        elif tag == "delete":
+            deletions += i2 - i1
+            content_bytes += sum(len(s) for s in old_lines[i1:i2])
+        elif tag == "insert":
+            insertions += j2 - j1
+            content_bytes += sum(len(s) for s in new_lines[j1:j2])
+
+    # compute_delta counts two 16-char truncated hashes into size_bytes;
+    # keep the same constant so the stats match diff_stats() exactly.
+    size_bytes = 32 + content_bytes
+    original_size = len(old.encode()) if old else 0
+    stats = {
+        "insertions": insertions,
+        "deletions": deletions,
+        "modifications": modifications,
+        "delta_size_bytes": size_bytes,
+        "original_size": original_size,
+        "compression_ratio": size_bytes / original_size if original_size else 0,
+    }
+
+    # Unified diff from the same matcher (opcodes are memoized by difflib).
+    # Formatting mirrors difflib.unified_diff minus the ---/+++ file headers
+    # that generate_diff strips anyway.
+    parts: list[str] = []
+    for group in sm.get_grouped_opcodes(context_lines):
+        first, last = group[0], group[-1]
+        range1 = _format_range_unified(first[1], last[2])
+        range2 = _format_range_unified(first[3], last[4])
+        parts.append(f"@@ -{range1} +{range2} @@\n")
+        for gtag, gi1, gi2, gj1, gj2 in group:
+            if gtag == "equal":
+                parts.extend(" " + line for line in old_lines[gi1:gi2])
+                continue
+            if gtag in ("replace", "delete"):
+                parts.extend("-" + line for line in old_lines[gi1:gi2])
+            if gtag in ("replace", "insert"):
+                parts.extend("+" + line for line in new_lines[gj1:gj2])
+    diff_text = "".join(parts)
+
+    return (diff_text if diff_text else "// No changes", stats)
+
+
 def diff_stats(old: str, new: str) -> dict:
     delta = compute_delta(old, new)
     original_size = len(old.encode()) if old else 0

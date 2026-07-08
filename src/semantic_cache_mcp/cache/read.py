@@ -14,7 +14,7 @@ from ..core.hashing import hash_content
 from ..logger import log_marker
 from ..types import BatchReadResult, FileReadSummary, ReadResult
 from ..utils import aread_bytes, astat
-from ._helpers import _is_binary_content
+from ._helpers import _diff_context_lines, _is_binary_content
 from .store import SemanticCache
 
 # Magic-byte prefixes for cheap mime sniffing when extension lookup fails.
@@ -158,6 +158,7 @@ async def smart_read(
                 tokens_saved=cached.tokens - msg_tokens,
                 truncated=False,
                 compression_ratio=msg_tokens / cached.tokens if cached.tokens else 1.0,
+                content_hash=cached.content_hash,
             )
         cached_content = await cache.get_content(cached)
         return ReadResult(
@@ -169,6 +170,7 @@ async def smart_read(
             tokens_saved=0,
             truncated=False,
             compression_ratio=1.0,
+            content_hash=cached.content_hash,
         )
 
     # Slow path: file changed, missing from cache, or force_full requested.
@@ -197,11 +199,22 @@ async def smart_read(
 
     tokens_original = count_tokens(content)
 
+    # Memoized hash of the just-read content: several branches below compare
+    # it, and the ReadResult carries it back so callers don't need an extra
+    # cache-entry lookup to learn the current hash.
+    _hash: str | None = None
+
+    def _content_hash() -> str:
+        nonlocal _hash
+        if _hash is None:
+            _hash = hash_content(content)
+        return _hash
+
     cache_is_fresh = False
     if cached and force_full:
         if cached.mtime >= mtime:
             cache_is_fresh = True
-        elif hash_content(content) == cached.content_hash:
+        elif _content_hash() == cached.content_hash:
             await cache.update_mtime(str(file_path), mtime)
             cache_is_fresh = True
 
@@ -210,7 +223,7 @@ async def smart_read(
         if cached.mtime >= mtime:
             # File unchanged (mtime match)
             pass
-        elif hash_content(content) == cached.content_hash:
+        elif _content_hash() == cached.content_hash:
             # Content identical despite mtime change — update mtime, treat as unchanged
             await cache.update_mtime(str(file_path), mtime)
         else:
@@ -236,6 +249,7 @@ async def smart_read(
                     tokens_saved=tokens_original - msg_tokens,
                     truncated=False,
                     compression_ratio=len(unchanged_msg) / len(content) if content else 1.0,
+                    content_hash=cached.content_hash,
                 )
 
             # Small file - return full content
@@ -249,6 +263,7 @@ async def smart_read(
                 tokens_saved=0,
                 truncated=False,
                 compression_ratio=1.0,
+                content_hash=cached.content_hash,
             )
 
         # Restore the original entry — we nulled it as sentinel above.
@@ -258,7 +273,9 @@ async def smart_read(
         # File changed - generate diff with stats
         if cached is not None:
             old_content = await cache.get_content(cached)
-            diff_content = generate_diff(old_content, content)
+            diff_content = generate_diff(
+                old_content, content, context_lines=_diff_context_lines(old_content)
+            )
             diff_tokens = count_tokens(diff_content)
 
             if (
@@ -285,6 +302,7 @@ async def smart_read(
                     tokens_saved=tokens_original - tokens_returned,
                     truncated=False,
                     compression_ratio=len(result_content) / len(content),
+                    content_hash=_content_hash(),
                 )
 
     # Strategy 3 & 4: Full read (semantic summarization if large)
@@ -340,6 +358,7 @@ async def smart_read(
         tokens_saved=tokens_original - tokens_returned if truncated else 0,
         truncated=truncated,
         compression_ratio=len(final_content) / len(content) if content else 1.0,
+        content_hash=_content_hash(),
     )
 
 

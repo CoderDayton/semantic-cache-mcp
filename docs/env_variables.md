@@ -17,7 +17,7 @@ All environment variables are optional. Defaults are tuned for typical usage.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_LEVEL` | `INFO` | Logging verbosity. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Set to `DEBUG` for troubleshooting storage issues. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `DEBUG` for troubleshooting storage issues. An unrecognized value falls back to `INFO` instead of failing startup. |
 
 ## Tool Response
 

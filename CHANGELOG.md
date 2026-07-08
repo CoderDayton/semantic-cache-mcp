@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-07: Correctness and token-efficiency fixes
+
+A focused follow-up to 0.5.0 from a full-repo audit. It fixes three data-safety
+bugs in the write, edit, and summarize paths, tightens input validation and
+error handling across the server and storage layers, and trims a little more
+from diff payloads. There are no public API changes and no cache-format change,
+so upgrading is a drop-in with no migration.
+
+### Fixed
+
+- **`batch_edit` no longer corrupts a file when two edits target overlapping
+  line ranges.** Successful edits are applied back-to-front against a running
+  copy of the file, so a later edit whose line range overlaps an earlier one
+  read shifted offsets and could splice garbage or raise mid-batch after other
+  edits had already been written. Overlapping ranges are now detected up front;
+  the later edit fails with a clear "overlaps another edit in this batch" message
+  and the file ends up exactly as the surviving edits alone would leave it.
+- **`batch_edit` degrades gracefully on invalid UTF-8.** When a file with
+  non-UTF-8 bytes had no cache entry, `batch_edit` raised where `write` and
+  `edit` had long since learned to retry with replacement characters and log a
+  warning. It now follows the same try-strict, fall-back-to-replace pattern in
+  both of its disk-read branches.
+- **`read` validates `offset`/`limit` before forwarding.** A negative `offset`
+  or a `limit` below 1 is now rejected locally instead of being forwarded to the
+  worker unchecked.
+- **Summarization fallback covers whole paragraphs.** The blank-line paragraph
+  splitter used when a file has no function or header boundaries could drop the
+  overflow lines of any paragraph longer than the segment limit. This path isn't
+  reached today — the boundary splitter always fires first — so this is a latent
+  fix, but the fallback is now correct and covered by a test.
+- **An invalid `LOG_LEVEL` no longer crashes startup.** An unrecognized value
+  now falls back to `INFO` instead of raising during import, matching how the
+  other environment settings tolerate bad input.
+- **Closed a race in the eviction index.** A file re-write landing while the
+  in-memory index was rebuilding itself from disk could merge stale document IDs
+  into the fresh entry. The rebuild now skips any path that was written during
+  the rebuild window.
+
+### Changed
+
+- **Leaner diffs.** Files under 100 lines now use 2 lines of surrounding context
+  in a diff instead of 3, where the third line is a large share of a small
+  payload; larger files keep the usual 3. When a diff is too large to send in
+  full, the suppressed summary now includes the per-hunk `@@` headers (which
+  regions changed, and by how much) up to a limit, so you can pull the specifics
+  with a ranged `read` instead of re-reading the whole file.
+- **One diff pass instead of two.** `write`, `edit`, `batch_edit`, and
+  `compare` used to run the line-matcher twice over the same two texts — once for
+  the diff, once for its statistics. They now share a single pass. The output is
+  identical; large-file writes and edits are measurably faster (a 360 KB chunked
+  write dropped from about 21 ms to about 8 ms).
+
+### Internal
+
+- Removed dead unreachable guards, narrowed a few over-broad `except` blocks,
+  added an identifier allowlist on the one SQL column name that is interpolated
+  rather than bound, added missing failure logging, and added direct
+  (non-mocked) test coverage for the async file-I/O helpers.
+
 ## [0.5.0] - 2026-06-09: Biggest release yet, a near-complete rewrite
 
 This is the biggest release so far. The embedding and vector search code is gone,

@@ -487,6 +487,44 @@ class TestSuppressLargeDiff:
         """None input returns None."""
         assert _suppress_large_diff(None, full_tokens=100) is None
 
+    async def test_suppressed_diff_keeps_hunk_headers(self) -> None:
+        """Middle tier: a suppressed diff with few hunks keeps per-hunk
+        header lines so the caller can target a ranged read."""
+        lines = ["@@ -1,2000 +1,2000 @@"]
+        for i in range(2000):
+            lines.append(f"-old line {i}")
+            lines.append(f"+new line {i}")
+        lines.append("@@ -5000,10 +5000,12 @@")
+        lines.append("+extra one")
+        lines.append("+extra two")
+        diff = "\n".join(lines)
+
+        result = _suppress_large_diff(diff, full_tokens=50000)
+
+        assert result is not None
+        assert result.startswith("[diff suppressed:")
+        assert "2 hunks" in result
+        assert "@@ -1,2000 +1,2000 @@ +2000 -2000" in result
+        assert "@@ -5000,10 +5000,12 @@ +2 -0" in result
+        # Bodies must not survive suppression.
+        assert "old line 5" not in result
+
+    async def test_suppressed_diff_many_hunks_falls_back_to_bare_summary(self) -> None:
+        """Beyond the hunk-header cap, only the one-line summary is returned."""
+        lines = []
+        for h in range(40):
+            lines.append(f"@@ -{h * 100 + 1},50 +{h * 100 + 1},50 @@")
+            for i in range(200):
+                lines.append(f"-old {h}/{i}")
+                lines.append(f"+new {h}/{i}")
+        diff = "\n".join(lines)
+
+        result = _suppress_large_diff(diff, full_tokens=100000)
+
+        assert result is not None
+        assert "40 hunks" in result
+        assert "\n" not in result  # bare summary only, no header lines
+
     async def test_small_file_preserves_diff(self) -> None:
         """Files <=200 tokens always get full diff regardless of ratio."""
         # This diff is larger than the "file" (ratio > 0.9) but file is small
@@ -1006,6 +1044,43 @@ class TestSmartBatchEditLineRange:
 
         assert result.succeeded == 2
         assert file_path.read_text() == "aaa\nXXX\nYYY\nddd\n"
+
+    async def test_overlapping_ranges_fail_later_edit(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Overlapping line-range edits: the first applies, the later one fails."""
+        file_path = temp_dir / "batch_overlap.txt"
+        file_path.write_text("aaa\nbbb\nccc\nddd\neee\n")
+
+        result = await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [(None, "X\n", 2, 3), (None, "Y\n", 3, 4)],
+        )
+
+        assert result.succeeded == 1
+        assert result.failed == 1
+        assert result.outcomes[0].success is True
+        assert result.outcomes[1].success is False
+        assert "overlap" in (result.outcomes[1].error or "")
+        # Exactly what the surviving edit alone would produce.
+        assert file_path.read_text() == "aaa\nX\nddd\neee\n"
+
+    async def test_batch_edit_invalid_utf8_uncached(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Invalid UTF-8 without a cache entry degrades instead of raising."""
+        file_path = temp_dir / "batch_bad_utf8.txt"
+        file_path.write_bytes(b"hello \x80\x81 world\n")
+
+        result = await smart_batch_edit(
+            semantic_cache_no_embeddings,
+            str(file_path),
+            [("hello", "goodbye", None, None)],
+        )
+
+        assert result.succeeded == 1
+        assert "goodbye" in file_path.read_text(errors="replace")
 
 
 class TestBestEffortCacheRefresh:

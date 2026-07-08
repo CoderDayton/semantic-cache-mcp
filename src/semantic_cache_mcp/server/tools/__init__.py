@@ -423,8 +423,8 @@ async def read(
             absolute path for files outside the project root.
         max_size: Byte threshold above which the file is semantically
             summarized; recover exact lines afterward with `offset`/`limit`.
-        offset: 1-based first line for a ranged read. `0` means from the start
-            (same as omitting).
+        offset: 1-based first line for a ranged read; omit or pass 0 to start
+            from the first line.
         limit: Number of lines to return starting at `offset`.
         known_hash: The `content_hash` from your last read of this file; pass it
             back to get `"unchanged"` instead of the content re-sent. Omit only
@@ -435,19 +435,21 @@ async def read(
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
-    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
-        state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
-    )
-    if remote_result is not None:
-        return remote_result
 
-    # Validate bounds. `offset=0` is accepted and treated as from-start.
+    # Validate bounds locally before any remote forwarding. `offset=0` is
+    # accepted and treated as from-start.
     if offset is not None and offset < 0:
         _raise_tool_error(
             "read", "offset must be >= 0 (1-based; 0 is from start)", max_response_tokens
         )
     if limit is not None and limit < 1:
         _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
+
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
+    )
+    if remote_result is not None:
+        return remote_result
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:
@@ -524,8 +526,7 @@ async def read(
                 full_text = result.content
                 full_tokens = result.tokens_original
                 ranged_from_cache = result.from_cache
-                refreshed = await cache.get(ranged_abs)
-                ranged_hash = refreshed.content_hash if refreshed is not None else None
+                ranged_hash = result.content_hash
 
             lines = full_text.splitlines(keepends=True)
             start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
@@ -1845,8 +1846,18 @@ async def batch_read(
         if remote_result is not None:
             return remote_result
 
-        # Expand glob patterns
-        path_list = _expand_globs(path_list)
+        # Expand glob patterns off the event loop: a single blocking glob()
+        # step can't be interrupted by _expand_globs' internal deadline, so
+        # run it in the IO executor and bound the wait here.
+        try:
+            path_list = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    cache._io_executor, _expand_globs, path_list
+                ),
+                timeout=_EXPAND_GLOBS_TIMEOUT + 1,
+            )
+        except TimeoutError:
+            logger.warning("Glob expansion exceeded hard timeout; using raw paths")
 
         result = await asyncio.wait_for(
             batch_smart_read(

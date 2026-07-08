@@ -30,7 +30,7 @@ src/semantic_cache_mcp/
 
 │   ├── text/               # Diff generation and semantic summarization
 │   │   ├── __init__.py
-│   │   ├── _diff.py        # generate_diff, compute_delta, diff_stats
+│   │   ├── _diff.py        # generate_diff, diff_with_stats, compute_delta, diff_stats
 │   │   └���─ _summarize.py   # summarize_semantic (TCRA-LLM based)
 │   └���─ tokenizer.py        # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
@@ -161,8 +161,10 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 #### `_diff.py`: Diff and Delta Compression
 
 - Unified diffs via Python `difflib` with diff statistics (insertions, deletions, modifications)
+- `diff_with_stats()`: computes the unified diff and its statistics from a single line-matcher pass, shared by the write/edit/batch-edit and compare paths that need both (the output matches calling `generate_diff` and `diff_stats` separately)
+- Adaptive context width: files under 100 lines use 2 lines of diff context instead of 3, where the extra line is a large share of a small payload; larger files keep 3
 - Delta compression: store only changed lines (10 to 100x smaller for small edits to large files)
-- `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow
+- `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow. A middle tier keeps the per-hunk `@@` headers (which regions changed and by how much) when a diff is over budget but has few hunks, so the caller can fetch specifics with a ranged `read`; beyond a hunk cap it falls back to a bare count summary
 
 #### `_summarize.py`: Semantic Summarization
 

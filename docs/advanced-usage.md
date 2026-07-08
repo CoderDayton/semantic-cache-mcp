@@ -96,6 +96,9 @@ multi_result = smart_batch_edit(
 )
 print(f"Succeeded: {multi_result.succeeded}")
 print(f"Failed:    {multi_result.failed}")
+# Each edit is validated independently, so some can succeed while others fail.
+# Two edits whose line ranges overlap are rejected: the later one fails with an
+# "overlaps another edit in this batch" error rather than corrupting the splice.
 
 # 2-tuples (old, new) are also accepted for backward compatibility
 multi_result = smart_batch_edit(

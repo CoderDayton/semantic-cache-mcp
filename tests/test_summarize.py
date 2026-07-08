@@ -96,6 +96,23 @@ Even more content.
             n_lines = seg.content.count("\n")
             assert n_lines <= 20
 
+    def test_long_paragraphs_cover_all_lines(self) -> None:
+        """Paragraphs longer than max_segment_lines are chunked with no gaps."""
+        config = SummarizationConfig(max_segment_lines=10)
+        # Two paragraphs, each exceeding max_segment_lines by > 2x, with no
+        # structural boundary lines — segmentation must not drop any lines.
+        para1 = "\n".join(f"alpha {i} beta" for i in range(25))
+        para2 = "\n".join(f"gamma {i} delta" for i in range(25))
+        content = para1 + "\n\n" + para2 + "\n"
+        n_lines = len(content.splitlines())
+
+        segments = extract_segments(content, config)
+
+        covered: set[int] = set()
+        for seg in segments:
+            covered.update(range(seg.start_line, seg.end_line))
+        assert covered == set(range(n_lines))
+
 
 class TestSegmentScoring:
     """Tests for segment scoring."""

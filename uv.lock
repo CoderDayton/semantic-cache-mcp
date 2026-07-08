@@ -1399,7 +1399,7 @@ wheels = [
 
 [[package]]
 name = "semantic-cache-mcp"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },

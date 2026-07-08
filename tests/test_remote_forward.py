@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Context
+from fastmcp.exceptions import ToolError
 
 from semantic_cache_mcp.server import tools as tools_mod
 
@@ -176,6 +177,18 @@ def test_forward_kwargs_rejects_varargs_tool() -> None:
 
     with pytest.raises(TypeError, match="no stable forwarded name"):
         vararg_tool("ctx", "/p", foo=1)
+
+
+async def test_read_validates_bounds_before_forwarding() -> None:
+    """Invalid offset/limit are rejected locally, never forwarded."""
+    cache = _FakeRemoteCache()
+    ctx = _make_ctx(cache)
+
+    with pytest.raises(ToolError, match="offset"):
+        await tools_mod.read(ctx, path="x", offset=-1)
+    with pytest.raises(ToolError, match="limit"):
+        await tools_mod.read(ctx, path="x", limit=0)
+    assert not cache.calls, "invalid params must not reach the remote tool"
 
 
 def test_forward_kwargs_rejects_unknown_override() -> None:

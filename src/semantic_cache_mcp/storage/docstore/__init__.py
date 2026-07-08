@@ -441,6 +441,7 @@ class ContentStorage:
             # re-bootstraps from the DB instead of trusting a stale path→doc_ids
             # map — the same recovery discipline _delete_by_path and
             # _evict_if_needed apply when their delete fails.
+            logger.exception(f"docstore put failed for {path}; marking index dirty")
             self._index.mark_dirty()
             raise
         # Mirror the new doc IDs into the in-memory eviction index. Only do
@@ -996,7 +997,9 @@ class ContentStorage:
             logger.debug(f"Filter lookup failed for {path}: {e}")
             return []
 
-        # docs is list of (doc_id, text, metadata_dict)
+        # docs is (doc_id, text, metadata); reordered to (doc_id, metadata,
+        # text) — callers branch on metadata and often ignore the text, so it
+        # goes last per this helper's documented return type.
         return [(doc_id, meta, text) for doc_id, text, meta in docs]
 
     async def _delete_by_path(self, path: str) -> int:
