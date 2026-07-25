@@ -38,6 +38,14 @@ GLOB_TIMEOUT_SECONDS = 5
 # read as an operator.
 _FTS_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
+# Terms are joined with OR, not FTS5's implicit AND. Under AND a single word the
+# corpus happens not to contain empties the whole result set, which is exactly
+# what a natural-language query invites — "password hashing session token"
+# returns nothing because no one file carries all four words. OR keeps every
+# partial match alive and leaves the sorting to BM25, which is the part that
+# already knows a file matching four terms beats one matching a single term.
+_FTS_TERM_JOINER = " OR "
+
 
 def _sanitize_fts_query(query: str) -> str:
     """Turn a free-text query into a safe FTS5 ``MATCH`` expression.
@@ -47,15 +55,17 @@ def _sanitize_fts_query(query: str) -> str:
     runs (``in-flight`` -> ``in``, ``flight``) becomes an adjacency phrase
     ``"in flight"`` so the compound still matches the source text; a single run
     becomes a plain quoted term. Quoting makes every term a string literal, so
-    no input reaches the FTS5 parser as an operator. Returns ``""`` when the
-    query has no indexable characters (the caller then yields no matches).
+    no input reaches the FTS5 parser as an operator. Terms are then joined with
+    ``OR`` so one absent word cannot empty the result set — see
+    ``_FTS_TERM_JOINER``. Returns ``""`` when the query has no indexable
+    characters (the caller then yields no matches).
     """
     chunks: list[str] = []
     for raw in query.split():
         words = _FTS_WORD_RE.findall(raw)
         if words:
             chunks.append('"' + " ".join(words) + '"')
-    return " ".join(chunks)
+    return _FTS_TERM_JOINER.join(chunks)
 
 
 def _normalize_relevance(scores: list[float]) -> list[float]:

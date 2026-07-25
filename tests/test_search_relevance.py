@@ -63,8 +63,10 @@ class TestSanitizeFtsQuery:
     def test_plain_word(self) -> None:
         assert _sanitize_fts_query("needle") == '"needle"'
 
-    def test_multiword_terms_are_anded(self) -> None:
-        assert _sanitize_fts_query("drain shutdown") == '"drain" "shutdown"'
+    def test_multiword_terms_are_ored(self) -> None:
+        # OR, not FTS5's implicit AND: a single word the corpus happens not to
+        # contain must not empty the whole result set.
+        assert _sanitize_fts_query("drain shutdown") == '"drain" OR "shutdown"'
 
     def test_hyphen_becomes_adjacency_phrase(self) -> None:
         assert _sanitize_fts_query("in-flight") == '"in flight"'
@@ -80,7 +82,7 @@ class TestSanitizeFtsQuery:
             ("   ", ""),
             ("NEAR(", '"NEAR"'),
             ('"unbalanced', '"unbalanced"'),
-            ("a AND b", '"a" "AND" "b"'),
+            ("a AND b", '"a" OR "AND" OR "b"'),
         ],
     )
     def test_operators_neutralized(self, query: str, expected: str) -> None:
@@ -146,3 +148,36 @@ class TestSearchIntegration:
         # A real term beside an operator still matches.
         result2 = await semantic_search(semantic_cache, "hello *", k=5)
         assert any(m.path.endswith("y.py") for m in result2.matches)
+
+    async def test_absent_term_does_not_empty_the_result(
+        self, semantic_cache: SemanticCache
+    ) -> None:
+        """One unmatched word used to zero the result set (FTS5 implicit AND)."""
+        now = time.time()
+        await semantic_cache.put("/proj/auth.py", "password hashing helpers\n", now)
+
+        result = await semantic_search(semantic_cache, "password zzzabsentword", k=5)
+
+        assert [m.path for m in result.matches] == ["/proj/auth.py"]
+
+    async def test_every_term_absent_still_yields_nothing(
+        self, semantic_cache: SemanticCache
+    ) -> None:
+        now = time.time()
+        await semantic_cache.put("/proj/auth.py", "password hashing helpers\n", now)
+
+        result = await semantic_search(semantic_cache, "zzzabsentword", k=5)
+
+        assert result.matches == []
+
+    async def test_more_matched_terms_ranks_higher(self, semantic_cache: SemanticCache) -> None:
+        """OR keeps partial matches alive; BM25 still has to order them."""
+        now = time.time()
+        await semantic_cache.put("/proj/both.py", "password token helpers\n", now)
+        await semantic_cache.put("/proj/one.py", "password helpers only\n", now)
+
+        result = await semantic_search(semantic_cache, "password token", k=5)
+
+        paths = [m.path for m in result.matches]
+        assert paths[0] == "/proj/both.py", paths
+        assert "/proj/one.py" in paths

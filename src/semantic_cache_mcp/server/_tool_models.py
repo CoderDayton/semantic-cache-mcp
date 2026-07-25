@@ -33,6 +33,10 @@ class ReadResponse(ToolResponseModel):
     content: str | None = None
     lines: ReadLineRange | None = None
     unchanged: bool | None = None
+    # What the body actually holds. Emitted in every response mode: a caller
+    # must never have to sniff the content for `@@` headers to tell a diff or
+    # a summary apart from the file itself. (`truncated` marks the summary and
+    # is inherited from ToolResponseModel.)
     is_diff: bool | None = None
     total_tokens: int | None = None
     hint: str | None = None
@@ -45,6 +49,9 @@ class ReadResponse(ToolResponseModel):
     size: int | None = None
     mime: str | None = None
     content_hash: str | None = None
+    # Hash of a file only partly delivered (line range or summary). Namespaced
+    # with a `partial:` prefix so it cannot be redeemed as a `known_hash`.
+    file_hash: str | None = None
     total_lines: int | None = None
 
 
@@ -125,6 +132,7 @@ class WriteResponse(ToolResponseModel):
     tokens_written: int | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
 
 
@@ -138,6 +146,7 @@ class EditParams(ToolResponseModel):
 class EditResponse(ToolResponseModel):
     status: str | None = None
     path: str | None = None
+    dry_run: bool | None = None
     replaced: int | None = None
     line_numbers: list[int] | None = None
     diff: str | None = None
@@ -146,6 +155,7 @@ class EditResponse(ToolResponseModel):
     tokens_saved: int | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
     params: EditParams | None = None
 
@@ -186,6 +196,7 @@ class BatchEditParams(ToolResponseModel):
 class BatchEditResponse(ToolResponseModel):
     status: str | None = None
     path: str | None = None
+    dry_run: bool | None = None
     succeeded: int | None = None
     failed: int | None = None
     failures: list[BatchEditFailure] | None = None
@@ -196,6 +207,7 @@ class BatchEditResponse(ToolResponseModel):
     outcomes: list[BatchEditOutcome] | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
     params: BatchEditParams | None = None
 
@@ -241,6 +253,7 @@ class BatchReadFile(ToolResponseModel):
     hint: str | None = None
     tokens: int | None = None
     from_cache: bool | None = None
+    content_hash: str | None = None
 
 
 class BatchReadResponse(ToolResponseModel):

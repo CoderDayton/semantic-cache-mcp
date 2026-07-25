@@ -249,20 +249,54 @@ sessions (the LLM re-reads files it already has). Skipping `aread_bytes`, `count
 and the hash compute keeps single-file unchanged reads to **~1 ms** (vs ~2 ms when
 the disk read was unconditional in pre-0.4.6 builds).
 
-After context compression, use `diff_mode=False` to force full content.
+**The possession gate (0.5.2).** The diagram above is `smart_read`, which answers
+from cache state alone. That answer is a claim about the *server*: the store is on
+disk and outlives the process, the client session, and the caller's context window,
+so it can never establish that the caller still holds a file. The tool layer
+therefore re-gates it on evidence the caller supplies — `known_hash` on `read`, a
+`known_hashes` entry on `batch_read`. Only a matching hash turns the fast path into
+an `unchanged` reply; without one the caller gets the file, cheaply, from cache.
+The same rule governs diffs, which are just as unusable without the base content.
+
+Mutations answer to the same rule from the other direction: a tool hands back a
+claimable `content_hash` only when the caller could derive the result it just
+asked for. A full `write` qualifies on its own — the caller supplied every byte.
+`edit`, `batch_edit`, and `write append` need `known_hash` to match the
+operation's `previous_hash`, because an anchor can come from `grep` and editing a
+file is not the same as having read it. `auto_format` never qualifies: the
+formatter's output is not what the caller asked for. Everything else is reported
+as `file_hash`.
+
+This is why there is no compaction detection anywhere in the server, and why
+adding one would not help: MCP surfaces no compaction signal, and a client's
+`/clear` or auto-compaction does not re-initialize the session. Rather than infer
+what the caller has lost, the server declines to assume it has anything.
+
+After context compression, simply omit the hashes — or use `diff_mode=False` on
+the Python API — to force full content.
 
 ### Batch Read
 
 ```
-Client ──→ batch_smart_read(paths, diff_mode=True)
+Client ──→ batch_smart_read(paths, diff_mode=True, known_hashes={...})
                 │
          1. Gather all cache.get() in parallel (asyncio.gather)
                 │
          2. Pre-fetch stat results in parallel (asyncio.gather)
                 │
-         3. smart_read() per file (reuses the gathered entries)
+         3. Per file: does the caller's claimed hash match the entry?
                 │
-         4. Return BatchReadResult with per-file status
+         ┌──────┴─────────────────────┐
+         ▼                            ▼
+   claim matches               no claim / stale claim
+   smart_read(diff_mode)       smart_read(diff_mode=False,
+   → unchanged or diff           force_full=True,
+                                 refresh_cache=False)
+                               → literal bytes, and the index
+                                 is left alone when already fresh
+         └──────┬─────────────────────┘
+                │
+         4. Return BatchReadResult with per-file status + content_hash
 ```
 
 ### Write / Edit
@@ -306,6 +340,28 @@ The in-session result LRU lives on `SemanticCache._search_cache` (32-entry
 `OrderedDict`). It is invalidated on every cache mutation: `put`, `clear`,
 `delete_path`, and `update_mtime` all call `_bump_search_cache()`, which
 clears the LRU. So callers never see a result that predates a write.
+
+**Query sanitisation (`_sanitize_fts_query`).** A free-text query is split on
+whitespace and each run of word characters is quoted, so nothing the caller
+types ever reaches the FTS5 parser as an operator; a token that splits into
+several word runs (`in-flight`) becomes an adjacency phrase (`"in flight"`).
+The quoted terms are then joined with `OR`, not FTS5's implicit `AND`. Under
+`AND` a single word the corpus happens not to contain empties the entire result
+set — which is exactly what a natural-language query invites, since no one file
+carries every word of `"password hashing session token"`. `OR` keeps every
+partial match alive and leaves the ordering to BM25, which already ranks a file
+matching four terms above one matching a single term.
+
+### Grep
+
+`grep` runs the same corpus through a sound BM25 prefilter (required literal
+tokens expanded to the FTS5 vocabulary terms containing them) and then a
+compiled `re` pattern over the candidates. A pattern that cannot be used is an
+error, not an empty answer: an invalid regex, or one over `GREP_MAX_PATTERN_LEN`
+(1,000 characters, which bounds the ReDoS surface), raises `ValueError` and the
+tool layer surfaces it. Returning `[]` made a typo'd pattern indistinguishable
+from a genuine miss, which the caller then believed. `fixed_string=true` escapes
+the pattern instead, for anything meant to match literally.
 
 ---
 

@@ -210,6 +210,9 @@ async def smart_write(
         content_hash=content_hash,
         from_cache=from_cache,
         dry_run=dry_run,
+        # For an append this is the base the caller extended, so the tool layer
+        # can tell whether it holds the whole file or only the tail it sent.
+        previous_hash=hash_content(old_content) if old_content is not None else None,
     )
 
 
@@ -560,6 +563,9 @@ async def smart_edit(
         content_hash=content_hash,
         from_cache=from_cache,
         dry_run=dry_run,
+        # `content` is the pre-edit text: the edit built `new_content` from it
+        # and never rebinds it.
+        previous_hash=hash_content(content),
     )
 
 
@@ -847,4 +853,5 @@ async def smart_batch_edit(
         content_hash=content_hash,
         from_cache=from_cache,
         dry_run=dry_run,
+        previous_hash=hash_content(original_content),
     )

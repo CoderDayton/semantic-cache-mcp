@@ -246,14 +246,15 @@ class TestBatchReadOptimizations:
     """Tests for batch_read optimizations: unchanged collapse, priority, est_tokens, globs."""
 
     async def test_batch_read_collapses_unchanged(self, cache: SemanticCache, sample_files: dict):
-        """Unchanged files → unchanged_paths, status='unchanged', no content."""
+        """Unchanged files the caller still holds → unchanged_paths, no content."""
         paths = [str(sample_files["py"]), str(sample_files["txt"])]
 
-        # First read caches the files
-        await batch_smart_read(cache, paths)
+        # First read caches the files and hands back their hashes
+        first = await batch_smart_read(cache, paths)
+        claims = {f.path: f.content_hash for f in first.files if f.content_hash}
 
-        # Second read: files haven't changed → should be "unchanged"
-        result = await batch_smart_read(cache, paths)
+        # Second read, echoing the hashes: files haven't changed → "unchanged"
+        result = await batch_smart_read(cache, paths, known_hashes=claims)
 
         assert len(result.unchanged_paths) == 2
         # Unchanged files should NOT appear in contents
@@ -314,16 +315,19 @@ class TestBatchReadOptimizations:
     ):
         """Mix of cached-unchanged and new files works correctly."""
         py_path = str(sample_files["py"])
-        # Pre-cache one file
-        await smart_read(cache, py_path)
+        # Pre-cache one file, keeping the hash that proves we hold it
+        first = await smart_read(cache, py_path)
+        assert first.content_hash is not None
 
         # Create a new file
         new_file = temp_dir / "brand_new.py"
         new_file.write_text("x = 42\n")
 
-        result = await batch_smart_read(cache, [py_path, str(new_file)])
+        result = await batch_smart_read(
+            cache, [py_path, str(new_file)], known_hashes={py_path: first.content_hash}
+        )
 
-        # py_path should be unchanged (cached, not diff)
+        # py_path should be unchanged (held by the caller, cached, not diff)
         assert py_path in result.unchanged_paths
         # new file should have content
         assert str(new_file) in result.contents

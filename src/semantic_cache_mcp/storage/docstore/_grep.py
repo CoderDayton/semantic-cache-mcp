@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 GREP_MAX_CONTEXT_LINES = 20
 GREP_MAX_MATCHES = 10_000
 GREP_MAX_FILES = 500
+# Longest regex accepted. Caps the ReDoS surface: a pathological pattern needs
+# room to express itself, and no legitimate grep needs this much.
+GREP_MAX_PATTERN_LEN = 1000
 
 # Prefilter tuning.
 #
@@ -80,15 +83,20 @@ async def grep(
     if fixed_string:
         compiled = re.compile(re.escape(pattern), flags)
     else:
-        # Cap pattern length to mitigate ReDoS from pathological regexes.
-        if len(pattern) > 1000:
-            logger.warning(f"Regex pattern too long ({len(pattern)} chars), rejecting")
-            return []
+        # A pattern the caller cannot use is an error, not an empty result set.
+        # Returning [] here made a typo'd regex indistinguishable from a genuine
+        # miss — the caller reads "no matches" and moves on believing it.
+        if len(pattern) > GREP_MAX_PATTERN_LEN:
+            raise ValueError(
+                f"grep pattern too long ({len(pattern)} chars, limit {GREP_MAX_PATTERN_LEN})"
+            )
         try:
             compiled = re.compile(pattern, flags)
         except re.error as e:
-            logger.warning(f"Invalid regex pattern: {e}")
-            return []
+            raise ValueError(
+                f"invalid regex pattern {pattern!r}: {e}. "
+                f"Pass fixed_string=True to match it literally."
+            ) from e
 
     # Sound BM25 prefilter. Each required literal token is expanded to
     # the FTS5 vocabulary terms that contain it as a substring, then

@@ -25,16 +25,23 @@
 - **Fix:** The first `read` of any file populates the cache. Subsequent reads return diffs. Use `stats` to verify files are being cached.
 
 **All files reporting "unchanged" after model context compression**
-- **Cause:** The server only answers `unchanged` when the same session already received the file, or when you pass a `known_hash` that still matches. After context compression you no longer hold the text.
-- **Fix:** Read the file again without `known_hash` and you get full content back. If you only need part of it, use `read` with `offset`/`limit`.
+- **Cause (fixed in 0.5.2):** `batch_read` used to answer `unchanged` for any file the *server* had cached. The cache is on disk and outlives your context window, so after a compaction or a `/clear` you were told you already had files you had never seen.
+- **Now:** `unchanged` is only ever produced for a file whose `content_hash` you echoed back — `known_hash` on `read`, or a `known_hashes` entry on `batch_read`. Anything you cannot vouch for is sent in full, so simply omitting the hashes after a compaction is always safe.
+- **Note:** a partial read (a line range, or a summary of a large file) reports its hash as `file_hash`, prefixed `partial:`. It identifies the file but is not proof you hold it and will not be honoured as a `known_hash`.
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
 - **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/docstore.db` and restart
+- **Fixed in 0.5.2:** two paths that produced this on their own. A write landing between a cold read's `aread_bytes` and its `stat` was cached as pre-write content with a post-write mtime, so the entry looked fresh forever and the next edit wrote it back over the newer file — the stat is now taken first. And a file rewritten without changing its mtime (`cp -p`, `tar -x`, `touch -d`) is now detected by comparing content hashes on the full-read path, not mtimes.
 
 **`search` returns no results / stale results**
 - **Cause:** Only cached files are searched. New or unread files aren't in the cache yet.
 - **Fix:** Seed the cache with `read` or `batch_read` first.
+- **Note (0.5.2+):** query terms are joined with `OR`, so one word your corpus doesn't contain no longer empties the results — it just stops contributing to the ranking. Before 0.5.2 a query like `"password hashing session token"` returned nothing unless a single file held all four words. An empty result now means no cached file matched *any* term.
+
+**`grep` fails with "invalid regex pattern" or "pattern too long"**
+- **Cause (0.5.2+):** the pattern didn't compile, or it exceeds the 1,000-character ReDoS cap. Earlier versions logged a warning and returned no matches, which is indistinguishable from a genuine miss.
+- **Fix:** correct the regex, or pass `fixed_string=true` to match the text literally (`grep pattern="foo(bar" fixed_string=true`).
 
 **Repeated `search` queries return instantly (< 1 ms)**
 - **Cause (0.4.6+):** `SemanticCache` keeps an in-session 32-entry LRU of search results, keyed on `(query, k, directory)`. Identical queries skip the BM25 round-trip entirely.

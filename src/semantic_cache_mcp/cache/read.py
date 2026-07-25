@@ -12,7 +12,7 @@ from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
 from ..core.hashing import hash_content
 from ..logger import log_marker
-from ..types import BatchReadResult, FileReadSummary, ReadResult
+from ..types import BatchReadResult, CacheEntry, FileReadSummary, ReadResult
 from ..utils import aread_bytes, astat
 from ._helpers import _diff_context_lines, _is_binary_content
 from .store import SemanticCache
@@ -136,13 +136,15 @@ async def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Check cache first; only stat when needed (hit comparison or cold-path
-    # refresh). Reading bytes is the dominant cost on the slow path, so the
-    # stat is folded in just before refresh_path() instead of up front.
+    # Stat BEFORE reading content, always. The mtime we record must never be
+    # newer than the bytes it describes: a write landing between the read and
+    # the stat would otherwise be cached as (pre-write content, post-write
+    # mtime), and every later `cached.mtime >= mtime` gate reads that as fresh
+    # — the staleness is never detected and the next edit writes those bytes
+    # back over the newer file. Stat-first errs the safe way: the entry looks
+    # older than it is, so the hash check runs and disk wins.
     cached = await cache.get(str(file_path))
-    mtime: float = 0.0
-    if cached is not None:
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+    mtime: float = (await astat(file_path, cache._io_executor)).st_mtime
 
     if cached and diff_mode and not force_full and cached.mtime >= mtime:
         await cache.record_access(str(file_path))
@@ -210,13 +212,19 @@ async def smart_read(
             _hash = hash_content(content)
         return _hash
 
+    # Freshness on the force_full path is decided by the hash, never by mtime.
+    # We have already read and decoded the bytes and the ReadResult hashes them
+    # anyway, so the comparison is free — and mtime alone is not evidence: a
+    # `cp -p`/`tar -x`/`touch -d` rewrite, or a second write inside one tick on
+    # a coarse-timestamp filesystem, leaves `cached.mtime >= mtime` true over
+    # different content. Trusting that skipped the refresh, so the caller was
+    # handed the new bytes stamped with the old entry's `content_hash` while
+    # grep/search kept indexing the superseded text.
     cache_is_fresh = False
-    if cached and force_full:
-        if cached.mtime >= mtime:
-            cache_is_fresh = True
-        elif _content_hash() == cached.content_hash:
+    if cached and force_full and _content_hash() == cached.content_hash:
+        if cached.mtime < mtime:
             await cache.update_mtime(str(file_path), mtime)
-            cache_is_fresh = True
+        cache_is_fresh = True
 
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:
@@ -340,8 +348,6 @@ async def smart_read(
 
     should_refresh_cache = refresh_cache or not cache_is_fresh
     if should_refresh_cache:
-        if cached is None:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         await cache.refresh_path(
             str(file_path),
             content,
@@ -368,11 +374,22 @@ async def batch_smart_read(
     max_total_tokens: int = 50000,
     priority: list[str] | None = None,
     diff_mode: bool = True,
+    known_hashes: dict[str, str] | None = None,
 ) -> BatchReadResult:
     """Read multiple files with token budget, priority ordering, and unchanged detection.
 
     priority paths are read first but do NOT override the token budget.
     diff_mode=False forces full content (use after context compression).
+
+    ``known_hashes`` maps a path to the ``content_hash`` the caller still
+    holds for it, and is the only evidence that the caller has a file's
+    bytes. A cache entry proves the *server* has them — the store is on disk
+    and outlives the process, the client session, and the caller's context
+    window — so it can never stand in for that proof. Both token-saving
+    answers depend on the caller holding the previous content (``unchanged``
+    says nothing moved; a diff is unreadable without its base), so both are
+    produced only for a path whose claimed hash matches the cached one.
+    Every other path is sent in full.
     """
     # DoS protection
     paths = paths[:MAX_BATCH_FILES]
@@ -382,6 +399,17 @@ async def batch_smart_read(
     resolved_map = {p: str(Path(p).expanduser().resolve()) for p in paths}
     _entries = await asyncio.gather(*(cache.get(rp) for rp in resolved_map.values()))
     _cache_map = dict(zip(resolved_map.values(), _entries, strict=True))
+
+    # Possession claims may be keyed by either spelling the caller used, so
+    # accept the path as given and its fully resolved form.
+    _claims = known_hashes or {}
+
+    def _caller_holds(p: str, cached: CacheEntry | None) -> bool:
+        """True when the caller proved it still holds ``cached``'s content."""
+        if cached is None:
+            return False
+        claim = _claims.get(p) or _claims.get(resolved_map[p])
+        return claim is not None and claim == cached.content_hash
 
     # Pre-fetch stat results through the executor so the estimation loop
     # doesn't block the event loop with synchronous syscalls (matters on
@@ -407,7 +435,9 @@ async def batch_smart_read(
         if st is None:
             return 1
         if cached:
-            if cached.mtime >= st.st_mtime:
+            # Only a proven holder gets the marker-sized answer; everyone else
+            # is quoted the real cost of re-sending the file.
+            if _caller_holds(p, cached) and cached.mtime >= st.st_mtime:
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
             return cached.tokens
@@ -454,12 +484,26 @@ async def batch_smart_read(
             break
 
         try:
-            result = await smart_read(
-                cache,
-                path,
-                diff_mode=diff_mode,
-                force_full=False,
-            )
+            caller_holds = _caller_holds(path, _cache_map.get(resolved_map[path]))
+            if caller_holds:
+                result = await smart_read(
+                    cache,
+                    path,
+                    diff_mode=diff_mode,
+                    force_full=False,
+                )
+            else:
+                # No proof of possession, so the caller needs literal bytes.
+                # force_full with refresh_cache=False keeps the existing index
+                # when the entry is already fresh: the re-send costs one disk
+                # read and no re-chunking.
+                result = await smart_read(
+                    cache,
+                    path,
+                    diff_mode=False,
+                    force_full=True,
+                    refresh_cache=False,
+                )
 
             if result.is_binary:
                 # Binary files are silently skipped from batch results; the
@@ -470,8 +514,9 @@ async def batch_smart_read(
                 files_skipped += 1
                 continue
 
-            # Unchanged detection: from_cache=True and is_diff=False means LLM already has content
-            if result.from_cache and not result.is_diff:
+            # Unchanged: the caller echoed the current hash, so it holds the
+            # content already and only needs to be told nothing moved.
+            if caller_holds and result.from_cache and not result.is_diff:
                 unchanged_paths.append(path)
                 files.append(
                     FileReadSummary(
@@ -515,6 +560,8 @@ async def batch_smart_read(
                     tokens=result.tokens_returned,
                     status=status,
                     from_cache=result.from_cache,
+                    # A summary is not the file, so it earns no claimable hash.
+                    content_hash=None if result.truncated else result.content_hash,
                 )
             )
             contents[path] = result.content

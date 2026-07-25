@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-25: Possession-proof reads, honest failures
+
+The cache used to answer "you already have this file" from its own records. Those
+records live on disk and outlive the process, the client session, and the caller's
+context window, so a client that had compacted or cleared its context was told it
+held files it had never seen — and then edited them blind. An `unchanged` reply or
+a diff is now produced only for a caller that echoes back the `content_hash` it
+was given, and a mutation only hands back a claimable hash when the caller could
+have derived the result. Two silent failures elsewhere were made loud in the same
+pass: `grep` returning "no matches" for a regex it never compiled, and `search`
+returning nothing because one word of the query was absent from the corpus.
+
+This changes behaviour for any client that relied on bare `unchanged` replies. A
+client that sends no hashes still works — it receives full content, which is the
+safe answer. There is no cache-format change and no migration.
+
+### Changed
+
+- **`unchanged` and diffs require proof of possession.** Pass `known_hash` on
+  `read` (or a `known_hashes` entry on `batch_read`) to get the short reply; omit
+  it and the file comes back in full, still served from cache when it is fresh. A
+  partial or summarized read reports its digest as `file_hash` prefixed
+  `partial:`, which identifies the file across reads but structurally cannot be
+  redeemed as proof you hold it. Mutations follow the same rule from the other
+  side: a full `write` earns a claimable `content_hash` because the caller
+  supplied every byte, while `edit`, `batch_edit`, and `write append` need
+  `known_hash` to match the operation's `previous_hash` — an anchor can come from
+  `grep`, and editing a file is not the same as having read it. `auto_format`
+  never earns one, since the formatter's output is not what the caller asked for.
+- **`search` no longer empties on one missing word.** Query terms were joined
+  with FTS5's implicit `AND`, so `"password hashing session token"` returned
+  nothing unless a single file carried all four words — exactly the shape of a
+  natural-language query. Terms are now joined with `OR` and left to BM25 to
+  rank, which already scores a file matching four terms above one matching one.
+- **`grep` reports a bad pattern instead of hiding it.** An invalid regex or one
+  over the 1,000-character ReDoS cap used to be logged and answered with an empty
+  result set, indistinguishable from a genuine miss. Both now raise, and the
+  message points at `fixed_string=true` for patterns meant to match literally.
+- **Dry runs say so.** `write`, `edit`, and `batch_edit` previews return
+  `dry_run: true` alongside their `would_create` / `would_update` / `would_edit` /
+  `would_partial` status, so a caller can branch on the flag rather than parse the
+  status string. A partial `batch_edit` preview also returns its full diff.
+- **Read responses mark what the body holds.** `is_diff` is now emitted in every
+  response mode (with `truncated` marking a summary), so a caller never has to
+  sniff the content for `@@` headers to tell a diff from the file itself.
+
+### Fixed
+
+- **A write landing mid-read is no longer cached as fresh.** The cold read path
+  stat'd the file *after* reading its bytes, so a write in that window was stored
+  as pre-write content carrying a post-write mtime. Every freshness gate compares
+  mtime first and skips the hash check when the cached entry looks newer, so that
+  entry stayed "fresh" forever and the next edit wrote the stale content back over
+  the changed file. The stat now happens before the read, so the recorded mtime is
+  never newer than the bytes it describes and disk always wins.
+- **A ranged read no longer answers `unchanged` for lines it was never asked
+  about.** `read` with `offset`/`limit` compared against the whole-file entry, so
+  requesting a range of a cached file could collapse to `unchanged` even though
+  the caller had never seen those lines.
+- **`batch_read` no longer reports server-side cache hits as `unchanged`.** It
+  answered `unchanged` for any file the store had, regardless of whether the
+  caller had ever received it.
+
+### Added
+
+- **Server instructions.** The server now ships FastMCP `instructions` that teach
+  the hash-echo flow once, instead of repeating it across thirteen tool
+  descriptions.
+- **Python API.** `WriteResult`, `EditResult`, and `BatchEditResult` carry
+  `previous_hash` (the digest the operation started from, `None` on create), and
+  `FileReadSummary` carries `content_hash` for the file it delivered — `None`
+  whenever what was sent is not the file itself.
+
+### Internal
+
+- Freshness on the force-full read path is decided by comparing content hashes,
+  not mtimes. The bytes have already been read and hashed on that path, so the
+  comparison is free, and mtime alone is not evidence: a `cp -p`, `tar -x`, or
+  `touch -d` rewrite leaves the cached mtime looking current over different
+  content.
+
 ## [0.5.1] - 2026-07-07: Correctness and token-efficiency fixes
 
 A focused follow-up to 0.5.0 from a full-repo audit. It fixes three data-safety
@@ -649,7 +730,21 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.9...v0.5.0
+[0.4.9]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.8...v0.4.9
+[0.4.8]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.7...v0.4.8
+[0.4.7]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.6...v0.4.7
+[0.4.6]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.5...v0.4.6
+[0.4.5]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.5...v0.4.0
+[0.3.4]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.3.0...v0.3.1

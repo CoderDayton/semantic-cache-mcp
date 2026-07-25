@@ -14,8 +14,8 @@ The numbers below were captured on:
 | **CPU** | Intel Core i9-13900K (32 cores) |
 | **Python** | 3.13 |
 | **Search** | BM25 keyword (FTS5), no embedding model |
-| **Corpus** | 40 source files, **185,692 tokens**, 226 documents |
-| **Version** | `0.5.1` |
+| **Corpus** | 40 source files, **193,200 tokens**, 233 documents |
+| **Version** | `0.5.2` |
 
 Reproduce with:
 
@@ -30,18 +30,25 @@ uv run python benchmarks/benchmark_performance.py --json out.json --iterations 1
 
 Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_read` / `semantic_search` and reports tokens emitted vs. tokens that would have been read in the absence of the cache.
 
+Every saving below is earned by a caller that echoes back the `content_hash` it was given (`known_hash` on `read`, `known_hashes` on `batch_read`). Since 0.5.2 that is a hard requirement, not an optimization: a caller that cannot prove it still holds a file is sent the file. The phases model an agent that keeps its hashes, which is the flow the numbers describe.
+
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
-| 1 | Cold read | First read, no cache (baseline) | 185,692 | 185,692 | 0.0% |
-| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,579 | 185,692 | **99.1%** |
-| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,579 | 185,692 | **99.1%** |
-| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 3,947 | 186,068 | **97.9%** |
-| 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 2,853 | 114,637 | 97.5% |
-| 4b |  → unchanged files | Fast path | 1,094 | 71,431 | 98.5% |
-| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,580 | 186,068 | **99.2%** |
-| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 305 | 116,050 | **99.7%** |
+| 1 | Cold read | First read, no cache (baseline) | 193,200 | 193,200 | 0.0% |
+| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,619 | 193,200 | **99.2%** |
+| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,619 | 193,200 | **99.2%** |
+| 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 3,976 | 193,584 | **97.9%** |
+| 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 2,853 | 118,949 | 97.6% |
+| 4b |  → unchanged files | Fast path | 1,123 | 74,635 | 98.5% |
+| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus, echoing the hashes phase 4 returned | 1,620 | 193,584 | **99.2%** |
+| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 1,718 | 120,750 | **98.6%** |
 
-**Aggregate (phases 2 to 6): 99.0% token reduction.**
+**Aggregate (phases 2 to 6): 98.8% token reduction.**
+
+Phase 6 costs more than it did in 0.5.1 (98.6% vs. 99.7%), and deliberately so:
+`search` now joins query terms with `OR`, so a query returns the files that match
+*some* of it rather than only the files that match all of it. The extra ~1,400
+tokens buy back the queries that used to return nothing at all.
 
 The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_token_savings.py) asserts ≥ 80% overall as a regression gate.
 
@@ -49,9 +56,10 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 
 | Strategy | Savings | Trigger |
 |----------|--------:|---------|
-| Unchanged (mtime) | ~99% | `cached.mtime >= file.mtime`, disk read skipped entirely |
-| Content hash | ~99% | mtime drifted but BLAKE3 hash still matches |
-| Diff (changed) | 80 to 95% | File modified since last cache; emitted as unified diff |
+| Unchanged (mtime) | ~99% | Caller's hash matches and `cached.mtime >= file.mtime`; disk read skipped entirely |
+| Content hash | ~99% | Caller's hash matches; mtime drifted but BLAKE3 hash still matches |
+| Diff (changed) | 80 to 95% | File modified since last cache, and the caller holds the base content; emitted as unified diff |
+| No possession proof | 0% | Caller sent no matching hash — the file is returned in full, served from cache when fresh |
 | Search previews | ~100% | `search` returns 200-char previews, never full files |
 | Summarised | 50 to 80% | File exceeds `MAX_CONTENT_SIZE`; semantic skeleton retained |
 
@@ -65,48 +73,48 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Single unchanged read (fast path) | **0.9 ms** | 1.0 ms | mtime check + cache hit; **no disk I/O** |
+| Single unchanged read (fast path) | **1.0 ms** | 1.5 ms | mtime check + cache hit; **no disk I/O** |
 | Single diff read (changed file) | 0.7 ms | 0.8 ms | Hash check + unified diff |
-| Unchanged re-read (40 files) | 18 ms | 18 ms | Whole-corpus pass |
-| Cold read (40 files, total) | n/a | n/a | 119 ms one-shot (~3.0 ms/file avg) |
+| Unchanged re-read (40 files) | 17 ms | 18 ms | Whole-corpus pass |
+| Cold read (40 files, total) | n/a | n/a | 87 ms one-shot (~2.2 ms/file avg) |
 
 ### Batch read
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| `batch_read` (40 files, diff mode) | 23.7 ms | 25.3 ms |
+| `batch_read` (40 files, diff mode) | 33.1 ms | 35.1 ms |
 
 ### Write + edit
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Write (200-line file) | 1.6 ms | 1.9 ms |
+| Write (200-line file) | 1.7 ms | 1.9 ms |
 | Edit (scoped find/replace) | 2.2 ms | 2.2 ms |
 
 ### Chunked write (large files, CDC-split)
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Chunked write (72 KB, ~25 chunks) | 3.0 ms | 3.7 ms |
-| Chunked write (360 KB, ~125 chunks) | 8.4 ms | 11.2 ms |
-| Chunked re-read (72 KB, record_access fan-out) | 0.9 ms | 0.9 ms |
+| Chunked write (72 KB, ~25 chunks) | 2.9 ms | 4.0 ms |
+| Chunked write (360 KB, ~125 chunks) | 9.3 ms | 10.9 ms |
+| Chunked re-read (72 KB, record_access fan-out) | 0.9 ms | 1.0 ms |
 
 ### Search
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Search k=5 (cache **miss**) | 1.6 ms | n/a | BM25 keyword search (FTS5) |
+| Search k=5 (cache **miss**) | 1.9 ms | n/a | BM25 keyword search (FTS5) |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | < 0.01 ms | In-session result LRU |
 | Search k=10 (cache hit) | < 0.01 ms | < 0.01 ms | |
 
-The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm < 0.01 ms vs. cold ~5.0 ms over 5 queries — about 590× faster).
+The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm < 0.01 ms vs. cold ~8.8 ms over 5 queries — about 970× faster).
 
 ### Grep
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Literal (`def `) | 1.4 ms | 1.5 ms |
-| Regex (`class\s+\w+`) | 3.1 ms | 3.2 ms |
+| Literal (`def `) | 1.4 ms | 1.4 ms |
+| Regex (`class\s+\w+`) | 3.2 ms | 3.4 ms |
 
 ### Response shaping
 
@@ -121,8 +129,8 @@ The in-session search cache delivers a **hundreds-fold speedup** on repeated que
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Tokeniser (~87 KB) | 0.19 ms | Warm BPE encode |
-| Tokeniser (~423 KB, all files) | 0.21 ms | Merge cache amortises full sweeps |
+| Tokeniser (~96 KB) | 0.19 ms | Warm BPE encode |
+| Tokeniser (~440 KB, all files) | 0.21 ms | Merge cache amortises full sweeps |
 
 ---
 
@@ -134,9 +142,9 @@ stayed the same. The optimisations below still land directly in the table above:
 
 | Optimisation | Where it lands | Visible effect |
 |--------------|----------------|----------------|
-| `stat` + cache lookup before `aread_bytes` | `cache/read.py` | Single unchanged read drops to ~0.9 ms (no disk I/O) |
-| No embedding on write/refresh | `cache/store.py`, `cache/write.py` | Write (200-line file) drops to ~1.6 ms; cold read to ~119 ms |
-| Single-pass diff + stats (`diff_with_stats`) | `core/text/_diff.py`, `cache/write.py` | Write/edit no longer run the line-matcher twice; 360 KB chunked write drops from ~21 ms to ~8 ms |
+| `stat` + cache lookup before `aread_bytes` | `cache/read.py` | Single unchanged read drops to ~1.0 ms (no disk I/O); the stat is taken before the read so a concurrent write is never cached as fresh |
+| No embedding on write/refresh | `cache/store.py`, `cache/write.py` | Write (200-line file) drops to ~1.7 ms; cold read to ~87 ms |
+| Single-pass diff + stats (`diff_with_stats`) | `core/text/_diff.py`, `cache/write.py` | Write/edit no longer run the line-matcher twice; 360 KB chunked write drops from ~21 ms to ~9 ms |
 | Adaptive diff context (2 lines under 100-line files) | `core/text/_diff.py`, `cache/_helpers.py` | Small-file diffs carry less context overhead; suppressed diffs keep per-hunk headers |
 | In-session search-result LRU | `cache/search.py`, `cache/store.py` | Repeat-query hits at < 0.01 ms |
 | Drop `// Stats:` line from diff content | `cache/read.py` | ~15 tokens trimmed per changed file in phase 4 |

@@ -260,11 +260,22 @@ class TestContentStorageGrep:
         paths = [r["path"] for r in results]
         assert "/grep/nomatch.txt" not in paths
 
-    async def test_grep_invalid_regex_returns_empty(self, tmp_path: Path) -> None:
+    async def test_grep_invalid_regex_raises(self, tmp_path: Path) -> None:
+        """An unusable pattern is an error, not an empty result.
+
+        Returning [] made a typo'd regex indistinguishable from a genuine
+        miss, so the caller read "no matches" and believed it.
+        """
         vs = _make_vector_storage(tmp_path)
         await vs.put("/grep/bad.txt", "content\n", mtime=1.0)
-        results = await vs.grep("[invalid regex(")
-        assert results == []
+        with pytest.raises(ValueError, match="invalid regex"):
+            await vs.grep("[invalid regex(")
+
+    async def test_grep_invalid_regex_is_matchable_as_fixed_string(self, tmp_path: Path) -> None:
+        vs = _make_vector_storage(tmp_path)
+        await vs.put("/grep/bad.txt", "a [invalid regex( here\n", mtime=1.0)
+        results = await vs.grep("[invalid regex(", fixed_string=True)
+        assert [r["path"] for r in results] == ["/grep/bad.txt"]
 
     async def test_grep_max_matches_limit(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)
@@ -518,16 +529,71 @@ class TestBatchSmartRead:
         result = await batch_smart_read(cache, paths)
         assert result.files_read + result.files_skipped <= 50
 
-    async def test_batch_read_unchanged_detection(self, tmp_path: Path) -> None:
+    async def test_batch_read_unchanged_requires_possession_proof(self, tmp_path: Path) -> None:
+        """`unchanged` needs the caller's hash, not just a warm cache entry.
+
+        The store is on disk and outlives the caller's context window, so a
+        cache hit alone says nothing about whether the caller still holds the
+        file. Without an echoed hash the content must be re-sent.
+        """
         cache = _make_cache(tmp_path)
         f = tmp_path / "unchanged.txt"
         f.write_text("stable content\n")
 
-        # First read populates cache
-        await batch_smart_read(cache, [str(f)])
-        # Second read should detect unchanged
-        result = await batch_smart_read(cache, [str(f)])
-        assert str(f) in result.unchanged_paths
+        # First read populates the cache and hands back a claimable hash.
+        first = await batch_smart_read(cache, [str(f)])
+        content_hash = first.files[0].content_hash
+        assert content_hash is not None
+
+        # Re-read with no claim: the file is cached and fresh, but the caller
+        # has not proved it holds the bytes, so it gets them in full.
+        blind = await batch_smart_read(cache, [str(f)])
+        assert blind.unchanged_paths == []
+        assert blind.contents[str(f)] == "stable content\n"
+
+        # Re-read echoing the hash: possession proven, nothing re-sent.
+        proven = await batch_smart_read(cache, [str(f)], known_hashes={str(f): content_hash})
+        assert str(f) in proven.unchanged_paths
+        assert str(f) not in proven.contents
+
+    async def test_batch_read_stale_claim_is_rejected(self, tmp_path: Path) -> None:
+        """A hash that no longer matches the cache buys nothing."""
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "claimed.txt"
+        f.write_text("original\n")
+        first = await batch_smart_read(cache, [str(f)])
+        stale_hash = first.files[0].content_hash
+        assert stale_hash is not None
+
+        f.write_text("rewritten on disk\n")
+        # Cache now holds the old bytes; the claim matches them, so a diff is
+        # usable. Either way the caller is never told "unchanged".
+        changed = await batch_smart_read(cache, [str(f)], known_hashes={str(f): stale_hash})
+        assert str(f) not in changed.unchanged_paths
+
+        # A claim matching nothing at all falls back to full content.
+        bogus = await batch_smart_read(cache, [str(f)], known_hashes={str(f): "0" * 64})
+        assert bogus.unchanged_paths == []
+        assert bogus.contents[str(f)] == "rewritten on disk\n"
+
+    async def test_batch_read_truncated_file_gets_no_claimable_hash(self, tmp_path: Path) -> None:
+        """A summary is not the file, so it earns no hash to claim it with."""
+        from semantic_cache_mcp.config import MAX_CONTENT_SIZE
+
+        cache = _make_cache(tmp_path)
+        f = tmp_path / "big.txt"
+        f.write_text(
+            "\n".join(
+                f"line_{i:05d} = {i}  # padding xxxxxxxxxxxxxxxxxxxxxxxxxxxx" for i in range(6000)
+            )
+            + "\n"
+        )
+        assert f.stat().st_size > MAX_CONTENT_SIZE
+
+        result = await batch_smart_read(cache, [str(f)], max_total_tokens=200_000)
+        summary = result.files[0]
+        assert summary.status == "truncated"
+        assert summary.content_hash is None
 
     async def test_batch_read_priority_ordering(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
