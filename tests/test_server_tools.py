@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -380,6 +381,7 @@ class TestDeleteTool:
         d = _parse(await delete(ctx, str(p), dry_run=True))
 
         assert d.get("status") == "would_delete"
+        assert d.get("dry_run") is True
         assert p.exists()
 
     async def test_delete_missing_file_returns_not_found(
@@ -1436,3 +1438,300 @@ class TestExpandGlobs:
             (tmp_path / f"f{i}.py").write_text(f"{i}")
         result = _expand_globs([str(tmp_path / "*.py"), str(tmp_path / "*.py")], max_files=4)
         assert len(result) <= 4
+
+
+# ===========================================================================
+# read: the size budget binds every read, not just the first
+# ===========================================================================
+
+
+@pytest.fixture()
+def large_file(tmp_path: Path) -> Path:
+    """A file far larger than the budgets used below (~40 KB)."""
+    p = tmp_path / "large.py"
+    with p.open("w") as f:
+        f.write('"""Module."""\n\n')
+        for i in range(400):
+            f.write(
+                f"def handler_{i:03d}(payload: dict) -> int:\n"
+                f'    """Handle event {i}."""\n'
+                f'    return payload.get("count", 0) * {i}\n\n\n'
+            )
+    return p
+
+
+_BUDGET = 4000
+
+
+class TestReadSizeBudget:
+    """`max_size` bounds the body of every read of a file, not only the first.
+
+    The cache-hit path used to hand back the whole entry, so a caller that
+    asked for a 4 KB digest got 4 KB once and the entire file on every read
+    after that — the reads where the budget matters most.
+    """
+
+    async def test_cached_reread_stays_within_budget(
+        self, ctx: MagicMock, large_file: Path
+    ) -> None:
+        first = _parse(await read(ctx, str(large_file), max_size=_BUDGET))
+        second = _parse(await read(ctx, str(large_file), max_size=_BUDGET))
+
+        on_disk = large_file.stat().st_size
+        assert len(first["content"]) < on_disk, "cold read should be summarized"
+        # The repeat read is a summary of the same file, so it lands in the
+        # same size class as the first — not the 10x jump to the full file.
+        assert len(second["content"]) <= len(first["content"]) * 2
+        assert len(second["content"]) < on_disk / 2
+
+    async def test_cached_summary_hash_is_partial_and_unredeemable(
+        self, ctx: MagicMock, large_file: Path
+    ) -> None:
+        await read(ctx, str(large_file), max_size=_BUDGET)
+        second = _parse(await read(ctx, str(large_file), max_size=_BUDGET))
+
+        assert "content_hash" not in second
+        assert second["file_hash"].startswith("partial:")
+
+        # A summary is not possession: echoing its hash must not buy silence.
+        third = _parse(
+            await read(ctx, str(large_file), max_size=_BUDGET, known_hash=second["file_hash"])
+        )
+        assert not third.get("unchanged")
+        assert "content" in third
+
+    async def test_summarized_read_is_labelled_truncated(
+        self, ctx: MagicMock, large_file: Path
+    ) -> None:
+        d = _parse(await read(ctx, str(large_file), max_size=_BUDGET))
+        assert d["truncated"] is True
+
+    async def test_file_under_budget_still_returns_full_claimable_content(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        first = _parse(await read(ctx, str(sample_file), max_size=_BUDGET))
+        second = _parse(await read(ctx, str(sample_file), max_size=_BUDGET))
+
+        assert second["content"] == first["content"] == sample_file.read_text()
+        assert "truncated" not in second
+        assert second["content_hash"] == first["content_hash"]
+
+    async def test_proven_holder_of_a_large_file_still_gets_unchanged(
+        self, ctx: MagicMock, large_file: Path
+    ) -> None:
+        # A full read (default budget) is what mints a claimable hash.
+        first = _parse(await read(ctx, str(large_file)))
+        second = _parse(await read(ctx, str(large_file), known_hash=first["content_hash"]))
+
+        assert second["unchanged"] is True
+        assert "content" not in second
+
+    async def test_ranged_read_is_unaffected(self, ctx: MagicMock, large_file: Path) -> None:
+        d = _parse(await read(ctx, str(large_file), offset=1, limit=5))
+        assert d["lines"]["end"] == 5
+        assert d["file_hash"].startswith("partial:")
+
+
+class TestReadBodyLabels:
+    """A diff and a summary are labelled in every response mode.
+
+    Compact mode used to gate `is_diff` behind normal/debug, so the default
+    mode delivered a unified diff under `content` with nothing to distinguish
+    it from the file's literal bytes.
+    """
+
+    async def test_diff_is_labelled_in_compact_mode(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "diffable.py"
+        p.write_text("\n".join(f"line_{i} = {i}" for i in range(60)) + "\n")
+        first = _parse(await read(ctx, str(p)))
+
+        p.write_text("\n".join(f"line_{i} = {i * 2 if i == 30 else i}" for i in range(60)) + "\n")
+        second = _parse(await read(ctx, str(p), known_hash=first["content_hash"]))
+
+        assert second["content"].lstrip().startswith("@@"), "expected a diff body"
+        assert second["is_diff"] is True
+
+    async def test_full_content_carries_no_diff_label(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        d = _parse(await read(ctx, str(sample_file)))
+        assert "is_diff" not in d
+        assert "truncated" not in d
+
+    async def test_hash_describes_the_bytes_returned(self, ctx: MagicMock, tmp_path: Path) -> None:
+        """A rewrite that preserves mtime must not be stamped with the old hash.
+
+        `cp -p`/`tar -x`/`touch -d`, or two writes inside one tick on a
+        coarse-timestamp filesystem, leave `cached.mtime >= mtime` true over
+        different content. Trusting mtime there skipped the cache refresh, so
+        the response carried the new bytes under the superseded entry's
+        `content_hash` and grep kept indexing the old text.
+        """
+        p = tmp_path / "preserved_mtime.py"
+        p.write_text("alpha = 1\n")
+        st = p.stat()
+        first = _parse(await read(ctx, str(p)))
+
+        p.write_text("beta = 2\n")
+        os.utime(p, (st.st_atime, st.st_mtime))
+        second = _parse(await read(ctx, str(p)))
+
+        assert second["content"] == "beta = 2\n"
+        assert second["content_hash"] != first["content_hash"]
+        # The cache followed, so exact search sees the new text...
+        assert _parse(await grep(ctx, "beta"))["total_matches"] == 1
+        # ...and the hash it just handed out is redeemable.
+        third = _parse(await read(ctx, str(p), known_hash=second["content_hash"]))
+        assert third["unchanged"] is True
+
+
+# ===========================================================================
+# dry runs are distinguishable from applied mutations
+# ===========================================================================
+
+
+class TestDryRunIsDistinguishable:
+    """A preview never reports a mutation's status.
+
+    `edit(dry_run=True)` used to answer `status: "edited", replaced: 1` —
+    byte-identical to a real edit apart from an absent hash field.
+    """
+
+    async def test_write_dry_run(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "w.txt"
+        p.write_text("before\n")
+        await read(ctx, str(p))
+
+        d = _parse(await write(ctx, str(p), "after\n", dry_run=True))
+
+        assert d["dry_run"] is True
+        assert d["status"] == "would_update"
+        assert p.read_text() == "before\n"
+
+    async def test_write_dry_run_on_a_new_path(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "new.txt"
+        d = _parse(await write(ctx, str(p), "hello\n", dry_run=True))
+
+        assert d["dry_run"] is True
+        assert d["status"] == "would_create"
+        assert not p.exists()
+
+    async def test_edit_dry_run(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "e.txt"
+        p.write_text("value = 1\n")
+        await read(ctx, str(p))
+
+        d = _parse(
+            await edit(ctx, str(p), old_string="value = 1", new_string="value = 2", dry_run=True)
+        )
+
+        assert d["dry_run"] is True
+        assert d["status"] == "would_edit"
+        assert p.read_text() == "value = 1\n"
+
+    async def test_batch_edit_dry_run(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "b.txt"
+        p.write_text("a = 1\nb = 2\n")
+        await read(ctx, str(p))
+
+        d = _parse(
+            await batch_edit(
+                ctx, str(p), json.dumps([["a = 1", "a = 9"], ["b = 2", "b = 8"]]), dry_run=True
+            )
+        )
+
+        assert d["dry_run"] is True
+        assert d["status"] == "would_edit"
+        assert p.read_text() == "a = 1\nb = 2\n"
+
+    async def test_batch_edit_dry_run_partial(self, ctx: MagicMock, tmp_path: Path) -> None:
+        p = tmp_path / "bp.txt"
+        p.write_text("a = 1\n")
+        await read(ctx, str(p))
+
+        d = _parse(
+            await batch_edit(
+                ctx, str(p), json.dumps([["a = 1", "a = 9"], ["absent", "x"]]), dry_run=True
+            )
+        )
+
+        assert d["dry_run"] is True
+        assert d["status"] == "would_partial"
+        # A partial batch always ships its diff — the preview of a partial
+        # batch is exactly where the caller needs to see what would land.
+        assert d["diff_state"] == "full"
+        assert "diff" in d
+        assert p.read_text() == "a = 1\n"
+
+    async def test_applied_mutations_carry_no_dry_run_flag(
+        self, ctx: MagicMock, tmp_path: Path
+    ) -> None:
+        p = tmp_path / "real.txt"
+        p.write_text("value = 1\n")
+        await read(ctx, str(p))
+
+        written = _parse(await write(ctx, str(p), "value = 1\n"))
+        edited = _parse(await edit(ctx, str(p), old_string="value = 1", new_string="value = 2"))
+
+        assert written["status"] == "updated"
+        assert "dry_run" not in written
+        assert edited["status"] == "edited"
+        assert "dry_run" not in edited
+        assert p.read_text() == "value = 2\n"
+
+
+# ===========================================================================
+# grep: honours context_lines, and refuses an unusable pattern
+# ===========================================================================
+
+
+class TestGrepContextAndErrors:
+    async def test_context_lines_honoured_in_default_mode(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        d = _parse(await grep(ctx, "line3", context_lines=1))
+
+        match = d["files"][0]["matches"][0]
+        assert match["before"] == ["line2"]
+        assert match["after"] == ["line4"]
+
+    async def test_no_context_requested_means_no_context_keys(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        d = _parse(await grep(ctx, "line3"))
+
+        match = d["files"][0]["matches"][0]
+        assert "before" not in match
+        assert "after" not in match
+
+    async def test_invalid_regex_is_an_error_not_an_empty_result(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        with pytest.raises(ToolError, match="invalid regex"):
+            await grep(ctx, "[unclosed")
+
+    async def test_absent_pattern_is_a_clean_zero(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        d = _parse(await grep(ctx, "zzz_definitely_absent"))
+        assert d["total_matches"] == 0
+
+    async def test_invalid_regex_is_fine_as_a_fixed_string(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        p = tmp_path / "brackets.txt"
+        p.write_text("a [unclosed thing\n")
+        await smart_read(tmp_cache, str(p))
+        d = _parse(await grep(ctx, "[unclosed", fixed_string=True))
+        assert d["total_matches"] == 1
+
+    async def test_overlong_pattern_is_an_error(
+        self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
+    ) -> None:
+        await smart_read(tmp_cache, str(sample_file))
+        with pytest.raises(ToolError, match="too long"):
+            await grep(ctx, "a" * 1001)

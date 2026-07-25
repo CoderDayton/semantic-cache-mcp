@@ -212,13 +212,19 @@ async def smart_read(
             _hash = hash_content(content)
         return _hash
 
+    # Freshness on the force_full path is decided by the hash, never by mtime.
+    # We have already read and decoded the bytes and the ReadResult hashes them
+    # anyway, so the comparison is free — and mtime alone is not evidence: a
+    # `cp -p`/`tar -x`/`touch -d` rewrite, or a second write inside one tick on
+    # a coarse-timestamp filesystem, leaves `cached.mtime >= mtime` true over
+    # different content. Trusting that skipped the refresh, so the caller was
+    # handed the new bytes stamped with the old entry's `content_hash` while
+    # grep/search kept indexing the superseded text.
     cache_is_fresh = False
-    if cached and force_full:
-        if cached.mtime >= mtime:
-            cache_is_fresh = True
-        elif _content_hash() == cached.content_hash:
+    if cached and force_full and _content_hash() == cached.content_hash:
+        if cached.mtime < mtime:
             await cache.update_mtime(str(file_path), mtime)
-            cache_is_fresh = True
+        cache_is_fresh = True
 
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:

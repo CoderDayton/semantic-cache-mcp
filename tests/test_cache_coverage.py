@@ -260,11 +260,22 @@ class TestContentStorageGrep:
         paths = [r["path"] for r in results]
         assert "/grep/nomatch.txt" not in paths
 
-    async def test_grep_invalid_regex_returns_empty(self, tmp_path: Path) -> None:
+    async def test_grep_invalid_regex_raises(self, tmp_path: Path) -> None:
+        """An unusable pattern is an error, not an empty result.
+
+        Returning [] made a typo'd regex indistinguishable from a genuine
+        miss, so the caller read "no matches" and believed it.
+        """
         vs = _make_vector_storage(tmp_path)
         await vs.put("/grep/bad.txt", "content\n", mtime=1.0)
-        results = await vs.grep("[invalid regex(")
-        assert results == []
+        with pytest.raises(ValueError, match="invalid regex"):
+            await vs.grep("[invalid regex(")
+
+    async def test_grep_invalid_regex_is_matchable_as_fixed_string(self, tmp_path: Path) -> None:
+        vs = _make_vector_storage(tmp_path)
+        await vs.put("/grep/bad.txt", "a [invalid regex( here\n", mtime=1.0)
+        results = await vs.grep("[invalid regex(", fixed_string=True)
+        assert [r["path"] for r in results] == ["/grep/bad.txt"]
 
     async def test_grep_max_matches_limit(self, tmp_path: Path) -> None:
         vs = _make_vector_storage(tmp_path)

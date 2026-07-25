@@ -462,6 +462,8 @@ async def read(
     summary of a large one — reports its hash as `file_hash` (prefixed
     `partial:`) rather than `content_hash`: it identifies the file across reads
     but is not proof you hold it, and cannot be redeemed as `known_hash`.
+    What the body holds is always labelled: `is_diff` marks a unified diff and
+    `truncated` marks a summary, so you never have to infer it from the bytes.
     A binary file returns metadata instead of content; for images
     use `read_image`.
 
@@ -629,11 +631,33 @@ async def read(
 
             return _finalize_payload(payload, max_response_tokens)
 
+        # `unchanged` is driven entirely by the caller asserting freshness: it
+        # passes back the content_hash it already holds. If that matches the
+        # cached hash and the file is cache-fresh (disk == cache), the caller
+        # provably has the current bytes, so we skip re-sending. cache_fresh
+        # still gates this, so a stale known_hash can never mask a real change.
+        # With no known_hash the server makes no assumption and sends content.
+        #
+        # Possession also decides how the file is read, so it is settled before
+        # reading. A proven caller can take the cache-hit shortcuts: the
+        # `unchanged` marker, or a diff against the bytes it holds. An unproven
+        # one needs literal bytes, and those have to come back through the size
+        # budget — serving a cached entry directly returns the whole file
+        # however large, which is how `max_size` came to bound the first read of
+        # a file and nothing after it.
+        abs_path = str(Path(path).expanduser().resolve())
+        prior_entry = await cache.get(abs_path)
+        caller_has_current = (
+            bool(known_hash) and prior_entry is not None and known_hash == prior_entry.content_hash
+        )
         result = await asyncio.wait_for(
             smart_read(
                 cache=cache,
                 path=path,
                 max_size=max_size,
+                diff_mode=caller_has_current,
+                force_full=not caller_has_current,
+                refresh_cache=caller_has_current,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -644,21 +668,12 @@ async def read(
         if result.is_binary:
             return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
 
-        # `unchanged` is driven entirely by the caller asserting freshness: it
-        # passes back the content_hash it already holds. If that matches the
-        # cached hash and the file is cache-fresh (disk == cache), the caller
-        # provably has the current bytes, so we skip re-sending. cache_fresh
-        # still gates this, so a stale known_hash can never mask a real change.
-        # With no known_hash the server makes no assumption and sends content.
         cache_fresh = result.from_cache and not result.is_diff
-        abs_path = str(Path(path).expanduser().resolve())
-        # Fetch the entry once: used for the hash check and to stamp content_hash
-        # onto whatever payload we return.
-        entry = await cache.get(abs_path)
-        caller_has_current = (
-            bool(known_hash) and entry is not None and known_hash == entry.content_hash
-        )
         unchanged = cache_fresh and caller_has_current
+        # Re-read the entry now that the read has run: it seeds a file the cache
+        # had never seen and refreshes one that moved on disk, so the pre-read
+        # entry is the wrong thing to stamp a hash from.
+        entry = prior_entry if unchanged else await cache.get(abs_path)
 
         payload = {
             "ok": True,
@@ -683,27 +698,12 @@ async def read(
                         0 if cached_text.endswith("\n") else 1
                     )
         else:
-            # `result.content` is real bytes for new/changed/small-cached files.
-            # For a file already warm in the cache, smart_read may return the
-            # "// File unchanged" marker instead of content, so re-fetch the real
-            # bytes from the cache before delivering.
-            content_text = result.content
-            has_full_content = (
-                not result.is_diff
-                and not result.truncated
-                and result.tokens_returned >= result.tokens_original > 0
-            )
-            if (
-                not has_full_content
-                and not result.is_diff
-                and not result.truncated
-                and result.from_cache
-                and entry is not None
-            ):
-                fetched = await cache.get_content(entry)
-                if fetched:
-                    content_text = fetched
-            payload["content"] = content_text
+            # Always literal bytes: an unproven caller is read with force_full,
+            # so smart_read returns real content bounded by max_size rather than
+            # the "// File unchanged" marker. Nothing is re-fetched from the
+            # cache here — that was the path that handed back whole files
+            # regardless of the budget the caller asked for.
+            payload["content"] = result.content
         # Always surface the current hash so the caller can echo it back as
         # known_hash on its next read and skip a re-send. A summarized read
         # delivered a digest rather than the file, so its hash goes out under
@@ -713,24 +713,25 @@ async def read(
                 payload["file_hash"] = _PARTIAL_HASH_PREFIX + entry.content_hash
             else:
                 payload["content_hash"] = entry.content_hash
-        if mode in _MODE_NORMAL:
-            if result.is_diff:
-                payload["is_diff"] = True
-            if result.truncated:
-                payload["truncated"] = True
-            if result.truncated:
-                # Truncated reads use semantic summarization — the returned
-                # content is non-contiguous, so line numbers don't map to the
-                # original file. Don't hint a specific offset; instead tell
-                # the caller to use offset/limit to read specific line ranges.
-                entry = await cache.get(str(Path(path).expanduser().resolve()))
-                total_tokens = entry.tokens if entry else result.tokens_original
-                payload["total_tokens"] = total_tokens
-                payload["hint"] = (
-                    f"File was semantically summarized ({total_tokens} tokens total). "
-                    f"Use read with offset=<line> and limit=<n> to read specific "
-                    f"sections of the original file."
-                )
+        # A diff and a summary are not the file. Whatever the response mode,
+        # the payload has to say which one it carries — otherwise the caller
+        # has to sniff the bytes for `@@` headers to find out what it holds.
+        if result.is_diff:
+            payload["is_diff"] = True
+        if result.truncated:
+            payload["truncated"] = True
+        if mode in _MODE_NORMAL and result.truncated:
+            # Truncated reads use semantic summarization — the returned
+            # content is non-contiguous, so line numbers don't map to the
+            # original file. Don't hint a specific offset; instead tell
+            # the caller to use offset/limit to read specific line ranges.
+            total_tokens = entry.tokens if entry else result.tokens_original
+            payload["total_tokens"] = total_tokens
+            payload["hint"] = (
+                f"File was semantically summarized ({total_tokens} tokens total). "
+                f"Use read with offset=<line> and limit=<n> to read specific "
+                f"sections of the original file."
+            )
         if mode == _MODE_DEBUG:
             payload["from_cache"] = result.from_cache
             payload["tokens_saved"] = result.tokens_saved
@@ -1167,10 +1168,10 @@ async def delete(
     Use this for explicit single-path removal instead of shelling out. A
     missing path is reported as status `not_found`, not an error.
 
-    Statuses: `deleted` (removed), `would_delete` (dry-run preview only),
-    `not_found` (nothing was there). Constraints: one path only — no globs,
-    no recursion, no real-directory deletes. A symlink path deletes the link
-    itself, never its target.
+    Statuses: `deleted` (removed), `would_delete` (dry-run preview only, and
+    `dry_run: true` comes back with it), `not_found` (nothing was there).
+    Constraints: one path only — no globs, no recursion, no real-directory
+    deletes. A symlink path deletes the link itself, never its target.
 
     Args:
         path: File or symlink path (absolute, or relative to the project root).
@@ -1277,8 +1278,10 @@ async def write(
     Use this for new files or full rewrites; for localized changes prefer
     `edit` or `batch_edit`. Status is `created` for a new path or `updated`
     for an existing one, and an update returns a unified diff against the
-    previous content. Writing refreshes the cache so later reads, `grep`, and
-    `search` see the new text. The response carries the new `content_hash`;
+    previous content. A `dry_run` writes nothing and says so: the status is
+    `would_create`/`would_update` and `dry_run: true` comes back with it.
+    Writing refreshes the cache so later reads, `grep`, and `search` see the
+    new text. The response carries the new `content_hash`;
     pass it back as `read`'s `known_hash`, or as a `batch_read` `known_hashes`
     entry, to get `unchanged` instead of re-reading the file you just wrote.
     Missing parent directories are created unless `create_parents=false`.
@@ -1326,12 +1329,21 @@ async def write(
         )
         cache.metrics.record("write", result)
 
+        # A preview is not a mutation, so it does not report one. `would_*`
+        # mirrors the vocabulary `delete` already uses for its dry run, and the
+        # explicit `dry_run` flag lets a caller branch on either.
+        if result.dry_run:
+            status = "would_create" if result.created else "would_update"
+        else:
+            status = "created" if result.created else "updated"
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "write",
-            "status": "created" if result.created else "updated",
+            "status": status,
             "path": result.path,
         }
+        if result.dry_run:
+            payload["dry_run"] = True
         # Surface the resulting hash so the caller can echo it as known_hash on a
         # later read and get `unchanged` instead of a re-send. Only when the write
         # actually landed; a dry_run leaves disk and cache untouched. A full write
@@ -1359,7 +1371,6 @@ async def write(
 
         if mode in _MODE_NORMAL:
             payload["created"] = result.created
-            payload["dry_run"] = dry_run
             payload["tokens_saved"] = result.tokens_saved
         if mode == _MODE_DEBUG:
             payload["bytes_written"] = result.bytes_written
@@ -1422,8 +1433,9 @@ async def edit(
     and, unless `replace_all=true`, must be unique, or the edit fails. Use
     `edit_preview` first if you're unsure an anchor is unique. Returns the
     replacement count, affected line numbers, and a unified diff, and refreshes
-    the cache. For several edits to one file use `batch_edit`; for a full
-    rewrite use `write`.
+    the cache. A `dry_run` writes nothing and says so: the status is
+    `would_edit` and `dry_run: true` comes back with it. For several edits to
+    one file use `batch_edit`; for a full rewrite use `write`.
 
     Pass `known_hash` — the hash you hold for this file — and the response
     carries the new `content_hash`, so you never need a read after an edit just
@@ -1479,12 +1491,15 @@ async def edit(
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "edit",
-            "status": "edited",
+            # A preview is not a mutation, so it does not report one.
+            "status": "would_edit" if dry_run else "edited",
             "path": result.path,
             # matches_found always equals replacements_made — collapse to one field
             "replaced": result.replacements_made,
             "line_numbers": result.line_numbers,
         }
+        if dry_run:
+            payload["dry_run"] = True
         # Surface the resulting hash so the caller can echo it as known_hash on a
         # later read and skip re-reading the file it just edited. Skip on dry_run,
         # which leaves disk and cache untouched. An edit is only derivable by a
@@ -1656,8 +1671,9 @@ async def batch_edit(
     applied atomically, faster on large files. Partial success is allowed —
     any failed edits are returned with their reason so you can retry just the
     misses (status is `edited` when all apply, `partial` when some fail,
-    `no_changes` when none do). For edits across different files, call the
-    tool once per file.
+    `no_changes` when none do). A `dry_run` writes nothing and says so: the
+    status becomes `would_edit`/`would_partial` and `dry_run: true` comes back
+    with it. For edits across different files, call the tool once per file.
 
     `edits` is a JSON array; each entry is one of:
     - `[old, new]` — exact find/replace.
@@ -1745,6 +1761,16 @@ async def batch_edit(
             if result.failed == 0
             else ("partial" if result.succeeded > 0 else "no_changes")
         )
+        # A partial batch always ships its diff, so the caller can see which
+        # edits landed. Captured before the dry-run rename below, which would
+        # otherwise make `would_partial` fail the check and omit the diff on
+        # exactly the preview that needs it most.
+        is_partial = status == "partial"
+        # A preview is not a mutation, so it does not report one. The counts
+        # still describe what would happen; only the verb changes. `no_changes`
+        # needs no prefix — nothing would change either way.
+        if dry_run:
+            status = {"edited": "would_edit", "partial": "would_partial"}.get(status, status)
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "batch_edit",
@@ -1752,6 +1778,8 @@ async def batch_edit(
             "path": result.path,
             "succeeded": result.succeeded,
         }
+        if dry_run:
+            payload["dry_run"] = True
         # Omit failed when 0 — saves tokens in the common all-succeed case
         if result.failed:
             payload["failed"] = result.failed
@@ -1779,7 +1807,7 @@ async def batch_edit(
             diff_content=result.diff_content,
             mode=mode,
             show_diff=show_diff,
-            partial=status == "partial",
+            partial=is_partial,
         )
         if mode in _MODE_NORMAL:
             payload["tokens_saved"] = result.tokens_saved
@@ -1845,9 +1873,11 @@ async def search(
     `read`/`batch_read` (thin results usually mean too few files are cached).
     Ranks by BM25 term relevance, so multi-word and keyword queries work
     well; matching is lexical, not embedding-based, so synonyms won't match a
-    word that isn't present. For an exact string or regex use `grep`; to pull
-    more of the repo into the cache use `batch_read`. Returns matches with a
-    normalized 0–1 relevance score (best match = 1.0) and a short preview.
+    word that isn't present. Terms are OR'd — a word the corpus happens not to
+    contain costs you ranking, not the whole result set. For an exact string or
+    regex use `grep`; to pull more of the repo into the cache use `batch_read`.
+    Returns matches with a normalized 0–1 relevance score (best match = 1.0)
+    and a short preview.
 
     Args:
         query: Keywords to rank by. Natural-language phrasing is fine, but
@@ -2163,8 +2193,10 @@ async def grep(
 
     Fast, exact, line-numbered matching over files already in the cache — it
     does NOT touch disk, so seed files first with `batch_read`/`read` (empty
-    results usually mean the files aren't cached). For concept-level questions
-    where you don't know the exact term, use `search` instead.
+    results usually mean the files aren't cached). A pattern that is not a
+    valid regex is an error, never an empty result, so zero matches always
+    means zero matches. For concept-level questions where you don't know the
+    exact term, use `search` instead.
 
     Args:
         pattern: A regular expression, or a literal string when
@@ -2172,7 +2204,8 @@ async def grep(
         path: Optional filter — an exact path, a path suffix, or a glob.
         fixed_string: Match `pattern` literally instead of as a regex.
         case_sensitive: Match case-sensitively.
-        context_lines: Lines of surrounding context to include per match.
+        context_lines: Lines of surrounding context to include per match,
+            returned as `before`/`after` on each match.
         max_matches: Cap on total matches returned across all files.
         max_files: Cap on the number of files returned.
     """
@@ -2187,15 +2220,16 @@ async def grep(
         return remote_result
 
     try:
-        # In compact mode, context lines are dropped in the response anyway —
-        # skip fetching them to avoid wasted storage work.
-        effective_context = context_lines if mode in _MODE_NORMAL else 0
+        # `context_lines` is an explicit request for more output, so it is
+        # honoured in every response mode — the rule `show_diff` already
+        # follows. Compact mode suppresses context nobody asked for, which is
+        # what the default of 0 already does on its own.
         results = await cache._storage.grep(
             pattern,
             path=path,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
-            context_lines=effective_context,
+            context_lines=context_lines,
             max_matches=max_matches,
             max_files=max_files,
         )
@@ -2228,7 +2262,7 @@ async def grep(
                     "line_number": m["line_number"],
                     "line": m["line"],
                 }
-                if effective_context > 0:
+                if context_lines > 0:
                     if "before" in m:
                         item["before"] = m["before"]
                     if "after" in m:
@@ -2239,7 +2273,7 @@ async def grep(
                     # + braces + commas + quotes). Add context-line bytes when
                     # present so the soft budget accounts for them.
                     running_chars += len(m["line"]) + 32
-                    if effective_context > 0:
+                    if context_lines > 0:
                         for ctx_line in m.get("before", ()):
                             running_chars += len(ctx_line) + 4
                         for ctx_line in m.get("after", ()):
@@ -2289,6 +2323,10 @@ async def grep(
 
     except ToolError:
         raise
+    except ValueError as e:
+        # Bad input (an uncompilable pattern), not a server fault — report it
+        # without a traceback, and never as an empty result set.
+        _raise_tool_error("grep", str(e), max_response_tokens)
     except Exception as e:
         logger.exception("Error in grep")
         _raise_tool_error("grep", str(e), max_response_tokens)
