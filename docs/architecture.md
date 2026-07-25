@@ -341,6 +341,28 @@ The in-session result LRU lives on `SemanticCache._search_cache` (32-entry
 `delete_path`, and `update_mtime` all call `_bump_search_cache()`, which
 clears the LRU. So callers never see a result that predates a write.
 
+**Query sanitisation (`_sanitize_fts_query`).** A free-text query is split on
+whitespace and each run of word characters is quoted, so nothing the caller
+types ever reaches the FTS5 parser as an operator; a token that splits into
+several word runs (`in-flight`) becomes an adjacency phrase (`"in flight"`).
+The quoted terms are then joined with `OR`, not FTS5's implicit `AND`. Under
+`AND` a single word the corpus happens not to contain empties the entire result
+set — which is exactly what a natural-language query invites, since no one file
+carries every word of `"password hashing session token"`. `OR` keeps every
+partial match alive and leaves the ordering to BM25, which already ranks a file
+matching four terms above one matching a single term.
+
+### Grep
+
+`grep` runs the same corpus through a sound BM25 prefilter (required literal
+tokens expanded to the FTS5 vocabulary terms containing them) and then a
+compiled `re` pattern over the candidates. A pattern that cannot be used is an
+error, not an empty answer: an invalid regex, or one over `GREP_MAX_PATTERN_LEN`
+(1,000 characters, which bounds the ReDoS surface), raises `ValueError` and the
+tool layer surfaces it. Returning `[]` made a typo'd pattern indistinguishable
+from a genuine miss, which the caller then believed. `fixed_string=true` escapes
+the pattern instead, for anything meant to match literally.
+
 ---
 
 [← Back to README](../README.md)

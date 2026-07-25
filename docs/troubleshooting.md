@@ -32,10 +32,16 @@
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
 - **Fix:** Use `clear` to reset the cache, or delete `~/.cache/semantic-cache-mcp/docstore.db` and restart
+- **Fixed in 0.5.2:** two paths that produced this on their own. A write landing between a cold read's `aread_bytes` and its `stat` was cached as pre-write content with a post-write mtime, so the entry looked fresh forever and the next edit wrote it back over the newer file — the stat is now taken first. And a file rewritten without changing its mtime (`cp -p`, `tar -x`, `touch -d`) is now detected by comparing content hashes on the full-read path, not mtimes.
 
 **`search` returns no results / stale results**
 - **Cause:** Only cached files are searched. New or unread files aren't in the cache yet.
 - **Fix:** Seed the cache with `read` or `batch_read` first.
+- **Note (0.5.2+):** query terms are joined with `OR`, so one word your corpus doesn't contain no longer empties the results — it just stops contributing to the ranking. Before 0.5.2 a query like `"password hashing session token"` returned nothing unless a single file held all four words. An empty result now means no cached file matched *any* term.
+
+**`grep` fails with "invalid regex pattern" or "pattern too long"**
+- **Cause (0.5.2+):** the pattern didn't compile, or it exceeds the 1,000-character ReDoS cap. Earlier versions logged a warning and returned no matches, which is indistinguishable from a genuine miss.
+- **Fix:** correct the regex, or pass `fixed_string=true` to match the text literally (`grep pattern="foo(bar" fixed_string=true`).
 
 **Repeated `search` queries return instantly (< 1 ms)**
 - **Cause (0.4.6+):** `SemanticCache` keeps an in-session 32-entry LRU of search results, keyed on `(query, k, directory)`. Identical queries skip the BM25 round-trip entirely.

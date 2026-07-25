@@ -109,6 +109,8 @@ multi_result = smart_batch_edit(
 
 # Keyword search (BM25) over cached files
 # Must seed the cache first with smart_read / batch_smart_read
+# Query terms are quoted (never parsed as FTS5 operators) and joined with OR,
+# so a word the corpus lacks narrows the ranking instead of emptying the results.
 search_result = semantic_search(
     cache=cache,
     query="authentication logic",
@@ -268,6 +270,7 @@ print(f"Cleared {cleared} entries")
 | `tokens_saved`     | `int`         | Tokens saved vs returning full content         |
 | `truncated`        | `bool`        | Whether content was truncated/summarized       |
 | `compression_ratio`| `float`       | Size ratio (returned / original)               |
+| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or summarized one |
 | `semantic_match`   | `str \| None` | Unused; always `None` since the embedding layer was removed |
 
 ### WriteResult

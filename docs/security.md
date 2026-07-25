@@ -34,10 +34,13 @@ Size limits prevent memory exhaustion from oversized inputs:
 | `MAX_EDIT_SIZE`  | 10 MB   | `edit` and `batch_edit` file size      |
 | `MAX_CONTENT_SIZE` | 100 KB | Default max bytes returned by `read`  |
 | `MAX_MATCHES`    | 10,000  | `replace_all` match count in `edit`   |
+| `GREP_MAX_PATTERN_LEN` | 1,000 chars | `grep` regex source, before compilation |
 
 All limits are enforced **before** any I/O operation, so they fail fast.
 
 **Search.** Results are capped at 100, and glob is capped at 1,000 matches with a 5-second timeout.
+
+**Regex.** `grep` caps the pattern length to bound the ReDoS surface — a pathological backtracking pattern needs room to express itself, and no legitimate grep needs that much. An over-long or uncompilable pattern raises an error rather than returning an empty result set, so a rejected pattern can never be mistaken for a search that found nothing. Patterns meant to be matched literally should be passed with `fixed_string=true`, which escapes them and skips the regex engine.
 
 ### SQL Injection
 
