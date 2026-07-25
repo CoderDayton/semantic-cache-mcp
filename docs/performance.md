@@ -30,6 +30,8 @@ uv run python benchmarks/benchmark_performance.py --json out.json --iterations 1
 
 Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_read` / `semantic_search` and reports tokens emitted vs. tokens that would have been read in the absence of the cache.
 
+Every saving below is earned by a caller that echoes back the `content_hash` it was given (`known_hash` on `read`, `known_hashes` on `batch_read`). Since 0.5.2 that is a hard requirement, not an optimization: a caller that cannot prove it still holds a file is sent the file. The phases model an agent that keeps its hashes, which is the flow the numbers describe.
+
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
 | 1 | Cold read | First read, no cache (baseline) | 185,692 | 185,692 | 0.0% |
@@ -38,7 +40,7 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 | 4 | Small edits (12/40 changed) | Real ~5% line changes on 30% of files | 3,947 | 186,068 | **97.9%** |
 | 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 2,853 | 114,637 | 97.5% |
 | 4b |  → unchanged files | Fast path | 1,094 | 71,431 | 98.5% |
-| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus | 1,580 | 186,068 | **99.2%** |
+| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus, echoing the hashes phase 4 returned | 1,580 | 186,068 | **99.2%** |
 | 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 305 | 116,050 | **99.7%** |
 
 **Aggregate (phases 2 to 6): 99.0% token reduction.**
@@ -49,9 +51,10 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 
 | Strategy | Savings | Trigger |
 |----------|--------:|---------|
-| Unchanged (mtime) | ~99% | `cached.mtime >= file.mtime`, disk read skipped entirely |
-| Content hash | ~99% | mtime drifted but BLAKE3 hash still matches |
-| Diff (changed) | 80 to 95% | File modified since last cache; emitted as unified diff |
+| Unchanged (mtime) | ~99% | Caller's hash matches and `cached.mtime >= file.mtime`; disk read skipped entirely |
+| Content hash | ~99% | Caller's hash matches; mtime drifted but BLAKE3 hash still matches |
+| Diff (changed) | 80 to 95% | File modified since last cache, and the caller holds the base content; emitted as unified diff |
+| No possession proof | 0% | Caller sent no matching hash — the file is returned in full, served from cache when fresh |
 | Search previews | ~100% | `search` returns 200-char previews, never full files |
 | Summarised | 50 to 80% | File exceeds `MAX_CONTENT_SIZE`; semantic skeleton retained |
 

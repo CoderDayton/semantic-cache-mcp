@@ -339,6 +339,7 @@ async def test_batch_read_resolves_relative_paths_before_remote_dispatch(
             "paths": '["/repo/src/**/*.py", "/repo/README.md"]',
             "max_total_tokens": 50000,
             "priority": '["/repo/docs/guide.md"]',
+            "known_hashes": "",
         },
         output_mode="compact",
         max_response_tokens=None,

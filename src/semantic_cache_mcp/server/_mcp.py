@@ -90,5 +90,33 @@ async def app_lifespan(server: FastMCP):
         logger.info("Semantic cache MCP server stopped")
 
 
-mcp = FastMCP("semantic-cache-mcp", lifespan=app_lifespan)
+# Client-visible server instructions. The hash-echo discipline is what turns
+# the cache from storage into savings, and it spans every file tool, so it is
+# stated once here rather than repeated across thirteen tool descriptions.
+INSTRUCTIONS = """\
+Every file operation runs through one cache, and every response that delivers a \
+file carries its `content_hash`.
+
+Keep those hashes and pass them back: `known_hash` on `read`, a `known_hashes` \
+entry on `batch_read`. A matching hash is the only evidence the server has that \
+the content is still in your context — a warm cache proves the *server* holds \
+the file, never that you do — so it answers `unchanged` instead of re-sending \
+bytes you already have. Without a hash it always sends the file in full.
+
+That makes forgetting cheap to recover from: after a context compaction, or \
+any point where you no longer hold a file's text, read it again without the \
+hash and you get the whole thing back.
+
+Pass `known_hash` when you edit or append too. Editing a file is not the same \
+as having read it — an anchor can come from `grep` — so an edit only returns a \
+claimable `content_hash` to a caller that showed it held the text being \
+changed. With it, you never need a read after an edit to learn what the file \
+now contains.
+
+A hash reported as `file_hash` (prefixed `partial:`) came from a partial or \
+summarized read. It identifies the file across reads but is not proof you hold \
+it, and is never accepted as `known_hash`.
+"""
+
+mcp = FastMCP("semantic-cache-mcp", instructions=INSTRUCTIONS, lifespan=app_lifespan)
 mcp.add_middleware(ParamHintsMiddleware())

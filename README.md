@@ -41,7 +41,9 @@ Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io
 
 ## Why this exists
 
-**1. Reads stop costing tokens.** The first read seeds the cache and hands back a `content_hash`. Send that hash back on the next read (as `known_hash`) and the server replies `unchanged` without resending the file. A modified file returns a unified diff with the changed line numbers. A file larger than the budget collapses to a structure-preserving summary instead of a blind cut at a byte offset.
+**1. Reads stop costing tokens.** The first read seeds the cache and hands back a `content_hash`. Send that hash back on the next read (as `known_hash`, or a `known_hashes` entry on `batch_read`) and the server replies `unchanged` without resending the file. A modified file returns a unified diff with the changed line numbers. A file larger than the budget collapses to a structure-preserving summary instead of a blind cut at a byte offset.
+
+That echoed hash is the whole contract: it is the only evidence the server has that a file is still in your context. A warm cache proves the *server* holds the file, never that you do — the store is on disk and outlives the process, the session, and your context window — so a read without a matching hash always sends the file. Forgetting is therefore safe: after a compaction, omit the hashes and you get your files back in full.
 
 **2. Search and grep run on the cache, not the disk.** Keyword search (BM25), glob, and grep all read from the same indexed corpus that `read`/`batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
 
@@ -128,12 +130,12 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Single-file cache-aware read. Returns full content plus a `content_hash` on the first read, a short `unchanged` reply when you pass back a matching `known_hash`, and a diff when the file changed. Supports `offset`/`limit` for targeted line recovery. |
+| `read` | Single-file cache-aware read. Returns full content plus a `content_hash` on the first read, a short `unchanged` reply when you pass back a matching `known_hash`, and a diff when the file changed. Supports `offset`/`limit` for targeted line recovery; a partial or summarized read reports `file_hash` (prefixed `partial:`) instead, which identifies the file but is never accepted as proof you hold it. |
 | `read_image` | Pass-through for image files. Returns an MCP image content block (base64 + mime) so vision models can see the pixels; sidecar metadata holds size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not by extension. Bypasses the semantic cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `delete` | Single-path delete for one file or symlink, with cache eviction and `dry_run=true`. Intentionally does not support globs, recursive delete, or real-directory delete. |
-| `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. |
-| `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. For multiple edits to the same file, prefer `batch_edit`. |
-| `batch_edit` | Multiple exact edits in one file with partial success reporting. Preferred over repeated `edit` calls on the same file: single response, atomic, faster on large files. |
+| `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff, supports `append=true`, and can run formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
+| `edit` | Single-file exact edit using cached content. Supports scoped and line-range replacement plus `dry_run=true`. Pass `known_hash` to get a claimable `content_hash` back and skip the read after the edit. For multiple edits to the same file, prefer `batch_edit`. |
+| `batch_edit` | Multiple exact edits in one file with partial success reporting. Preferred over repeated `edit` calls on the same file: single response, atomic, faster on large files. Takes `known_hash` on the same terms as `edit`. |
 | `edit_preview` | Read-only probe that returns match count, line numbers, and small context snippets for a candidate `old_string`. Use before a costly `edit` to confirm anchor uniqueness. |
 
 ### Discovery
@@ -142,7 +144,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 |------|-------------|
 | `search` | Cache-only BM25 keyword search that ranks cached files by relevance to a query. Seed likely files first with `batch_read`. |
 | `glob` | File discovery plus cache coverage. Use it to find candidates, then pass those paths into `batch_read`. |
-| `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, unchanged suppression, and diff/full routing. |
+| `batch_read` | Multi-file cache-aware read for seeding and retrieval. Handles globs, priorities, token budgets, and diff/full routing. Returns each file's `content_hash`; pass them back as `known_hashes` to suppress the ones you still hold. |
 | `grep` | Cache-only exact search with regex or literal matching, line numbers, and optional context. Best for symbols and exact strings. |
 
 ### Management
@@ -243,10 +245,11 @@ batch_edit path="/src/app.py" edits='[
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
 batch_read paths='["/src/a.py","/src/b.py"]' priority="/src/main.py"
 batch_read paths="/src/*.py" max_total_tokens=30000
+batch_read paths="/src/a.py,/src/b.py" known_hashes='{"/src/a.py":"8f3c..."}'
 ```
 
 - Expands simple globs, honors `priority`, enforces `max_total_tokens`, and reports skipped paths with recovery hints.
-- Unchanged files are collapsed into the summary instead of repeating content.
+- Every file is returned in full unless you prove you still hold it. Each delivered file carries a `content_hash`; echo those back as `known_hashes` and the ones you hold collapse into an `unchanged` count instead of being re-sent.
 
 </details>
 

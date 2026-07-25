@@ -134,6 +134,10 @@ batch_result = batch_smart_read(
     max_total_tokens=30000,
     priority=["/src/a.py"],   # a.py read first regardless of size
     diff_mode=True,           # set False after context compression
+    # Possession proof: only files whose hash you echo here can come back as
+    # `unchanged` or as a diff. Everything else is sent in full, so omitting
+    # this after a compaction is always safe.
+    known_hashes={"/src/a.py": "8f3c..."},
 )
 print(f"Files read:    {batch_result.files_read}")
 print(f"Tokens saved:  {batch_result.tokens_saved}")
@@ -278,6 +282,7 @@ print(f"Cleared {cleared} entries")
 | `diff_stats`   | `dict \| None`| Insertions, deletions, modifications     |
 | `tokens_saved` | `int`         | Tokens saved by returning diff           |
 | `content_hash` | `str`         | BLAKE3 hex digest                        |
+| `previous_hash`| `str \| None` | Digest of the content the write started from; `None` when the file was created. The tool layer matches it against `known_hash` to decide whether an append is claimable |
 | `from_cache`   | `bool`        | Whether old content came from cache      |
 
 ### EditResult
@@ -292,6 +297,7 @@ print(f"Cleared {cleared} entries")
 | `diff_stats`       | `dict`     | Insertions, deletions, modifications |
 | `tokens_saved`     | `int`      | Tokens saved by cached read          |
 | `content_hash`     | `str`      | BLAKE3 hex digest of new content     |
+| `previous_hash`    | `str \| None` | Digest of the pre-edit content     |
 | `from_cache`       | `bool`     | Whether content came from cache      |
 
 ### BatchEditResult
@@ -306,6 +312,7 @@ print(f"Cleared {cleared} entries")
 | `diff_stats`   | `dict`                  | Insertions, deletions, modifications |
 | `tokens_saved` | `int`                   | Tokens saved by cached read          |
 | `content_hash` | `str`                   | BLAKE3 hex digest of final content   |
+| `previous_hash`| `str \| None`           | Digest of the pre-edit content       |
 | `from_cache`   | `bool`                  | Whether content came from cache      |
 
 ### SearchResult
@@ -325,7 +332,7 @@ print(f"Cleared {cleared} entries")
 | `files_skipped`  | `int`            | Files skipped due to budget                      |
 | `total_tokens`   | `int`            | Total tokens returned                            |
 | `tokens_saved`   | `int`            | Tokens saved by caching                          |
-| `unchanged_paths`| `list[str]`      | Files unchanged since last read                  |
+| `unchanged_paths`| `list[str]`      | Files the caller proved it holds (via `known_hashes`) that have not changed |
 
 | Field       | Type        | Description                                                           |
 |-------------|-------------|-----------------------------------------------------------------------|
@@ -334,6 +341,7 @@ print(f"Cleared {cleared} entries")
 | `status`    | `str`       | `"full"`, `"diff"`, `"truncated"`, `"skipped"`, or `"unchanged"`    |
 | `from_cache`| `bool`      | Whether content came from cache                                       |
 | `est_tokens`| `int \| None` | Estimated tokens for skipped files (for budget planning)           |
+| `content_hash`| `str \| None` | Hash of the delivered content — pass it back in `known_hashes` next time. `None` when what was sent is not the file itself (skipped, or a summary of a large file) |
 
 ### DiffResult
 

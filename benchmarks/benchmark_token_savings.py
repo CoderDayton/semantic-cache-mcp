@@ -117,9 +117,7 @@ def _file_chunks(data: bytes) -> list[bytes]:
     return list(get_optimal_chunker(prefer_simd=True)(data))
 
 
-def measure_chunk_economics(
-    v1: dict[str, bytes], v2: dict[str, bytes]
-) -> dict[str, float | int]:
+def measure_chunk_economics(v1: dict[str, bytes], v2: dict[str, bytes]) -> dict[str, float | int]:
     """Quantify whether chunk-level content addressing would pay off here.
 
     `v1` maps every corpus path to its original bytes; `v2` maps the edited
@@ -193,12 +191,16 @@ async def phase_content_hash(cache: SemanticCache, files: list[Path]) -> tuple[i
 
 
 async def phase_small_modifications(
-    cache: SemanticCache, files: list[Path], modified: list[Path]
+    cache: SemanticCache, files: list[Path], modified: list[Path], held: dict[str, str]
 ) -> dict[str, tuple[int, int]]:
     modified_set = set(modified)
     ch_ret = ch_orig = unch_ret = unch_orig = 0
     for f in files:
         result = await smart_read(cache, str(f), diff_mode=True)
+        # Remember what each read left us holding: the next phase has to prove
+        # possession to skip a re-send, exactly as a real caller would.
+        if result.content_hash:
+            held[str(f)] = result.content_hash
         if f in modified_set:
             ch_ret += result.tokens_returned
             ch_orig += result.tokens_original
@@ -212,9 +214,18 @@ async def phase_small_modifications(
     }
 
 
-async def phase_batch_read(cache: SemanticCache, files: list[Path]) -> tuple[int, int]:
+async def phase_batch_read(
+    cache: SemanticCache, files: list[Path], held: dict[str, str]
+) -> tuple[int, int]:
+    # Re-reading a corpus the agent still holds: it echoes the hashes its
+    # earlier reads returned, the only evidence batch_smart_read accepts that
+    # the content is still in context.
     result = await batch_smart_read(
-        cache, [str(f) for f in files], max_total_tokens=200_000, diff_mode=True
+        cache,
+        [str(f) for f in files],
+        max_total_tokens=200_000,
+        diff_mode=True,
+        known_hashes=held,
     )
     return result.total_tokens, result.total_tokens + result.tokens_saved
 
@@ -353,7 +364,9 @@ async def run_benchmark(
         modified = _apply_small_edits(files, fraction=0.3, seed=seed)
         v2_bytes = {str(f): f.read_bytes() for f in modified}
         chunk_econ = measure_chunk_economics(v1_bytes, v2_bytes)
-        p4 = await phase_small_modifications(cache, files, modified)
+        # What the agent still holds after its most recent read of each file.
+        held: dict[str, str] = {}
+        p4 = await phase_small_modifications(cache, files, modified, held)
         p4c_ret, p4c_orig = p4["combined"]
         if not quiet:
             ch_ret, ch_orig = p4["changed"]
@@ -390,7 +403,7 @@ async def run_benchmark(
             )
 
         # Phase 5: Batch
-        p5_ret, p5_orig = await phase_batch_read(cache, files)
+        p5_ret, p5_orig = await phase_batch_read(cache, files, held)
         if not quiet:
             print("\nPhase 5: Batch Read (200K budget)")
             print(_fmt_row("Batch read", p5_ret, p5_orig))

@@ -25,8 +25,9 @@
 - **Fix:** The first `read` of any file populates the cache. Subsequent reads return diffs. Use `stats` to verify files are being cached.
 
 **All files reporting "unchanged" after model context compression**
-- **Cause:** The server only answers `unchanged` when the same session already received the file, or when you pass a `known_hash` that still matches. After context compression you no longer hold the text.
-- **Fix:** Read the file again without `known_hash` and you get full content back. If you only need part of it, use `read` with `offset`/`limit`.
+- **Cause (fixed in 0.5.2):** `batch_read` used to answer `unchanged` for any file the *server* had cached. The cache is on disk and outlives your context window, so after a compaction or a `/clear` you were told you already had files you had never seen.
+- **Now:** `unchanged` is only ever produced for a file whose `content_hash` you echoed back — `known_hash` on `read`, or a `known_hashes` entry on `batch_read`. Anything you cannot vouch for is sent in full, so simply omitting the hashes after a compaction is always safe.
+- **Note:** a partial read (a line range, or a summary of a large file) reports its hash as `file_hash`, prefixed `partial:`. It identifies the file but is not proof you hold it and will not be honoured as a `known_hash`.
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated

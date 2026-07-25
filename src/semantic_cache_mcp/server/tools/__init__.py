@@ -166,6 +166,24 @@ def _resolve_path_list(raw: str, state: _ToolCallState) -> list[str]:
     return [state.resolve(path) for path in _parse_path_list(raw)]
 
 
+def _parse_known_hashes(raw: str, state: _ToolCallState) -> dict[str, str]:
+    """Parse a caller's ``path -> content_hash`` possession claims.
+
+    Keys are resolved exactly as ``paths`` is, so a claim lands on the file it
+    names however the caller spelled it.
+    """
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"known_hashes must be a JSON object of path -> content_hash: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError("known_hashes must be a JSON object of path -> content_hash")
+    return {state.resolve(str(p)): str(h) for p, h in parsed.items() if h}
+
+
 def _get_tool_lock() -> asyncio.Lock:
     """Return the per-event-loop tool lock, creating it lazily on first use.
 
@@ -390,6 +408,31 @@ def _binary_read_payload(path: str, result: Any) -> dict[str, Any]:
     }
 
 
+# A partial or summarized read reports the file's hash under `file_hash`, and
+# never as a bare content hash: a caller echoing it back as `known_hash` would
+# be claiming possession of a file it saw only part of. Namespacing the value
+# makes that claim impossible to make by accident instead of merely discouraged
+# in prose, while still letting the caller compare it across reads to notice the
+# file moved.
+_PARTIAL_HASH_PREFIX = "partial:"
+
+
+def _stamp_result_hash(payload: dict[str, Any], new_hash: str, *, caller_holds: bool) -> None:
+    """Attach a mutation's resulting hash under the key its evidence supports.
+
+    A write or edit leaves the caller holding the new content only when the
+    caller could derive that content itself: it supplied the whole file, or it
+    supplied a transformation and had proved it held what the file started
+    from. Otherwise the hash goes out as `file_hash` — a caller that edited a
+    file it never read must not be handed a token that would later buy it an
+    `unchanged` reply for content it has never seen.
+    """
+    if caller_holds:
+        payload["content_hash"] = new_hash
+    else:
+        payload["file_hash"] = _PARTIAL_HASH_PREFIX + new_hash
+
+
 @mcp.tool(
     output_schema=output_schema(ReadResponse),
     meta={"version": _pkg_version("semantic-cache-mcp")},
@@ -415,7 +458,11 @@ async def read(
     proof that you still hold the content, so use it every time you can; the
     server then skips re-sending unchanged bytes. Use `offset`/`limit` to read
     or recover an exact line range, for example after a large file was
-    summarized. A binary file returns metadata instead of content; for images
+    summarized. A read that returns only part of a file — a line range, or a
+    summary of a large one — reports its hash as `file_hash` (prefixed
+    `partial:`) rather than `content_hash`: it identifies the file across reads
+    but is not proof you hold it, and cannot be redeemed as `known_hash`.
+    A binary file returns metadata instead of content; for images
     use `read_image`.
 
     Args:
@@ -472,31 +519,6 @@ async def read(
                 and ranged_entry.mtime >= ranged_st.st_mtime
             )
 
-            # Hash-gated short-circuit: the caller still holds this exact file, so
-            # a ranged re-read is pointless. Confirm with a stat only (no byte
-            # read, no re-slice) and answer unchanged for the range. Recorded as a
-            # cache hit that saved the whole file.
-            if known_hash and ranged_fresh and known_hash == ranged_entry.content_hash:
-                ranged_text = await cache.get_content(ranged_entry)
-                # Count lines the same way the literal ranged path does
-                # (splitlines) so `lines.total` agrees for the same file,
-                # including the empty-file edge case.
-                total = len(ranged_text.splitlines(keepends=True))
-                cache.metrics.record(
-                    "read", _ranged_metrics(ranged_entry.tokens, 0, from_cache=True)
-                )
-                return _finalize_payload(
-                    {
-                        "ok": True,
-                        "tool": "read",
-                        "path": path,
-                        "unchanged": True,
-                        "content_hash": ranged_entry.content_hash,
-                        "lines": {"total": total},
-                    },
-                    max_response_tokens,
-                )
-
             # Materialize the file to address specific lines. Serve from the cache
             # when it is fresh (no disk read); only touch disk when the cache is
             # missing or stale, in which case smart_read also refreshes it.
@@ -532,6 +554,36 @@ async def read(
             start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
+            # A ranged read only ever shows the caller the window it asked for,
+            # so only a window spanning the whole file may mint or redeem a
+            # `content_hash`. Anything narrower and the caller would be handed —
+            # or credited with — bytes it never saw.
+            covers_whole_file = start == 0 and end >= len(lines)
+
+            # Hash-gated short-circuit: the caller still holds this exact file
+            # and asked for all of it, so there is nothing left to re-send.
+            # Recorded as a cache hit that saved the whole file.
+            if (
+                covers_whole_file
+                and known_hash
+                and ranged_fresh
+                and ranged_entry is not None
+                and known_hash == ranged_entry.content_hash
+            ):
+                cache.metrics.record(
+                    "read", _ranged_metrics(ranged_entry.tokens, 0, from_cache=True)
+                )
+                return _finalize_payload(
+                    {
+                        "ok": True,
+                        "tool": "read",
+                        "path": path,
+                        "unchanged": True,
+                        "content_hash": ranged_entry.content_hash,
+                        "lines": {"total": len(lines)},
+                    },
+                    max_response_tokens,
+                )
 
             # Format with line numbers like built-in Read tool. Generator
             # expression avoids materializing the intermediate list; `selected`
@@ -561,7 +613,14 @@ async def read(
                 "lines": line_info,
             }
             if ranged_hash is not None:
-                payload["content_hash"] = ranged_hash
+                # A window over the whole file leaves the caller holding it, so
+                # it earns an echoable `content_hash`. A narrower window reports
+                # the same hash under `file_hash`, namespaced so it cannot be
+                # redeemed as a possession claim.
+                if covers_whole_file:
+                    payload["content_hash"] = ranged_hash
+                else:
+                    payload["file_hash"] = _PARTIAL_HASH_PREFIX + ranged_hash
             if mode in _MODE_NORMAL:
                 payload["truncated"] = False
             if mode == _MODE_DEBUG:
@@ -645,10 +704,15 @@ async def read(
                 if fetched:
                     content_text = fetched
             payload["content"] = content_text
-        # Always surface the current content_hash so the caller can echo it back
-        # as known_hash on its next read and skip a re-send.
+        # Always surface the current hash so the caller can echo it back as
+        # known_hash on its next read and skip a re-send. A summarized read
+        # delivered a digest rather than the file, so its hash goes out under
+        # `file_hash` and cannot be redeemed as a possession claim.
         if entry is not None and "content_hash" not in payload:
-            payload["content_hash"] = entry.content_hash
+            if result.truncated:
+                payload["file_hash"] = _PARTIAL_HASH_PREFIX + entry.content_hash
+            else:
+                payload["content_hash"] = entry.content_hash
         if mode in _MODE_NORMAL:
             if result.is_diff:
                 payload["is_diff"] = True
@@ -1206,6 +1270,7 @@ async def write(
     auto_format: bool = False,
     show_diff: bool = False,
     append: bool = False,
+    known_hash: str | None = None,
 ) -> dict[str, Any]:
     """Create a file or replace its entire contents.
 
@@ -1214,9 +1279,15 @@ async def write(
     for an existing one, and an update returns a unified diff against the
     previous content. Writing refreshes the cache so later reads, `grep`, and
     `search` see the new text. The response carries the new `content_hash`;
-    pass it back as `read`'s `known_hash` to get `unchanged` instead of
-    re-reading the file you just wrote. Missing parent directories are created
-    unless `create_parents=false`.
+    pass it back as `read`'s `known_hash`, or as a `batch_read` `known_hashes`
+    entry, to get `unchanged` instead of re-reading the file you just wrote.
+    Missing parent directories are created unless `create_parents=false`.
+
+    A full write supplies the whole file, so its hash is yours to keep. An
+    append only adds a tail, so pass `known_hash` to show you held the rest —
+    without it you get `file_hash` instead, since you cannot vouch for a file
+    you have only seen the end of. `auto_format` reports `file_hash` too: the
+    formatter's output is not what you sent.
 
     Args:
         path: File path to create or replace (absolute, or relative to root).
@@ -1226,6 +1297,8 @@ async def write(
         auto_format: Run the formatter after writing.
         show_diff: Return the unified diff even on a deterministic write.
         append: Append `content` to the end of the file instead of overwriting.
+        known_hash: The `content_hash` you hold for this file. Only needed for
+            `append`, to prove you hold the part you are not resending.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1259,11 +1332,21 @@ async def write(
             "status": "created" if result.created else "updated",
             "path": result.path,
         }
-        # Surface the new content_hash so the caller can echo it as known_hash on
-        # a later read and get `unchanged` instead of a re-send. Only when the
-        # write actually landed; a dry_run leaves disk and cache untouched.
+        # Surface the resulting hash so the caller can echo it as known_hash on a
+        # later read and get `unchanged` instead of a re-send. Only when the write
+        # actually landed; a dry_run leaves disk and cache untouched. A full write
+        # supplies the whole file, so it needs no prior possession; an append only
+        # extends a base the caller must already have held, and a formatter pass
+        # rewrites the file on its own terms, so neither is derivable without it.
         if not result.dry_run:
-            payload["content_hash"] = result.content_hash
+            base_held = (
+                not append
+                or result.previous_hash is None
+                or (known_hash is not None and known_hash == result.previous_hash)
+            )
+            _stamp_result_hash(
+                payload, result.content_hash, caller_holds=base_held and not auto_format
+            )
         if result.created:
             payload["diff_state"] = "none"
         else:
@@ -1326,6 +1409,7 @@ async def edit(
     show_diff: bool = False,
     start_line: int | None = None,
     end_line: int | None = None,
+    known_hash: str | None = None,
 ) -> dict[str, Any]:
     """Edit one file by exact text replacement.
 
@@ -1341,6 +1425,13 @@ async def edit(
     the cache. For several edits to one file use `batch_edit`; for a full
     rewrite use `write`.
 
+    Pass `known_hash` — the hash you hold for this file — and the response
+    carries the new `content_hash`, so you never need a read after an edit just
+    to learn what the file now contains: you held the old text and you know what
+    you replaced. Without it (or with `auto_format`, whose output is not what
+    you asked for) the result comes back as `file_hash`, which cannot be
+    redeemed as `known_hash` — editing a file is not the same as having read it.
+
     Args:
         path: File path to modify (absolute, or relative to root).
         old_string: Exact text to find. Omit only for a line-range replacement.
@@ -1351,6 +1442,9 @@ async def edit(
         show_diff: Return the diff even on a deterministic edit.
         start_line: 1-based inclusive start line for a scoped or line-range edit.
         end_line: 1-based inclusive end line for a scoped or line-range edit.
+        known_hash: The `content_hash` from your last read of this file. Proves
+            you hold the text being edited, so the result can be handed back as
+            a claimable `content_hash`.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1391,11 +1485,16 @@ async def edit(
             "replaced": result.replacements_made,
             "line_numbers": result.line_numbers,
         }
-        # Surface the new content_hash so the caller can echo it as known_hash on
-        # a later read and skip re-reading the file it just edited. Skip on
-        # dry_run, which leaves disk and cache untouched.
+        # Surface the resulting hash so the caller can echo it as known_hash on a
+        # later read and skip re-reading the file it just edited. Skip on dry_run,
+        # which leaves disk and cache untouched. An edit is only derivable by a
+        # caller that held the pre-edit content — it knows what it replaced — and
+        # a formatter pass rewrites the result beyond what it asked for.
         if not dry_run:
-            payload["content_hash"] = result.content_hash
+            base_held = known_hash is not None and known_hash == result.previous_hash
+            _stamp_result_hash(
+                payload, result.content_hash, caller_holds=base_held and not auto_format
+            )
         _apply_mutation_diff(
             payload,
             diff_content=result.diff_content,
@@ -1549,6 +1648,7 @@ async def batch_edit(
     dry_run: bool = False,
     auto_format: bool = False,
     show_diff: bool = False,
+    known_hash: str | None = None,
 ) -> dict[str, Any]:
     """Apply many exact edits to one file in a single atomic call.
 
@@ -1566,6 +1666,10 @@ async def batch_edit(
     - `{"old": ..., "new": ..., "start_line": ..., "end_line": ...}` — object form.
 
     Prefer line-range entries when you already have line numbers from `read`.
+    Pass `known_hash` — the hash you hold for this file — and the response
+    carries the new `content_hash`, so you need no read afterwards to learn what
+    the file now contains. Without it (or with `auto_format`) the result comes
+    back as `file_hash`, which cannot be redeemed as `known_hash`.
 
     Args:
         path: File path to modify (absolute, or relative to root).
@@ -1573,6 +1677,9 @@ async def batch_edit(
         dry_run: Preview without writing.
         auto_format: Run the formatter after all edits.
         show_diff: Return the full diff even on a deterministic all-success batch.
+        known_hash: The `content_hash` from your last read of this file. Proves
+            you hold the text being edited, so the result can be handed back as
+            a claimable `content_hash`.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -1657,12 +1764,16 @@ async def batch_edit(
                 for o in result.outcomes
                 if not o.success
             ]
-        # Surface the new content_hash so the caller can echo it as known_hash on
-        # a later read and skip re-reading the file it just edited. Only when an
-        # edit actually applied (cache refreshed); dry_run and all-failed leave
-        # disk and cache untouched.
+        # Surface the resulting hash so the caller can echo it as known_hash on a
+        # later read and skip re-reading the file it just edited. Only when an edit
+        # actually applied (cache refreshed); dry_run and all-failed leave disk and
+        # cache untouched. Derivable only for a caller that held the pre-edit
+        # content and did not hand the result to a formatter.
         if not dry_run and result.succeeded > 0:
-            payload["content_hash"] = result.content_hash
+            base_held = known_hash is not None and known_hash == result.previous_hash
+            _stamp_result_hash(
+                payload, result.content_hash, caller_holds=base_held and not auto_format
+            )
         _apply_mutation_diff(
             payload,
             diff_content=result.diff_content,
@@ -1808,21 +1919,26 @@ async def batch_read(
     paths: str,
     max_total_tokens: int = 50000,
     priority: str = "",
+    known_hashes: str = "",
 ) -> dict[str, Any]:
     """Read several files at once under a shared token budget.
 
     The efficient way to seed the cache before `search`/`grep`, and cheaper
-    than many single `read` calls. New files return full content, changed
-    files return a diff, and files already in your context are reported as
-    `unchanged` with no body. Smallest files are read first; once the budget
-    is spent the rest are listed under `skipped` — recover them with `read`
-    using `offset`/`limit`.
+    than many single `read` calls. Every file is returned in full unless you
+    prove you still hold it: pass `known_hashes` and each proven file collapses
+    to an `unchanged` count, or to a diff when it moved on disk. Each file you
+    are sent comes back with its `content_hash` — keep those and pass them next
+    time. Smallest files are read first; once the budget is spent the rest are
+    listed under `skipped` — recover them with `read` using `offset`/`limit`.
 
     Args:
         paths: The files to read — a comma-separated list, a JSON array, or
             glob patterns (expanded for you).
         max_total_tokens: Total token budget shared across the whole batch.
         priority: Optional paths to read first, ahead of the remaining files.
+        known_hashes: JSON object mapping a path to the `content_hash` you
+            still hold for it, e.g. `{"src/a.py": "8f3c..."}`. Any file you
+            cannot vouch for this way is sent in full.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
@@ -1832,6 +1948,10 @@ async def batch_read(
     try:
         path_list = _resolve_path_list(paths, state)
         priority_list = _resolve_path_list(priority, state) if priority.strip() else None
+        try:
+            hash_claims = _parse_known_hashes(known_hashes, state)
+        except ValueError as e:
+            _raise_tool_error("batch_read", str(e), max_response_tokens)
         remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
             state,
             "batch_read",
@@ -1839,6 +1959,7 @@ async def batch_read(
                 overrides={
                     "paths": json.dumps(path_list),
                     "priority": json.dumps(priority_list) if priority_list else "",
+                    "known_hashes": json.dumps(hash_claims) if hash_claims else "",
                 }
             ),
             timeout=_TOOL_TIMEOUT * 2,
@@ -1865,6 +1986,7 @@ async def batch_read(
                 path_list,
                 max_total_tokens=max_total_tokens,
                 priority=priority_list,
+                known_hashes=hash_claims,
             ),
             timeout=_TOOL_TIMEOUT * 2,
         )  # batch gets double timeout
@@ -1908,6 +2030,10 @@ async def batch_read(
                         f"Truncated. Use read with offset={returned_lines + 1} "
                         f"to continue. Do NOT re-read from the beginning."
                     )
+                # Only exact deliveries carry a hash — pass it back as a
+                # `known_hashes` entry next time to skip re-sending this file.
+                if f.content_hash is not None:
+                    item["content_hash"] = f.content_hash
                 if mode == _MODE_DEBUG:
                     item["tokens"] = f.tokens
                     item["from_cache"] = f.from_cache

@@ -58,6 +58,10 @@ class WriteResult:
     content_hash: ContentHash
     from_cache: bool
     dry_run: bool = False
+    # Hash of the content this operation started from; None when the file was
+    # created. The tool layer matches it against the caller's `known_hash` to
+    # decide whether the caller could derive the result and so still holds it.
+    previous_hash: ContentHash | None = None
 
 
 @dataclass(slots=True)
@@ -74,6 +78,8 @@ class EditResult:
     content_hash: ContentHash
     from_cache: bool
     dry_run: bool = False
+    # Hash of the pre-edit content — see WriteResult.previous_hash.
+    previous_hash: ContentHash | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -132,6 +138,12 @@ class FileReadSummary:
     status: str  # "full", "diff", "truncated", "skipped", "unchanged"
     from_cache: bool
     est_tokens: int | None = None
+    # Hash of the delivered content, so the caller can claim possession of
+    # this file on its next batch_read. Left None whenever what we sent is
+    # not the file itself (skipped, or a summary of a large file) — a hash
+    # the caller cannot back with content is exactly the false claim the
+    # possession gate exists to reject.
+    content_hash: ContentHash | None = None
 
 
 @dataclass(slots=True)
@@ -204,3 +216,5 @@ class BatchEditResult:
     content_hash: ContentHash
     from_cache: bool
     dry_run: bool = False
+    # Hash of the pre-edit content — see WriteResult.previous_hash.
+    previous_hash: ContentHash | None = None

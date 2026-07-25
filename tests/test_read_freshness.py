@@ -226,23 +226,67 @@ async def test_small_change_to_tiny_file_returns_full(
 
 
 # ---------------------------------------------------------------------------
-# Cache-aware ranged reads: known_hash short-circuits a ranged re-read
+# Cache-aware ranged reads: a known_hash short-circuits a ranged re-read only
+# when the requested window covers the whole file. Holding a file's hash says
+# nothing about holding a window the caller never asked for before.
 # ---------------------------------------------------------------------------
 
 
-async def test_ranged_read_known_hash_short_circuits(
+async def test_ranged_read_partial_window_never_claims_unchanged(
     ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
 ) -> None:
+    """Regression: a narrow window answered `unchanged` on a whole-file hash.
+
+    The caller holding the file's hash proves it holds the file, but the
+    server answered a *range* request with "you already have it" and no body
+    — so a caller asking for lines it had never seen got nothing at all.
+    """
     f = tmp_path / "ranged.py"
     f.write_text("\n".join(f"row_{i} = {i}" for i in range(40)) + "\n")
     d1 = _parse(await read(ctx, str(f)))
     h = d1["content_hash"]
 
     d = _parse(await read(ctx, str(f), offset=2, limit=3, known_hash=h))
+    assert d.get("unchanged") is not True
+    assert "row_1 = 1" in d["content"]  # line 2 really is delivered
+    assert d["lines"]["total"] == 40
+
+
+async def test_ranged_read_whole_file_window_short_circuits(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    """A window spanning the file is a re-read of the file, so it may skip."""
+    f = tmp_path / "ranged_full.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(40)) + "\n")
+    d1 = _parse(await read(ctx, str(f)))
+    h = d1["content_hash"]
+
+    d = _parse(await read(ctx, str(f), offset=1, known_hash=h))
     assert d.get("unchanged") is True
     assert d["content_hash"] == h
     assert "content" not in d
     assert d["lines"]["total"] == 40
+
+
+async def test_partial_read_hash_cannot_be_redeemed(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+) -> None:
+    """A partial read hands back `file_hash`, not a claimable `content_hash`.
+
+    Namespacing it means a caller that echoes it back cannot accidentally
+    claim possession of a file it only saw three lines of.
+    """
+    f = tmp_path / "partial_hash.py"
+    f.write_text("\n".join(f"row_{i} = {i}" for i in range(40)) + "\n")
+
+    d = _parse(await read(ctx, str(f), offset=2, limit=3))
+    assert "content_hash" not in d
+    assert d["file_hash"].startswith("partial:")
+
+    # Echoing it back buys nothing: the content is sent in full.
+    d2 = _parse(await read(ctx, str(f), known_hash=d["file_hash"]))
+    assert d2.get("unchanged") is not True
+    assert "row_39 = 39" in d2["content"]
 
 
 async def test_ranged_read_known_hash_mtime_bump_falls_through(
@@ -364,17 +408,72 @@ async def test_write_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) 
 
 
 async def test_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_path: Path) -> None:
-    """The hash an edit returns lets the next read answer `unchanged`."""
+    """An edit by a caller that held the file returns a claimable hash.
+
+    Holding the old text and knowing what was replaced is enough to derive the
+    new text, so the next read can answer `unchanged`.
+    """
     f = tmp_path / "edited_hash.py"
     f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
-    await read(ctx, str(f))
-    e = _parse(await edit(ctx, str(f), "a_0 = 0", "a_0 = 999"))
+    r = _parse(await read(ctx, str(f)))
+    e = _parse(await edit(ctx, str(f), "a_0 = 0", "a_0 = 999", known_hash=r["content_hash"]))
     h = e["content_hash"]
     assert h
 
     d = _parse(await read(ctx, str(f), known_hash=h))
     assert d.get("unchanged") is True
     assert d["content_hash"] == h
+
+
+async def test_blind_edit_yields_no_claimable_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """Editing a file is not the same as having read it.
+
+    An anchor can come from `grep`, so an edit alone proves nothing about
+    holding the file. Its hash must not later buy an `unchanged` reply for
+    content the caller has never seen.
+    """
+    f = tmp_path / "blind_edit.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+
+    e = _parse(await edit(ctx, str(f), "a_0 = 0", "a_0 = 999"))
+    assert "content_hash" not in e
+    assert e["file_hash"].startswith("partial:")
+
+    d = _parse(await read(ctx, str(f), known_hash=e["file_hash"]))
+    assert d.get("unchanged") is not True
+    assert "a_0 = 999" in d["content"]
+
+
+async def test_stale_known_hash_on_edit_yields_no_claim(ctx: MagicMock, tmp_path: Path) -> None:
+    """A hash that does not match what the edit started from proves nothing."""
+    f = tmp_path / "stale_edit.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    await read(ctx, str(f))
+
+    e = _parse(await edit(ctx, str(f), "a_0 = 0", "a_0 = 999", known_hash="0" * 64))
+    assert "content_hash" not in e
+    assert e["file_hash"].startswith("partial:")
+
+
+async def test_auto_format_edit_yields_no_claimable_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    """A formatter rewrites the file on its own terms, so the result is not
+    what the caller asked for and cannot be claimed."""
+    f = tmp_path / "formatted_edit.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    r = _parse(await read(ctx, str(f)))
+
+    e = _parse(
+        await edit(
+            ctx,
+            str(f),
+            "a_0 = 0",
+            "a_0 = 999",
+            known_hash=r["content_hash"],
+            auto_format=True,
+        )
+    )
+    assert "content_hash" not in e
+    assert e["file_hash"].startswith("partial:")
 
 
 async def test_edit_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
@@ -388,9 +487,14 @@ async def test_edit_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -
 async def test_batch_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_path: Path) -> None:
     f = tmp_path / "batch_hash.py"
     f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
-    await read(ctx, str(f))
+    r = _parse(await read(ctx, str(f)))
     b = _parse(
-        await batch_edit(ctx, str(f), '[["a_0 = 0", "a_0 = 111"], ["a_1 = 1", "a_1 = 222"]]')
+        await batch_edit(
+            ctx,
+            str(f),
+            '[["a_0 = 0", "a_0 = 111"], ["a_1 = 1", "a_1 = 222"]]',
+            known_hash=r["content_hash"],
+        )
     )
     h = b["content_hash"]
     assert h
@@ -398,6 +502,38 @@ async def test_batch_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_p
     d = _parse(await read(ctx, str(f), known_hash=h))
     assert d.get("unchanged") is True
     assert d["content_hash"] == h
+
+
+async def test_blind_batch_edit_yields_no_claimable_hash(ctx: MagicMock, tmp_path: Path) -> None:
+    f = tmp_path / "blind_batch.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    b = _parse(
+        await batch_edit(ctx, str(f), '[["a_0 = 0", "a_0 = 111"], ["a_1 = 1", "a_1 = 222"]]')
+    )
+    assert "content_hash" not in b
+    assert b["file_hash"].startswith("partial:")
+
+
+async def test_write_claims_only_what_the_caller_supplied(ctx: MagicMock, tmp_path: Path) -> None:
+    """A full write hands over the whole file, so its hash needs no proof.
+    An append only adds a tail, so it does."""
+    f = tmp_path / "written_claim.py"
+
+    full = _parse(await write(ctx, str(f), "a = 1\nb = 2\n"))
+    assert full["content_hash"]
+
+    # Appending without vouching for the existing text: the caller holds only
+    # the tail it just sent, so the result is not claimable.
+    blind = _parse(await write(ctx, str(f), "c = 3\n", append=True))
+    assert "content_hash" not in blind
+    assert blind["file_hash"].startswith("partial:")
+
+    # Appending while vouching for the base: old + new is derivable.
+    r = _parse(await read(ctx, str(f)))
+    proven = _parse(await write(ctx, str(f), "d = 4\n", append=True, known_hash=r["content_hash"]))
+    assert proven["content_hash"]
+    d = _parse(await read(ctx, str(f), known_hash=proven["content_hash"]))
+    assert d.get("unchanged") is True
 
 
 # ---------------------------------------------------------------------------

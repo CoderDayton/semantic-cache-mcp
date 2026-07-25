@@ -45,6 +45,9 @@ class ReadResponse(ToolResponseModel):
     size: int | None = None
     mime: str | None = None
     content_hash: str | None = None
+    # Hash of a file only partly delivered (line range or summary). Namespaced
+    # with a `partial:` prefix so it cannot be redeemed as a `known_hash`.
+    file_hash: str | None = None
     total_lines: int | None = None
 
 
@@ -125,6 +128,7 @@ class WriteResponse(ToolResponseModel):
     tokens_written: int | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
 
 
@@ -146,6 +150,7 @@ class EditResponse(ToolResponseModel):
     tokens_saved: int | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
     params: EditParams | None = None
 
@@ -196,6 +201,7 @@ class BatchEditResponse(ToolResponseModel):
     outcomes: list[BatchEditOutcome] | None = None
     diff_stats: dict[str, Any] | None = None
     content_hash: str | None = None
+    file_hash: str | None = None
     from_cache: bool | None = None
     params: BatchEditParams | None = None
 
@@ -241,6 +247,7 @@ class BatchReadFile(ToolResponseModel):
     hint: str | None = None
     tokens: int | None = None
     from_cache: bool | None = None
+    content_hash: str | None = None
 
 
 class BatchReadResponse(ToolResponseModel):

@@ -552,8 +552,17 @@ class TestEditTool:
             await edit(ctx, "/no/such/file.py", old_string="x", new_string="y")
 
     async def test_edit_debug_mode_includes_diff_stats(self, ctx: MagicMock, py_file: Path) -> None:
+        r = _parse(await read(ctx, str(py_file)))
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
-            d = _parse(await edit(ctx, str(py_file), old_string="hello", new_string="hi"))
+            d = _parse(
+                await edit(
+                    ctx,
+                    str(py_file),
+                    old_string="hello",
+                    new_string="hi",
+                    known_hash=r["content_hash"],
+                )
+            )
         assert "diff" in d
         assert "diff_stats" in d
         assert "content_hash" in d
@@ -900,12 +909,34 @@ class TestBatchReadTool:
     async def test_unchanged_files_reported_in_summary(
         self, ctx: MagicMock, sample_file: Path
     ) -> None:
-        # Seed cache
-        await batch_read(ctx, str(sample_file))
-        # Second read: should be unchanged
-        d = _parse(await batch_read(ctx, str(sample_file)))
+        # Seed the cache and keep the hash it hands back.
+        first = _parse(await batch_read(ctx, str(sample_file)))
+        claim = {str(sample_file): first["files"][0]["content_hash"]}
+        # Second read, echoing the claim: nothing is re-sent.
+        d = _parse(await batch_read(ctx, str(sample_file), known_hashes=json.dumps(claim)))
         assert d["summary"]["unchanged_count"] == 1
         assert "unchanged" not in d["summary"]
+        assert d["files"] == []
+
+    async def test_cached_file_without_claim_is_sent_in_full(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        """A warm cache entry is not evidence the caller holds the file.
+
+        Regression: batch_read reported cached files as `unchanged` with no
+        body, so a caller whose context had been cleared or compacted was told
+        it already had a file it had never seen.
+        """
+        await batch_read(ctx, str(sample_file))
+        d = _parse(await batch_read(ctx, str(sample_file)))
+        assert d["summary"].get("unchanged_count") is None
+        assert d["files"][0]["content"]
+
+    async def test_malformed_known_hashes_returns_error(
+        self, ctx: MagicMock, sample_file: Path
+    ) -> None:
+        with pytest.raises(ToolError, match="known_hashes must be a JSON object"):
+            await batch_read(ctx, str(sample_file), known_hashes='["not", "an object"]')
 
     async def test_skipped_hint_moves_to_summary(self, ctx: MagicMock, tmp_path: Path) -> None:
         big = tmp_path / "big.txt"

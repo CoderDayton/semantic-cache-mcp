@@ -793,13 +793,14 @@ class TestBatchRead:
     async def test_unchanged_detection(
         self, cache: SemanticCache, small_py: Path, tmp_path: Path
     ) -> None:
-        """Second batch read should detect unchanged files."""
+        """Second batch read should detect unchanged files the caller holds."""
         f2 = tmp_path / "other.py"
         f2.write_text("y = 2\n")
         paths = [str(small_py), str(f2)]
 
-        await batch_smart_read(cache, paths)
-        result = await batch_smart_read(cache, paths)
+        first = await batch_smart_read(cache, paths)
+        claims = {f.path: f.content_hash for f in first.files if f.content_hash}
+        result = await batch_smart_read(cache, paths, known_hashes=claims)
         assert len(result.unchanged_paths) == 2
 
     async def test_priority_ordering(self, cache: SemanticCache, tmp_path: Path) -> None:
