@@ -400,6 +400,82 @@ async def test_batch_edit_content_hash_works_as_known_hash(ctx: MagicMock, tmp_p
     assert d["content_hash"] == h
 
 
+# ---------------------------------------------------------------------------
+# Cold-read freshness: content and mtime must be sampled in the safe order.
+# A write landing between the two is otherwise recorded as already-cached, and
+# every later gate (cached.mtime >= disk mtime) trusts it without a hash check,
+# so the next edit writes the stale bytes back over the file.
+# ---------------------------------------------------------------------------
+
+
+def _rust_source(literal: str) -> str:
+    return f'const ARROW: &str = "{literal}";\n' + "\n".join(f"fn f_{i}() {{}}" for i in range(60))
+
+
+async def _cold_read_racing_external_fix(
+    f: Path,
+    fixed: str,
+    tmp_cache: SemanticCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold-read `f` while the corrected content lands mid-read.
+
+    The write is applied after smart_read has the bytes but before it stats
+    the file, which is the window the cold path leaves open.
+    """
+    import semantic_cache_mcp.cache.read as read_mod
+
+    real = read_mod.aread_bytes
+
+    async def _read_then_external_write(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raw = await real(*args, **kwargs)
+        f.write_text(fixed)
+        future = time.time() + 60
+        os.utime(f, (future, future))
+        return raw
+
+    monkeypatch.setattr(read_mod, "aread_bytes", _read_then_external_write)
+    try:
+        await smart_read(tmp_cache, str(f))
+    finally:
+        monkeypatch.setattr(read_mod, "aread_bytes", real)
+
+
+async def test_cold_read_does_not_record_stale_content_as_fresh(
+    tmp_path: Path, tmp_cache: SemanticCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold read must never pair pre-write content with a post-write mtime."""
+    f = tmp_path / "mod.rs"
+    f.write_text(_rust_source("?"))
+    await _cold_read_racing_external_fix(f, _rust_source("→"), tmp_cache, monkeypatch)
+
+    entry = await tmp_cache.get(str(f.resolve()))
+    assert entry is not None
+    # The entry must not claim to be at least as new as the file it no longer
+    # matches — that is what makes the staleness undetectable afterwards.
+    assert entry.mtime < f.stat().st_mtime
+
+
+async def test_batch_edit_never_writes_stale_cache_over_changed_file(
+    ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """batch_edit must not rewrite the whole file from a stale cached copy.
+
+    Regression: a correction made on disk was silently reverted because the
+    cached (pre-correction) content was treated as fresh and written back.
+    """
+    f = tmp_path / "mod.rs"
+    f.write_text(_rust_source("?"))
+    await _cold_read_racing_external_fix(f, _rust_source("→"), tmp_cache, monkeypatch)
+
+    d = _parse(await batch_edit(ctx, str(f), '[["fn f_0() {}", "fn f_0() { touched(); }"]]'))
+    assert d["status"] == "edited"
+
+    body = f.read_text()
+    assert "fn f_0() { touched(); }" in body  # the requested edit applied
+    assert '"→"' in body  # and the on-disk correction survived it
+
+
 async def test_debug_mode_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: Path) -> None:
     """Even in debug mode, a dry_run must not advertise a content_hash, while a
     real write still surfaces one."""

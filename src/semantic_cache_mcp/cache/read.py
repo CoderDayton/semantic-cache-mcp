@@ -136,13 +136,15 @@ async def smart_read(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Check cache first; only stat when needed (hit comparison or cold-path
-    # refresh). Reading bytes is the dominant cost on the slow path, so the
-    # stat is folded in just before refresh_path() instead of up front.
+    # Stat BEFORE reading content, always. The mtime we record must never be
+    # newer than the bytes it describes: a write landing between the read and
+    # the stat would otherwise be cached as (pre-write content, post-write
+    # mtime), and every later `cached.mtime >= mtime` gate reads that as fresh
+    # — the staleness is never detected and the next edit writes those bytes
+    # back over the newer file. Stat-first errs the safe way: the entry looks
+    # older than it is, so the hash check runs and disk wins.
     cached = await cache.get(str(file_path))
-    mtime: float = 0.0
-    if cached is not None:
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
+    mtime: float = (await astat(file_path, cache._io_executor)).st_mtime
 
     if cached and diff_mode and not force_full and cached.mtime >= mtime:
         await cache.record_access(str(file_path))
@@ -340,8 +342,6 @@ async def smart_read(
 
     should_refresh_cache = refresh_cache or not cache_is_fresh
     if should_refresh_cache:
-        if cached is None:
-            mtime = (await astat(file_path, cache._io_executor)).st_mtime
         await cache.refresh_path(
             str(file_path),
             content,
