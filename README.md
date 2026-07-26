@@ -347,7 +347,7 @@ callers never see a result that predates a write.
 
 ## Performance
 
-Measured on this project's 40 source files (**193,200 tokens**), i9-13900K, with the corpus held fixed across all phases. Every phase models a caller that keeps its hashes and echoes them back — that is what earns the savings. Reproducible via `--json` output for CI diffing.
+Measured on this project's 41 source files (**200,756 tokens**), i9-13900K, with the corpus held fixed across all phases. Every phase models a caller that keeps its hashes and echoes them back — that is what earns the savings. Reproducible via `--json` output for CI diffing.
 
 ### Token savings: **98.8%** overall (phases 2 to 6)
 
@@ -357,25 +357,25 @@ Measured on this project's 40 source files (**193,200 tokens**), i9-13900K, with
 | Unchanged re-read | mtime match, fast path skips disk I/O | 99.2% |
 | Content hash | mtime drifted, BLAKE3 still matches | 99.2% |
 | Batch read | All files via `batch_read`, 200K budget | 99.2% |
-| Search previews | 5 queries × k=5, previews vs full reads | 98.6% |
-| Small edits | Real ~5% line changes in 30% of files | 97.9% |
-| Cold read | First read, no cache (baseline) | 0% |
+| Search previews | 5 queries × k=5, previews vs full reads | 98.5% |
+| Small edits | Real ~5% line changes in 30% of files | 98.1% |
+| Cold read | First read, no cache; one corpus file now exceeds `MAX_CONTENT_SIZE` and comes back summarised, which is not a cache saving | 5.6% |
 
 ### Latency: **unchanged reads ~1 ms; repeat searches < 0.01 ms**
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Single unchanged read (fast path) | **1.0 ms** | mtime + cache hit; no disk I/O |
-| Single diff read (changed file) | 0.7 ms | hash check + unified diff |
+| Single unchanged read (fast path) | **1.2 ms** | mtime + cache hit; no disk I/O |
+| Single diff read (changed file) | 0.8 ms | hash check + unified diff |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU; hundreds× vs cold |
-| Search k=5 (cache **miss**) | 1.9 ms | BM25 keyword search |
+| Search k=5 (cache **miss**) | 2.2 ms | BM25 keyword search |
 | Edit (scoped find/replace) | 2.2 ms | uses cached content |
-| Grep (literal `def `) | 1.4 ms | FTS5 over cached corpus |
-| Grep (regex) | 3.2 ms | regex compiled once |
-| Batch read (40 files, diff mode) | 33.1 ms | chunk + tokenize new/changed files |
-| Unchanged re-read (40 files) | 17 ms | whole-corpus pass |
-| Cold read (40 files, total) | 87 ms | no embedding model, pure disk I/O plus tokenisation |
-| Write (200-line file) | 1.7 ms | creates + caches (no embed) |
+| Grep (literal `def `) | 1.5 ms | FTS5 over cached corpus |
+| Grep (regex) | 3.6 ms | regex compiled once |
+| Batch read (41 files, diff mode) | 51.2 ms | chunk + tokenize new/changed files; up from 33.1 ms because one file now summarises on every full pass |
+| Unchanged re-read (41 files) | 21 ms | whole-corpus pass |
+| Cold read (41 files, total) | 114 ms | no embedding model, pure disk I/O plus tokenisation and one summarisation |
+| Write (200-line file) | 1.9 ms | creates + caches (no embed) |
 
 Run benchmarks yourself:
 
