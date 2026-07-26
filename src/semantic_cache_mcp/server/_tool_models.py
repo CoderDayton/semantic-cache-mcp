@@ -52,6 +52,10 @@ class ReadResponse(ToolResponseModel):
     # Hash of a file only partly delivered (line range or summary). Namespaced
     # with a `partial:` prefix so it cannot be redeemed as a `known_hash`.
     file_hash: str | None = None
+    # Signed record of the line ranges a ranged read has delivered. Echoed back
+    # as `known_hash` it buys `unchanged` for a window already held; unlike
+    # `file_hash` it is redeemable, because it names what the caller was sent.
+    coverage_token: str | None = None
     total_lines: int | None = None
 
 

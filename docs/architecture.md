@@ -267,6 +267,16 @@ file is not the same as having read it. `auto_format` never qualifies: the
 formatter's output is not what the caller asked for. Everything else is reported
 as `file_hash`.
 
+Ranged reads refine the same rule rather than bending it. Delivering one window
+is no proof of the file, but it is proof of the window, so a ranged read returns
+a `coverage_token` naming the lines it sent — signed with a per-process keyed
+hash, so a token the server did not mint verifies as nothing and the bytes go
+out. Coverage accumulates in the caller's token, never in server state: tracking
+it here would miss a compaction between two windows and certify possession of
+bytes the caller had already dropped, which is the failure this whole design
+exists to prevent. Once the accumulated windows account for every line, the
+caller has been shown the file and earns a real `content_hash`.
+
 This is why there is no compaction detection anywhere in the server, and why
 adding one would not help: MCP surfaces no compaction signal, and a client's
 `/clear` or auto-compaction does not re-initialize the session. Rather than infer

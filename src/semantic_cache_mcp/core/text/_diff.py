@@ -223,6 +223,31 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     return result if result else "// No changes"
 
 
+# Unified-diff hunk header: "@@ -<start>[,<len>] +<start>[,<len>] @@".
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)? @@", re.MULTILINE)
+
+
+def rebase_diff_hunks(diff: str, line_offset: int) -> str:
+    """Shift a diff's hunk line numbers by *line_offset*.
+
+    A diff taken over a slice of a file numbers its hunks from the slice's own
+    first line, so a reader thinking in file coordinates misreads every one of
+    them. Rebasing is a uniform shift of both sides' starting line; the hunk
+    lengths describe the hunk itself and are unaffected. The shift stays
+    correct for difflib's zero-length ranges, which decrement the start before
+    formatting — moving the origin moves that result by the same amount.
+    """
+    if not line_offset:
+        return diff
+
+    def _shift(match: re.Match[str]) -> str:
+        old_start = int(match.group(1)) + line_offset
+        new_start = int(match.group(3)) + line_offset
+        return f"@@ -{old_start}{match.group(2) or ''} +{new_start}{match.group(4) or ''} @@"
+
+    return _HUNK_HEADER_RE.sub(_shift, diff)
+
+
 # ---------------------------------------------------------------------------
 # Utility: diff statistics
 # ---------------------------------------------------------------------------

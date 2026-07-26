@@ -3,6 +3,7 @@ from __future__ import annotations
 from ._blake import (
     _CONTENT_CACHE_BYPASS_SIZE,
     DEFAULT_CONFIG,
+    KEYED_HASH_KEY_SIZE,
     CollisionTracker,
     DeduplicateIndex,
     HashConfig,
@@ -19,10 +20,13 @@ from ._blake import (
     hash_chunks_streaming,
     hash_content,
     hash_file_streaming,
+    keyed_hash,
     reset_collision_tracker,
 )
 
 __all__ = [
+    "keyed_hash",
+    "KEYED_HASH_KEY_SIZE",
     "hash_content",
     "hash_chunk",
     "hash_chunk_binary",

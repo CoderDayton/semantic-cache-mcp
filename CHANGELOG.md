@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-26: Windowed possession for ranged reads
+
+A ranged read could never earn anything redeemable. It reported its digest as
+`file_hash` prefixed `partial:` — correct, since seeing one window is no proof you
+hold the file — but that left a caller consulting the same region of a large file
+paying full price on every visit, and never able to be told the region had not
+moved. The evidence was simply too coarse: possession was tracked per file when
+the delivery was per window. A ranged read now returns a signed `coverage_token`
+naming the lines it actually sent. Echo it back and a window you already hold
+answers `unchanged`, a new window widens the coverage, and windows that add up to
+the whole file mint a claimable `content_hash`.
+
+Nothing becomes claimable that was not delivered. The token is signed with a
+keyed hash held only by the process that issued it, so a fabricated or
+hand-widened one verifies as nothing and the bytes are sent; a restarted worker
+rejects its predecessor's tokens, which costs a re-read and never a false claim.
+Coverage is carried by the caller rather than tracked server-side, for the same
+reason `unchanged` always was: server-side accumulation would miss a compaction
+between two windows and certify possession of bytes the caller had already
+dropped. There is no cache-format change and no migration, and a client that
+ignores `coverage_token` behaves exactly as it did in 0.5.2.
+
+### Added
+
+- **`coverage_token` on ranged `read`.** A signed record of the line ranges a
+  ranged read delivered, accepted back as `known_hash`. A window already held —
+  or any sub-window of one — answers `unchanged` instead of being re-sent; a new
+  window is delivered and folded into a widened token; coverage reaching every
+  line upgrades to a claimable `content_hash`. A bare whole-file `content_hash`
+  is deliberately still *not* accepted as proof for a narrower window: holding a
+  file says nothing about holding a window you are now asking for, and answering
+  that request with no body strands the caller.
+- **Window-scoped diffs.** When the file moved on disk and the caller holds the
+  superseded window, `read` returns a diff of that window rather than the whole
+  window again. Hunk headers are rebased onto file line numbers, so `@@` means
+  the same thing it means in every other diff the server sends.
+- **`keyed_hash()` and `KEYED_HASH_KEY_SIZE` in `core.hashing`.** Keyed BLAKE3
+  where the wheel is present, keyed BLAKE2b otherwise; both are MACs by
+  construction in keyed mode, so no HMAC wrapper is involved. The 32-byte key
+  size is the one BLAKE3 accepts and is enforced for both backends.
+- **`rebase_diff_hunks()` in `core.text`.** Shifts a diff's hunk line numbers so
+  a diff taken over a slice can be read in whole-file coordinates.
+
+### Fixed
+
+- **Three tool descriptions promised behaviour the code does not have.** `edit`
+  and `write` both advertised a unified diff in the response, but the diff is
+  omitted unless `show_diff` is set or the server runs in debug mode — the
+  default is `compact`. `batch_read` claimed every file it returns carries a
+  `content_hash`, when a file large enough to come back summarized carries none.
+  `read`'s opening also stated that a later read of an unchanged file answers
+  `unchanged`, without the `known_hash` that this has required since 0.5.2. All
+  four are now accurate, and a new contract test keeps tool prose and schema in
+  step: every tool and parameter must be described, and any tool whose output
+  schema can carry `content_hash`, `file_hash`, or `coverage_token` must say so.
+
 ## [0.5.2] - 2026-07-25: Possession-proof reads, honest failures
 
 The cache used to answer "you already have this file" from its own records. Those
@@ -730,7 +786,8 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.9...v0.5.0

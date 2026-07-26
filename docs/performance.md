@@ -32,6 +32,8 @@ Each phase reads the same 40-file corpus through `smart_read` / `batch_smart_rea
 
 Every saving below is earned by a caller that echoes back the `content_hash` it was given (`known_hash` on `read`, `known_hashes` on `batch_read`). Since 0.5.2 that is a hard requirement, not an optimization: a caller that cannot prove it still holds a file is sent the file. The phases model an agent that keeps its hashes, which is the flow the numbers describe.
 
+Since 0.5.3 a ranged read earns a `coverage_token` on the same terms, redeemable for the lines it delivered. These phases read whole files, so that path is not exercised by the table below and contributes nothing to these numbers — the row it would change is a repeated read of one region of a large file, which this corpus does not model.
+
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
 | 1 | Cold read | First read, no cache (baseline) | 193,200 | 193,200 | 0.0% |

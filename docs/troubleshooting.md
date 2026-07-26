@@ -28,6 +28,7 @@
 - **Cause (fixed in 0.5.2):** `batch_read` used to answer `unchanged` for any file the *server* had cached. The cache is on disk and outlives your context window, so after a compaction or a `/clear` you were told you already had files you had never seen.
 - **Now:** `unchanged` is only ever produced for a file whose `content_hash` you echoed back — `known_hash` on `read`, or a `known_hashes` entry on `batch_read`. Anything you cannot vouch for is sent in full, so simply omitting the hashes after a compaction is always safe.
 - **Note:** a partial read (a line range, or a summary of a large file) reports its hash as `file_hash`, prefixed `partial:`. It identifies the file but is not proof you hold it and will not be honoured as a `known_hash`.
+- **Since 0.5.3:** a ranged read additionally returns a `coverage_token` recording the lines it did deliver, and that *is* honoured as a `known_hash` — for those lines only. Re-reading a window you hold answers `unchanged`, a new window widens the token, and full coverage upgrades to a claimable `content_hash`. Like every other claim it is yours to make honestly: pass it back only while you still hold the lines it names, and after a compaction just omit it.
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from functools import lru_cache
-from typing import Protocol
+from typing import Final, Protocol
 
 
 class _Hasher(Protocol):
@@ -67,21 +67,46 @@ DEFAULT_CONFIG = HashConfig()
 # ---------------------------------------------------------------------------
 
 
+# Key length for keyed hashing. BLAKE3's keyed mode requires exactly 32 bytes
+# and rejects anything else; BLAKE2b accepts up to 64. One size therefore works
+# whichever backend is present, so callers never have to know which signed.
+KEYED_HASH_KEY_SIZE: Final = 32
+
+
 if HAS_BLAKE3:
     _blake3_blake3 = blake3.blake3
 
     def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
         return _blake3_blake3(data).digest(length=digest_size)
+
+    def _keyed_bytes(data: bytes, key: bytes, digest_size: int) -> bytes:
+        return _blake3_blake3(data, key=key).digest(length=digest_size)
 else:
     _hashlib_blake2b = hashlib.blake2b
 
     def _hash_bytes(data: bytes, digest_size: int = 32) -> bytes:
         return _hashlib_blake2b(data, digest_size=digest_size).digest()
 
+    def _keyed_bytes(data: bytes, key: bytes, digest_size: int) -> bytes:
+        return _hashlib_blake2b(data, key=key, digest_size=digest_size).digest()
+
 
 def _hash_hex(data: bytes, digest_size: int = 32) -> str:
     digest = _hash_bytes(data, digest_size)
     return digest.hex()
+
+
+def keyed_hash(data: bytes, key: bytes, digest_size: int) -> str:
+    """Authenticate *data* under *key*, returning a hex tag.
+
+    Both backends are MACs by construction in keyed mode, so this needs no
+    HMAC wrapper. The tag is only comparable against one produced by the same
+    process with the same key — which is the point: it proves the value came
+    from here and was not assembled by hand.
+    """
+    if len(key) != KEYED_HASH_KEY_SIZE:
+        raise ValueError(f"keyed_hash requires a {KEYED_HASH_KEY_SIZE}-byte key")
+    return _keyed_bytes(data, key, digest_size).hex()
 
 
 # ---------------------------------------------------------------------------
