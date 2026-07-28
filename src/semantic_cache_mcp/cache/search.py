@@ -167,8 +167,10 @@ async def semantic_search(
     )
 
     if not results:
-        stats = await storage.get_stats()
-        total = stats.get("files_cached", 0)
+        # Only the file count is reported, so ask for that alone: get_stats()
+        # also aggregates tokens and stats the DB file, none of which a search
+        # response carries.
+        total = await storage.count_files()
         empty = SearchResult(query=query, matches=[], files_searched=0, cached_files=int(total))
         _store_search_result(cache, cache_key, empty)
         return empty
@@ -204,8 +206,7 @@ async def semantic_search(
             )
         )
 
-    stats = await storage.get_stats()
-    total = stats.get("files_cached", 0)
+    total = await storage.count_files()
 
     result = SearchResult(
         query=query,

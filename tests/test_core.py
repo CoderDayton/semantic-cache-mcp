@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from semantic_cache_mcp.core.chunking import hypercdc_chunks
-from semantic_cache_mcp.core.hashing import hash_chunk, hash_content
+from semantic_cache_mcp.core.hashing import (
+    KEYED_HASH_KEY_SIZE,
+    hash_chunk,
+    hash_content,
+    keyed_hash,
+)
 from semantic_cache_mcp.core.text import (
     diff_stats,
     diff_with_stats,
     generate_diff,
+    rebase_diff_hunks,
     truncate_smart,
 )
 
@@ -115,6 +123,34 @@ class TestHashing:
         assert len(result) == 64
 
 
+class TestKeyedHashing:
+    """Tests for keyed hashing (BLAKE3 keyed mode, BLAKE2b fallback)."""
+
+    KEY = b"\x01" * KEYED_HASH_KEY_SIZE
+    OTHER_KEY = b"\x02" * KEYED_HASH_KEY_SIZE
+
+    def test_keyed_hash_is_deterministic(self) -> None:
+        assert keyed_hash(b"payload", self.KEY, 8) == keyed_hash(b"payload", self.KEY, 8)
+
+    def test_keyed_hash_depends_on_the_key(self) -> None:
+        """Without this a token signed by one process verifies under another."""
+        assert keyed_hash(b"payload", self.KEY, 8) != keyed_hash(b"payload", self.OTHER_KEY, 8)
+
+    def test_keyed_hash_depends_on_the_data(self) -> None:
+        """Without this a tampered token keeps its original tag."""
+        assert keyed_hash(b"payload", self.KEY, 8) != keyed_hash(b"payloae", self.KEY, 8)
+
+    def test_keyed_hash_honors_digest_size(self) -> None:
+        assert len(keyed_hash(b"payload", self.KEY, 8)) == 16  # hex, so two chars a byte
+        assert len(keyed_hash(b"payload", self.KEY, 32)) == 64
+
+    @pytest.mark.parametrize("bad_key", [b"", b"short", b"\x00" * 31, b"\x00" * 64])
+    def test_keyed_hash_rejects_a_wrong_sized_key(self, bad_key: bytes) -> None:
+        """BLAKE3 requires exactly 32 bytes; reject early so both backends agree."""
+        with pytest.raises(ValueError, match="32-byte key"):
+            keyed_hash(b"payload", bad_key, 8)
+
+
 class TestDiffGeneration:
     """Tests for unified diff generation."""
 
@@ -161,6 +197,50 @@ class TestDiffGeneration:
         assert "+++ " not in result
         assert "-Line 2\n" in result
         assert "+Line 2 changed\n" in result
+
+
+class TestDiffRebasing:
+    """Tests for rebasing a slice's diff onto whole-file line numbers."""
+
+    def test_zero_offset_is_identity(self) -> None:
+        diff = generate_diff("a\nb\nc\n", "a\nB\nc\n")
+        assert rebase_diff_hunks(diff, 0) == diff
+
+    def test_both_sides_shift_and_lengths_are_untouched(self) -> None:
+        assert rebase_diff_hunks("@@ -8,7 +8,7 @@\n ctx\n", 19) == "@@ -27,7 +27,7 @@\n ctx\n"
+
+    def test_single_line_range_has_no_length_suffix(self) -> None:
+        assert rebase_diff_hunks("@@ -1 +1 @@\n", 10) == "@@ -11 +11 @@\n"
+
+    def test_every_hunk_is_shifted(self) -> None:
+        diff = "@@ -1,2 +1,2 @@\n x\n@@ -50,2 +50,2 @@\n y\n"
+        assert rebase_diff_hunks(diff, 5) == "@@ -6,2 +6,2 @@\n x\n@@ -55,2 +55,2 @@\n y\n"
+
+    def test_no_changes_marker_is_left_alone(self) -> None:
+        assert rebase_diff_hunks("// No changes", 42) == "// No changes"
+
+    def test_body_lines_are_never_rewritten(self) -> None:
+        """Only headers move; content that looks like a header must not."""
+        diff = "@@ -1,2 +1,2 @@\n-was @@ -9,9 +9,9 @@ inline\n+now\n"
+        rebased = rebase_diff_hunks(diff, 100)
+        assert rebased.startswith("@@ -101,2 +101,2 @@")
+        assert "-was @@ -9,9 +9,9 @@ inline" in rebased
+
+    def test_rebased_slice_matches_a_whole_file_diff(self) -> None:
+        """The property that matters: same change, same reported line numbers."""
+        old = [f"line_{i}\n" for i in range(60)]
+        new = list(old)
+        new[29] = "line_29_changed\n"
+
+        whole = generate_diff("".join(old), "".join(new))
+        # Diff only file lines 20-40, then rebase that slice onto the file.
+        sliced = generate_diff("".join(old[19:40]), "".join(new[19:40]))
+        rebased = rebase_diff_hunks(sliced, 19)
+
+        whole_header = re.search(r"@@ -\d+", whole)
+        rebased_header = re.search(r"@@ -\d+", rebased)
+        assert whole_header is not None and rebased_header is not None
+        assert whole_header.group(0) == rebased_header.group(0)
 
 
 class TestDiffWithStats:

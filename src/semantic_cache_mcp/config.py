@@ -1,11 +1,14 @@
 """Configuration constants for semantic-cache-mcp."""
 
+import logging
 import sys
 from os import environ
 from pathlib import Path
 from typing import Final
 
 from .logger import DEFAULT_LOG_FORMAT, configure_logging, get_log_dir, get_log_file_path
+
+logger = logging.getLogger(__name__)
 
 
 # Paths
@@ -52,7 +55,14 @@ LOG_FORMAT: Final = DEFAULT_LOG_FORMAT
 
 configure_logging(LOG_DIR, LOG_FILE_PATH, log_level=LOG_LEVEL, log_format=LOG_FORMAT)
 
+if _raw_log_level != LOG_LEVEL:
+    # Warn only once logging exists — this is the first point where it does.
+    logger.warning("Invalid LOG_LEVEL=%r; using %s", _raw_log_level, LOG_LEVEL)
 
+
+# A malformed override is a mistake worth hearing about. Falling back silently
+# leaves the operator believing a setting took effect when it never did, and the
+# symptom shows up far from the typo.
 def _env_int(name: str, default: int) -> int:
     raw = environ.get(name)
     if raw is None:
@@ -60,6 +70,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw.strip())
     except ValueError:
+        logger.warning("Invalid %s=%r (expected an integer); using %d", name, raw, default)
         return default
 
 
@@ -70,6 +81,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         return float(raw.strip())
     except ValueError:
+        logger.warning("Invalid %s=%r (expected a number); using %s", name, raw, default)
         return default
 
 

@@ -35,12 +35,31 @@ Size limits prevent memory exhaustion from oversized inputs:
 | `MAX_CONTENT_SIZE` | 100 KB | Default max bytes returned by `read`  |
 | `MAX_MATCHES`    | 10,000  | `replace_all` match count in `edit`   |
 | `GREP_MAX_PATTERN_LEN` | 1,000 chars | `grep` regex source, before compilation |
+| `DOWNLOAD_TIMEOUT_S` | 30 s | Tokenizer bootstrap download |
+| `DOWNLOAD_MAX_BYTES` | 32 MB | Tokenizer bootstrap download |
 
 All limits are enforced **before** any I/O operation, so they fail fast.
 
 **Search.** Results are capped at 100, and glob is capped at 1,000 matches with a 5-second timeout.
 
-**Regex.** `grep` caps the pattern length to bound the ReDoS surface — a pathological backtracking pattern needs room to express itself, and no legitimate grep needs that much. An over-long or uncompilable pattern raises an error rather than returning an empty result set, so a rejected pattern can never be mistaken for a search that found nothing. Patterns meant to be matched literally should be passed with `fixed_string=true`, which escapes them and skips the regex engine.
+**Regex.** See [Regular expression safety](#regular-expression-safety) below.
+
+### Regular expression safety
+
+`grep` compiles a caller-supplied pattern, which makes catastrophic backtracking a denial-of-service surface. It is a real one, not a theoretical one: before 0.5.3, `(a+)+$` against 28 characters of input ran for **11.22 seconds** and 40 characters exceeded two minutes — both under a 1-second timeout budget that never fired, because the timeout could not interrupt a running match.
+
+Two defences that sound plausible do not work here, and both were measured before being discarded:
+
+- **A length cap is not sufficient.** The blow-up is driven by the length of the *subject*, not the pattern. `(a+)+$` is six characters.
+- **Offloading to a thread does not help.** CPython holds the GIL for the duration of a `re` match, so a scan moved to the executor starves the event loop anyway — while also occupying the single thread the store serialises its I/O through.
+
+So the pattern is rejected by shape, before `re.compile`, in about 0.01 ms: a repeatable group (`*`, `+`, `{n,}`, or `{n,m}` with m ≥ 2) enclosing an unbounded quantifier is refused, and the error names a safe equivalent. Character classes are parsed rather than scanned, so a quantifier inside `[...]` is not mistaken for a nested one.
+
+This is a conservative shape check, not a proof of termination — it rejects the constructs that cause exponential backtracking in practice, and does not claim to catch every pathological pattern expressible in the language. Alongside it:
+
+- `GREP_MAX_PATTERN_LEN` (1,000 chars) bounds the pattern source.
+- An over-long, uncompilable, or rejected pattern raises an error rather than returning an empty result set, so a refusal can never be mistaken for a search that found nothing.
+- `fixed_string=true` escapes the pattern and skips the regex engine entirely — the escape hatch for anything meant to match literally.
 
 ### SQL Injection
 
@@ -64,7 +83,9 @@ All inputs are validated before I/O:
 
 **Local only.** All data is stored in `~/.cache/semantic-cache-mcp/` with `700` permissions.
 
-**No network transmission.** The only outbound request is a one-time download on first use: the BPE tokenizer from `openaipublic.blob.core.windows.net` (~3.5MB). It is SHA256-verified, and a corrupted download is discarded.
+**No network transmission.** The only outbound request is a one-time download on first use: the BPE tokenizer from `openaipublic.blob.core.windows.net` (~3.5MB). It is SHA256-verified, and a corrupted download is discarded. The request is streamed under a 30-second timeout and a 32 MB ceiling, and the partial file is removed on any failure. Before 0.5.3 it used `urlretrieve`, which accepts no timeout at all, while holding a lock during server startup — an endpoint that accepted the connection and then stalled hung the server indefinitely.
+
+**Durable writes.** Every file write goes through an atomic temp-file-then-rename. Since 0.5.3 the temp file and its parent directory are both `fsync`ed before the rename, so a crash cannot land the rename ahead of the bytes it points at — which would otherwise leave a file that exists, is the wrong size, and that the cache believes it wrote correctly. This costs roughly 1.1 ms per write on ext4/NVMe.
 
 **SQLite WAL mode.** Crash recovery, with no data corruption on abrupt termination.
 
@@ -120,7 +141,8 @@ chmod 700 ~/.cache/semantic-cache-mcp/
 | No access control         | Relies entirely on OS filesystem permissions       |
 | No audit trail            | Logging is operational, not security-grade         |
 | Single-user design        | Multi-tenant use is not supported                  |
-| Network on first use only | Tokenizer download only, hash-verified             |
+| Network on first use only | Tokenizer download only, hash-verified, bounded by timeout and size |
+| Regex guard is heuristic  | Rejects the shapes that backtrack catastrophically in practice, not a termination proof |
 
 ---
 

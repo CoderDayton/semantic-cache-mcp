@@ -97,8 +97,14 @@ multi_result = smart_batch_edit(
 print(f"Succeeded: {multi_result.succeeded}")
 print(f"Failed:    {multi_result.failed}")
 # Each edit is validated independently, so some can succeed while others fail.
-# Two edits whose line ranges overlap are rejected: the later one fails with an
-# "overlaps another edit in this batch" error rather than corrupting the splice.
+# Three shapes are rejected rather than silently resolved:
+#   - two edits whose line ranges overlap
+#   - a find/replace whose anchor falls inside another edit's line range
+#   - an old_string matching more than once (batch has no replace_all; scope it
+#     with start_line/end_line instead)
+# Every reported success is verified against the text it produced, so an edit
+# whose anchor was consumed by an earlier one in the batch fails with that
+# reason instead of being counted as applied.
 
 # 2-tuples (old, new) are also accepted for backward compatibility
 multi_result = smart_batch_edit(
@@ -121,6 +127,8 @@ for match in search_result.matches:
     print(f"{match.path}: {match.similarity:.2f}")
 
 # Compare two files (returns a unified diff)
+# Not exposed as an MCP tool — the agent-facing surface is read/write/edit/grep.
+# It is supported programmatic API and is not going away.
 diff_result = compare_files(
     cache=cache,
     path1="/path/to/old.py",
@@ -270,7 +278,7 @@ print(f"Cleared {cleared} entries")
 | `tokens_saved`     | `int`         | Tokens saved vs returning full content         |
 | `truncated`        | `bool`        | Whether content was truncated/summarized       |
 | `compression_ratio`| `float`       | Size ratio (returned / original)               |
-| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or summarized one |
+| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or summarized one. A ranged read also carries a signed `coverage_token` naming the delivered lines, which *is* redeemable as `known_hash` for those lines |
 | `semantic_match`   | `str \| None` | Unused; always `None` since the embedding layer was removed |
 
 ### WriteResult

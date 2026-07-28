@@ -5,6 +5,216 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-28: Windowed possession, audited edits, a cache that shrinks
+
+A ranged read could never earn anything redeemable. It reported its digest as
+`file_hash` prefixed `partial:` — correct, since seeing one window is no proof you
+hold the file — but that left a caller consulting the same region of a large file
+paying full price on every visit, and never able to be told the region had not
+moved. The evidence was simply too coarse: possession was tracked per file when
+the delivery was per window. A ranged read now returns a signed `coverage_token`
+naming the lines it actually sent. Echo it back and a window you already hold
+answers `unchanged`, a new window widens the coverage, and windows that add up to
+the whole file mint a claimable `content_hash`.
+
+Nothing becomes claimable that was not delivered. The token is signed with a
+keyed hash held only by the process that issued it, so a fabricated or
+hand-widened one verifies as nothing and the bytes are sent; a restarted worker
+rejects its predecessor's tokens, which costs a re-read and never a false claim.
+Coverage is carried by the caller rather than tracked server-side, for the same
+reason `unchanged` always was: server-side accumulation would miss a compaction
+between two windows and certify possession of bytes the caller had already
+dropped. Nothing about it changes the cache format, and a client that ignores
+`coverage_token` behaves exactly as it did in 0.5.2.
+
+The rest of 0.5.3 is an audit pass over correctness, performance, security and
+footprint. The theme running through the correctness fixes is the one that
+motivated 0.5.2: a tool that reports success it did not achieve is worse than
+one that fails, because the caller builds on the report. `batch_edit` reported
+success for edits that never applied, `grep` reported a truncated count as a
+total, and `edit_preview` searched a summary instead of the file it was asked
+about. Each now either does the thing or says plainly that it did not. One item
+touches an existing cache: a store created before 0.5.3 is rewritten once on
+first open to enable incremental auto-vacuum. The schema and every document are
+unchanged by it.
+
+### Added
+
+- **`coverage_token` on ranged `read`.** A signed record of the line ranges a
+  ranged read delivered, accepted back as `known_hash`. A window already held —
+  or any sub-window of one — answers `unchanged` instead of being re-sent; a new
+  window is delivered and folded into a widened token; coverage reaching every
+  line upgrades to a claimable `content_hash`. A bare whole-file `content_hash`
+  is deliberately still *not* accepted as proof for a narrower window: holding a
+  file says nothing about holding a window you are now asking for, and answering
+  that request with no body strands the caller.
+- **Window-scoped diffs.** When the file moved on disk and the caller holds the
+  superseded window, `read` returns a diff of that window rather than the whole
+  window again. Hunk headers are rebased onto file line numbers, so `@@` means
+  the same thing it means in every other diff the server sends.
+- **`keyed_hash()` and `KEYED_HASH_KEY_SIZE` in `core.hashing`.** Keyed BLAKE3
+  where the wheel is present, keyed BLAKE2b otherwise; both are MACs by
+  construction in keyed mode, so no HMAC wrapper is involved. The 32-byte key
+  size is the one BLAKE3 accepts and is enforced for both backends.
+- **`rebase_diff_hunks()` in `core.text`.** Shifts a diff's hunk line numbers so
+  a diff taken over a slice can be read in whole-file coordinates.
+- **The cache file now shrinks.** FTS5 records a deletion as an index entry
+  rather than removing one, so a store that evicts files accumulates the
+  vocabulary of every file it ever held; and SQLite retains freed pages rather
+  than returning them, so the file sits at its high-water mark forever. Neither
+  is visible in any metric the server reports. Shutdown now merges the index and
+  hands the freed pages back, and stores are opened in incremental auto-vacuum
+  mode — one 50 ms rewrite on the first open of a pre-0.5.3 store, then never
+  again, since the mode lives in the database header and needs no marker file.
+  A real 153 MB store holding 244 files and 4.2 MB of text settled at 17.5 MB
+  with every document intact. Neither half works alone: without the merge the
+  index keeps growing, and without the vacuum the file never moves.
+- **Truncation reporting on `grep`.** Responses carry `complete`,
+  `limit_reached`, `files_not_searched` and `files_in_response`, and an empty
+  result carries `reason` and `hint`. A capped scan previously reported the
+  capped count as `total_matches`, which reads as a complete answer.
+
+### Fixed
+
+- **Four tool descriptions promised behaviour the code does not have.** `edit`
+  and `write` both advertised a unified diff in the response, but the diff is
+  omitted unless `show_diff` is set or the server runs in debug mode — the
+  default is `compact`. `batch_read` claimed every file it returns carries a
+  `content_hash`, when a file large enough to come back summarized carries none.
+  `read`'s opening also stated that a later read of an unchanged file answers
+  `unchanged`, without the `known_hash` that this has required since 0.5.2. All
+  four are now accurate, and a new contract test keeps tool prose and schema in
+  step: every tool and parameter must be described, and any tool whose output
+  schema can carry `content_hash`, `file_hash`, or `coverage_token` must say so.
+- **`batch_edit` reported success for edits that never applied.** An edit whose
+  anchor had been consumed or displaced by an earlier edit in the same batch was
+  counted as succeeded. Every replacement is now verified against the text it
+  produced, and an edit whose anchor is gone by the time its turn comes fails
+  with that reason.
+- **`batch_edit` silently clobbered a find/replace that fell inside another
+  edit's line range.** Both edits reported success and one of them was
+  overwritten. Overlapping ranges were already rejected in 0.5.1; an anchor
+  sitting inside another edit's range now is too, from either direction.
+- **`batch_edit` silently replaced one of several identical matches.** `edit`
+  refuses an ambiguous anchor and always has. `batch_edit` took the first match
+  and reported success, so a three-way-ambiguous anchor edited a line the caller
+  never chose. It now rejects the same case and suggests `start_line`/`end_line`,
+  which is the disambiguator a batch has (there is no `replace_all` there).
+- **`edit_preview` searched a summary instead of the file.** Above
+  `MAX_CONTENT_SIZE` the probe ran against the summarized text, so an anchor at
+  line 20,001 of a 1.7 MB file came back `found: false` with no line numbers —
+  the exact answer that tells a caller to give up. It now reads the full file.
+- **`grep` reported a truncated scan as a complete one.** A search stopping at
+  the match cap returned that cap as `total_matches`: 180 real matches were
+  reported as 100, with nothing saying the scan had stopped.
+- **Writes were not durable.** `awrite_atomic` wrote a temp file and renamed it
+  without ever calling `fsync`, so a crash could land the rename ahead of the
+  bytes it pointed at — leaving a file that exists, is the wrong size, and that
+  the cache believes it wrote. The temp file and its parent directory are now
+  both flushed before the rename. It costs ~1.1 ms per write on ext4/NVMe, which
+  earlier benchmark runs did not show because they ran on tmpfs.
+- **A whole-file ranged read handed back a hash for bytes it never sent.** The
+  line-numbered rendering stripped trailing whitespace, but a window covering
+  every line minted a claimable `content_hash` for the original content — so a
+  caller was certified as holding text it had not been given, and could then
+  redeem that hash for `unchanged`. Only the line terminator is stripped now, so
+  what a caller receives is losslessly invertible to what the hash names.
+- **`batch_edit` enforced no size limit at all.** `edit` capped files at
+  `MAX_EDIT_SIZE` (10 MB); the batch path, which does strictly more work, had no
+  check. Both now guard before reading.
+- **`grep` found nothing when its `path` filter named a directory.** The filter
+  matched an exact path, a suffix, a basename or a glob — never a directory — so
+  passing the folder you had just seeded returned zero matches. Worse, the same
+  matcher decides the empty-result explanation, so the answer came back
+  `no_files_cached_under_path` with a hint to seed the cache: a diagnosis of a
+  cache that was already warm, and a remedy that could not work. Only appending
+  `/*` would have helped, and nothing said so. A directory now names every file
+  beneath it, matching on whole path components — `src` covers `src/a.py` and
+  never `srclib/a.py`.
+- **A trimmed response threw away the answer it had already computed.** When a
+  payload exceeded `TOOL_MAX_RESPONSE_TOKENS` it was cut down to a keep-list
+  that held none of `grep`'s counts, so a search over 400 matches came back as
+  `{"path": ..., "truncated": true}` — indistinguishable from a failure, with
+  the total, the cap that stopped the scan and the reason all dropped. Trimming
+  now sheds the bulky fields and keeps the scalars that say what was found;
+  they cost a handful of tokens and they are the part the caller cannot
+  reconstruct.
+- **`grep` sized its match budget as though JSON were prose.** The soft budget
+  reserved room at ~4 chars per token, which serialized matches do not obey —
+  quoted keys, braces and line numbers all tokenize denser — so it assembled a
+  payload over the hard cap and had the whole thing trimmed away. With a cap set
+  anywhere between roughly 2,000 and 15,000 tokens, `grep` reported nothing at
+  all. The estimate is now conservative, and the per-match and per-context
+  envelope sizes are named constants rather than inline numbers.
+- **Two more descriptions overstated what the code does.** `batch_read` said the
+  rest of a batch is skipped "once the budget is spent", when a file too big for
+  the remaining budget is skipped while smaller ones keep being read — one large
+  file cannot starve the batch. Its `priority` argument described ordering as
+  though it were precedence; a priority file still has to fit, and is skipped
+  like any other when it does not.
+
+### Changed
+
+- **Hash caches are sized by retained bytes, not entry count.** Every hash LRU is
+  keyed on the buffer it hashed, so an entry pins that buffer for as long as it
+  stays cached. The limits were set as though entries cost a pointer, which put
+  the worst case near 1.2 GB in a long-lived server. Resized to a ~96 MB ceiling,
+  keeping the 1.6–3.1× a cache hit is actually worth.
+- **`batch_edit` builds its line index once per call.** It was rebuilt for every
+  edit — 87% of the runtime of a large batch. A 30-edit batch over a 20,000-line
+  file went from 1210 ms to 656 ms; the replacement is proved equivalent to the
+  original over 3,550 exhaustive cases.
+- **Metadata-only reads no longer load document text.** `stats`, the search file
+  count, and the eviction index each asked for whole documents to read one field,
+  re-materializing the entire cached corpus. `get_stats` 11.0 → 5.6 ms,
+  `has_cached_paths_under` 12.6 → 3.1 ms.
+- **The binary check reads 8 KB, not the file.** `write`, `edit` and `batch_edit`
+  each read a file in full to inspect its first 8 KB for null bytes.
+- **A malformed environment override is now logged.** An unparseable
+  `MAX_CACHE_ENTRIES` or an invalid `LOG_LEVEL` fell back silently, leaving the
+  operator believing a setting had taken effect when the symptom would surface
+  somewhere else entirely.
+- **Benchmarks record the filesystem they ran on.** The suite works in `TMPDIR`,
+  which is usually tmpfs, and tmpfs discards `fsync` — so it reported a write
+  latency the durable path never achieves. Reports now carry `workdir_fs` and a
+  tmpfs run prints a warning.
+
+### Removed
+
+- **The unused hashing API:** `HierarchicalHasher`, `DeduplicateIndex`,
+  `CollisionTracker`, `StreamingHasher`, `hash_block`, `hash_chunk_binary`,
+  `hash_chunk_with_collision_check`, `hash_chunks_streaming`,
+  `hash_file_streaming`, `get_hash_stats` and `reset_collision_tracker`, from
+  `core.hashing` and the `core` re-export. None had a caller outside its own
+  tests, and none should acquire one: chunk-level deduplication finds 0.0%
+  duplicate chunks on a real source corpus, and collision tracking for a 256-bit
+  digest would retain every input buffer to detect a ~2⁻¹²⁸ event, reporting a
+  `collisions_detected` count that is structurally always zero. `hash_content`,
+  `hash_chunk` and `keyed_hash` are unaffected, and dropping
+  `hash_file_streaming` leaves `core/` free of I/O apart from the tokenizer's
+  one-time bootstrap. `cache.compare_files` is deliberately kept: it is
+  documented programmatic API, merely not exposed as an MCP tool.
+
+### Security
+
+- **`grep` could be hung by its own pattern.** A caller-supplied regex was
+  compiled and run inline, so a shape that backtracks catastrophically —
+  `(a+)+$` and friends — burned CPU on the event loop with no way to interrupt
+  it: 28 characters of input ran for 11.22 s against a 1.0 s timeout budget that
+  never fired, and 40 characters exceeded two minutes. The length cap alone does
+  not help, because the input does the damage, not the pattern. Offloading to a
+  thread does not help either, and was measured not to: `re` holds the GIL for
+  the duration of a match, so the event loop starved anyway while the store's
+  serialized I/O thread was occupied. Patterns with a repeatable group wrapping
+  an unbounded quantifier are now rejected in ~0.01 ms, before compilation, with
+  a working safe equivalent in the message; `fixed_string=true` remains the
+  escape hatch for anything meant literally.
+- **The tokenizer download had no timeout.** First-use bootstrap used
+  `urlretrieve`, which accepts no timeout parameter, under a lock held at server
+  startup — so an endpoint that accepted the connection and then stalled hung
+  the server indefinitely. It is now bounded by both a 30 s timeout and a 32 MB
+  ceiling, streamed, and cleaned up on any failure.
+
 ## [0.5.2] - 2026-07-25: Possession-proof reads, honest failures
 
 The cache used to answer "you already have this file" from its own records. Those
@@ -730,7 +940,8 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.4.9...v0.5.0

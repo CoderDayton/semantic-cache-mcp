@@ -205,3 +205,328 @@ class TestStructureAndAsync:
         finally:
             ex.shutdown(wait=True)
             store.close()
+
+
+class TestMetadataProjections:
+    """Text-free reads: every caller that only inspects metadata uses these.
+
+    Selecting the text column to read one metadata field re-materializes the
+    whole cached corpus, which is what `stats`, `search` and the eviction index
+    were each doing on every call.
+    """
+
+    @staticmethod
+    def _seed(store: DocStore) -> None:
+        store.add_texts(
+            ["", "chunk one", "chunk two", "solo file", "orphan"],
+            [
+                {"path": "/big", "is_parent": True, "total_chunks": 2, "tokens": 90},
+                {"path": "/big", "chunk_index": 0, "total_chunks": 2, "tokens": 40},
+                {"path": "/big", "chunk_index": 1, "total_chunks": 2, "tokens": 50},
+                {"path": "/solo", "total_chunks": 1, "tokens": 7},
+                {"path": "", "total_chunks": 1, "tokens": 3},
+            ],
+        )
+
+    def test_get_metadata_matches_get_documents(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "m.db")
+        try:
+            self._seed(store)
+            expected = [(doc_id, meta) for doc_id, _text, meta in store.get_documents()]
+            assert store.get_metadata() == expected
+            filtered = [
+                (doc_id, meta) for doc_id, _text, meta in store.get_documents({"path": "/big"})
+            ]
+            assert store.get_metadata({"path": "/big"}) == filtered
+        finally:
+            store.close()
+
+    def test_get_document_ids_matches_get_documents(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "i.db")
+        try:
+            self._seed(store)
+            assert store.get_document_ids() == [d[0] for d in store.get_documents()]
+        finally:
+            store.close()
+
+    def test_file_stats_matches_the_python_accounting(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "s.db")
+        try:
+            self._seed(store)
+            unique: set[str] = set()
+            tokens = 0
+            for _doc_id, _text, meta in store.get_documents():
+                if meta.get("path"):
+                    unique.add(meta["path"])
+                if meta.get("is_parent", False) or meta.get("total_chunks", 1) == 1:
+                    tokens += meta.get("tokens", 0)
+            assert store.file_stats(
+                path_key="path",
+                tokens_key="tokens",
+                is_parent_key="is_parent",
+                total_chunks_key="total_chunks",
+            ) == (len(unique), tokens)
+            # A chunked file is counted once, through its parent — not per chunk.
+            assert tokens == 90 + 7 + 3
+        finally:
+            store.close()
+
+    def test_file_stats_on_an_empty_store(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "e.db")
+        try:
+            assert store.file_stats(
+                path_key="path",
+                tokens_key="tokens",
+                is_parent_key="is_parent",
+                total_chunks_key="total_chunks",
+            ) == (0, 0)
+        finally:
+            store.close()
+
+    def test_distinct_paths_skips_parents_and_blanks(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "p.db")
+        try:
+            self._seed(store)
+            assert sorted(store.distinct_paths(path_key="path", is_parent_key="is_parent")) == [
+                "/big",
+                "/solo",
+            ]
+        finally:
+            store.close()
+
+
+class TestFtsOptimize:
+    """A delete leaves an index entry behind; only a full merge discards it.
+
+    FTS5 records a deletion as an entry rather than removing one, so a store
+    that has evicted many files carries the vocabulary of every file it ever
+    held. ``documents_fts_data`` is the index's own shadow table, so its row
+    count measures how many segments survive without needing ``dbstat``.
+    """
+
+    @staticmethod
+    def _segments(store: DocStore) -> int:
+        # Single-threaded test, so raw-connection access needs no extra locking.
+        return int(store.conn.execute("SELECT count(*) FROM documents_fts_data").fetchone()[0])
+
+    @staticmethod
+    def _churn(store: DocStore) -> list[int]:
+        """Add 300 docs one commit at a time, then evict the first 200."""
+        ids: list[int] = []
+        for i in range(300):
+            text = " ".join(f"t{i}w{j}" for j in range(60))
+            ids.extend(store.add_texts([text], [{"path": f"/f{i}"}]))
+        store.delete_by_ids(ids[:200])
+        return ids
+
+    def test_optimize_discards_delete_markers(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "opt.db")
+        try:
+            ids = self._churn(store)
+            before = self._segments(store)
+            store.optimize()
+            after = self._segments(store)
+            assert after < before, f"optimize left {after} segments (was {before})"
+            # Survivors stay searchable and evicted documents stay gone.
+            assert len(store.keyword_search("t250w5", k=5)) == 1
+            assert store.keyword_search("t10w5", k=5) == []
+            assert store.count() == len(ids) - 200
+        finally:
+            store.close()
+
+    def test_optimize_preserves_bm25_ranking(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "rank.db")
+        try:
+            store.add_texts(
+                ["needle needle needle filler", "needle filler filler filler"],
+                [{"path": "/dense"}, {"path": "/sparse"}],
+            )
+            before = [(d.metadata["path"], s) for d, s in store.keyword_search("needle", k=5)]
+            store.optimize()
+            after = [(d.metadata["path"], s) for d, s in store.keyword_search("needle", k=5)]
+            assert before == after
+        finally:
+            store.close()
+
+    def test_optimize_is_safe_on_an_empty_store(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "empty.db")
+        try:
+            store.optimize()
+            assert store.count() == 0
+        finally:
+            store.close()
+
+    def test_optimize_after_close_does_not_raise(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "closed.db")
+        store.add_texts(["alpha"], [{"path": "/a"}])
+        store.close()
+        store.optimize()  # the connection is gone; this must be a no-op
+
+    def test_content_storage_close_runs_it(self, tmp_path: Path, monkeypatch) -> None:
+        """Shutdown is the only path that pays for the merge."""
+        from semantic_cache_mcp.storage.docstore import ContentStorage
+
+        calls: list[str] = []
+        real = DocStore.optimize
+        monkeypatch.setattr(
+            DocStore,
+            "optimize",
+            lambda self: (calls.append("optimize"), real(self))[1],
+        )
+        storage = ContentStorage(db_path=tmp_path / "cs.db")
+        storage.close()
+        assert calls == ["optimize"]
+
+
+class TestFileReclaim:
+    """Freeing pages and giving them back are two different things.
+
+    SQLite retains freed pages and reuses them unless the database is in an
+    auto-vacuum mode, so a cache that evicts and re-indexes for weeks sits at
+    its high-water mark no matter how much of its content is dead.
+    """
+
+    AUTO_VACUUM_INCREMENTAL = 2
+
+    @staticmethod
+    def _mode(store: DocStore) -> int:
+        return int(store.conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+
+    @staticmethod
+    def _pages(store: DocStore) -> tuple[int, int]:
+        """(page_count, freelist_count) — logical size and reclaimable pages."""
+        return (
+            int(store.conn.execute("PRAGMA page_count").fetchone()[0]),
+            int(store.conn.execute("PRAGMA freelist_count").fetchone()[0]),
+        )
+
+    def test_new_store_is_created_in_incremental_mode(self, tmp_path: Path, caplog) -> None:
+        """And gets there without a rewrite: the mode is set while the file is
+        still empty, before the WAL pragma writes its first header page.
+        """
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="semantic_cache_mcp.storage.docstore._docstore"):
+            store = DocStore(tmp_path / "new.db")
+        try:
+            assert self._mode(store) == self.AUTO_VACUUM_INCREMENTAL
+            assert "auto-vacuum" not in caplog.text
+        finally:
+            store.close()
+
+    def test_legacy_store_is_migrated_without_losing_data(self, tmp_path: Path, caplog) -> None:
+        """A database written before 0.5.3 opens in mode 0 and must be rewritten."""
+        import logging
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        legacy = sqlite3.connect(str(db_path))
+        legacy.execute(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT NOT NULL, metadata TEXT, parent_id INTEGER)"
+        )
+        legacy.execute("CREATE VIRTUAL TABLE documents_fts USING fts5(text)")
+        legacy.execute(
+            "INSERT INTO documents(text, metadata) VALUES ('survivor term', '{\"path\":\"/keep\"}')"
+        )
+        legacy.execute("INSERT INTO documents_fts(rowid, text) VALUES (1, 'survivor term')")
+        legacy.commit()
+        assert int(legacy.execute("PRAGMA auto_vacuum").fetchone()[0]) == 0
+        legacy.close()
+
+        with caplog.at_level(logging.INFO, logger="semantic_cache_mcp.storage.docstore._docstore"):
+            store = DocStore(db_path)
+        try:
+            assert self._mode(store) == self.AUTO_VACUUM_INCREMENTAL
+            assert "incremental auto-vacuum" in caplog.text  # it really was rewritten
+            results = store.keyword_search("survivor", k=5)
+            assert len(results) == 1
+            assert results[0][0].metadata["path"] == "/keep"
+            assert store.count() == 1
+        finally:
+            store.close()
+
+    def test_the_mode_persists_so_a_reopen_never_pays_again(self, tmp_path: Path) -> None:
+        """The mode lives in the database header, so the check is self-describing
+        and needs no migration marker beside the file.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "twice.db"
+        first = DocStore(db_path)
+        first.add_texts(["alpha"], [{"path": "/a"}])
+        first.close()
+
+        # Read the persisted header directly — this is the value the reopen path
+        # sees, and reading INCREMENTAL is exactly what makes it return early.
+        raw = sqlite3.connect(str(db_path))
+        try:
+            assert int(raw.execute("PRAGMA auto_vacuum").fetchone()[0]) == (
+                self.AUTO_VACUUM_INCREMENTAL
+            )
+        finally:
+            raw.close()
+
+        second = DocStore(db_path)
+        try:
+            assert self._mode(second) == self.AUTO_VACUUM_INCREMENTAL
+            assert second.count() == 1
+        finally:
+            second.close()
+
+    def test_reclaim_returns_pages_after_a_large_eviction(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "reclaim.db")
+        try:
+            ids: list[int] = []
+            for i in range(400):
+                ids.extend(
+                    store.add_texts(
+                        [" ".join(f"t{i}w{j}" for j in range(80))], [{"path": f"/f{i}"}]
+                    )
+                )
+            store.delete_by_ids(ids[:350])
+            store.optimize()
+            before_pages, before_free = self._pages(store)
+            assert before_free > 0, "nothing was freed, so this proves nothing"
+
+            store.reclaim_free_pages()
+            after_pages, after_free = self._pages(store)
+            assert after_pages < before_pages
+            assert after_free == 0
+            # The surviving documents are untouched by the rewrite.
+            assert store.count() == len(ids) - 350
+            assert len(store.keyword_search("t399w5", k=5)) == 1
+        finally:
+            store.close()
+
+    def test_reclaim_is_a_no_op_with_nothing_to_give_back(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "quiet.db")
+        try:
+            store.add_texts(["alpha"], [{"path": "/a"}])
+            before = self._pages(store)
+            store.reclaim_free_pages()
+            assert self._pages(store) == before
+        finally:
+            store.close()
+
+    def test_reclaim_after_close_does_not_raise(self, tmp_path: Path) -> None:
+        store = DocStore(tmp_path / "closed2.db")
+        store.add_texts(["alpha"], [{"path": "/a"}])
+        store.close()
+        store.reclaim_free_pages()
+
+    def test_content_storage_close_reclaims(self, tmp_path: Path, monkeypatch) -> None:
+        from semantic_cache_mcp.storage.docstore import ContentStorage
+
+        calls: list[str] = []
+        for name in ("optimize", "reclaim_free_pages"):
+            real = getattr(DocStore, name)
+            monkeypatch.setattr(
+                DocStore,
+                name,
+                lambda self, _n=name, _r=real: (calls.append(_n), _r(self))[1],
+            )
+        storage = ContentStorage(db_path=tmp_path / "cs2.db")
+        storage.close()
+        # Order matters: the merge frees the pages this then hands back.
+        assert calls == ["optimize", "reclaim_free_pages"]

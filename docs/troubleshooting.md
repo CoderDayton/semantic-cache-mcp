@@ -28,6 +28,7 @@
 - **Cause (fixed in 0.5.2):** `batch_read` used to answer `unchanged` for any file the *server* had cached. The cache is on disk and outlives your context window, so after a compaction or a `/clear` you were told you already had files you had never seen.
 - **Now:** `unchanged` is only ever produced for a file whose `content_hash` you echoed back — `known_hash` on `read`, or a `known_hashes` entry on `batch_read`. Anything you cannot vouch for is sent in full, so simply omitting the hashes after a compaction is always safe.
 - **Note:** a partial read (a line range, or a summary of a large file) reports its hash as `file_hash`, prefixed `partial:`. It identifies the file but is not proof you hold it and will not be honoured as a `known_hash`.
+- **Since 0.5.3:** a ranged read additionally returns a `coverage_token` recording the lines it did deliver, and that *is* honoured as a `known_hash` — for those lines only. Re-reading a window you hold answers `unchanged`, a new window widens the token, and full coverage upgrades to a claimable `content_hash`. Like every other claim it is yours to make honestly: pass it back only while you still hold the lines it names, and after a compaction just omit it.
 
 **Stale content returned**
 - **Cause:** File was modified outside normal flow (e.g., by another process) and the mtime wasn't updated
@@ -42,6 +43,11 @@
 **`grep` fails with "invalid regex pattern" or "pattern too long"**
 - **Cause (0.5.2+):** the pattern didn't compile, or it exceeds the 1,000-character ReDoS cap. Earlier versions logged a warning and returned no matches, which is indistinguishable from a genuine miss.
 - **Fix:** correct the regex, or pass `fixed_string=true` to match the text literally (`grep pattern="foo(bar" fixed_string=true`).
+
+**`grep` rejects a pattern that looks valid to you**
+- **Cause (0.5.3+):** the pattern has a repeatable group wrapping an unbounded quantifier — `(a+)+`, `(\w*)*`, `(x+){2,}` — which can backtrack exponentially. Left to run, `(a+)$` against 40 characters exceeded two minutes and could not be interrupted, so it is refused before compilation instead.
+- **Fix:** the error names a safe equivalent; `(a+)+` almost always wants to be `a+`. If you meant the text literally, pass `fixed_string=true`.
+- **Note:** the check is on shape, so it can refuse a pattern that would have been fine in practice. It never accepts one it should have refused silently — a rejection is always an error, never an empty result.
 
 **Repeated `search` queries return instantly (< 1 ms)**
 - **Cause (0.4.6+):** `SemanticCache` keeps an in-session 32-entry LRU of search results, keyed on `(query, k, directory)`. Identical queries skip the BM25 round-trip entirely.
@@ -68,6 +74,12 @@
 - **Options:**
   - Use `clear` to evict cached entries and reduce DB size
   - Reduce `MAX_CACHE_ENTRIES` to lower the number of cached entries
+
+**`docstore.db` is far larger than the files it caches**
+- **Cause (fixed in 0.5.3):** two independent accumulations, neither visible in `stats`. FTS5 records a deletion as an index entry rather than removing one, so a store that evicts files keeps the vocabulary of every file it ever held; and SQLite retains freed pages instead of returning them, pinning the file at its high-water mark. A real store holding 244 files and 4.2 MB of text had grown to 153 MB.
+- **Now:** shutdown merges the index and hands the freed pages back, and stores are opened in incremental auto-vacuum mode. That same store settles at 17.5 MB.
+- **Upgrading:** a store created before 0.5.3 is rewritten once on its first open (~50 ms for 153 MB) to enable the mode. Nothing is lost — the schema and every document are untouched, and the log line reads `enabled incremental auto-vacuum`.
+- **Note:** the merge only runs on a clean shutdown. A store whose server is repeatedly `SIGKILL`ed never gets one, and will drift upward again.
 
 **Glob timeout**
 - **Cause:** Very broad pattern (e.g., `**/*.py` on a large monorepo) exceeds the 5-second timeout

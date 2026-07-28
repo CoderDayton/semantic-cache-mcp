@@ -116,6 +116,13 @@ now contains.
 A hash reported as `file_hash` (prefixed `partial:`) came from a partial or \
 summarized read. It identifies the file across reads but is not proof you hold \
 it, and is never accepted as `known_hash`.
+
+A ranged read (`offset`/`limit`) instead returns a `coverage_token` recording \
+the lines it sent you. Keep it per file and pass it back as `known_hash` on \
+your next ranged read: a window you already hold answers `unchanged`, a new \
+window widens the coverage, and once the windows add up to the whole file you \
+get a claimable `content_hash`. It vouches only for the lines actually \
+delivered, so pass it back only while you still hold them.
 """
 
 mcp = FastMCP("semantic-cache-mcp", instructions=INSTRUCTIONS, lifespan=app_lifespan)

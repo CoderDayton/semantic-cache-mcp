@@ -12,7 +12,7 @@ import stat as stat_module
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
@@ -30,13 +30,19 @@ from ...cache import (
     smart_read,
     smart_write,
 )
-from ...cache._helpers import _PhaseTimer
-from ...cache.read import _sniff_image_mime
+from ...cache._helpers import _diff_context_lines, _PhaseTimer
+from ...cache.read import _DIFF_MAX_RATIO, _DIFF_MIN_TOKENS, _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
-from ...core import count_tokens
+from ...core import count_tokens, generate_diff, rebase_diff_hunks
 from ...types import ReadResult
 from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
+from .._coverage import (
+    EMPTY_SPANS,
+    LineSpans,
+    decode_coverage_token,
+    encode_coverage_token,
+)
 from .._mcp import mcp
 from .._tool_models import (
     BatchEditResponse,
@@ -69,6 +75,18 @@ logger = logging.getLogger(__name__)
 
 # Tool timeout from config (env TOOL_TIMEOUT, default 30s).
 _TOOL_TIMEOUT: float = TOOL_TIMEOUT
+
+# Chars per token to assume when sizing a payload of serialized JSON matches.
+# Prose runs ~4; JSON punctuation, quoted keys and line numbers run denser, so
+# budgeting at the prose rate overshoots the response cap.
+_JSON_CHARS_PER_TOKEN: Final = 2
+
+# Per-match JSON envelope: the `line_number`/`line` keys, braces, quotes and
+# separators that wrap each match line.
+_MATCH_ENVELOPE_CHARS: Final = 32
+
+# Per-context-line JSON envelope inside a match.
+_CONTEXT_ENVELOPE_CHARS: Final = 4
 
 
 def _ranged_metrics(tokens_original: int, tokens_returned: int, *, from_cache: bool) -> ReadResult:
@@ -433,6 +451,29 @@ def _stamp_result_hash(payload: dict[str, Any], new_hash: str, *, caller_holds: 
         payload["file_hash"] = _PARTIAL_HASH_PREFIX + new_hash
 
 
+def _stamp_ranged_possession(
+    payload: dict[str, Any],
+    content_hash: str,
+    covered: LineSpans,
+    total_lines: int,
+) -> None:
+    """Record what a ranged read leaves the caller able to prove it holds.
+
+    Coverage spanning every line means the whole file has now been delivered
+    for this version, so the caller earns a claimable `content_hash`. Anything
+    narrower keeps reporting the file's identity under `file_hash` — unchanged
+    from before, so a caller comparing it across reads still learns only
+    whether the file moved — and adds a signed `coverage_token` naming the
+    windows it does hold, which its next ranged read can redeem for
+    `unchanged` instead of a re-send.
+    """
+    if covered.covers_all(total_lines):
+        payload["content_hash"] = content_hash
+        return
+    payload["file_hash"] = _PARTIAL_HASH_PREFIX + content_hash
+    payload["coverage_token"] = encode_coverage_token(content_hash, covered)
+
+
 @mcp.tool(
     output_schema=output_schema(ReadResponse),
     meta={"version": _pkg_version("semantic-cache-mcp")},
@@ -448,10 +489,12 @@ async def read(
 ) -> dict[str, Any]:
     """Read a file, returning as few tokens as possible. For 2+ files, use `batch_read`.
 
-    The first read returns the full numbered content plus a `content_hash`.
-    A later read of an unchanged file returns `"unchanged": true` with no body
-    (you already have it); a changed file returns a unified diff. Reading also
-    caches the file so `grep`, `search`, and `batch_read` can see it.
+    The first read returns the file's full content plus a `content_hash`
+    (a ranged read numbers its lines; a whole-file read returns them as-is).
+    Echo that hash back as `known_hash` and a later read of an unchanged file
+    answers `"unchanged": true` with no body; a changed file returns a unified
+    diff. Omit it and the file is always sent in full. Reading also caches the
+    file so `grep`, `search`, and `batch_read` can see it.
 
     Whenever you re-read a file you have read before, pass back `known_hash`
     (the `content_hash` from your last read of it). It is the server's only
@@ -462,10 +505,17 @@ async def read(
     summary of a large one — reports its hash as `file_hash` (prefixed
     `partial:`) rather than `content_hash`: it identifies the file across reads
     but is not proof you hold it, and cannot be redeemed as `known_hash`.
+
+    A ranged read also returns a `coverage_token` recording the lines it just
+    sent you. Pass that back as `known_hash` on your next ranged read of the
+    file: a window you already hold answers `unchanged` instead of being
+    re-sent, and a new window widens the token's coverage. Once the windows add
+    up to the whole file you are handed a claimable `content_hash` for it.
+
     What the body holds is always labelled: `is_diff` marks a unified diff and
     `truncated` marks a summary, so you never have to infer it from the bytes.
-    A binary file returns metadata instead of content; for images
-    use `read_image`.
+    A binary file returns metadata instead of content; for images use
+    `read_image`.
 
     Args:
         path: File path (absolute, or relative to the project root). Use an
@@ -475,9 +525,10 @@ async def read(
         offset: 1-based first line for a ranged read; omit or pass 0 to start
             from the first line.
         limit: Number of lines to return starting at `offset`.
-        known_hash: The `content_hash` from your last read of this file; pass it
-            back to get `"unchanged"` instead of the content re-sent. Omit only
-            on a first read or when you no longer hold the hash.
+        known_hash: The `content_hash` from your last read of this file — or the
+            `coverage_token` from your last ranged read of it — passed back to
+            get `"unchanged"` instead of the content re-sent. Omit only on a
+            first read, or when you no longer hold what it vouches for.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -521,15 +572,34 @@ async def read(
                 and ranged_entry.mtime >= ranged_st.st_mtime
             )
 
+            # A coverage token names the version its windows came from, so it is
+            # decoded up front and matched below against the bytes actually
+            # served. Anything that is not a token this process signed — a bare
+            # `content_hash`, a `partial:` file hash, an invented string —
+            # decodes to nothing and therefore claims nothing.
+            claimed = decode_coverage_token(known_hash)
+
             # Materialize the file to address specific lines. Serve from the cache
             # when it is fresh (no disk read); only touch disk when the cache is
             # missing or stale, in which case smart_read also refreshes it.
+            superseded_text: str | None = None
             if ranged_fresh:
                 full_text = await cache.get_content(ranged_entry)
                 full_tokens = ranged_entry.tokens
                 ranged_from_cache = True
                 ranged_hash: str | None = ranged_entry.content_hash
             else:
+                # A token can name the version the cache is about to lose:
+                # smart_read refreshes a stale entry, and those retired bytes
+                # are the only base a window diff could be built against. Fetch
+                # them first, and only when a token actually claims that
+                # version, so the ordinary path pays nothing for this.
+                if (
+                    claimed is not None
+                    and ranged_entry is not None
+                    and claimed[0] == ranged_entry.content_hash
+                ):
+                    superseded_text = await cache.get_content(ranged_entry)
                 result = await asyncio.wait_for(
                     smart_read(
                         cache=cache,
@@ -556,11 +626,26 @@ async def read(
             start = max(0, (offset or 0) - 1)  # Convert to 0-based; offset 0/None both start at 0
             end = start + (limit or len(lines) - start)
             selected = lines[start:end]
-            # A ranged read only ever shows the caller the window it asked for,
-            # so only a window spanning the whole file may mint or redeem a
-            # `content_hash`. Anything narrower and the caller would be handed —
-            # or credited with — bytes it never saw.
+            # A ranged read only ever shows the caller the window it asked for.
+            # A window spanning the whole file mints or redeems a `content_hash`
+            # outright. Anything narrower is credited to `covered`: what the
+            # caller can prove it holds once this window lands, being whatever
+            # coverage it carried in widened by what is served now.
             covers_whole_file = start == 0 and end >= len(lines)
+            window_end = min(end, len(lines))
+            claimed_spans = (
+                claimed[1]
+                if claimed is not None and ranged_hash is not None and claimed[0] == ranged_hash
+                else EMPTY_SPANS
+            )
+            covered = claimed_spans.merge(start, window_end)
+            line_info = {
+                # Empty window (offset past EOF / empty file): report
+                # start==end==total instead of a start that exceeds end.
+                "start": start + 1 if selected else len(lines),
+                "end": window_end,
+                "total": len(lines),
+            }
 
             # Hash-gated short-circuit: the caller still holds this exact file
             # and asked for all of it, so there is nothing left to re-send.
@@ -587,19 +672,88 @@ async def read(
                     max_response_tokens,
                 )
 
-            # Format with line numbers like built-in Read tool. Generator
+            # Coverage short-circuit: the caller carried in a token proving it
+            # was already sent these exact lines of this exact version, so the
+            # window would be re-sent for nothing. A whole-file `content_hash`
+            # is deliberately NOT accepted here — holding the file says nothing
+            # about still holding a window the caller is now asking for, and
+            # answering that request with no body strands it.
+            if selected and ranged_hash is not None and claimed_spans.covers(start, window_end):
+                cache.metrics.record("read", _ranged_metrics(full_tokens, 0, from_cache=True))
+                held_payload: dict[str, Any] = {
+                    "ok": True,
+                    "tool": "read",
+                    "path": path,
+                    "unchanged": True,
+                    "lines": line_info,
+                }
+                _stamp_ranged_possession(held_payload, ranged_hash, covered, len(lines))
+                return _finalize_payload(held_payload, max_response_tokens)
+
+            # Window diff: the caller holds this window of the version just
+            # superseded, so send what changed inside it instead of the whole
+            # window again. Applying this diff to the lines it holds yields the
+            # lines being served, which is what a re-read would have delivered.
+            # Coverage does not carry over — outside this window the caller's
+            # copy is now the old file — so `covered` is this window alone.
+            if (
+                selected
+                and superseded_text is not None
+                and ranged_hash is not None
+                and claimed is not None
+                and claimed[1].covers(start, window_end)
+            ):
+                base_window = "".join(superseded_text.splitlines(keepends=True)[start:end])
+                # Diffing a slice numbers its hunks from the slice's first
+                # line. Rebase onto the file so `@@` means what it means in
+                # every other diff this server sends — a caller that reads a
+                # window-relative number as a file line goes and re-reads the
+                # wrong place, which costs far more than the header saved.
+                window_diff = rebase_diff_hunks(
+                    generate_diff(
+                        base_window,
+                        "".join(selected),
+                        context_lines=_diff_context_lines(base_window),
+                    ),
+                    start,
+                )
+                window_tokens = count_tokens("".join(selected))
+                diff_tokens = count_tokens(window_diff)
+                # Same gate the whole-file diff uses: below a floor the @@-header
+                # overhead outweighs the saving, and a diff that is not much
+                # smaller than the window is not worth the caller reassembling.
+                if (
+                    window_tokens >= _DIFF_MIN_TOKENS
+                    and diff_tokens < window_tokens * _DIFF_MAX_RATIO
+                ):
+                    cache.metrics.record(
+                        "read", _ranged_metrics(full_tokens, diff_tokens, from_cache=True)
+                    )
+                    diff_payload: dict[str, Any] = {
+                        "ok": True,
+                        "tool": "read",
+                        "path": path,
+                        "content": window_diff,
+                        "is_diff": True,
+                        "lines": line_info,
+                    }
+                    _stamp_ranged_possession(diff_payload, ranged_hash, covered, len(lines))
+                    return _finalize_payload(diff_payload, max_response_tokens)
+
+            # Format with line numbers like the built-in Read tool. Generator
             # expression avoids materializing the intermediate list; `selected`
             # may be thousands of lines on partial reads of large files.
+            #
+            # Only the line terminator is stripped, never trailing whitespace
+            # within the line. A window covering the whole file mints a
+            # claimable `content_hash`, and that claim is only true if the
+            # caller can reconstruct the bytes it is vouching for — rstrip()
+            # silently dropped trailing spaces and tabs, certifying possession
+            # of content that was never sent.
             content = "\n".join(
-                f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
+                f"{i:6d}\t{line.removesuffix(chr(10)).removesuffix(chr(13))}"
+                for i, line in enumerate(selected, start=start + 1)
             )
-            line_info = {
-                # Empty window (offset past EOF / empty file): report
-                # start==end==total instead of a start that exceeds end.
-                "start": start + 1 if selected else len(lines),
-                "end": min(end, len(lines)),
-                "total": len(lines),
-            }
             # Bill only the slice actually returned; the rest of the file is saved
             # versus a naive full read.
             ranged_returned = count_tokens(content)
@@ -615,14 +769,7 @@ async def read(
                 "lines": line_info,
             }
             if ranged_hash is not None:
-                # A window over the whole file leaves the caller holding it, so
-                # it earns an echoable `content_hash`. A narrower window reports
-                # the same hash under `file_hash`, namespaced so it cannot be
-                # redeemed as a possession claim.
-                if covers_whole_file:
-                    payload["content_hash"] = ranged_hash
-                else:
-                    payload["file_hash"] = _PARTIAL_HASH_PREFIX + ranged_hash
+                _stamp_ranged_possession(payload, ranged_hash, covered, len(lines))
             if mode in _MODE_NORMAL:
                 payload["truncated"] = False
             if mode == _MODE_DEBUG:
@@ -1277,8 +1424,9 @@ async def write(
 
     Use this for new files or full rewrites; for localized changes prefer
     `edit` or `batch_edit`. Status is `created` for a new path or `updated`
-    for an existing one, and an update returns a unified diff against the
-    previous content. A `dry_run` writes nothing and says so: the status is
+    for an existing one; an update reports `diff_state`, and includes the diff
+    against the previous content only when you ask with `show_diff`. A
+    `dry_run` writes nothing and says so: the status is
     `would_create`/`would_update` and `dry_run: true` comes back with it.
     Writing refreshes the cache so later reads, `grep`, and `search` see the
     new text. The response carries the new `content_hash`;
@@ -1432,9 +1580,11 @@ async def edit(
     `old_string` must match exactly — whitespace and indentation included —
     and, unless `replace_all=true`, must be unique, or the edit fails. Use
     `edit_preview` first if you're unsure an anchor is unique. Returns the
-    replacement count, affected line numbers, and a unified diff, and refreshes
-    the cache. A `dry_run` writes nothing and says so: the status is
-    `would_edit` and `dry_run: true` comes back with it. For several edits to
+    replacement count and the affected line numbers, and refreshes the cache.
+    The diff itself is omitted unless you ask for it with `show_diff`;
+    `diff_state` always tells you which you got. A `dry_run` writes nothing
+    and says so: the status is `would_edit` and `dry_run: true` comes back
+    with it. For several edits to
     one file use `batch_edit`; for a full rewrite use `write`.
 
     Pass `known_hash` — the hash you hold for this file — and the response
@@ -1607,6 +1757,12 @@ async def edit_preview(
                 diff_mode=False,
                 force_full=True,
                 refresh_cache=False,
+                # Anchors and their line numbers only mean anything against the
+                # literal file. Summarizing first made this tool answer
+                # "found: false" for text that is in the file, and quote line
+                # numbers belonging to the summary — a confident wrong answer to
+                # the one question it exists to settle.
+                summarize=False,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -1956,16 +2112,21 @@ async def batch_read(
     The efficient way to seed the cache before `search`/`grep`, and cheaper
     than many single `read` calls. Every file is returned in full unless you
     prove you still hold it: pass `known_hashes` and each proven file collapses
-    to an `unchanged` count, or to a diff when it moved on disk. Each file you
-    are sent comes back with its `content_hash` — keep those and pass them next
-    time. Smallest files are read first; once the budget is spent the rest are
-    listed under `skipped` — recover them with `read` using `offset`/`limit`.
+    to an `unchanged` count, or to a diff when it moved on disk. Each file sent
+    in full comes back with its `content_hash` — keep those and pass them next
+    time. A file large enough to come back summarized carries none: a summary is
+    not the file, so it cannot be vouched for. Smallest files are read first, and
+    a file too big for the remaining budget is listed under `skipped` while
+    smaller ones keep being read — so one large file cannot starve the rest of
+    the batch. Recover anything skipped with `read` using `offset`/`limit`.
 
     Args:
         paths: The files to read — a comma-separated list, a JSON array, or
             glob patterns (expanded for you).
         max_total_tokens: Total token budget shared across the whole batch.
         priority: Optional paths to read first, ahead of the remaining files.
+            Ordering only — a priority file still has to fit the budget, and is
+            skipped like any other when it does not.
         known_hashes: JSON object mapping a path to the `content_hash` you
             still hold for it, e.g. `{"src/a.py": "8f3c..."}`. Any file you
             cannot vouch for this way is sent in full.
@@ -2198,10 +2359,19 @@ async def grep(
     means zero matches. For concept-level questions where you don't know the
     exact term, use `search` instead.
 
+    Counts are complete unless the response says otherwise: if a cap stops the
+    scan, `complete` comes back false with `limit_reached` naming which one, so
+    `total_matches` is never mistaken for the total that exists.
+
+    A repeated group wrapping an unbounded quantifier (`(a+)+`) is rejected
+    rather than run — it can take exponential time and cannot be interrupted
+    once started. Drop the redundant repeat, or pass `fixed_string=true`.
+
     Args:
         pattern: A regular expression, or a literal string when
             `fixed_string=true`.
-        path: Optional filter — an exact path, a path suffix, or a glob.
+        path: Optional filter — an exact path, a path suffix, a directory
+            (matching every cached file beneath it), or a glob.
         fixed_string: Match `pattern` literally instead of as a regex.
         case_sensitive: Match case-sensitively.
         context_lines: Lines of surrounding context to include per match,
@@ -2224,14 +2394,20 @@ async def grep(
         # honoured in every response mode — the rule `show_diff` already
         # follows. Compact mode suppresses context nobody asked for, which is
         # what the default of 0 already does on its own.
-        results = await cache._storage.grep(
-            pattern,
-            path=path,
-            fixed_string=fixed_string,
-            case_sensitive=case_sensitive,
-            context_lines=context_lines,
-            max_matches=max_matches,
-            max_files=max_files,
+        # Bounded like every other tool. The pattern comes from the caller and
+        # `re` has no interrupt, so the scan runs off the event loop (see
+        # `_grep.grep`); that is what lets this timeout actually fire.
+        results = await asyncio.wait_for(
+            cache._storage.grep(
+                pattern,
+                path=path,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+                context_lines=context_lines,
+                max_matches=max_matches,
+                max_files=max_files,
+            ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("grep", None)
 
@@ -2242,8 +2418,14 @@ async def grep(
         # token cap in _finalize_payload still applies as a backstop.
         char_budget: int | None = None
         if max_response_tokens is not None and max_response_tokens > 0:
-            # Leave ~512 tokens for the response envelope/metadata.
-            char_budget = max(1024, (max_response_tokens - 512) * 4)
+            # Leave ~512 tokens for the response envelope/metadata, and budget
+            # the rest at _JSON_CHARS_PER_TOKEN rather than the ~4 chars/token
+            # of prose. Serialized matches are not prose: quoted keys, braces,
+            # commas and line numbers all tokenize far denser, so a prose-rate
+            # estimate assembles a payload over the hard cap and the whole
+            # thing is cut down to the minimal form — losing every match line
+            # the budget existed to preserve.
+            char_budget = max(1024, (max_response_tokens - 512) * _JSON_CHARS_PER_TOKEN)
 
         # Build response
         files_payload: list[dict[str, Any]] = []
@@ -2269,15 +2451,14 @@ async def grep(
                         item["after"] = m["after"]
                 match_items.append(item)
                 if char_budget is not None:
-                    # ~32 chars JSON envelope per match (line_number, line keys
-                    # + braces + commas + quotes). Add context-line bytes when
-                    # present so the soft budget accounts for them.
-                    running_chars += len(m["line"]) + 32
+                    # Account for the JSON envelope each match carries, and for
+                    # context-line bytes when they are present.
+                    running_chars += len(m["line"]) + _MATCH_ENVELOPE_CHARS
                     if context_lines > 0:
                         for ctx_line in m.get("before", ()):
-                            running_chars += len(ctx_line) + 4
+                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
                         for ctx_line in m.get("after", ()):
-                            running_chars += len(ctx_line) + 4
+                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
                     if running_chars > char_budget:
                         budget_exceeded = True
                         # Count remaining matches in this file as truncated
@@ -2306,6 +2487,19 @@ async def grep(
             payload["files_in_response"] = len(files_payload)
             if truncated_files > 0:
                 payload["truncated_files"] = truncated_files
+        # The scan itself stops at max_matches/max_files, so the corpus past
+        # that point was never examined. Say so explicitly: `total_matches`
+        # otherwise reads as the complete count of what exists, and a caller
+        # that believes it moves on without ever looking at the rest.
+        if not results.complete:
+            payload["complete"] = False
+            payload["limit_reached"] = "max_matches" if results.truncated_matches else "max_files"
+            if results.files_not_searched:
+                payload["files_not_searched"] = results.files_not_searched
+            payload["hint"] = (
+                "counts are a floor, not a total — raise max_matches/max_files, "
+                "or narrow the pattern or path"
+            )
         # Distinguish "no files cached under that path" from "no matches".
         # The audit found 22/29 empty greps fit the cache-miss shape, so the
         # caller should know whether to seed via batch_read/glob.
@@ -2323,6 +2517,16 @@ async def grep(
 
     except ToolError:
         raise
+    except TimeoutError:
+        # A pattern that backtracks catastrophically leaves the executor thread
+        # wedged; reset it so the next call is not stuck behind it.
+        _handle_timeout(cache, "grep", pattern[:50])
+        _raise_tool_error(
+            "grep",
+            f"timed out after {_TOOL_TIMEOUT}s — the pattern is too expensive to "
+            "run over the cached files; simplify it or narrow `path`",
+            max_response_tokens,
+        )
     except ValueError as e:
         # Bad input (an uncompilable pattern), not a server fault — report it
         # without a traceback, and never as an empty result set.

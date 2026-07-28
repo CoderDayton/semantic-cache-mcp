@@ -1,12 +1,5 @@
 from .chunking import get_optimal_chunker, hypercdc_chunks
-from .hashing import (
-    DeduplicateIndex,
-    HierarchicalHasher,
-    StreamingHasher,
-    hash_chunk,
-    hash_chunk_binary,
-    hash_content,
-)
+from .hashing import hash_chunk, hash_content
 from .text import (
     DEFAULT_SUMMARIZATION_CONFIG,
     Segment,
@@ -16,6 +9,7 @@ from .text import (
     diff_with_stats,
     extract_segments,
     generate_diff,
+    rebase_diff_hunks,
     score_segments,
     summarize_semantic,
     truncate_semantic,
@@ -29,12 +23,9 @@ __all__ = [
     "get_optimal_chunker",
     "hash_chunk",
     "hash_content",
-    "hash_chunk_binary",
-    "DeduplicateIndex",
-    "HierarchicalHasher",
-    "StreamingHasher",
     "count_tokens",
     "generate_diff",
+    "rebase_diff_hunks",
     "truncate_smart",
     "truncate_semantic",
     "compute_delta",

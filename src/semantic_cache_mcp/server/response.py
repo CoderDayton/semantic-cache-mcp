@@ -48,7 +48,14 @@ def _response_overrides(mode: str, max_response_tokens: int | None):
 
 
 def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Strip payload to essential fields when response exceeds token budget."""
+    """Strip payload to essential fields when response exceeds token budget.
+
+    The bulky fields go; the ones that say what the answer *was* stay. A
+    response cut down to `{"path": ..., "truncated": true}` reads as a failure
+    with no result, when the tool in fact counted 400 matches and knows the
+    scan was capped — the caller needs those scalars far more than it needs
+    the match lines, and they cost a handful of tokens.
+    """
     keep_order = (
         "ok",
         "tool",
@@ -56,12 +63,23 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "path",
         "path1",
         "path2",
+        "pattern",
         "summary",
         "skipped",
         "files_read",
         "files_skipped",
         "succeeded",
         "failed",
+        "total_matches",
+        "files_matched",
+        "files_in_response",
+        "truncated_matches",
+        "truncated_files",
+        "complete",
+        "limit_reached",
+        "files_not_searched",
+        "reason",
+        "hint",
         "message",
         "error",
     )

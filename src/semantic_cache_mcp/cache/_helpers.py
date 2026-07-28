@@ -8,11 +8,13 @@ import logging
 import os
 import shutil
 import stat as stat_module
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 
 from ..core import count_tokens
+from ..utils import astat
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,12 @@ _PRINTABLE_DELETE = bytes(b for b in range(256) if b not in _NON_PRINTABLE)
 MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10MB max content size for write
 MAX_EDIT_SIZE = 10 * 1024 * 1024  # 10MB max file size for edit
 MAX_MATCHES = 10000  # Max occurrences for replace_all
+# Bytes sampled to decide whether a file is text — the window
+# `_is_binary_content` actually inspects.
+BINARY_SNIFF_BYTES = 8192
+# UTF-8 spends at most four bytes per code point, so a file larger than this
+# cannot possibly decode to MAX_EDIT_SIZE characters or fewer.
+MAX_EDIT_FILE_BYTES = MAX_EDIT_SIZE * 4
 MAX_RETURN_DIFF_TOKENS = 8000  # Hard cap for emitted diff payloads
 MAX_DIFF_TO_FULL_RATIO = 0.9  # Suppress diff payloads near full-content size
 
@@ -143,6 +151,26 @@ async def _format_file(path: Path) -> bool:
         return False
 
 
+async def _guard_editable_size(file_path: Path, executor: Executor | None) -> None:
+    """Reject a file too large to edit *before* it is read into memory.
+
+    ``MAX_EDIT_SIZE`` bounds decoded characters, so the check enforcing it can
+    only run once the whole file has been read. Refusing past
+    ``MAX_EDIT_FILE_BYTES`` here is sound — no file that size decodes to fewer
+    characters than the limit — so it can never reject one the later check
+    would have accepted, and it keeps a multi-gigabyte file from being read
+    into memory just to be turned away.
+    """
+    try:
+        size = (await astat(file_path, executor)).st_size
+    except OSError:
+        return  # Let the read itself report the real error.
+    if size > MAX_EDIT_FILE_BYTES:
+        raise ValueError(
+            f"File too large for edit: {size:,} bytes exceeds {MAX_EDIT_FILE_BYTES:,} byte limit"
+        )
+
+
 def _is_binary_content(data: bytes) -> bool:
     """Check if content is binary using multiple heuristics.
 
@@ -196,44 +224,83 @@ def _is_binary_content(data: bytes) -> bool:
     return len(sample) > 0 and non_printable / len(sample) > 0.3
 
 
-def _find_match_line_numbers(content: str, search_string: str) -> list[int]:
-    """Return 1-based line numbers for each occurrence of search_string. O(M log N)."""
-    lines = content.splitlines(keepends=True)
-    line_numbers: list[int] = []
+def build_line_starts(content: str) -> list[int]:
+    """Character offset where each line begins, one entry per
+    ``splitlines(keepends=True)`` line.
 
-    if not lines:
+    Found by scanning for newlines rather than materializing the lines: callers
+    only ever want the offsets, and allocating one string per line to recover
+    them is what made every line-addressed helper cost a full pass over the
+    file. Pass the result back into ``_find_match_line_numbers`` /
+    ``_extract_line_range`` to reuse it across calls against the same text.
+    """
+    if not content:
+        return []
+    starts = [0]
+    append = starts.append
+    find = content.find
+    end = len(content)
+    pos = find("\n")
+    while pos != -1:
+        following = pos + 1
+        if following == end:
+            # A trailing newline closes the last line; it opens no new one.
+            break
+        append(following)
+        pos = find("\n", following)
+    return starts
+
+
+def _find_match_line_numbers(
+    content: str,
+    search_string: str,
+    *,
+    line_starts: list[int] | None = None,
+) -> list[int]:
+    """Return 1-based line numbers for each occurrence of search_string. O(M log N).
+
+    ``line_starts`` supplies a precomputed index from ``build_line_starts`` for
+    the same ``content``; omit it and one is built per call.
+    """
+    if line_starts is None:
+        line_starts = build_line_starts(content)
+
+    line_numbers: list[int] = []
+    if not line_starts:
         return line_numbers
 
-    # Build cumulative character positions for binary search
-    char_pos = 0
-    line_starts: list[int] = []
-    for line in lines:
-        line_starts.append(char_pos)
-        char_pos += len(line)
-
-    # Find all occurrences with O(log N) line lookup
+    # Find all occurrences with O(log N) line lookup.
+    # bisect_right returns the insertion point, which is already the 1-based
+    # number of the line containing idx.
+    bisect_right = bisect.bisect_right
+    find = content.find
     start = 0
     while True:
-        idx = content.find(search_string, start)
+        idx = find(search_string, start)
         if idx == -1:
             break
-
-        # Binary search for line number - O(log N) per match
-        # bisect_right returns insertion point; -1 gives us the line containing idx
-        line_num = bisect.bisect_right(line_starts, idx)
-        line_numbers.append(line_num)  # Already 1-based due to bisect_right behavior
+        line_numbers.append(bisect_right(line_starts, idx))
         start = idx + 1
 
     return line_numbers
 
 
-def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[str, int, int]:
+def _extract_line_range(
+    content: str,
+    start_line: int,
+    end_line: int,
+    *,
+    line_starts: list[int] | None = None,
+) -> tuple[str, int, int]:
     """Return (substring, char_start, char_end) for a 1-based inclusive line range.
 
     Char offsets support direct splicing: content[:char_start] + new + content[char_end:]
+    ``line_starts`` supplies a precomputed index from ``build_line_starts`` for
+    the same ``content``, making the lookup O(1) instead of a pass over the file.
     """
-    lines = content.splitlines(keepends=True)
-    total = len(lines)
+    if line_starts is None:
+        line_starts = build_line_starts(content)
+    total = len(line_starts)
 
     if total == 0:
         raise ValueError("Cannot extract line range from empty file")
@@ -250,11 +317,10 @@ def _extract_line_range(content: str, start_line: int, end_line: int) -> tuple[s
     if end_line > total:
         raise ValueError(f"end_line ({end_line}) exceeds total lines ({total})")
 
-    # Two non-overlapping passes over line lengths: char_start covers the
-    # lines before the range, char_end extends it through the range. O(1)
-    # extra memory — no full prefix-sum list materialized for two indices.
-    char_start = sum(len(lines[i]) for i in range(start_line - 1))
-    char_end = char_start + sum(len(lines[i]) for i in range(start_line - 1, end_line))
+    char_start = line_starts[start_line - 1]
+    # The range runs to the start of the following line, or to EOF when it
+    # includes the last one.
+    char_end = line_starts[end_line] if end_line < total else len(content)
 
     substring = content[char_start:char_end]
     return substring, char_start, char_end

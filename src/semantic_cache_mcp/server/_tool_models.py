@@ -52,6 +52,10 @@ class ReadResponse(ToolResponseModel):
     # Hash of a file only partly delivered (line range or summary). Namespaced
     # with a `partial:` prefix so it cannot be redeemed as a `known_hash`.
     file_hash: str | None = None
+    # Signed record of the line ranges a ranged read has delivered. Echoed back
+    # as `known_hash` it buys `unchanged` for a window already held; unlike
+    # `file_hash` it is redeemable, because it names what the caller was sent.
+    coverage_token: str | None = None
     total_lines: int | None = None
 
 
@@ -299,6 +303,15 @@ class GrepResponse(ToolResponseModel):
     files: list[GrepFile] | None = None
     truncated_matches: int | None = None
     truncated_files: int | None = None
+    # False when a cap stopped the scan early, so `total_matches` counts only
+    # what was examined. Absent means the scan ran to completion.
+    complete: bool | None = None
+    limit_reached: str | None = None
+    files_not_searched: int | None = None
+    files_in_response: int | None = None
+    # Why an empty result was empty, and what to do about it.
+    reason: str | None = None
+    hint: str | None = None
     fixed_string: bool | None = None
     case_sensitive: bool | None = None
     context_lines: int | None = None

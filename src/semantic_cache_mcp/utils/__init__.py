@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from ._async_io import aread_bytes, aread_text, astat, awrite_atomic
+from ._async_io import aread_bytes, aread_head, aread_text, astat, awrite_atomic
 from ._detached_executor import DetachedExecutor
 from ._retry import retry
 
-__all__ = ["aread_bytes", "aread_text", "astat", "awrite_atomic", "DetachedExecutor", "retry"]
+__all__ = [
+    "aread_bytes",
+    "aread_head",
+    "aread_text",
+    "astat",
+    "awrite_atomic",
+    "DetachedExecutor",
+    "retry",
+]

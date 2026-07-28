@@ -6,6 +6,7 @@ from ._diff import (
     diff_stats,
     diff_with_stats,
     generate_diff,
+    rebase_diff_hunks,
     truncate_semantic,
     truncate_smart,
 )
@@ -23,6 +24,7 @@ __all__ = [
     # diff / delta / truncation
     "DiffDelta",
     "generate_diff",
+    "rebase_diff_hunks",
     "diff_stats",
     "diff_with_stats",
     "compute_delta",
