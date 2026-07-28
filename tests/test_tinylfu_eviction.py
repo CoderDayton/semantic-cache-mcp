@@ -107,11 +107,11 @@ class TestTinyLFUIndex:
     async def test_ensure_loaded_replays_history_into_sketch(self) -> None:
         idx = TinyLFUIndex(capacity=16, history_size=5)
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             # Two paths; "warm" has 4 historical accesses, "cold" has 1.
             return [
-                (1, "", {"path": "warm.py", "access_history": "[1,2,3,4]"}),
-                (2, "", {"path": "cold.py", "access_history": "[1]"}),
+                (1, {"path": "warm.py", "access_history": "[1,2,3,4]"}),
+                (2, {"path": "cold.py", "access_history": "[1]"}),
             ]
 
         await idx.ensure_loaded(loader)
@@ -123,9 +123,9 @@ class TestTinyLFUIndex:
         idx = TinyLFUIndex(capacity=16, history_size=5)
         calls = {"n": 0}
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             calls["n"] += 1
-            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+            return [(1, {"path": "a.py", "access_history": "[1]"})]
 
         await idx.ensure_loaded(loader)
         await idx.ensure_loaded(loader)
@@ -135,9 +135,9 @@ class TestTinyLFUIndex:
         idx = TinyLFUIndex(capacity=16, history_size=5)
         calls = {"n": 0}
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             calls["n"] += 1
-            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+            return [(1, {"path": "a.py", "access_history": "[1]"})]
 
         await idx.ensure_loaded(loader)
         idx.mark_dirty()
@@ -151,12 +151,12 @@ class TestTinyLFUIndex:
         idx = TinyLFUIndex(capacity=16, history_size=5)
         calls = {"n": 0}
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             calls["n"] += 1
             # Simulate a concurrent mark_dirty() landing mid-bootstrap,
             # while ensure_loaded() holds the lock and awaits this loader.
             idx.mark_dirty()
-            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+            return [(1, {"path": "a.py", "access_history": "[1]"})]
 
         await idx.ensure_loaded(loader)
         await idx.ensure_loaded(loader)
@@ -169,14 +169,14 @@ class TestTinyLFUIndex:
         """
         idx = TinyLFUIndex(capacity=16, history_size=5)
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             # Simulate a concurrent _delete_by_path: it calls index.remove()
             # while ensure_loaded() holds the lock and awaits this loader,
             # then returns a snapshot taken before that delete committed.
             idx.remove("gone.py")
             return [
-                (1, "", {"path": "gone.py", "access_history": "[1]"}),
-                (2, "", {"path": "kept.py", "access_history": "[2]"}),
+                (1, {"path": "gone.py", "access_history": "[1]"}),
+                (2, {"path": "kept.py", "access_history": "[2]"}),
             ]
 
         await idx.ensure_loaded(loader)
@@ -192,11 +192,11 @@ class TestTinyLFUIndex:
         idx = TinyLFUIndex(capacity=16, history_size=5)
         calls = {"n": 0}
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("transient DB failure")
-            return [(1, "", {"path": "a.py", "access_history": "[1]"})]
+            return [(1, {"path": "a.py", "access_history": "[1]"})]
 
         await idx.ensure_loaded(loader)
         idx.mark_dirty()
@@ -227,11 +227,11 @@ class TestTinyLFUIndex:
         """
         idx = TinyLFUIndex(capacity=16, history_size=5)
 
-        async def loader() -> list[tuple[int, str, dict]]:
+        async def loader() -> list[tuple[int, dict]]:
             return [
-                (1, "", {"path": "good.py", "access_history": "[1.0, 2.0]"}),
-                (2, "", {"path": "bad.py", "access_history": '[1.0, "corrupt"]'}),
-                (3, "", {"path": "junk.py", "access_history": "not-json"}),
+                (1, {"path": "good.py", "access_history": "[1.0, 2.0]"}),
+                (2, {"path": "bad.py", "access_history": '[1.0, "corrupt"]'}),
+                (3, {"path": "junk.py", "access_history": "not-json"}),
             ]
 
         await idx.ensure_loaded(loader)
@@ -287,7 +287,7 @@ class TestContentStorageEvictionUsesIndex:
             for i in range(3):
                 await vs.put(f"/f{i}.txt", f"x {i}\n", mtime=float(i))
             # Force the index into memory.
-            await vs._index.ensure_loaded(vs._collection.get_documents)  # noqa: SLF001
+            await vs._index.ensure_loaded(vs._collection.get_metadata)  # noqa: SLF001
             assert vs._index.loaded is True  # noqa: SLF001
 
             calls = {"n": 0}
@@ -315,7 +315,7 @@ class TestBootstrapUpsertRace:
         idx = TinyLFUIndex(capacity=16, history_size=4)
 
         async def initial_loader():
-            return [(1, "", {"path": "/a", "access_history": "[1.0]"})]
+            return [(1, {"path": "/a", "access_history": "[1.0]"})]
 
         await idx.ensure_loaded(initial_loader)
         assert idx.doc_ids_for("/a") == [1]
@@ -326,7 +326,7 @@ class TestBootstrapUpsertRace:
         async def slow_stale_loader():
             await gate.wait()
             # Snapshot predates the concurrent upsert: still shows doc 1.
-            return [(1, "", {"path": "/a", "access_history": "[1.0]"})]
+            return [(1, {"path": "/a", "access_history": "[1.0]"})]
 
         task = asyncio.create_task(idx.ensure_loaded(slow_stale_loader))
         for _ in range(5):

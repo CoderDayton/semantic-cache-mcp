@@ -286,7 +286,7 @@ async def test_failed_store_marks_index_dirty(
     path = "/big.py"
     await storage.put(path, _big_text("orig"), time.time())
     # Force the index to load so `loaded` reflects real state, not lazy-unloaded.
-    await storage._index.ensure_loaded(storage._collection.get_documents)
+    await storage._index.ensure_loaded(storage._collection.get_metadata)
     assert storage._index.loaded is True
 
     async def boom(*_args: object, **_kwargs: object) -> object:

@@ -21,6 +21,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
@@ -31,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _TABLE = "documents"
 _FTS = "documents_fts"
+
+# PRAGMA auto_vacuum mode 2. Freed pages go on a free list that
+# ``PRAGMA incremental_vacuum`` can hand back to the filesystem, instead of
+# being retained and reused (mode 0), which pins the file at its high-water
+# mark forever.
+_AUTO_VACUUM_INCREMENTAL = 2
 
 # Defense-in-depth: table names are module constants, never user input, but
 # validate anyway since they are interpolated into SQL.
@@ -66,11 +73,48 @@ class DocStore:
         # WAL, but Python's `with conn:` transaction context is not thread-safe.
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._closed = False
+        # Before the WAL pragma, which writes a header page: while the database
+        # is still genuinely empty the mode is adopted with no rewrite at all,
+        # so only a store created before 0.5.3 ever pays for the VACUUM.
+        self._enable_incremental_vacuum()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
+
+    def _enable_incremental_vacuum(self) -> None:
+        """Make freed pages returnable to the filesystem, once per store.
+
+        Without this SQLite keeps freed pages inside the file and reuses them,
+        so a cache that has evicted and re-indexed for weeks sits at its
+        high-water mark: 139 MB of file for 4 MB of text, measured. The mode
+        lives in the database header, so this check is self-describing and
+        needs no migration marker. Changing it on a database that already has
+        pages only takes effect after a full rewrite, which is what the VACUUM
+        is for — 38.6 ms on that 139 MB store, and never again.
+        """
+        try:
+            if int(self._conn.execute("PRAGMA auto_vacuum").fetchone()[0]) == (
+                _AUTO_VACUUM_INCREMENTAL
+            ):
+                return
+            # Read the page count before setting the mode, not after: recording
+            # the mode is itself a write, so it creates the first header page
+            # and would make every new store look like one needing a rewrite.
+            populated = int(self._conn.execute("PRAGMA page_count").fetchone()[0]) > 0
+            self._conn.execute(f"PRAGMA auto_vacuum = {_AUTO_VACUUM_INCREMENTAL}")
+            if populated:
+                started = time.perf_counter()
+                self._conn.execute("VACUUM")
+                logger.info(
+                    "enabled incremental auto-vacuum on %s in %.1f ms",
+                    self._path.name,
+                    (time.perf_counter() - started) * 1000,
+                )
+        except sqlite3.Error as exc:
+            # A cache that cannot shrink still works; never fail startup for it.
+            logger.warning(f"could not enable incremental auto-vacuum: {exc}")
 
     def _create_tables(self) -> None:
         with self._lock, self._conn:
@@ -239,6 +283,82 @@ class DocStore:
             rows = self._conn.execute(sql, tuple(filter_params)).fetchall()
         return [(int(r[0]), r[1], json.loads(r[2]) if r[2] else {}) for r in rows]
 
+    def get_metadata(
+        self, filter_dict: dict[str, Any] | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return ``(id, metadata)`` for all docs (optionally filtered), no text.
+
+        The text column holds the entire cached corpus, so selecting it just to
+        read a metadata field re-materializes every cached file in memory.
+        Callers that never look at the text use this projection instead.
+        """
+        filter_clause = ""
+        filter_params: list[Any] = []
+        if filter_dict:
+            filter_clause, filter_params = self.build_filter_clause(filter_dict, "metadata")
+        sql = f"SELECT id, metadata FROM {_TABLE} WHERE 1=1 {filter_clause} ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(filter_params)).fetchall()
+        return [(int(r[0]), json.loads(r[1]) if r[1] else {}) for r in rows]
+
+    def distinct_paths(self, *, path_key: str, is_parent_key: str) -> list[str]:
+        """Distinct non-parent document paths, extracted and de-duplicated in SQL.
+
+        Returns bare strings. Callers that only match paths were decoding every
+        document's whole metadata JSON in Python to reach one field, which cost
+        more than the query itself.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT DISTINCT json_extract(metadata, ?) FROM {_TABLE} "
+                "WHERE COALESCE(json_extract(metadata, ?), 0) != 1",
+                (f'$."{path_key}"', f'$."{is_parent_key}"'),
+            ).fetchall()
+        return [r[0] for r in rows if r[0]]
+
+    def get_document_ids(self) -> list[int]:
+        """Every document id — the cheapest projection there is."""
+        with self._lock:
+            rows = self._conn.execute(f"SELECT id FROM {_TABLE} ORDER BY id").fetchall()
+        return [int(r[0]) for r in rows]
+
+    def file_stats(
+        self,
+        *,
+        path_key: str,
+        tokens_key: str,
+        is_parent_key: str,
+        total_chunks_key: str,
+    ) -> tuple[int, int]:
+        """``(distinct files, summed file-level tokens)``, aggregated in SQL.
+
+        Mirrors the per-document accounting exactly: a chunked file contributes
+        its tokens once through its parent doc and an unchunked one through its
+        only doc, so summing every row would double-count the chunked files.
+        The metadata key names belong to the caller's schema, so they arrive as
+        arguments and are bound as JSON paths rather than duplicated here.
+        """
+
+        def _path(key: str) -> str:
+            return f'$."{key}"'
+
+        with self._lock:
+            files_row = self._conn.execute(
+                f"SELECT COUNT(DISTINCT json_extract(metadata, ?)) FROM {_TABLE} "
+                "WHERE json_extract(metadata, ?) IS NOT NULL "
+                "AND json_extract(metadata, ?) != ''",
+                (_path(path_key),) * 3,
+            ).fetchone()
+            tokens_row = self._conn.execute(
+                f"SELECT COALESCE(SUM(json_extract(metadata, ?)), 0) FROM {_TABLE} "
+                "WHERE json_extract(metadata, ?) = 1 "
+                "OR COALESCE(json_extract(metadata, ?), 1) = 1",
+                (_path(tokens_key), _path(is_parent_key), _path(total_chunks_key)),
+            ).fetchone()
+        files = int(files_row[0]) if files_row and files_row[0] is not None else 0
+        tokens = int(tokens_row[0]) if tokens_row and tokens_row[0] is not None else 0
+        return files, tokens
+
     def count(self) -> int:
         with self._lock:
             row = self._conn.execute(f"SELECT COUNT(*) FROM {_TABLE}").fetchone()
@@ -302,6 +422,46 @@ class DocStore:
             self._conn.execute(f"DELETE FROM {_FTS}")
         return int(count)
 
+    def optimize(self) -> None:
+        """Merge the FTS5 index into one segment, discarding delete markers.
+
+        FTS5 records a deletion as an index entry rather than removing one, so
+        a store that has evicted many files keeps the vocabulary of every file
+        it ever held. Only a full merge discards them — the incremental
+        ``merge`` command leaves them in place. Measured on a 39 MB store:
+        24.7 MB of index down to 1.2 MB in 144 ms. Called at shutdown, where a
+        one-off cost is affordable and an interrupted merge is simply rolled
+        back.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                with self._conn:
+                    self._conn.execute(f"INSERT INTO {_FTS}({_FTS}) VALUES('optimize')")
+            except sqlite3.Error as exc:
+                logger.debug(f"fts optimize failed: {exc}")
+
+    def reclaim_free_pages(self) -> None:
+        """Return freed pages to the filesystem.
+
+        A no-op until :meth:`_enable_incremental_vacuum` has run, and cheap
+        when there is nothing to give back. Paired with :meth:`optimize` at
+        shutdown: the merge is what frees the pages, and this is what hands
+        them over — on their own, neither shrinks the file.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                # Each step of this pragma hands back one page and yields, so a
+                # bare execute() reclaims exactly one. It has to be driven to
+                # completion or the file never measurably shrinks.
+                self._conn.execute("PRAGMA incremental_vacuum").fetchall()
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.debug(f"incremental_vacuum failed: {exc}")
+
     def save(self) -> None:
         """Commit and checkpoint the WAL."""
         with self._lock:
@@ -357,6 +517,40 @@ class AsyncDocStore:
         self, filter_dict: dict[str, Any] | None = None
     ) -> list[tuple[int, str, dict[str, Any]]]:
         return await self._run(self._store.get_documents, filter_dict)
+
+    async def get_metadata(
+        self, filter_dict: dict[str, Any] | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        return await self._run(self._store.get_metadata, filter_dict)
+
+    async def get_document_ids(self) -> list[int]:
+        return await self._run(self._store.get_document_ids)
+
+    async def distinct_paths(self, *, path_key: str, is_parent_key: str) -> list[str]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._store.distinct_paths(path_key=path_key, is_parent_key=is_parent_key),
+        )
+
+    async def file_stats(
+        self,
+        *,
+        path_key: str,
+        tokens_key: str,
+        is_parent_key: str,
+        total_chunks_key: str,
+    ) -> tuple[int, int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._store.file_stats(
+                path_key=path_key,
+                tokens_key=tokens_key,
+                is_parent_key=is_parent_key,
+                total_chunks_key=total_chunks_key,
+            ),
+        )
 
     async def count(self) -> int:
         return await self._run(self._store.count)

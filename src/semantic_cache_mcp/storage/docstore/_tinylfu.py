@@ -169,9 +169,9 @@ class _Entry:
     history: list[float] = field(default_factory=list)
 
 
-# Shape of one document tuple from the store's get_documents():
-# (doc_id, text, metadata). We only use doc_id and metadata.
-DocLoader = Callable[[], Awaitable[Iterable[tuple[int, str, dict]]]]
+# Shape of one row from the store's get_metadata(): (doc_id, metadata). The
+# index never reads document text, so the loader never fetches it.
+DocLoader = Callable[[], Awaitable[Iterable[tuple[int, dict]]]]
 
 
 class TinyLFUIndex:
@@ -273,7 +273,7 @@ class TinyLFUIndex:
                 self._entries.clear()
                 self._lru.clear()
                 self._sketch = _CountMinSketch(self._capacity)
-                for doc_id, _text, meta in await load_all():
+                for doc_id, meta in await load_all():
                     path = meta.get("path", "")
                     if not path:
                         continue

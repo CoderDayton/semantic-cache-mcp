@@ -251,7 +251,7 @@ class ContentStorage:
     def _has_premanifest_chunks(self) -> bool:
         """True if the store holds a chunked parent doc with no manifest — the
         pre-chunk-hash format that predates content-addressed reconciliation."""
-        for _doc_id, _text, meta in self._sync_collection.get_documents():
+        for _doc_id, meta in self._sync_collection.get_metadata():
             if meta.get(_META_IS_PARENT, False) and _META_MANIFEST not in meta:
                 return True
         return False
@@ -298,6 +298,13 @@ class ContentStorage:
             nonlocal close_error
             with self._save_lock:
                 try:
+                    # Discard the FTS5 delete markers this session accumulated,
+                    # then hand the pages that frees back to the filesystem.
+                    # Neither shrinks the file alone: the first stops the index
+                    # carrying the vocabulary of every file ever evicted, the
+                    # second stops the file sitting at its high-water mark.
+                    self._db.optimize()
+                    self._db.reclaim_free_pages()
                     self._db.save()
                     self._db.close()
                 except Exception as exc:
@@ -815,7 +822,6 @@ class ContentStorage:
         """
         if self._closed:
             return False
-        import time
 
         key = path_filter or ""
         ttl_cache: dict[str, tuple[float, bool]] = self._has_cached_cache
@@ -824,19 +830,18 @@ class ContentStorage:
         if entry is not None and now - entry[0] < self._HAS_CACHED_TTL_S:
             return entry[1]
 
-        all_docs = await self._collection.get_documents()
+        # Paths only. This answers a question about paths, so it asks SQL for
+        # exactly those: loading every cached file's text — or even decoding
+        # every document's metadata JSON — to produce one boolean cost more
+        # than the entire query.
+        paths = await self._collection.distinct_paths(
+            path_key=_META_PATH, is_parent_key=_META_IS_PARENT
+        )
         if not path_filter:
-            result = any(not meta.get(_META_IS_PARENT, False) for _id, _text, meta in all_docs)
+            result = bool(paths)
         else:
             matcher = _grep.path_matches
-            result = False
-            for _doc_id, _text, meta in all_docs:
-                if meta.get(_META_IS_PARENT, False):
-                    continue
-                doc_path = meta.get(_META_PATH, "")
-                if doc_path and matcher(doc_path, path_filter=path_filter):
-                    result = True
-                    break
+            result = any(matcher(doc_path, path_filter=path_filter) for doc_path in paths)
         ttl_cache[key] = (now, result)
         # Bound memory: keep the map small — bursty wrong paths typically
         # share a small alphabet of distinct keys.
@@ -855,10 +860,12 @@ class ContentStorage:
         context_lines: int = 0,
         max_matches: int = 100,
         max_files: int = 50,
-    ) -> list[dict]:
+    ) -> _grep.GrepResults:
         """Exact pattern matching across cached files — like ripgrep on the cache.
 
-        Unlike search, returns line numbers and context, not ranked scores.
+        Unlike search, returns line numbers and context, not ranked scores. The
+        returned :class:`~._grep.GrepResults` is a list of per-file hits that
+        also reports whether a cap truncated the scan.
         Implementation lives in ``_grep`` to keep this module from becoming a god-object.
         """
         return await _grep.grep(
@@ -921,27 +928,34 @@ class ContentStorage:
         except OSError:
             db_size = 0
 
-        # Count unique files (not chunks)
-        unique_paths: set[str] = set()
-        total_tokens = 0
-
-        all_docs = await self._collection.get_documents()
-        for _doc_id, _text, meta in all_docs:
-            path = meta.get(_META_PATH, "")
-            if path:
-                unique_paths.add(path)
-            # Only count tokens from parent docs or single-chunk files.
-            # Child chunks also store token counts, so summing all docs
-            # would double-count chunked files.
-            if meta.get(_META_IS_PARENT, False) or meta.get(_META_TOTAL_CHUNKS, 1) == 1:
-                total_tokens += meta.get(_META_TOKENS, 0)
+        # Distinct files and file-level tokens are aggregated in SQL. Doing it
+        # in Python meant loading every cached file's text and re-parsing every
+        # document's JSON on each call — an O(corpus) cost for two integers,
+        # paid by `stats` and by every `search`.
+        files_cached, total_tokens = await self._file_stats()
 
         return {
-            "files_cached": len(unique_paths),
+            "files_cached": files_cached,
             "total_tokens_cached": total_tokens,
             "total_documents": count,
             "db_size_mb": round(db_size / 1024 / 1024, 2),
         }
+
+    async def _file_stats(self) -> tuple[int, int]:
+        """``(distinct cached files, file-level token total)`` straight from SQL."""
+        return await self._collection.file_stats(
+            path_key=_META_PATH,
+            tokens_key=_META_TOKENS,
+            is_parent_key=_META_IS_PARENT,
+            total_chunks_key=_META_TOTAL_CHUNKS,
+        )
+
+    async def count_files(self) -> int:
+        """Number of distinct cached files, without the rest of ``get_stats``."""
+        if self._closed:
+            return 0
+        files, _tokens = await self._file_stats()
+        return files
 
     def _clear_sync(self) -> int:
         """Synchronous clear — safe to call without an event loop.
@@ -953,8 +967,9 @@ class ContentStorage:
         sync_coll = self._sync_collection
         count = sync_coll.count()
         if count > 0:
-            all_docs = sync_coll.get_documents()
-            doc_ids = [doc_id for doc_id, _, _ in all_docs]
+            # Ids only — the rows are about to be deleted, so their text is the
+            # last thing worth loading.
+            doc_ids = sync_coll.get_document_ids()
             if doc_ids:
                 sync_coll.delete_by_ids(doc_ids)
                 sync_coll.save()
@@ -1049,8 +1064,9 @@ class ContentStorage:
             if await self._collection.count() <= cap:
                 return
             # Lazy bootstrap. Captures the executor closure here so the index
-            # module stays decoupled from the async store's exact API.
-            await self._index.ensure_loaded(self._collection.get_documents)
+            # module stays decoupled from the async store's exact API. The index
+            # reads only metadata, so the loader hands it exactly that.
+            await self._index.ensure_loaded(self._collection.get_metadata)
 
         if self._index.total_paths() <= cap:
             return
