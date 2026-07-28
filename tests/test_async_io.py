@@ -11,6 +11,7 @@ import pytest
 
 from semantic_cache_mcp.utils._async_io import (
     aread_bytes,
+    aread_head,
     aread_text,
     astat,
     aunlink,
@@ -108,3 +109,31 @@ class TestAunlink:
 
     async def test_missing_ok_suppresses(self, tmp_path: Path) -> None:
         await aunlink(tmp_path / "absent", missing_ok=True)
+
+
+class TestAreadHead:
+    """Reads a bounded prefix, so a huge file costs a window and not itself."""
+
+    async def test_returns_only_the_requested_prefix(self, tmp_path: Path) -> None:
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"0123456789" * 1000)
+        assert await aread_head(f, 8) == b"01234567"
+
+    async def test_short_file_returns_everything(self, tmp_path: Path) -> None:
+        f = tmp_path / "short.bin"
+        f.write_bytes(b"abc")
+        assert await aread_head(f, 4096) == b"abc"
+
+    async def test_empty_file_returns_empty(self, tmp_path: Path) -> None:
+        f = tmp_path / "empty.bin"
+        f.write_bytes(b"")
+        assert await aread_head(f, 4096) == b""
+
+    async def test_missing_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            await aread_head(tmp_path / "absent.bin", 16)
+
+    async def test_matches_the_prefix_of_a_full_read(self, tmp_path: Path) -> None:
+        f = tmp_path / "mixed.bin"
+        f.write_bytes(bytes(range(256)) * 40)
+        assert await aread_head(f, 8192) == (await aread_bytes(f))[:8192]

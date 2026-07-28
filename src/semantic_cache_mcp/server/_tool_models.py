@@ -303,6 +303,15 @@ class GrepResponse(ToolResponseModel):
     files: list[GrepFile] | None = None
     truncated_matches: int | None = None
     truncated_files: int | None = None
+    # False when a cap stopped the scan early, so `total_matches` counts only
+    # what was examined. Absent means the scan ran to completion.
+    complete: bool | None = None
+    limit_reached: str | None = None
+    files_not_searched: int | None = None
+    files_in_response: int | None = None
+    # Why an empty result was empty, and what to do about it.
+    reason: str | None = None
+    hint: str | None = None
     fixed_string: bool | None = None
     case_sensitive: bool | None = None
     context_lines: int | None = None

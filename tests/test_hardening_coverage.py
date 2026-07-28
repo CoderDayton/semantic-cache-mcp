@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import threading
 from pathlib import Path
@@ -128,7 +130,7 @@ class TestTokenizerThreadSafety:
 
             with (
                 patch.object(Path, "exists", return_value=False),
-                patch("urllib.request.urlretrieve", side_effect=urllib.error.URLError("fail")),
+                patch("urllib.request.urlopen", side_effect=urllib.error.URLError("fail")),
                 patch.object(Path, "mkdir"),
             ):
                 result = tokenizer._ensure_tokenizer()
@@ -633,7 +635,7 @@ class TestTokenizerCachePaths:
 
         try:
             with patch(
-                "urllib.request.urlretrieve",
+                "urllib.request.urlopen",
                 side_effect=urllib.error.URLError("timeout"),
             ):
                 result = tok_mod._ensure_tokenizer()
@@ -722,3 +724,103 @@ class TestSemanticSearchDirectoryFilter:
             directory="/nonexistent/dir",
         )
         assert len(result.matches) == 0
+
+
+class TestAtomicWriteDurability:
+    """The temp-file rename must be backed by an fsync, not just a rename."""
+
+    def test_content_and_permissions_survive(self, tmp_path: Path) -> None:
+        from semantic_cache_mcp.utils._async_io import _atomic_write_sync
+
+        target = tmp_path / "durable.txt"
+        target.write_text("old")
+        target.chmod(0o640)
+
+        _atomic_write_sync(target, "new content\n")
+
+        assert target.read_text() == "new content\n"
+        assert target.stat().st_mode & 0o777 == 0o640
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_file_is_flushed_before_the_rename(self, tmp_path: Path) -> None:
+        """Rename is atomic against a reader, not against a crash — data first."""
+        import os
+
+        from semantic_cache_mcp.utils import _async_io
+
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = Path.replace
+
+        def tracking_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def tracking_replace(self: Path, target: Path) -> Path:  # type: ignore[override]
+            events.append("replace")
+            return real_replace(self, target)
+
+        with (
+            patch.object(_async_io.os, "fsync", tracking_fsync),
+            patch.object(Path, "replace", tracking_replace),
+        ):
+            _async_io._atomic_write_sync(tmp_path / "ordered.txt", "payload")
+
+        assert events[0] == "fsync", f"data must be flushed before the rename: {events}"
+        assert "replace" in events
+        assert events.index("fsync") < events.index("replace")
+
+    def test_directory_fsync_is_best_effort(self, tmp_path: Path) -> None:
+        """No directory descriptor (Windows) must not turn into a write failure."""
+        from semantic_cache_mcp.utils._async_io import _fsync_directory
+
+        # Unopenable directory: returns instead of raising.
+        _fsync_directory(tmp_path / "does-not-exist")
+        # Real directory: also returns, having actually flushed it.
+        _fsync_directory(tmp_path)
+
+    def test_rename_is_flushed_into_its_directory(self, tmp_path: Path) -> None:
+        """Without this the data is durable but the new name can still be lost."""
+        from semantic_cache_mcp.utils import _async_io
+
+        seen: list[Path] = []
+        with patch.object(_async_io, "_fsync_directory", seen.append):
+            _async_io._atomic_write_sync(tmp_path / "named.txt", "payload")
+
+        assert seen == [tmp_path]
+        assert (tmp_path / "named.txt").read_text() == "payload"
+
+
+class TestTokenizerDownloadBounds:
+    """The one-time fetch must not be able to hang or fill the disk."""
+
+    def test_urlopen_is_called_with_a_timeout(self, tmp_path: Path) -> None:
+        from semantic_cache_mcp.core.tokenizer import _bpe
+
+        payload = io.BytesIO(b"payload-bytes")
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(url: str, timeout: float | None = None):  # type: ignore[no-untyped-def]
+            captured["url"] = url
+            captured["timeout"] = timeout
+            return contextlib.closing(payload)
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            _bpe._download_tokenizer(_bpe.O200K_BASE_URL, tmp_path / "out.bin")
+
+        assert captured["timeout"] == _bpe.DOWNLOAD_TIMEOUT_S
+        assert (tmp_path / "out.bin").read_bytes() == b"payload-bytes"
+
+    def test_oversized_response_is_rejected(self, tmp_path: Path) -> None:
+        from semantic_cache_mcp.core.tokenizer import _bpe
+
+        oversized = io.BytesIO(b"\x00" * (_bpe.DOWNLOAD_MAX_BYTES + 1))
+
+        def fake_urlopen(url: str, timeout: float | None = None):  # type: ignore[no-untyped-def]
+            return contextlib.closing(oversized)
+
+        with (
+            patch("urllib.request.urlopen", fake_urlopen),
+            pytest.raises(ValueError, match="exceeded"),
+        ):
+            _bpe._download_tokenizer(_bpe.O200K_BASE_URL, tmp_path / "big.bin")

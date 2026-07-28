@@ -55,6 +55,37 @@ GREP_PREFILTER_FETCH_CAP = 1000
 # fixed-string patterns are immune because there the characters are literal.
 GREP_UNSAFE_REGEX_CHARS = frozenset("|?*{[")
 
+# Quantifiers that let their target repeat two or more times. Applied to a group
+# that already contains an unbounded quantifier, these are what make a pattern
+# exponential: `(a+)+` explores every way to partition the same run of a's.
+_UNBOUNDED_QUANTIFIERS = frozenset("*+")
+_REPEAT_STARTERS = frozenset("*+{")
+
+
+class GrepResults(list[dict]):
+    """Grep hits, plus whether a cap stopped the scan before it finished.
+
+    Subclasses ``list`` so every existing caller keeps indexing and iterating
+    the results unchanged, while the tool layer can tell the caller its answer
+    is partial. Without that, a scan that stops at ``max_matches`` reports the
+    capped count as though it were the total — the one thing a search must
+    never claim about work it did not do. ``files_not_searched`` counts the
+    cached files the scan never opened.
+    """
+
+    __slots__ = ("truncated_matches", "truncated_files", "files_not_searched")
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        self.truncated_matches: bool = False
+        self.truncated_files: bool = False
+        self.files_not_searched: int = 0
+
+    @property
+    def complete(self) -> bool:
+        """True when every candidate file was scanned to the end."""
+        return not (self.truncated_matches or self.truncated_files)
+
 
 async def grep(
     store: ContentStorage,
@@ -66,13 +97,15 @@ async def grep(
     context_lines: int = 0,
     max_matches: int = 100,
     max_files: int = 50,
-) -> list[dict]:
+) -> GrepResults:
     """Exact pattern matching across cached files — like ripgrep on the cache.
 
-    Unlike search, returns line numbers and context, not ranked scores.
+    Unlike search, returns line numbers and context, not ranked scores. The
+    result carries whether ``max_matches``/``max_files`` cut the scan short, so
+    a capped count is never mistaken for a complete one.
     """
     if store._closed:
-        return []
+        return GrepResults()
 
     # Clamp inputs to prevent excessive memory/CPU usage
     context_lines = max(0, min(context_lines, GREP_MAX_CONTEXT_LINES))
@@ -89,6 +122,14 @@ async def grep(
         if len(pattern) > GREP_MAX_PATTERN_LEN:
             raise ValueError(
                 f"grep pattern too long ({len(pattern)} chars, limit {GREP_MAX_PATTERN_LEN})"
+            )
+        if has_nested_quantifier(pattern):
+            raise ValueError(
+                f"unsafe regex pattern {pattern!r}: a repeated group contains an "
+                "unbounded quantifier (e.g. `(a+)+`), which can take exponential "
+                "time to match and cannot be interrupted once started. Drop the "
+                "inner or outer repeat — one of them is almost always redundant — "
+                "or pass fixed_string=True to match the text literally."
             )
         try:
             compiled = re.compile(pattern, flags)
@@ -112,7 +153,7 @@ async def grep(
         # Vocabulary expansion makes the candidate set exact: empty means
         # nothing matches, non-empty is complete — no full scan needed.
         if not candidates:
-            return []
+            return GrepResults()
         files = await load_files(store, candidates)
     else:
         all_docs = await store._collection.get_documents()
@@ -125,12 +166,40 @@ async def grep(
             chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
             files.setdefault(doc_path, []).append((chunk_idx, text))
 
-    # Search each file's content
-    results: list[dict] = []
-    total_matches = 0
+    return scan_files(
+        files,
+        compiled,
+        context_lines=context_lines,
+        max_matches=max_matches,
+        max_files=max_files,
+    )
 
-    for doc_path, chunks in files.items():
-        if total_matches >= max_matches or len(results) >= max_files:
+
+def scan_files(
+    files: dict[str, list[tuple[int, str]]],
+    compiled: re.Pattern[str],
+    *,
+    context_lines: int,
+    max_matches: int,
+    max_files: int,
+) -> GrepResults:
+    """Run *compiled* over already-loaded file chunks. Synchronous, no I/O.
+
+    Every early exit records why, because a capped scan has not seen the rest
+    of the corpus and must say so.
+    """
+    results = GrepResults()
+    total_matches = 0
+    pending = list(files.items())
+
+    for index, (doc_path, chunks) in enumerate(pending):
+        if total_matches >= max_matches:
+            results.truncated_matches = True
+            results.files_not_searched = len(pending) - index
+            break
+        if len(results) >= max_files:
+            results.truncated_files = True
+            results.files_not_searched = len(pending) - index
             break
 
         # Reconstruct file content from sorted chunks
@@ -141,6 +210,9 @@ async def grep(
         file_matches: list[dict] = []
         for i, line in enumerate(lines):
             if total_matches >= max_matches:
+                # Stopped part-way through this file: the lines after this one
+                # were never tested, so the count so far is a floor.
+                results.truncated_matches = True
                 break
             if compiled.search(line):
                 match_info: dict[str, object] = {
@@ -159,6 +231,100 @@ async def grep(
             results.append({"path": doc_path, "matches": file_matches})
 
     return results
+
+
+def _repeat_allows_many(pattern: str, index: int) -> tuple[bool, int]:
+    """Can the quantifier at *index* repeat its target two or more times?
+
+    Returns ``(allows_many, next_index)``. ``?`` and ``{0,1}`` cannot repeat, so
+    they cannot compound an inner quantifier and are never flagged.
+    """
+    char = pattern[index]
+    if char in _UNBOUNDED_QUANTIFIERS:
+        return True, index + 1
+    if char != "{":
+        return False, index + 1
+    close = pattern.find("}", index)
+    if close == -1:
+        return False, index + 1  # a literal brace, not a quantifier
+    parts = pattern[index + 1 : close].split(",")
+    try:
+        if len(parts) == 1:
+            return int(parts[0]) >= 2, close + 1
+        low = int(parts[0]) if parts[0] else 0
+        if not parts[1]:
+            return True, close + 1  # {n,} is unbounded
+        return max(low, int(parts[1])) >= 2, close + 1
+    except ValueError:
+        return False, close + 1  # not a numeric repeat; treat as a literal
+
+
+def _skip_character_class(pattern: str, index: int) -> int:
+    """Return the index just past the ``[...]`` class starting at *index*."""
+    length = len(pattern)
+    index += 1
+    if index < length and pattern[index] == "^":
+        index += 1
+    if index < length and pattern[index] == "]":
+        index += 1  # a leading ']' is a literal member
+    while index < length and pattern[index] != "]":
+        index += 2 if pattern[index] == "\\" else 1
+    return index + 1
+
+
+def has_nested_quantifier(pattern: str) -> bool:
+    r"""True when a repeatable group encloses an unbounded quantifier.
+
+    This is the shape behind catastrophic backtracking — ``(a+)+``, ``(\w*)*``,
+    ``([0-9]{2,})+`` — where the engine explores exponentially many ways to
+    split one run of input between the inner and the outer repeat. Detecting it
+    statically is the only defense available here: ``re`` offers no match
+    budget, and it holds the GIL while matching, so no timeout, worker thread,
+    or cancellation can interrupt a match already under way.
+
+    Deliberately narrow. A repeated group with no inner quantifier (``(abc)+``,
+    ``(foo|bar)*``) is left alone — refusing ordinary patterns would cost far
+    more than the rare exponential one does.
+    """
+    # One frame per group nesting level, recording whether an unbounded
+    # quantifier has been seen inside that group.
+    stack: list[bool] = [False]
+    index = 0
+    length = len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            index = _skip_character_class(pattern, index)
+            continue
+        if char == "(":
+            stack.append(False)
+            index += 1
+            continue
+        if char == ")":
+            inner_unbounded = stack.pop() if len(stack) > 1 else False
+            index += 1
+            if index < length and pattern[index] in _REPEAT_STARTERS:
+                allows_many, index = _repeat_allows_many(pattern, index)
+                if allows_many and inner_unbounded:
+                    return True
+                if allows_many:
+                    stack[-1] = True
+            # An inner unbounded quantifier still counts toward the enclosing
+            # group even when this group itself is not repeated.
+            if inner_unbounded:
+                stack[-1] = True
+            continue
+        if char in _REPEAT_STARTERS:
+            allows_many, next_index = _repeat_allows_many(pattern, index)
+            if allows_many:
+                stack[-1] = True
+            index = next_index
+            continue
+        index += 1
+    return False
 
 
 def required_tokens(pattern: str, *, fixed_string: bool) -> list[str] | None:

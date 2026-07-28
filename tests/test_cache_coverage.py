@@ -760,8 +760,10 @@ class TestSmartEditEdgeCases:
         cache = _make_cache(tmp_path)
         f = tmp_path / "permerr.txt"
         f.write_text("content")
+        # The binary sniff reads only the leading window, so the seam is
+        # Path.open, not Path.read_bytes.
         with (
-            patch.object(Path, "read_bytes", side_effect=OSError("no permission")),
+            patch.object(Path, "open", side_effect=OSError("no permission")),
             pytest.raises(PermissionError),
         ):
             await smart_edit(cache, str(f), "content", "new")

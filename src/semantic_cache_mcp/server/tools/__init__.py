@@ -477,7 +477,8 @@ async def read(
 ) -> dict[str, Any]:
     """Read a file, returning as few tokens as possible. For 2+ files, use `batch_read`.
 
-    The first read returns the full numbered content plus a `content_hash`.
+    The first read returns the file's full content plus a `content_hash`
+    (a ranged read numbers its lines; a whole-file read returns them as-is).
     Echo that hash back as `known_hash` and a later read of an unchanged file
     answers `"unchanged": true` with no body; a changed file returns a unified
     diff. Omit it and the file is always sent in full. Reading also caches the
@@ -727,11 +728,19 @@ async def read(
                     _stamp_ranged_possession(diff_payload, ranged_hash, covered, len(lines))
                     return _finalize_payload(diff_payload, max_response_tokens)
 
-            # Format with line numbers like built-in Read tool. Generator
+            # Format with line numbers like the built-in Read tool. Generator
             # expression avoids materializing the intermediate list; `selected`
             # may be thousands of lines on partial reads of large files.
+            #
+            # Only the line terminator is stripped, never trailing whitespace
+            # within the line. A window covering the whole file mints a
+            # claimable `content_hash`, and that claim is only true if the
+            # caller can reconstruct the bytes it is vouching for — rstrip()
+            # silently dropped trailing spaces and tabs, certifying possession
+            # of content that was never sent.
             content = "\n".join(
-                f"{i:6d}\t{line.rstrip()}" for i, line in enumerate(selected, start=start + 1)
+                f"{i:6d}\t{line.removesuffix(chr(10)).removesuffix(chr(13))}"
+                for i, line in enumerate(selected, start=start + 1)
             )
             # Bill only the slice actually returned; the rest of the file is saved
             # versus a naive full read.
@@ -1736,6 +1745,12 @@ async def edit_preview(
                 diff_mode=False,
                 force_full=True,
                 refresh_cache=False,
+                # Anchors and their line numbers only mean anything against the
+                # literal file. Summarizing first made this tool answer
+                # "found: false" for text that is in the file, and quote line
+                # numbers belonging to the summary — a confident wrong answer to
+                # the one question it exists to settle.
+                summarize=False,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -2329,6 +2344,14 @@ async def grep(
     means zero matches. For concept-level questions where you don't know the
     exact term, use `search` instead.
 
+    Counts are complete unless the response says otherwise: if a cap stops the
+    scan, `complete` comes back false with `limit_reached` naming which one, so
+    `total_matches` is never mistaken for the total that exists.
+
+    A repeated group wrapping an unbounded quantifier (`(a+)+`) is rejected
+    rather than run — it can take exponential time and cannot be interrupted
+    once started. Drop the redundant repeat, or pass `fixed_string=true`.
+
     Args:
         pattern: A regular expression, or a literal string when
             `fixed_string=true`.
@@ -2355,14 +2378,20 @@ async def grep(
         # honoured in every response mode — the rule `show_diff` already
         # follows. Compact mode suppresses context nobody asked for, which is
         # what the default of 0 already does on its own.
-        results = await cache._storage.grep(
-            pattern,
-            path=path,
-            fixed_string=fixed_string,
-            case_sensitive=case_sensitive,
-            context_lines=context_lines,
-            max_matches=max_matches,
-            max_files=max_files,
+        # Bounded like every other tool. The pattern comes from the caller and
+        # `re` has no interrupt, so the scan runs off the event loop (see
+        # `_grep.grep`); that is what lets this timeout actually fire.
+        results = await asyncio.wait_for(
+            cache._storage.grep(
+                pattern,
+                path=path,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+                context_lines=context_lines,
+                max_matches=max_matches,
+                max_files=max_files,
+            ),
+            timeout=_TOOL_TIMEOUT,
         )
         cache.metrics.record("grep", None)
 
@@ -2437,6 +2466,19 @@ async def grep(
             payload["files_in_response"] = len(files_payload)
             if truncated_files > 0:
                 payload["truncated_files"] = truncated_files
+        # The scan itself stops at max_matches/max_files, so the corpus past
+        # that point was never examined. Say so explicitly: `total_matches`
+        # otherwise reads as the complete count of what exists, and a caller
+        # that believes it moves on without ever looking at the rest.
+        if not results.complete:
+            payload["complete"] = False
+            payload["limit_reached"] = "max_matches" if results.truncated_matches else "max_files"
+            if results.files_not_searched:
+                payload["files_not_searched"] = results.files_not_searched
+            payload["hint"] = (
+                "counts are a floor, not a total — raise max_matches/max_files, "
+                "or narrow the pattern or path"
+            )
         # Distinguish "no files cached under that path" from "no matches".
         # The audit found 22/29 empty greps fit the cache-miss shape, so the
         # caller should know whether to seed via batch_read/glob.
@@ -2454,6 +2496,16 @@ async def grep(
 
     except ToolError:
         raise
+    except TimeoutError:
+        # A pattern that backtracks catastrophically leaves the executor thread
+        # wedged; reset it so the next call is not stuck behind it.
+        _handle_timeout(cache, "grep", pattern[:50])
+        _raise_tool_error(
+            "grep",
+            f"timed out after {_TOOL_TIMEOUT}s — the pattern is too expensive to "
+            "run over the cached files; simplify it or narrow `path`",
+            max_response_tokens,
+        )
     except ValueError as e:
         # Bad input (an uncompilable pattern), not a server fault — report it
         # without a traceback, and never as an empty result set.

@@ -35,6 +35,16 @@ TOKENIZER_CACHE_DIR = CACHE_DIR / "tokenizer"
 O200K_BASE_URL = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
 O200K_BASE_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
 
+# Bounds on the one-time tokenizer fetch. urlretrieve honours no timeout at
+# all, so an endpoint that accepts the connection and then stalls wedges the
+# first count_tokens() call forever — and the server primes that at startup,
+# under a lock every other thread queues behind. The size cap bounds a
+# hijacked or misconfigured endpoint: the real file is ~4 MB, and anything
+# larger fails the hash check anyway, so stop before it reaches the disk.
+DOWNLOAD_TIMEOUT_S = 30.0
+DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 1 << 16
+
 
 class BPETokenizer:
     """Self-contained BPE tokenizer compatible with tiktoken o200k_base encoding.
@@ -355,6 +365,34 @@ def _init_tokenizer(cache_file: Path) -> BPETokenizer:
     return tok
 
 
+def _download_tokenizer(url: str, dest: Path) -> None:
+    """Stream *url* to *dest* under a socket timeout and a hard size cap.
+
+    Raises OSError (which covers socket timeouts) on a stalled or unreachable
+    endpoint, and ValueError when the response exceeds ``DOWNLOAD_MAX_BYTES`` —
+    both already handled by the caller as "no tokenizer, use the heuristic".
+    """
+    import urllib.request  # noqa: PLC0415
+
+    written = 0
+    # URL is a module-level https constant and the result is hash-verified by
+    # the caller before it is ever loaded.
+    with (
+        urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as response,  # nosec B310
+        open(dest, "wb") as out,
+    ):
+        while True:
+            chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > DOWNLOAD_MAX_BYTES:
+                raise ValueError(
+                    f"tokenizer download exceeded {DOWNLOAD_MAX_BYTES} bytes; aborting"
+                )
+            out.write(chunk)
+
+
 def _verify_hash(path: Path, expected: str) -> bool:
     sha256 = hashlib.sha256()
     with open(path, "rb") as f:
@@ -399,7 +437,11 @@ def _ensure_tokenizer() -> BPETokenizer | None:
             # Download to temp file then rename atomically. URL is a
             # compile-time constant and the result is hash-verified below.
             tmp_file = cache_file.with_suffix(".tmp")
-            urllib.request.urlretrieve(O200K_BASE_URL, tmp_file)  # nosec B310
+            try:
+                _download_tokenizer(O200K_BASE_URL, tmp_file)
+            except BaseException:
+                tmp_file.unlink(missing_ok=True)
+                raise
 
             if not _verify_hash(tmp_file, O200K_BASE_SHA256):
                 tmp_file.unlink(missing_ok=True)

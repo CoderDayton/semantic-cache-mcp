@@ -9,11 +9,12 @@ from pathlib import Path
 from ..core import count_tokens, diff_with_stats
 from ..core.hashing import hash_content
 from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
-from ..utils import aread_bytes, aread_text, astat, awrite_atomic
+from ..utils import aread_bytes, aread_head, aread_text, astat, awrite_atomic
 from ..utils._async_io import (
     _atomic_write_sync as _atomic_write,  # noqa: F401 — re-exported for tests
 )
 from ._helpers import (
+    BINARY_SNIFF_BYTES,
     MAX_EDIT_SIZE,
     MAX_MATCHES,
     MAX_WRITE_SIZE,
@@ -21,9 +22,11 @@ from ._helpers import (
     _extract_line_range,
     _find_match_line_numbers,
     _format_file,
+    _guard_editable_size,
     _is_binary_content,
     _PhaseTimer,
     _suppress_large_diff,
+    build_line_starts,
 )
 from .store import SemanticCache
 
@@ -31,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 # DoS limit for batch_edit
 MAX_BATCH_EDITS = 50
+
+# Cap on line numbers quoted back in an ambiguous-anchor error. Enough to see
+# the shape of the duplication without spending the response budget on it.
+_MAX_REPORTED_MATCH_LINES = 10
 
 
 async def smart_write(
@@ -91,9 +98,10 @@ async def smart_write(
     mtime: float | None = None
 
     if not created:
-        # Check for binary file
+        # Check for binary file. Only the sniff window is read — the existing
+        # content, when needed for the diff, is fetched further down.
         try:
-            sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
+            sample = await aread_head(file_path, BINARY_SNIFF_BYTES, cache._io_executor)
             if _is_binary_content(sample):
                 raise ValueError(
                     f"Binary file not supported: {path}. Cannot overwrite binary with text."
@@ -344,11 +352,13 @@ async def smart_edit(
     if original.is_symlink():
         logger.debug(f"Following symlink: {path} -> {file_path}")
 
-    # Check for binary file
+    # Reject an unreadably large file before anything reads it, then sniff for
+    # binary content using only the sniff window.
     if timer is not None:
         timer.enter("binary_check")
+    await _guard_editable_size(file_path, cache._io_executor)
     try:
-        sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
+        sample = await aread_head(file_path, BINARY_SNIFF_BYTES, cache._io_executor)
         if _is_binary_content(sample):
             raise ValueError(f"Binary file not supported: {path}. Edit only works with text files.")
     except OSError as e:
@@ -569,6 +579,21 @@ async def smart_edit(
     )
 
 
+def _mark_anchor_lost(outcome: SingleEditOutcome, where: str) -> None:
+    """Fail an edit whose anchor is gone by the time its turn to apply comes.
+
+    Anchors are validated against the file as it was read, but edits apply to
+    the progressively-mutated text, so an earlier edit in the batch can consume
+    the text a later one matched. Counting that as applied would tell the caller
+    a change landed when the file never received it.
+    """
+    outcome.success = False
+    outcome.line_number = None
+    outcome.error = (
+        f"old_string no longer present in {where} after earlier edits in this batch applied"
+    )
+
+
 async def smart_batch_edit(
     cache: SemanticCache,
     path: str,
@@ -606,9 +631,10 @@ async def smart_batch_edit(
     if not file_path.is_file():
         raise ValueError(f"Not a regular file: {path}")
 
-    # Check for binary file
+    # Same guards as `edit`: size first, then a sniff of the leading window.
+    await _guard_editable_size(file_path, cache._io_executor)
     try:
-        sample = (await aread_bytes(file_path, cache._io_executor))[:8192]
+        sample = await aread_head(file_path, BINARY_SNIFF_BYTES, cache._io_executor)
         if _is_binary_content(sample):
             raise ValueError(f"Binary file not supported: {path}")
     except OSError as e:
@@ -648,7 +674,19 @@ async def smart_batch_edit(
             content = await aread_text(file_path, errors="replace", executor=cache._io_executor)
             logger.warning(f"File {path} contains non-UTF-8 characters")
 
+    # Same character-count ceiling `edit` enforces; without it batch_edit was
+    # the one mutation path with no upper bound on the text it would process.
+    if len(content) > MAX_EDIT_SIZE:
+        raise ValueError(
+            f"File too large for edit: {len(content):,} bytes exceeds {MAX_EDIT_SIZE:,} byte limit"
+        )
+
     original_content = content
+    # Every edit is validated against this one immutable text, so the line-start
+    # index is built once instead of per edit. Rebuilding it each time made
+    # validation quadratic in (edits x file size) and dominated the whole call
+    # on large files.
+    line_starts = build_line_starts(content)
 
     # Normalize edits to 4-tuples: (old | None, new, start_line | None, end_line | None)
     normalized: list[tuple[str | None, str, int | None, int | None]] = []
@@ -676,7 +714,8 @@ async def smart_batch_edit(
                 if not has_range:
                     raise ValueError("old_string is required without line range")
                 if sl is not None and el is not None:
-                    _extract_line_range(content, sl, el)  # validates bounds
+                    # Validates bounds against the file as read.
+                    _extract_line_range(content, sl, el, line_starts=line_starts)
                     sort_line = sl
                     outcomes.append(
                         SingleEditOutcome(
@@ -701,7 +740,7 @@ async def smart_batch_edit(
                 # Mode B: scoped search
                 if sl is None or el is None:
                     raise TypeError("start_line and end_line required for line-range mode")
-                substring, _cs, _ce = _extract_line_range(content, sl, el)
+                substring, _cs, _ce = _extract_line_range(content, sl, el, line_starts=line_starts)
                 sub_matches = _find_match_line_numbers(substring, old_string)
                 if not sub_matches:
                     raise ValueError(f"old_string not found within lines {sl}-{el}")
@@ -721,9 +760,23 @@ async def smart_batch_edit(
 
             else:
                 # Mode A: full-file search
-                line_numbers = _find_match_line_numbers(content, old_string)
+                line_numbers = _find_match_line_numbers(
+                    content, old_string, line_starts=line_starts
+                )
                 if not line_numbers:
                     raise ValueError("not found")
+                if len(line_numbers) > 1:
+                    # Same uniqueness rule `edit` enforces. Replacing one of
+                    # several identical anchors picks an occurrence the caller
+                    # never named, and inside a batch that lands silently among
+                    # other edits — so refuse and say where the duplicates are.
+                    shown = line_numbers[:_MAX_REPORTED_MATCH_LINES]
+                    suffix = ", ..." if len(line_numbers) > len(shown) else ""
+                    raise ValueError(
+                        f"old_string found {len(line_numbers)} times at lines "
+                        f"{shown}{suffix}. Hint: provide more context to make the "
+                        "match unique, or scope it with start_line/end_line"
+                    )
                 outcomes.append(
                     SingleEditOutcome(
                         old_string=old_string,
@@ -748,30 +801,52 @@ async def smart_batch_edit(
                 )
             )
 
-    # Ranged edits (Mode B/C) splice by character offsets re-derived from the
-    # progressively-mutated content, so two edits over overlapping line ranges
-    # would corrupt each other. Fail the later-listed one instead of applying.
+    # Two edits that target the same lines corrupt each other: ranged edits
+    # (Mode B/C) splice by character offsets re-derived from the progressively-
+    # mutated content, and a Mode A replacement lands wherever its anchor sits,
+    # so a range that swallows another edit's anchor silently discards it.
+    # Whichever conflicting edit is listed later fails instead of applying.
     accepted_ranges: list[tuple[int, int]] = []
+    accepted_anchors: list[int] = []
     surviving: list[tuple[str | None, str, int, int | None, int | None, int]] = []
     for entry in successful_edits:
-        sl, el, outcome_idx = entry[3], entry[4], entry[5]
+        anchor_line, sl, el, outcome_idx = entry[2], entry[3], entry[4], entry[5]
+        conflict: str | None = None
         if sl is not None and el is not None:
             if any(sl <= hi and lo <= el for lo, hi in accepted_ranges):
-                outcome = outcomes[outcome_idx]
-                outcome.success = False
-                outcome.line_number = None
-                outcome.error = f"line range {sl}-{el} overlaps another edit in this batch"
-                continue
+                conflict = f"line range {sl}-{el} overlaps another edit in this batch"
+            elif any(sl <= line <= el for line in accepted_anchors):
+                conflict = f"line range {sl}-{el} contains another edit's anchor in this batch"
+        elif any(lo <= anchor_line <= hi for lo, hi in accepted_ranges):
+            conflict = (
+                f"old_string matches line {anchor_line}, inside another edit's "
+                "line range in this batch"
+            )
+
+        if conflict is not None:
+            outcome = outcomes[outcome_idx]
+            outcome.success = False
+            outcome.line_number = None
+            outcome.error = conflict
+            continue
+
+        if sl is not None and el is not None:
             accepted_ranges.append((sl, el))
+        else:
+            accepted_anchors.append(anchor_line)
         surviving.append(entry)
     successful_edits = surviving
 
-    # Apply successful edits (sort by line number descending to preserve positions)
+    # Apply the surviving edits highest-line-first, so an earlier splice never
+    # shifts the offsets a later one was validated against. Each find/replace is
+    # re-checked against the text it actually lands on: validation ran on the
+    # file as read, and an edit accepted then can have had its anchor consumed
+    # since. One that would quietly do nothing is reported failed, never applied.
     new_content = content
     if successful_edits:
         successful_edits.sort(key=lambda x: x[2], reverse=True)
 
-        for old_str, new_str, _sort_line, sl, el, _outcome_idx in successful_edits:
+        for old_str, new_str, _sort_line, sl, el, outcome_idx in successful_edits:
             if old_str is None and sl is not None and el is not None:
                 # Mode C: splice by line range
                 _sub, cs, ce = _extract_line_range(new_content, sl, el)
@@ -782,10 +857,17 @@ async def smart_batch_edit(
                 # Mode B: scoped replace
                 sub, cs, ce = _extract_line_range(new_content, sl, el)
                 new_sub = sub.replace(old_str, new_str, 1)
+                if new_sub == sub:
+                    _mark_anchor_lost(outcomes[outcome_idx], f"lines {sl}-{el}")
+                    continue
                 new_content = new_content[:cs] + new_sub + new_content[ce:]
             elif old_str is not None:
                 # Mode A: full-file replace
-                new_content = new_content.replace(old_str, new_str, 1)
+                replaced = new_content.replace(old_str, new_str, 1)
+                if replaced == new_content:
+                    _mark_anchor_lost(outcomes[outcome_idx], "the file")
+                    continue
+                new_content = replaced
 
     # Generate combined diff
     diff_content, stats = diff_with_stats(
