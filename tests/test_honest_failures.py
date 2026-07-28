@@ -298,3 +298,136 @@ async def test_grep_results_behaves_like_a_list(
     assert len(results) >= 1
     assert results[0]["path"] == str(path)
     assert [r["path"] for r in results] == [str(path)]
+
+
+class TestGrepAnswersAboutTheRightFiles:
+    """A path filter that names a directory must find what is under it."""
+
+    async def test_directory_filter_matches_files_beneath_it(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """A bare directory is a filter, not a typo — it names every file below."""
+        pkg = temp_dir / "pkg"
+        pkg.mkdir()
+        for i in range(3):
+            leaf = pkg / f"m{i}.py"
+            leaf.write_text("needle here\n")
+            await smart_read(semantic_cache, str(leaf), force_full=True)
+
+        results = await semantic_cache._storage.grep("needle", path=str(pkg))
+
+        assert len(results) == 3
+        assert all(r["path"].startswith(str(pkg)) for r in results)
+
+    async def test_directory_filter_matches_whole_components_only(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """`src` is a directory of `src/a.py`, never of `srclib/a.py`."""
+        for name in ("src", "srclib"):
+            d = temp_dir / name
+            d.mkdir()
+            leaf = d / "a.py"
+            leaf.write_text("needle here\n")
+            await smart_read(semantic_cache, str(leaf), force_full=True)
+
+        results = await semantic_cache._storage.grep("needle", path=str(temp_dir / "src"))
+
+        assert [r["path"] for r in results] == [str(temp_dir / "src" / "a.py")]
+
+    async def test_seeded_directory_is_not_reported_as_an_unseeded_cache(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """The empty-result explanation must not blame a cache that is warm."""
+        from semantic_cache_mcp.server import tools
+
+        pkg = temp_dir / "warm"
+        pkg.mkdir()
+        leaf = pkg / "a.py"
+        leaf.write_text("needle here\n")
+        await smart_read(semantic_cache, str(leaf), force_full=True)
+
+        ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
+        ctx.list_roots = _no_roots
+        payload = await tools.grep(ctx, "needle", path=str(pkg))
+
+        assert payload["total_matches"] == 1
+        assert "reason" not in payload
+
+    async def test_genuinely_unseeded_directory_still_says_so(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """The cache-miss explanation has to survive the directory fix."""
+        from semantic_cache_mcp.server import tools
+
+        cold = temp_dir / "cold"
+        cold.mkdir()
+        (cold / "a.py").write_text("needle here\n")
+
+        ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
+        ctx.list_roots = _no_roots
+        payload = await tools.grep(ctx, "needle", path=str(cold))
+
+        assert payload["total_matches"] == 0
+        assert payload["reason"] == "no_files_cached_under_path"
+
+
+class TestTruncationKeepsItsExplanation:
+    """A response cut down for size must still say what it found."""
+
+    async def test_capped_grep_keeps_its_counts_when_trimmed(
+        self, semantic_cache: SemanticCache, temp_dir: Path
+    ) -> None:
+        """Trimming drops match lines, never the scalars that explain them."""
+        from semantic_cache_mcp.server import tools
+        from semantic_cache_mcp.server.response import _response_overrides
+
+        path = temp_dir / "many.txt"
+        path.write_text(
+            "\n".join(
+                f"needle the quick brown fox number {i} jumps over the lazy dog" for i in range(400)
+            )
+            + "\n"
+        )
+        await smart_read(semantic_cache, str(path), force_full=True)
+
+        ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
+        ctx.list_roots = _no_roots
+
+        # Sweep the whole band between "one match fits" and "everything fits".
+        # A response that reports nothing is the failure being guarded against,
+        # so no cap in the range may produce one.
+        for cap in (2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 15_000):
+            with _response_overrides("compact", cap):
+                payload = await tools.grep(ctx, "needle", path=str(path), max_matches=400)
+
+            assert payload.get("total_matches") == 400, f"cap={cap} lost the total: {payload}"
+            assert "message" not in payload or "files" in payload, (
+                f"cap={cap} was cut to a bare truncation notice: {payload}"
+            )
+
+    def test_minimal_payload_retains_the_explanatory_scalars(self) -> None:
+        """The keep list is what makes a trimmed response readable."""
+        from semantic_cache_mcp.server.response import _minimal_payload
+
+        trimmed = _minimal_payload(
+            {
+                "ok": True,
+                "tool": "grep",
+                "pattern": "needle",
+                "path": "/x",
+                "total_matches": 400,
+                "files_matched": 3,
+                "complete": False,
+                "limit_reached": "max_matches",
+                "files_not_searched": 9,
+                "hint": "raise max_matches",
+                "files": [{"path": "/x/a", "matches": ["..."] * 500}],
+            }
+        )
+
+        assert trimmed["total_matches"] == 400
+        assert trimmed["complete"] is False
+        assert trimmed["limit_reached"] == "max_matches"
+        assert trimmed["files_not_searched"] == 9
+        assert trimmed["truncated"] is True
+        assert "files" not in trimmed, "the bulky field is what trimming is for"

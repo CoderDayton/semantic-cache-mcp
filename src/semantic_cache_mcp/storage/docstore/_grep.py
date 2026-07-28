@@ -505,7 +505,14 @@ async def load_files(
 
 
 def path_matches(path: str, *, path_filter: str | None) -> bool:
-    """Match exact paths, relative suffixes, basenames, and glob filters."""
+    """Match exact paths, relative suffixes, basenames, directories, and globs.
+
+    A directory names every file beneath it. Without that case a caller who
+    passes the directory it just seeded gets zero matches, and — since this is
+    also what decides the empty-result explanation — an answer blaming a cache
+    that is already warm. The remedy it suggests (seed the cache) cannot work,
+    because the files are in there; only appending `/*` would have helped.
+    """
     if not path_filter:
         return True
 
@@ -522,8 +529,14 @@ def path_matches(path: str, *, path_filter: str | None) -> bool:
             )
         )
 
+    # Match on whole path components only: `src` is a directory of
+    # `/repo/src/a.py`, but not of `/repo/srclib/a.py`.
+    directory = normalized_filter.rstrip("/")
+
     return (
         normalized_path == normalized_filter
         or normalized_path.endswith(f"/{normalized_filter}")
         or Path(normalized_path).name == normalized_filter
+        or bool(directory)
+        and (normalized_path.startswith(f"{directory}/") or f"/{directory}/" in normalized_path)
     )

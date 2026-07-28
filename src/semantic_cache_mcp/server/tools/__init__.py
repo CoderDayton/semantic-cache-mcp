@@ -12,7 +12,7 @@ import stat as stat_module
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
@@ -75,6 +75,18 @@ logger = logging.getLogger(__name__)
 
 # Tool timeout from config (env TOOL_TIMEOUT, default 30s).
 _TOOL_TIMEOUT: float = TOOL_TIMEOUT
+
+# Chars per token to assume when sizing a payload of serialized JSON matches.
+# Prose runs ~4; JSON punctuation, quoted keys and line numbers run denser, so
+# budgeting at the prose rate overshoots the response cap.
+_JSON_CHARS_PER_TOKEN: Final = 2
+
+# Per-match JSON envelope: the `line_number`/`line` keys, braces, quotes and
+# separators that wrap each match line.
+_MATCH_ENVELOPE_CHARS: Final = 32
+
+# Per-context-line JSON envelope inside a match.
+_CONTEXT_ENVELOPE_CHARS: Final = 4
 
 
 def _ranged_metrics(tokens_original: int, tokens_returned: int, *, from_cache: bool) -> ReadResult:
@@ -2103,15 +2115,18 @@ async def batch_read(
     to an `unchanged` count, or to a diff when it moved on disk. Each file sent
     in full comes back with its `content_hash` — keep those and pass them next
     time. A file large enough to come back summarized carries none: a summary is
-    not the file, so it cannot be vouched for. Smallest files are read first;
-    once the budget is spent the rest are listed under `skipped` — recover them
-    with `read` using `offset`/`limit`.
+    not the file, so it cannot be vouched for. Smallest files are read first, and
+    a file too big for the remaining budget is listed under `skipped` while
+    smaller ones keep being read — so one large file cannot starve the rest of
+    the batch. Recover anything skipped with `read` using `offset`/`limit`.
 
     Args:
         paths: The files to read — a comma-separated list, a JSON array, or
             glob patterns (expanded for you).
         max_total_tokens: Total token budget shared across the whole batch.
         priority: Optional paths to read first, ahead of the remaining files.
+            Ordering only — a priority file still has to fit the budget, and is
+            skipped like any other when it does not.
         known_hashes: JSON object mapping a path to the `content_hash` you
             still hold for it, e.g. `{"src/a.py": "8f3c..."}`. Any file you
             cannot vouch for this way is sent in full.
@@ -2355,7 +2370,8 @@ async def grep(
     Args:
         pattern: A regular expression, or a literal string when
             `fixed_string=true`.
-        path: Optional filter — an exact path, a path suffix, or a glob.
+        path: Optional filter — an exact path, a path suffix, a directory
+            (matching every cached file beneath it), or a glob.
         fixed_string: Match `pattern` literally instead of as a regex.
         case_sensitive: Match case-sensitively.
         context_lines: Lines of surrounding context to include per match,
@@ -2402,8 +2418,14 @@ async def grep(
         # token cap in _finalize_payload still applies as a backstop.
         char_budget: int | None = None
         if max_response_tokens is not None and max_response_tokens > 0:
-            # Leave ~512 tokens for the response envelope/metadata.
-            char_budget = max(1024, (max_response_tokens - 512) * 4)
+            # Leave ~512 tokens for the response envelope/metadata, and budget
+            # the rest at _JSON_CHARS_PER_TOKEN rather than the ~4 chars/token
+            # of prose. Serialized matches are not prose: quoted keys, braces,
+            # commas and line numbers all tokenize far denser, so a prose-rate
+            # estimate assembles a payload over the hard cap and the whole
+            # thing is cut down to the minimal form — losing every match line
+            # the budget existed to preserve.
+            char_budget = max(1024, (max_response_tokens - 512) * _JSON_CHARS_PER_TOKEN)
 
         # Build response
         files_payload: list[dict[str, Any]] = []
@@ -2429,15 +2451,14 @@ async def grep(
                         item["after"] = m["after"]
                 match_items.append(item)
                 if char_budget is not None:
-                    # ~32 chars JSON envelope per match (line_number, line keys
-                    # + braces + commas + quotes). Add context-line bytes when
-                    # present so the soft budget accounts for them.
-                    running_chars += len(m["line"]) + 32
+                    # Account for the JSON envelope each match carries, and for
+                    # context-line bytes when they are present.
+                    running_chars += len(m["line"]) + _MATCH_ENVELOPE_CHARS
                     if context_lines > 0:
                         for ctx_line in m.get("before", ()):
-                            running_chars += len(ctx_line) + 4
+                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
                         for ctx_line in m.get("after", ()):
-                            running_chars += len(ctx_line) + 4
+                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
                     if running_chars > char_budget:
                         budget_exceeded = True
                         # Count remaining matches in this file as truncated

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.3] - 2026-07-27: Windowed possession, audited edits, a cache that shrinks
+## [0.5.3] - 2026-07-28: Windowed possession, audited edits, a cache that shrinks
 
 A ranged read could never earn anything redeemable. It reported its digest as
 `file_hash` prefixed `partial:` — correct, since seeing one window is no proof you
@@ -122,6 +122,36 @@ unchanged by it.
 - **`batch_edit` enforced no size limit at all.** `edit` capped files at
   `MAX_EDIT_SIZE` (10 MB); the batch path, which does strictly more work, had no
   check. Both now guard before reading.
+- **`grep` found nothing when its `path` filter named a directory.** The filter
+  matched an exact path, a suffix, a basename or a glob — never a directory — so
+  passing the folder you had just seeded returned zero matches. Worse, the same
+  matcher decides the empty-result explanation, so the answer came back
+  `no_files_cached_under_path` with a hint to seed the cache: a diagnosis of a
+  cache that was already warm, and a remedy that could not work. Only appending
+  `/*` would have helped, and nothing said so. A directory now names every file
+  beneath it, matching on whole path components — `src` covers `src/a.py` and
+  never `srclib/a.py`.
+- **A trimmed response threw away the answer it had already computed.** When a
+  payload exceeded `TOOL_MAX_RESPONSE_TOKENS` it was cut down to a keep-list
+  that held none of `grep`'s counts, so a search over 400 matches came back as
+  `{"path": ..., "truncated": true}` — indistinguishable from a failure, with
+  the total, the cap that stopped the scan and the reason all dropped. Trimming
+  now sheds the bulky fields and keeps the scalars that say what was found;
+  they cost a handful of tokens and they are the part the caller cannot
+  reconstruct.
+- **`grep` sized its match budget as though JSON were prose.** The soft budget
+  reserved room at ~4 chars per token, which serialized matches do not obey —
+  quoted keys, braces and line numbers all tokenize denser — so it assembled a
+  payload over the hard cap and had the whole thing trimmed away. With a cap set
+  anywhere between roughly 2,000 and 15,000 tokens, `grep` reported nothing at
+  all. The estimate is now conservative, and the per-match and per-context
+  envelope sizes are named constants rather than inline numbers.
+- **Two more descriptions overstated what the code does.** `batch_read` said the
+  rest of a batch is skipped "once the budget is spent", when a file too big for
+  the remaining budget is skipped while smaller ones keep being read — one large
+  file cannot starve the batch. Its `priority` argument described ordering as
+  though it were precedence; a priority file still has to fit, and is skipped
+  like any other when it does not.
 
 ### Changed
 
