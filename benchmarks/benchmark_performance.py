@@ -41,6 +41,7 @@ from _bench_lib import (  # noqa: E402
     BenchmarkReport,
     collect_metadata,
     common_argparser,
+    filesystem_of,
     print_header,
     time_async,
     time_sync,
@@ -400,12 +401,22 @@ async def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="scmcp_perf_") as tmp_str:
         tmp = Path(tmp_str)
+        # The write and edit rows are the only ones the filesystem changes, and
+        # tmpfs changes them a lot: it ignores fsync, so the durability the
+        # atomic write pays for costs nothing there. Record which one this was.
+        workdir_fs = filesystem_of(tmp)
+        report.measurements["workdir"] = str(tmp)
+        report.measurements["workdir_fs"] = workdir_fs
         work_dir = tmp / "src"
         work_dir.mkdir()
         files = _copy_to_tmp(source_files, src_root, work_dir)
         cache = SemanticCache(db_path=tmp / "cache.db")
 
         if not args.quiet:
+            print(f"  workdir: {tmp} ({workdir_fs})")
+            if workdir_fs == "tmpfs":
+                print("  WARNING: tmpfs discards fsync, so write/edit will read low.")
+                print("           Re-run with TMPDIR set to a path on a real disk.")
             print("\n--- Tokenizer ---")
         bench_tokenizer(report, files, iters)
 

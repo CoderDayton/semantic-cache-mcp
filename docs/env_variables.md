@@ -2,6 +2,10 @@
 
 All environment variables are optional. Defaults are tuned for typical usage.
 
+A malformed value falls back to the default rather than failing startup, and
+since 0.5.3 logs a warning naming the variable — a silent fallback leaves you
+believing a setting took effect when the symptom surfaces somewhere else.
+
 ## Cache & Storage
 
 | Variable | Default | Description |

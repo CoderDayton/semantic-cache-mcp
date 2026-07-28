@@ -178,6 +178,36 @@ def _cpu_brand() -> str:
     return platform.processor() or platform.machine()
 
 
+def filesystem_of(path: Path) -> str:
+    """Filesystem type backing *path*; ``"unknown"`` off Linux or on failure.
+
+    The work directory decides whether writes are durable or discarded: tmpfs
+    ignores fsync, so a run under the default `/tmp` reports a write latency
+    the real path never achieves. Recording it keeps a report honest about
+    which one it measured.
+    """
+    if sys.platform != "linux":
+        return "unknown"
+    try:
+        target = str(path.resolve())
+        best_mount = ""
+        best_type = "unknown"
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                mount, fstype = fields[1], fields[2]
+                # Longest matching mount point wins, so /home beats /.
+                if (target == mount or target.startswith(mount.rstrip("/") + "/")) and len(
+                    mount
+                ) >= len(best_mount):
+                    best_mount, best_type = mount, fstype
+        return best_type
+    except OSError:
+        return "unknown"
+
+
 def collect_metadata(repo_root: Path) -> dict[str, Any]:
     """Capture machine + repo metadata for benchmark provenance."""
     return {

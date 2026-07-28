@@ -25,14 +25,12 @@ src/semantic_cache_mcp/
 │   │   ├── __init__.py
 │   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
 │   │   └── _simd.py        # SIMD-accelerated parallel CDC
-
-│   ├── hashing/            # BLAKE3/BLAKE2b content hashing, DeduplicateIndex
-
+│   ├── hashing/            # BLAKE3/BLAKE2b content hashing and keyed MACs
 │   ├── text/               # Diff generation and semantic summarization
 │   │   ├── __init__.py
 │   │   ├── _diff.py        # generate_diff, diff_with_stats, compute_delta, diff_stats
-│   │   └���─ _summarize.py   # summarize_semantic (TCRA-LLM based)
-│   └���─ tokenizer.py        # BPE token counting (o200k_base)
+│   │   └── _summarize.py   # summarize_semantic (TCRA-LLM based)
+│   └���─ tokenizer/          # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
     ├── docstore/           # ContentStorage: vendored SQLite + FTS5 keyword store
@@ -57,6 +55,8 @@ The storage backend is a small SQLite store with FTS5, vendored into the package
 - **FTS5 full-text search.** BM25 keyword ranking powers `search` and `grep`
 - **Raw text storage.** File contents are stored as plain text in `page_content`, with no compression
 - **Metadata filtering.** Path and chunk lookups go through JSON metadata columns
+- **Text-free projections.** `get_metadata`, `get_document_ids`, `distinct_paths`, `file_stats` and `count_files` read metadata without selecting the text column, so a caller inspecting one field does not re-materialize the cached corpus
+- **Shutdown compaction.** Closing merges the FTS5 index (discarding the delete markers a deletion leaves behind) and returns the freed pages to the filesystem. Stores are opened in incremental auto-vacuum mode; one created before 0.5.3 is rewritten once to enable it. See [performance.md](performance.md#cache-footprint-on-disk)
 
 ### Document Model
 
@@ -68,7 +68,7 @@ Small file (< 8KB):
 
 Large file (≥ 8KB):
   ├── Parent document: page_content="", is_parent=True
-  └���─ Child documents (per CDC chunk):
+  └── Child documents (per CDC chunk):
       ├── page_content=chunk_text, chunk_index=0
       ├── page_content=chunk_text, chunk_index=1
       └── ...
@@ -135,13 +135,16 @@ Faster chunking via CPU-core-level parallelism:
 
 ---
 
-### Hashing (`core/hashing.py`)
+### Hashing (`core/hashing/`)
 
-BLAKE3 primary, BLAKE2b fallback. LRU-cached to avoid re-hashing identical data.
+BLAKE3 primary, BLAKE2b fallback. LRU-cached to avoid re-hashing identical data;
+the caches are keyed on the buffer they hashed, so they are sized by retained
+bytes rather than by entry count.
 
 - **Content hash freshness.** Detects mtime changes with identical content (touch, git checkout)
-- **Deduplication.** `DeduplicateIndex` for fingerprint-based dedup
 - **Change detection.** Cached versus current content hash
+- **Chunk identity.** `hash_chunk` gives each CDC chunk a stable id, which is what lets a re-write reinsert only the chunks that actually changed
+- **Possession proofs.** `keyed_hash` signs the `coverage_token` a ranged read hands back, under a key generated per process
 
 ---
 
