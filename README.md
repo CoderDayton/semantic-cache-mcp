@@ -24,7 +24,7 @@
     <img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" />
   </a>
   <a href="https://github.com/modelcontextprotocol/python-sdk">
-    <img src="https://img.shields.io/badge/FastMCP-3.2%2B-00A67E?style=for-the-badge" alt="FastMCP 3.2+" />
+    <img src="https://img.shields.io/badge/FastMCP-4.0%2B-00A67E?style=for-the-badge" alt="FastMCP 4.0+" />
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" />
@@ -416,7 +416,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks,
 
 ## Credits
 
-Built with [FastMCP 3.2+](https://github.com/jlowin/fastmcp) and:
+Built with [FastMCP 4.0+](https://github.com/jlowin/fastmcp) and:
 
 - SQLite with FTS5 for keyword (BM25) full-text search, vendored as a small built-in store
 - Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-08-31: fastmcp 4.0.0
+
+The server is launched with `uvx`, so its dependencies resolve to the newest
+matching release at every start. `fastmcp>=3.2` admitted fastmcp 4.0.0 the day it
+was published, and the server stopped importing: 4.0.0 removes the
+`fastmcp.tools.tool` module, whose `ToolResult` the tool layer imports. The
+dependency is now bounded at `fastmcp>=4.0.0,<5` — pinned forward, and closed
+against the next major so the same surprise cannot repeat.
+
+The code changes are two mechanical import fixes and one field rename.
+`ToolResult` comes from `fastmcp.tools`. `ImageContent` is constructed with
+`mime_type=`, the MCP SDK v2 spelling; the field keeps its `mimeType` alias, so
+the bytes on the wire are byte-identical. No tool name, parameter, or return
+shape changed.
+
+Relative paths still resolve against the client's project root. `Context.list_roots()`
+is gone from fastmcp 4.0.0, because the sessionless 2026-07-28 era has no
+back-channel for a server to ask a client anything mid-request — but the question
+outlives the method. Handshake-era connections still carry that back-channel, and
+it is still reachable through the raw session, so `roots/list` is now asked there
+and a client that advertises roots is answered exactly as it was under 3.x. On a
+connection that genuinely has none, the ask fails and a relative path falls back to
+the working directory, which is where it already went whenever a client declined
+to advertise roots. Absolute paths were never involved.
+
+`initialize` now reports this package's version. `serverInfo.version` had always
+carried whatever fastmcp was installed — `3.4.2` yesterday, `4.0.0` today — because
+the server was constructed without a `version`, and fastmcp fills its own in. It
+reports `0.5.4`.
+
 ## [0.5.3] - 2026-07-28: Windowed possession, audited edits, a cache that shrinks
 
 A ranged read could never earn anything redeemable. It reported its digest as

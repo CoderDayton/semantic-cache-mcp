@@ -9,6 +9,7 @@ import sys
 from fastmcp import FastMCP
 from fastmcp.server.lifespan import lifespan
 
+from .. import __version__
 from ..config import DB_PATH
 from ..core.tokenizer import get_tokenizer
 from ._param_hints import ParamHintsMiddleware
@@ -125,5 +126,11 @@ get a claimable `content_hash`. It vouches only for the lines actually \
 delivered, so pass it back only while you still hold them.
 """
 
-mcp = FastMCP("semantic-cache-mcp", instructions=INSTRUCTIONS, lifespan=app_lifespan)
+# Without an explicit version, `serverInfo.version` reports fastmcp's own version.
+mcp = FastMCP(
+    "semantic-cache-mcp",
+    version=__version__,
+    instructions=INSTRUCTIONS,
+    lifespan=app_lifespan,
+)
 mcp.add_middleware(ParamHintsMiddleware())

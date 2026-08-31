@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 
 from semantic_cache_mcp.cache import SemanticCache, smart_read
 from semantic_cache_mcp.server.response import _minimal_payload, _render_error, _render_response
