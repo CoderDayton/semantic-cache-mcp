@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import stat as stat_module
+import warnings
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -16,7 +17,8 @@ from typing import Any, Final, TypeVar, cast
 
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
+from mcp.shared.exceptions import MCPDeprecationWarning
 from mcp.types import ImageContent, TextContent
 
 from ...cache import (
@@ -125,17 +127,33 @@ _tool_lock_loop: asyncio.AbstractEventLoop | None = None
 _RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
 
 
-# Cached client root — resolved once per session via ctx.list_roots().
+# Cached client root — resolved once per session via the session's roots/list.
 _client_root: Path | None = None
 _client_root_resolved: bool = False
 
 
 async def _resolve_client_root(ctx: Context) -> Path | None:
-    """Fetch and cache the MCP client's project root (first list_roots entry)."""
+    """Fetch and cache the MCP client's project root (first roots/list entry).
+
+    fastmcp 4.0 removed ``Context.list_roots``: the sessionless 2026-07-28 era has
+    no back-channel for a server-initiated request. Handshake-era connections still
+    carry one, reachable through the raw session, so ask there. Every way of not
+    getting an answer — no session, no back-channel, no roots — means the same
+    thing here, and leaves relative paths resolving against the working directory.
+    """
     global _client_root, _client_root_resolved
     if not _client_root_resolved:
         try:
-            roots = await ctx.list_roots()
+            with warnings.catch_warnings():
+                # roots/list is deprecated as of 2026-07-28 (SEP-2577). The
+                # handshake-era back-channel is still the only way to ask, and
+                # the era that dropped it also drops the question. Filter only
+                # that one warning — `catch_warnings` mutates process-global
+                # state, and this block spans an await, so a blanket ignore
+                # would swallow warnings from concurrent tasks.
+                warnings.filterwarnings("ignore", category=MCPDeprecationWarning)
+                result = await ctx.session.list_roots()
+            roots = result.roots
             if roots:
                 uri = str(roots[0].uri)
                 if uri.startswith("file://"):
@@ -1086,7 +1104,7 @@ async def read_image(
     image_block = ImageContent(
         type="image",
         data=encoded.decode("ascii"),
-        mimeType=mime,
+        mime_type=mime,
     )
     text_block = TextContent(type="text", text=json.dumps(metadata))
     return ToolResult(content=[text_block, image_block], structured_content=metadata)

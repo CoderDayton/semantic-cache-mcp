@@ -5,7 +5,23 @@ from __future__ import annotations
 import pytest
 from fastmcp import Client
 
+from semantic_cache_mcp import __version__
 from semantic_cache_mcp.server import mcp
+
+
+@pytest.mark.asyncio
+async def test_initialize_reports_this_package_version() -> None:
+    """`serverInfo.version` names this server, not whatever fastmcp is installed.
+
+    Only the handshake era carries an initialize result at all, so the wire check
+    runs in legacy mode; the sessionless era reads the same value off the server.
+    """
+    async with Client(mcp, mode="legacy", timeout=20, init_timeout=30) as client:
+        info = client.initialize_result.server_info
+
+    assert info.name == "semantic-cache-mcp"
+    assert info.version == __version__
+    assert mcp.version == __version__
 
 
 @pytest.mark.asyncio
@@ -13,7 +29,7 @@ async def test_all_tools_expose_output_schema() -> None:
     async with Client(mcp, timeout=20, init_timeout=30) as client:
         tools = await client.list_tools()
 
-    missing = [tool.name for tool in tools if tool.outputSchema is None]
+    missing = [tool.name for tool in tools if tool.output_schema is None]
     assert missing == []
 
 
@@ -35,7 +51,7 @@ async def test_every_tool_and_parameter_is_described() -> None:
     for tool in tools:
         if not (tool.description or "").strip():
             undescribed.append(tool.name)
-        props = (tool.inputSchema or {}).get("properties") or {}
+        props = (tool.input_schema or {}).get("properties") or {}
         undescribed += [
             f"{tool.name}.{name}"
             for name, schema in props.items()
@@ -88,7 +104,7 @@ async def test_possession_fields_are_explained_where_they_can_be_returned() -> N
     async with Client(mcp, timeout=20, init_timeout=30) as client:
         tools = await client.list_tools()
 
-    schemas = {tool.name: (tool.outputSchema or {}).get("properties") or {} for tool in tools}
+    schemas = {tool.name: (tool.output_schema or {}).get("properties") or {} for tool in tools}
     # Self-check: if the output-schema shape ever changes, this guard would
     # silently inspect nothing and pass for the wrong reason.
     assert "coverage_token" in schemas["read"], "output schema shape changed; guard is blind"

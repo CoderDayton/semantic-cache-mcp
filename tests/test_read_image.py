@@ -81,7 +81,7 @@ async def test_read_image_returns_image_content_block(mcp_client, tmp_path: Path
     image_blocks = [b for b in blocks if getattr(b, "type", None) == "image"]
     assert len(image_blocks) == 1, f"expected one image block, got {blocks!r}"
     img = image_blocks[0]
-    assert img.mimeType == "image/png"
+    assert img.mime_type == "image/png"
     assert base64.b64decode(img.data) == _TINY_PNG
 
     # Structured metadata sidecar.
@@ -127,7 +127,7 @@ async def test_read_image_accepts_formats_by_magic(
     result = await mcp_client.call_tool("read_image", {"path": str(f)})
     image_blocks = [b for b in result.content if getattr(b, "type", None) == "image"]
     assert len(image_blocks) == 1
-    assert image_blocks[0].mimeType == expected_mime
+    assert image_blocks[0].mime_type == expected_mime
 
 
 async def test_read_image_accepts_image_with_wrong_extension(mcp_client, tmp_path: Path) -> None:
@@ -137,7 +137,7 @@ async def test_read_image_accepts_image_with_wrong_extension(mcp_client, tmp_pat
     result = await mcp_client.call_tool("read_image", {"path": str(f)})
     image_blocks = [b for b in result.content if getattr(b, "type", None) == "image"]
     assert len(image_blocks) == 1
-    assert image_blocks[0].mimeType == "image/png"
+    assert image_blocks[0].mime_type == "image/png"
 
 
 async def test_read_image_missing_file(mcp_client, tmp_path: Path) -> None:

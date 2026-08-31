@@ -23,11 +23,6 @@ from semantic_cache_mcp.cache.write import smart_batch_edit
 _OVER_SUMMARIZE_THRESHOLD_LINES = 20_000
 
 
-async def _no_roots() -> list[str]:
-    """Stand-in for Context.list_roots — these tests pass absolute paths."""
-    return []
-
-
 class TestBatchEditReportsWhatItDid:
     """smart_batch_edit outcomes must match what actually reached the file."""
 
@@ -256,7 +251,6 @@ class TestRangedReadHashIsHonest:
         target.write_text(source)
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        ctx.list_roots = _no_roots
         payload = await tools.read(ctx, str(target), offset=1)
 
         assert "content_hash" in payload, "a whole-file window should mint a claimable hash"
@@ -274,7 +268,6 @@ class TestRangedReadHashIsHonest:
         target.write_text("\n".join(f"line{i}" for i in range(1, 21)) + "\n")
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        ctx.list_roots = _no_roots
         payload = await tools.read(ctx, str(target), offset=1, limit=5)
 
         assert "content_hash" not in payload
@@ -347,7 +340,6 @@ class TestGrepAnswersAboutTheRightFiles:
         await smart_read(semantic_cache, str(leaf), force_full=True)
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        ctx.list_roots = _no_roots
         payload = await tools.grep(ctx, "needle", path=str(pkg))
 
         assert payload["total_matches"] == 1
@@ -364,7 +356,6 @@ class TestGrepAnswersAboutTheRightFiles:
         (cold / "a.py").write_text("needle here\n")
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        ctx.list_roots = _no_roots
         payload = await tools.grep(ctx, "needle", path=str(cold))
 
         assert payload["total_matches"] == 0
@@ -391,7 +382,6 @@ class TestTruncationKeepsItsExplanation:
         await smart_read(semantic_cache, str(path), force_full=True)
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        ctx.list_roots = _no_roots
 
         # Sweep the whole band between "one match fits" and "everything fits".
         # A response that reports nothing is the failure being guarded against,
