@@ -18,7 +18,7 @@ src/semantic_cache_mcp/
 │   ├── __init__.py
 │   ├── _mcp.py             # FastMCP app instance, lifespan, startup
 │   ├── response.py         # Response formatting, TOOL_OUTPUT_MODE handling
-│   └── tools/              # All 13 MCP tool definitions + _shielded_write helper
+│   └── tools/              # All 14 MCP tool definitions + _shielded_write helper
 ├── core/                   # Pure algorithms, stateless, zero I/O
 │   ├── __init__.py         # Flat re-exports from all sub-packages
 │   ├── chunking/           # Content-defined chunking (used for large file splitting)
@@ -68,7 +68,7 @@ Small file (< 8KB):
 
 Large file (≥ 8KB):
   ├── Parent document: page_content="", is_parent=True
-  └── Child documents (per CDC chunk):
+  └���─ Child documents (per CDC chunk):
       ├── page_content=chunk_text, chunk_index=0
       ├── page_content=chunk_text, chunk_index=1
       └── ...
@@ -83,7 +83,7 @@ Each document carries metadata for cache management:
 | Key | Type | Description |
 |-----|------|-------------|
 | `path` | `str` | Absolute file path |
-| `content_hash` | `str` | BLAKE3 hex digest of full file content |
+| `content_hash` | `str` | BLAKE3 hex digest of full file content. Stored in full; delivered to callers as its first 16 hex characters, which is what a possession claim is checked against (see `core/hashing/_wire.py`). A claim is accepted at exactly that length or the full digest, never a shorter prefix. |
 | `mtime` | `float` | File modification time |
 | `tokens` | `int` | Token count (BPE o200k_base) |
 | `chunk_index` | `int` | Chunk ordering (-1 for parent) |
