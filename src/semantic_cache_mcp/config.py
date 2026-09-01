@@ -85,6 +85,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+_TRUE_WORDS: Final = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS: Final = frozenset({"0", "false", "no", "off"})
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_WORDS:
+        return True
+    if normalized in _FALSE_WORDS:
+        return False
+    logger.warning(
+        "Invalid %s=%r (expected one of %s); using %s",
+        name,
+        raw,
+        sorted(_TRUE_WORDS | _FALSE_WORDS),
+        default,
+    )
+    return default
+
+
 def _env_mode(name: str, default: str) -> str:
     raw = environ.get(name)
     if raw is None:
@@ -100,6 +123,55 @@ MAX_CACHE_ENTRIES: Final = _env_int("MAX_CACHE_ENTRIES", 10_000)  # W-TinyLFU ev
 TOOL_OUTPUT_MODE: Final = _env_mode("TOOL_OUTPUT_MODE", "compact")
 TOOL_MAX_RESPONSE_TOKENS: Final = _env_int("TOOL_MAX_RESPONSE_TOKENS", 0)
 TOOL_TIMEOUT: Final = _env_float("TOOL_TIMEOUT", 30.0)  # seconds before tool call times out
+
+
+# ---------------------------------------------------------------------------
+# Wire-shape policy
+# ---------------------------------------------------------------------------
+#
+# Two costs are paid on every turn regardless of what any tool does:
+#
+#   * `tools/list` sits in the prompt prefix of every request. Output schemas
+#     are the majority of this server's advertised bytes and the Anthropic
+#     Messages API has no field to receive them, so they are not published by
+#     default. The Pydantic response models stay — they remain the declared
+#     contract, enforced by the response-contract tests.
+#   * A tool result may go out twice: once as a text block and again as
+#     `structuredContent`. Clients disagree on which they forward to the
+#     model, so emitting both risks doubling the cost of every file delivered.
+#     Off by default; the text block always carries the identical JSON.
+#
+# Turn either on for a client that consumes structured output. They are not
+# independent: MCP requires `structuredContent` from any tool that declares an
+# output schema, so publishing schemas forces structured content on.
+
+
+def resolve_output_policy(
+    publish_output_schema: bool, structured_content: bool
+) -> tuple[bool, bool]:
+    """Return the (publish_output_schema, structured_content) pair actually usable.
+
+    A tool that advertises an output schema and then returns no structured
+    content is a protocol violation on every call. Rather than let that be
+    configured, publication pulls structured content along with it.
+    """
+    if publish_output_schema and not structured_content:
+        return True, True
+    return publish_output_schema, structured_content
+
+
+_REQUESTED_STRUCTURED_CONTENT: Final = _env_bool("SCMCP_STRUCTURED_CONTENT", False)
+
+PUBLISH_OUTPUT_SCHEMA, STRUCTURED_CONTENT = resolve_output_policy(
+    _env_bool("SCMCP_PUBLISH_OUTPUT_SCHEMA", False),
+    _REQUESTED_STRUCTURED_CONTENT,
+)
+
+if PUBLISH_OUTPUT_SCHEMA and not _REQUESTED_STRUCTURED_CONTENT:
+    logger.warning(
+        "SCMCP_PUBLISH_OUTPUT_SCHEMA is on, so structured content is enabled too: "
+        "MCP requires structuredContent from any tool declaring an output schema"
+    )
 
 # Chunking
 CHUNK_MIN_SIZE: Final = 2048

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -84,9 +85,11 @@ async def test_read_image_returns_image_content_block(mcp_client, tmp_path: Path
     assert img.mime_type == "image/png"
     assert base64.b64decode(img.data) == _TINY_PNG
 
-    # Structured metadata sidecar.
-    meta = getattr(result, "structured_content", None) or getattr(result, "structuredContent", None)
-    assert meta is not None
+    # Metadata sidecar. Structured content is suppressed by default (see
+    # `server/_single_representation.py`); the text block carries the same JSON.
+    text_blocks = [b for b in blocks if getattr(b, "type", None) == "text"]
+    assert len(text_blocks) == 1, f"expected one metadata block, got {blocks!r}"
+    meta = json.loads(text_blocks[0].text)
     assert meta["mime"] == "image/png"
     assert meta["size"] == len(_TINY_PNG)
     assert meta["tool"] == "read_image"

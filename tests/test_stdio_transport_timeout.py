@@ -96,8 +96,10 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
     assert first.is_error is True
     assert "timed out" in first_body
     assert second.is_error is False
-    assert second.data is not None
-    assert type(second.data).__name__ == "StatsResponse"
-    assert second.data.storage is not None
-    assert second.data.session is not None
+    # The point of this assertion is that the *next* call still answers with a
+    # real report. Structured content is suppressed by default (see
+    # `server/_single_representation.py`), so the report is read out of the
+    # content blocks rather than off `.data`.
+    assert second.structured_content is None
+    assert second_body.strip()
     assert "files_cached" in second_body
