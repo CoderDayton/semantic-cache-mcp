@@ -94,7 +94,12 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: release_notes.md
-          files: dist/*
+          # Not `dist/*`: this action's globber matches dotfiles, and `uv build`
+          # leaves a one-byte `dist/.gitignore` behind, which GitHub then
+          # published on every release as `default.gitignore`.
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
           prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
