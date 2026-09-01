@@ -48,6 +48,12 @@ class SummarizationConfig:
     # a human-readable preview is wanted.
     include_markers: bool = False  # Include "[X lines omitted]" markers
     preserve_structure: bool = True  # Keep class/function headers
+    # Anchors ("// L120-170") naming the source range of each segment kept.
+    # A summary is non-contiguous, so without them the reader is told to
+    # re-read "specific sections" while holding no line number it can name,
+    # and the follow-up is a guess. They cost ~6 tokens per segment and are
+    # charged against the 20% marker reserve, so they are on by default.
+    include_line_anchors: bool = True
 
 
 DEFAULT_SUMMARIZATION_CONFIG = SummarizationConfig()
@@ -456,6 +462,16 @@ def summarize_semantic(
             omitted_lines = segment.start_line - last_end
             if omitted_lines > 0:
                 result_parts.append(f"\n// [...{omitted_lines} lines omitted...]\n")
+
+        if config.include_line_anchors:
+            # Must open its own line: an anchor glued to the tail of the
+            # previous segment names a range for text it does not describe.
+            if result_parts and not result_parts[-1].endswith("\n"):
+                result_parts.append("\n")
+            # `start_line` is a 0-based index and `end_line` is exclusive, so
+            # the 1-based inclusive range the reader can pass straight to
+            # `read(offset=..., limit=...)` is (start_line + 1, end_line).
+            result_parts.append(f"// L{segment.start_line + 1}-{segment.end_line}\n")
 
         result_parts.append(segment.content)
         last_end = segment.end_line
