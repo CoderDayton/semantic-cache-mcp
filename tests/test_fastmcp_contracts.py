@@ -7,6 +7,7 @@ from fastmcp import Client
 
 from semantic_cache_mcp import __version__
 from semantic_cache_mcp.server import mcp
+from semantic_cache_mcp.server._tool_models import TOOL_RESPONSE_MODELS
 
 
 @pytest.mark.asyncio
@@ -25,12 +26,16 @@ async def test_initialize_reports_this_package_version() -> None:
 
 
 @pytest.mark.asyncio
-async def test_all_tools_expose_output_schema() -> None:
+async def test_no_tool_publishes_an_output_schema() -> None:
+    """Output schemas stay off the wire; the models remain the contract.
+
+    See `tests/test_wire_footprint.py` for why, and for the guard that every
+    tool still declares a response model in `TOOL_RESPONSE_MODELS`.
+    """
     async with Client(mcp, timeout=20, init_timeout=30) as client:
         tools = await client.list_tools()
 
-    missing = [tool.name for tool in tools if tool.output_schema is None]
-    assert missing == []
+    assert [tool.name for tool in tools if tool.output_schema is not None] == []
 
 
 # Fields a caller must keep and echo back for the cache to save anything.
@@ -104,10 +109,12 @@ async def test_possession_fields_are_explained_where_they_can_be_returned() -> N
     async with Client(mcp, timeout=20, init_timeout=30) as client:
         tools = await client.list_tools()
 
-    schemas = {tool.name: (tool.output_schema or {}).get("properties") or {} for tool in tools}
-    # Self-check: if the output-schema shape ever changes, this guard would
-    # silently inspect nothing and pass for the wrong reason.
-    assert "coverage_token" in schemas["read"], "output schema shape changed; guard is blind"
+    # Read the shape from the declared models, not the wire: the schemas are
+    # deliberately unpublished, so `tool.output_schema` is None for every tool.
+    schemas = {name: set(model.model_fields) for name, model in TOOL_RESPONSE_MODELS.items()}
+    # Self-check: if the model shape ever changes, this guard would silently
+    # inspect nothing and pass for the wrong reason.
+    assert "coverage_token" in schemas["read"], "response model shape changed; guard is blind"
 
     missing = [
         f"{tool.name} can return `{field}` but never mentions it"
@@ -120,12 +127,15 @@ async def test_possession_fields_are_explained_where_they_can_be_returned() -> N
 
 
 @pytest.mark.asyncio
-async def test_stats_returns_named_typed_output() -> None:
+async def test_stats_returns_one_readable_report() -> None:
+    """`stats` answers in a single representation, and it carries the figures."""
     async with Client(mcp, timeout=20, init_timeout=30) as client:
         result = await client.call_tool("stats", {}, raise_on_error=False)
 
     assert result.is_error is False
-    assert result.data is not None
-    assert type(result.data).__name__ == "StatsResponse"
-    assert result.data.mode == "compact"
-    assert result.data.storage is not None
+    assert result.structured_content is None
+
+    text = "".join(getattr(block, "text", "") for block in result.content)
+    assert "Semantic Cache" in text
+    assert "Storage:" in text
+    assert "Session:" in text

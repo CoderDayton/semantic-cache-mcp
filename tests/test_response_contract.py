@@ -43,6 +43,7 @@ from semantic_cache_mcp.server._tool_models import (
     GrepResponse,
     ReadResponse,
     SearchResponse,
+    WarmResponse,
     WriteResponse,
 )
 from semantic_cache_mcp.server.response import _response_overrides
@@ -57,6 +58,7 @@ from semantic_cache_mcp.server.tools import (
     grep,
     read,
     search,
+    warm,
     write,
 )
 
@@ -226,6 +228,32 @@ _SCENARIOS: list[tuple[str, Any, type[BaseModel], _Setup]] = [
         GlobResponse,
         lambda d, f, c: {"pattern": "*.py", "directory": str(d)},
     ),
+    (
+        "read/outline",
+        read,
+        ReadResponse,
+        lambda d, f, c: {"path": str(f), "outline": True},
+    ),
+    # A file with no recognized definitions takes the `reason`/`hint` branch.
+    (
+        "read/outline_empty",
+        read,
+        ReadResponse,
+        lambda d, f, c: {"path": str(d / "flat.txt"), "outline": True},
+    ),
+    ("warm/basic", warm, WarmResponse, lambda d, f, c: {"paths": str(f)}),
+    (
+        "warm/skipped",
+        warm,
+        WarmResponse,
+        lambda d, f, c: {"paths": str(d / "never.py")},
+    ),
+    (
+        "warm/truncated",
+        warm,
+        WarmResponse,
+        lambda d, f, c: {"paths": str(d / "*.py"), "max_files": 1},
+    ),
     ("grep/hit", grep, GrepResponse, lambda d, f, c: {"pattern": "hello"}),
     (
         "grep/capped",
@@ -264,6 +292,7 @@ async def test_payload_keys_are_declared_in_model(
         "\n".join(f"def helper_{i}():\n    return {i}" for i in range(400))
     )
     (work / "blob.bin").write_bytes(b"\x00\x01\x02\xff" * 64)
+    (work / "flat.txt").write_text("alpha\nbeta\ngamma\n")
 
     cache = SemanticCache(db_path=work / "cache.db")
     ctx = _make_ctx(cache)
@@ -308,7 +337,9 @@ async def test_grep_truncation_keys_are_actually_reached(tmp_path: Path) -> None
 
     assert result["complete"] is False
     assert result["limit_reached"] == "max_matches"
-    assert "hint" in result
+    # No prose restating it: those two fields are the machine-readable form of
+    # "this count is a floor", and the docstring carries the rest.
+    assert "hint" not in result
 
 
 def test_contract_has_teeth() -> None:
