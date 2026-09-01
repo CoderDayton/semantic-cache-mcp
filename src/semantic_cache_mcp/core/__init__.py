@@ -2,14 +2,18 @@ from .chunking import get_optimal_chunker, hypercdc_chunks
 from .hashing import hash_chunk, hash_content
 from .text import (
     DEFAULT_SUMMARIZATION_CONFIG,
+    Outline,
+    OutlineEntry,
     Segment,
     SummarizationConfig,
     compute_delta,
     diff_stats,
     diff_with_stats,
+    extract_outline,
     extract_segments,
     generate_diff,
     rebase_diff_hunks,
+    render_outline,
     score_segments,
     summarize_semantic,
     truncate_semantic,
@@ -41,4 +45,9 @@ __all__ = [
     "score_segments",
     "summarize_semantic",
     "truncate_with_summarization",
+    # Structural outline
+    "Outline",
+    "OutlineEntry",
+    "extract_outline",
+    "render_outline",
 ]

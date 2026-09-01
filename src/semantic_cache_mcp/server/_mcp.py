@@ -13,6 +13,7 @@ from .. import __version__
 from ..config import DB_PATH
 from ..core.tokenizer import get_tokenizer
 from ._param_hints import ParamHintsMiddleware
+from ._single_representation import SingleRepresentationMiddleware
 from ._tool_worker import ToolProcessSupervisor
 
 logger = logging.getLogger(__name__)
@@ -134,3 +135,4 @@ mcp = FastMCP(
     lifespan=app_lifespan,
 )
 mcp.add_middleware(ParamHintsMiddleware())
+mcp.add_middleware(SingleRepresentationMiddleware())

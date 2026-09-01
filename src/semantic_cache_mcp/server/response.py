@@ -16,6 +16,15 @@ _MODE_NORMAL = {"normal", "debug"}
 _MODE_DEBUG = "debug"
 _UNSET = object()
 _NO_CHANGES_DIFF = "// No changes"
+# Quotes and comma around one rendered grep line in the JSON array.
+_LINE_BUDGET_OVERHEAD = 3
+# Chars per token to assume when refitting. Serialized matches are not prose:
+# quoted keys, punctuation and line numbers tokenize denser, so budgeting at
+# the ~4-chars-per-token prose rate builds a payload back over the cap.
+_MIN_CHARS_PER_TOKEN = 2
+# Characters reserved for the envelope (counts, flags, root, path) when
+# refitting grep matches into a truncated response.
+_TRUNCATION_ENVELOPE_CHARS = 200
 _SUPPRESSED_DIFF_PREFIX = "[diff suppressed:"
 _response_mode_override: ContextVar[str | None] = ContextVar("response_mode_override", default=None)
 _response_token_cap_override: ContextVar[int | None | object] = ContextVar(
@@ -47,7 +56,47 @@ def _response_overrides(mode: str, max_response_tokens: int | None):
         _response_token_cap_override.reset(cap_token)
 
 
-def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _fit_grep_files(files: list[Any], budget: int, spent: int) -> tuple[list[dict[str, Any]], bool]:
+    """Keep as many grep matches as the remaining budget allows.
+
+    Dropping every match was a net token *loss*: the caller learns a count it
+    cannot act on and runs the same grep again. Keeping a prefix that fits
+    means the common case — an estimate that came in slightly high — still
+    answers the question it was asked.
+    """
+    kept: list[dict[str, Any]] = []
+    dropped = False
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        lines = entry.get("lines")
+        if not isinstance(lines, list):
+            # Not a grep match list. `grep(output="paths")` legitimately sends
+            # a bare `{"path": ...}`, but a `batch_read` entry carries content
+            # and status here — reducing it to its path drops the answer, so
+            # it counts as a truncation rather than a free fit.
+            dropped = dropped or len(entry) > 1
+            kept.append({"path": path})
+            continue
+        fitted: list[str] = []
+        for line in lines:
+            cost = len(str(line)) + _LINE_BUDGET_OVERHEAD
+            if spent + cost > budget:
+                dropped = True
+                break
+            spent += cost
+            fitted.append(line)
+        if not fitted:
+            dropped = dropped or bool(lines)
+            break
+        kept.append({"path": path, "lines": fitted})
+        if dropped:
+            break
+    return kept, dropped or len(kept) < len(files)
+
+
+def _minimal_payload(payload: dict[str, Any], budget: int | None = None) -> dict[str, Any]:
     """Strip payload to essential fields when response exceeds token budget.
 
     The bulky fields go; the ones that say what the answer *was* stay. A
@@ -55,6 +104,9 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     with no result, when the tool in fact counted 400 matches and knows the
     scan was capped — the caller needs those scalars far more than it needs
     the match lines, and they cost a handful of tokens.
+
+    When a ``budget`` is given, grep matches degrade rather than vanish: as
+    many lines as fit are kept, and `truncated` says the rest were cut.
     """
     keep_order = (
         "ok",
@@ -104,6 +156,20 @@ def _minimal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     elif diff_state is not None:
         minimal["diff_state"] = diff_state
 
+    files = payload.get("files")
+    if budget is not None and isinstance(files, list) and files:
+        # Charge at the same conservative chars-per-token rate the grep tool
+        # budgets with, so a refit that says it fits actually does.
+        char_budget = max(0, budget * _MIN_CHARS_PER_TOKEN - _TRUNCATION_ENVELOPE_CHARS)
+        kept, dropped = _fit_grep_files(files, char_budget, 0)
+        if kept:
+            minimal["files"] = kept
+        if not dropped:
+            # Everything fitted after the bulky fields went, so this is no
+            # longer a truncated answer to the question that was asked.
+            minimal.pop("message", None)
+            return minimal
+
     minimal["truncated"] = True
     if "message" not in minimal:
         minimal["message"] = "Response truncated by max_response_tokens"
@@ -135,10 +201,18 @@ def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) 
         # Anything larger must be measured: density varies (CJK/emoji can
         # approach 1 token per char), and the token cap is the source of truth.
         if len(rendered) > max_response_tokens and count_tokens(rendered) > max_response_tokens:
-            body = _minimal_payload(body)
+            body = _minimal_payload(body, max_response_tokens)
             rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
             if len(rendered) > max_response_tokens and count_tokens(rendered) > max_response_tokens:
-                body = {"ok": False, "truncated": True}
+                # The refit overshot anyway; fall back to the bare form rather
+                # than ship a payload over the cap the caller set.
+                body = _minimal_payload(body)
+                rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+                if (
+                    len(rendered) > max_response_tokens
+                    and count_tokens(rendered) > max_response_tokens
+                ):
+                    body = {"ok": False, "truncated": True}
 
     return body
 

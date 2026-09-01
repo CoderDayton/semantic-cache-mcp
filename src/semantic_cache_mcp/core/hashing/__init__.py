@@ -12,9 +12,13 @@ from ._blake import (
     hash_content,
     keyed_hash,
 )
+from ._wire import WIRE_HASH_LENGTH, hash_matches, short_hash
 
 __all__ = [
     "keyed_hash",
+    "WIRE_HASH_LENGTH",
+    "short_hash",
+    "hash_matches",
     "KEYED_HASH_KEY_SIZE",
     "hash_content",
     "hash_chunk",

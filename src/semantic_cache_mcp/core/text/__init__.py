@@ -10,6 +10,12 @@ from ._diff import (
     truncate_semantic,
     truncate_smart,
 )
+from ._outline import (
+    Outline,
+    OutlineEntry,
+    extract_outline,
+    render_outline,
+)
 from ._summarize import (
     DEFAULT_SUMMARIZATION_CONFIG,
     Segment,
@@ -30,6 +36,11 @@ __all__ = [
     "compute_delta",
     "truncate_smart",
     "truncate_semantic",
+    # structural outline
+    "Outline",
+    "OutlineEntry",
+    "extract_outline",
+    "render_outline",
     # summarization
     "SummarizationConfig",
     "DEFAULT_SUMMARIZATION_CONFIG",

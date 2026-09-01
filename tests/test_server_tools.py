@@ -137,6 +137,33 @@ class TestMinimalPayload:
         assert m["diff_state"] == "omitted"
         assert m["diff_omitted"] is True
 
+    def test_batch_read_files_are_not_silently_emptied(self) -> None:
+        # `files` is a grep-shaped list only for grep. A batch_read `files`
+        # entry carries `content`, not `lines`; the budgeted refit must not
+        # strip that content and then report the answer as complete.
+        payload = {
+            "ok": True,
+            "tool": "batch_read",
+            "files": [
+                {"path": "a.py", "status": "full", "content": "X" * 5000},
+                {"path": "b.py", "status": "full", "content": "Y" * 5000},
+            ],
+        }
+        m = _minimal_payload(payload, 100)
+        assert m["truncated"] is True
+        assert "message" in m
+        assert all("content" not in f for f in m.get("files", []))
+
+    def test_grep_paths_mode_fits_without_truncation(self) -> None:
+        payload = {
+            "ok": True,
+            "tool": "grep",
+            "files": [{"path": "a.py"}, {"path": "b.py"}],
+        }
+        m = _minimal_payload(payload, 100)
+        assert "truncated" not in m
+        assert m["files"] == [{"path": "a.py"}, {"path": "b.py"}]
+
 
 class TestRenderResponse:
     def test_normal_mode_keeps_ok_and_tool(self) -> None:
@@ -239,7 +266,8 @@ class TestReadTool:
         assert "line4" not in content
 
     async def test_offset_includes_line_numbers(self, ctx: MagicMock, sample_file: Path) -> None:
-        d = _parse(await read(ctx, str(sample_file), offset=1, limit=1))
+        """The gutter is opt-in — it costs ~17% of a window (see test_read_modes.py)."""
+        d = _parse(await read(ctx, str(sample_file), offset=1, limit=1, line_numbers=True))
         # Format: "     1\tline1"
         assert "\t" in d["content"]
 
@@ -274,7 +302,7 @@ class TestReadTool:
         # Must exceed max_size so summarization would otherwise trigger.
         assert big.stat().st_size > MAX_CONTENT_SIZE
 
-        d = _parse(await read(ctx, str(big), offset=5400, limit=3))
+        d = _parse(await read(ctx, str(big), offset=5400, limit=3, line_numbers=True))
         # True total, not the summarized line count.
         assert d["lines"]["total"] == n_lines
         # The window is the actual disk lines 5400-5402 with real line numbers.
@@ -839,14 +867,17 @@ class TestSearchTool:
     async def test_search_debug_mode(self, ctx: MagicMock, py_file: Path) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="debug"):
             d = _parse(await search(ctx, "hello"))
-        assert "files_searched" in d
+        assert "query" in d
         assert "k" in d
         assert "show_preview" in d
 
-    async def test_search_normal_mode_includes_count(self, ctx: MagicMock, py_file: Path) -> None:
+    async def test_search_normal_mode_includes_corpus_size(
+        self, ctx: MagicMock, py_file: Path
+    ) -> None:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await search(ctx, "hello"))
-        assert "count" in d
+        # `count` is gone: it was `len(matches)` next to the matches array.
+        assert "count" not in d
         assert "cached_files" in d
         for match in d.get("matches", []):
             assert "preview" not in match
@@ -1098,9 +1129,9 @@ class TestGrepTool:
         with patch("semantic_cache_mcp.server.tools._response_mode", return_value="normal"):
             d = _parse(await grep(ctx, "line3", context_lines=1))
         files = d.get("files", [])
-        if files and files[0]["matches"]:
-            match = files[0]["matches"][0]
-            assert "before" in match or "after" in match
+        if files and files[0]["lines"]:
+            # Context lines carry a `-` after their number; matches carry `:`.
+            assert any("-" in line[:3] for line in files[0]["lines"])
 
     async def test_grep_debug_mode_includes_params(
         self, ctx: MagicMock, py_file: Path, tmp_cache: SemanticCache
@@ -1128,11 +1159,13 @@ class TestGrepTool:
         assert "files" in d
         for file_entry in d["files"]:
             assert "path" in file_entry
-            assert "count" in file_entry
-            assert "matches" in file_entry
-            for m in file_entry["matches"]:
-                assert "line_number" in m
-                assert "line" in m
+            # No per-file `count`: it sat next to the list it counted.
+            assert "count" not in file_entry
+            for line in file_entry["lines"]:
+                number, separator, text = line.partition(":")
+                assert number.isdigit()
+                assert separator
+                assert text
 
     async def test_grep_uncached_path_emits_reason(
         self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
@@ -1146,7 +1179,9 @@ class TestGrepTool:
         d = _parse(await grep(ctx, "foo", fixed_string=True, path="uncached_subtree/"))
         assert d["total_matches"] == 0
         assert d["reason"] == "no_files_cached_under_path"
-        assert "batch_read" in d["hint"]
+        # The hint names the tool that fixes it, and `warm` indexes without
+        # returning content, so it is the cheap way out of an empty grep.
+        assert "warm" in d["hint"]
 
     async def test_grep_zero_matches_with_cached_path_no_reason(
         self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
@@ -1277,7 +1312,13 @@ class TestRelativePathSupport:
         search_result = _parse(await search(ctx, "alpha", directory="pkg"))
 
         assert search_result["matches"]
-        assert all(str(subdir.resolve()) in match["path"] for match in search_result["matches"])
+        # Paths come back relative to the `root` the response names, when one
+        # was worth naming; either way they rebuild into the real files.
+        root = search_result.get("root", "")
+        assert all(
+            str(subdir.resolve()) in f"{root}/{match['path']}".replace("//", "/")
+            for match in search_result["matches"]
+        )
 
     async def test_glob_accepts_relative_directory(
         self, ctx: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1692,9 +1733,7 @@ class TestGrepContextAndErrors:
         await smart_read(tmp_cache, str(sample_file))
         d = _parse(await grep(ctx, "line3", context_lines=1))
 
-        match = d["files"][0]["matches"][0]
-        assert match["before"] == ["line2"]
-        assert match["after"] == ["line4"]
+        assert d["files"][0]["lines"] == ["2-line2", "3:line3", "4-line4"]
 
     async def test_no_context_requested_means_no_context_keys(
         self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache
@@ -1702,9 +1741,7 @@ class TestGrepContextAndErrors:
         await smart_read(tmp_cache, str(sample_file))
         d = _parse(await grep(ctx, "line3"))
 
-        match = d["files"][0]["matches"][0]
-        assert "before" not in match
-        assert "after" not in match
+        assert d["files"][0]["lines"] == ["3:line3"]
 
     async def test_invalid_regex_is_an_error_not_an_empty_result(
         self, ctx: MagicMock, sample_file: Path, tmp_cache: SemanticCache

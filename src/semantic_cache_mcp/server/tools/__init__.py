@@ -35,7 +35,14 @@ from ...cache import (
 from ...cache._helpers import _diff_context_lines, _PhaseTimer
 from ...cache.read import _DIFF_MAX_RATIO, _DIFF_MIN_TOKENS, _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
-from ...core import count_tokens, generate_diff, rebase_diff_hunks
+from ...core import (
+    count_tokens,
+    extract_outline,
+    generate_diff,
+    rebase_diff_hunks,
+    render_outline,
+)
+from ...core.hashing import hash_matches, short_hash
 from ...types import ReadResult
 from ...utils import aread_bytes, astat
 from ...utils._async_io import aunlink
@@ -46,6 +53,7 @@ from .._coverage import (
     encode_coverage_token,
 )
 from .._mcp import mcp
+from .._paths import relativize, shared_root
 from .._tool_models import (
     BatchEditResponse,
     BatchReadResponse,
@@ -59,8 +67,9 @@ from .._tool_models import (
     ReadResponse,
     SearchResponse,
     StatsResponse,
+    WarmResponse,
     WriteResponse,
-    output_schema,
+    register_response_model,
 )
 from ..response import (
     _MODE_DEBUG,
@@ -83,12 +92,35 @@ _TOOL_TIMEOUT: float = TOOL_TIMEOUT
 # budgeting at the prose rate overshoots the response cap.
 _JSON_CHARS_PER_TOKEN: Final = 2
 
-# Per-match JSON envelope: the `line_number`/`line` keys, braces, quotes and
-# separators that wrap each match line.
-_MATCH_ENVELOPE_CHARS: Final = 32
+# Per-line JSON envelope in a grep response: the quotes, comma, line number and
+# separator wrapping one rendered `"<n>:<text>"` entry. It replaced a 32-char
+# `{"line_number":N,"line":"..."}` object per match.
+_LINE_ENVELOPE_CHARS: Final = 10
 
-# Per-context-line JSON envelope inside a match.
-_CONTEXT_ENVELOPE_CHARS: Final = 4
+# Separators closing a grep line's number prefix: `:` for a line that matched,
+# `-` for a context line, as ripgrep renders them.
+_MATCH_SEPARATOR: Final = ":"
+_CONTEXT_SEPARATOR: Final = "-"
+
+# What a grep response may carry. `paths` and `count` exist because "which
+# files mention X" is a large share of real greps and used to pay for every
+# matching line.
+_GREP_OUTPUT_MODES: Final = ("matches", "paths", "count")
+
+# Ceilings for `read(outline=true)`. An outline exists to be cheap; a generated
+# or vendored file with tens of thousands of definitions would otherwise cost
+# more than the summary it replaces. Whatever is dropped is counted and stated
+# in the rendered output, never silently omitted.
+_OUTLINE_MAX_ENTRIES: Final = 2000
+_OUTLINE_MAX_TOKENS: Final = 4000
+
+# `warm` bounds. It exists to be called on a whole tree, so every limit is a
+# refusal that gets *reported* rather than a silent stop: a file left out of
+# the index is a file `grep` will never mention again.
+_WARM_MAX_FILES: Final = 2000
+_WARM_MAX_FILE_BYTES: Final = 4 * 1024 * 1024
+_WARM_MAX_TOTAL_BYTES: Final = 64 * 1024 * 1024
+_WARM_MAX_FAILURES_REPORTED: Final = 20
 
 
 def _ranged_metrics(tokens_original: int, tokens_returned: int, *, from_cache: bool) -> ReadResult:
@@ -464,9 +496,9 @@ def _stamp_result_hash(payload: dict[str, Any], new_hash: str, *, caller_holds: 
     `unchanged` reply for content it has never seen.
     """
     if caller_holds:
-        payload["content_hash"] = new_hash
+        payload["content_hash"] = short_hash(new_hash)
     else:
-        payload["file_hash"] = _PARTIAL_HASH_PREFIX + new_hash
+        payload["file_hash"] = _PARTIAL_HASH_PREFIX + short_hash(new_hash)
 
 
 def _stamp_ranged_possession(
@@ -486,14 +518,113 @@ def _stamp_ranged_possession(
     `unchanged` instead of a re-send.
     """
     if covered.covers_all(total_lines):
-        payload["content_hash"] = content_hash
+        payload["content_hash"] = short_hash(content_hash)
         return
-    payload["file_hash"] = _PARTIAL_HASH_PREFIX + content_hash
-    payload["coverage_token"] = encode_coverage_token(content_hash, covered)
+    payload["file_hash"] = _PARTIAL_HASH_PREFIX + short_hash(content_hash)
+    # The token carries the wire form too: it is compared with `hash_matches`,
+    # which accepts either length, and the short one keeps the token readable.
+    payload["coverage_token"] = encode_coverage_token(short_hash(content_hash), covered)
+
+
+async def _outline_read(
+    *,
+    cache: Any,
+    path: str,
+    max_size: int,
+    mode: str,
+    max_response_tokens: int | None,
+) -> dict[str, Any]:
+    """Answer `read(outline=true)`: the file's definitions, not its text.
+
+    Serves from the cache when disk has not moved past it, the same freshness
+    rule the rest of `read` uses; otherwise it reads and seeds the cache, so an
+    outline also makes the file visible to `grep` and `search`.
+
+    The result is never possession: an outline is a map of the file and a
+    caller holding it cannot reconstruct a single line, so the hash goes out
+    under `file_hash` where it structurally cannot be redeemed.
+    """
+    abs_path = str(Path(path).expanduser().resolve())
+    entry = await cache.get(abs_path)
+    st = None
+    if entry is not None:
+        try:
+            st = await astat(Path(abs_path), cache._io_executor)
+        except OSError:
+            st = None
+
+    if entry is not None and st is not None and entry.mtime >= st.st_mtime:
+        full_text: str = await cache.get_content(entry)
+        full_tokens: int = entry.tokens
+        from_cache = True
+        content_hash: str | None = entry.content_hash
+    else:
+        result = await asyncio.wait_for(
+            smart_read(
+                cache=cache,
+                path=path,
+                max_size=max_size,
+                diff_mode=False,
+                force_full=True,
+                refresh_cache=False,  # smart_read still refreshes when stale
+                # An outline maps the real file. Summarizing first would map a
+                # digest and hand back line numbers belonging to nothing.
+                summarize=False,
+            ),
+            timeout=_TOOL_TIMEOUT,
+        )
+        if result.is_binary:
+            cache.metrics.record("read", result)
+            return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
+        full_text = result.content
+        full_tokens = result.tokens_original
+        from_cache = result.from_cache
+        content_hash = result.content_hash
+
+    structure = extract_outline(
+        full_text,
+        filename=Path(path).name,
+        max_entries=_OUTLINE_MAX_ENTRIES,
+        max_tokens=_OUTLINE_MAX_TOKENS,
+        count_fn=count_tokens,
+    )
+    rendered = render_outline(structure)
+    tokens_returned = count_tokens(rendered)
+    cache.metrics.record(
+        "read", _ranged_metrics(full_tokens, tokens_returned, from_cache=from_cache)
+    )
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "tool": "read",
+        "path": path,
+        "outline": True,
+        "symbols": len(structure.entries),
+        "total_lines": structure.total_lines,
+    }
+    if content_hash is not None:
+        payload["file_hash"] = _PARTIAL_HASH_PREFIX + short_hash(content_hash)
+    if structure.entries:
+        payload["content"] = rendered
+    else:
+        # An empty body with no explanation reads as a broken tool. Say which
+        # of the two possible answers this is, and what to call instead.
+        payload["reason"] = "no_definitions_found"
+        payload["hint"] = (
+            "no class/function definitions were recognized in this file; "
+            "read it with offset/limit, or without outline"
+        )
+    if structure.truncated:
+        payload["truncated"] = True
+    if mode == _MODE_DEBUG:
+        payload["from_cache"] = from_cache
+        payload["tokens_saved"] = max(0, full_tokens - tokens_returned)
+
+    return _finalize_payload(payload, max_response_tokens)
 
 
 @mcp.tool(
-    output_schema=output_schema(ReadResponse),
+    output_schema=register_response_model("read", ReadResponse),
     meta={"version": _pkg_version("semantic-cache-mcp")},
 )
 @_serialized
@@ -504,11 +635,14 @@ async def read(
     offset: int | None = None,
     limit: int | None = None,
     known_hash: str | None = None,
+    outline: bool = False,
+    line_numbers: bool = False,
 ) -> dict[str, Any]:
     """Read a file, returning as few tokens as possible. For 2+ files, use `batch_read`.
 
     The first read returns the file's full content plus a `content_hash`
-    (a ranged read numbers its lines; a whole-file read returns them as-is).
+    (lines come back as-is; a ranged read numbers them only with
+    `line_numbers=true`).
     Echo that hash back as `known_hash` and a later read of an unchanged file
     answers `"unchanged": true` with no body; a changed file returns a unified
     diff. Omit it and the file is always sent in full. Reading also caches the
@@ -530,6 +664,11 @@ async def read(
     re-sent, and a new window widens the token's coverage. Once the windows add
     up to the whole file you are handed a claimable `content_hash` for it.
 
+    For a large or unfamiliar file, `outline=true` is the cheap first read: one
+    line per class/function as `<line>: <signature>`, typically a small fraction
+    of the file, and every number is an `offset` you can read next. An outline
+    is a map, not the file, so it comes back as `file_hash`.
+
     What the body holds is always labelled: `is_diff` marks a unified diff and
     `truncated` marks a summary, so you never have to infer it from the bytes.
     A binary file returns metadata instead of content; for images use
@@ -547,6 +686,11 @@ async def read(
             `coverage_token` from your last ranged read of it — passed back to
             get `"unchanged"` instead of the content re-sent. Omit only on a
             first read, or when you no longer hold what it vouches for.
+        outline: Return the file's definitions and their line numbers instead
+            of its text. Cannot be combined with `offset`/`limit`.
+        line_numbers: Prefix each line of a ranged read with its number. Costs
+            about 17% more tokens; the range is in `lines` either way. Requires
+            `offset` or `limit`.
     """
     state = await _tool_call_state(ctx)
     path = state.resolve(path)
@@ -562,6 +706,23 @@ async def read(
         )
     if limit is not None and limit < 1:
         _raise_tool_error("read", "limit must be >= 1", max_response_tokens)
+    # Two incompatible requests must not resolve by precedence: a caller that
+    # asked for both an outline and a window has to learn which one it is not
+    # getting, or it reads the wrong thing believing it read the right one.
+    ranged = offset is not None or limit is not None
+    if outline and ranged:
+        _raise_tool_error(
+            "read",
+            "outline cannot be combined with offset/limit — call it alone to "
+            "locate the file, then read the line ranges it names",
+            max_response_tokens,
+        )
+    if line_numbers and not ranged:
+        _raise_tool_error(
+            "read",
+            "line_numbers applies to a ranged read; pass offset and/or limit",
+            max_response_tokens,
+        )
 
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state, "read", _forward_kwargs(), timeout=_TOOL_TIMEOUT
@@ -571,8 +732,17 @@ async def read(
     max_size = max(1, min(max_size, MAX_CONTENT_SIZE * 10))
 
     try:
+        if outline:
+            return await _outline_read(
+                cache=cache,
+                path=path,
+                max_size=max_size,
+                mode=mode,
+                max_response_tokens=max_response_tokens,
+            )
+
         # If offset/limit specified, read specific lines (still caches full file)
-        if offset is not None or limit is not None:
+        if ranged:
             ranged_abs = str(Path(path).expanduser().resolve())
             ranged_entry = await cache.get(ranged_abs)
             ranged_st = None
@@ -615,7 +785,7 @@ async def read(
                 if (
                     claimed is not None
                     and ranged_entry is not None
-                    and claimed[0] == ranged_entry.content_hash
+                    and hash_matches(claimed[0], ranged_entry.content_hash)
                 ):
                     superseded_text = await cache.get_content(ranged_entry)
                 result = await asyncio.wait_for(
@@ -653,7 +823,9 @@ async def read(
             window_end = min(end, len(lines))
             claimed_spans = (
                 claimed[1]
-                if claimed is not None and ranged_hash is not None and claimed[0] == ranged_hash
+                if claimed is not None
+                and ranged_hash is not None
+                and hash_matches(claimed[0], ranged_hash)
                 else EMPTY_SPANS
             )
             covered = claimed_spans.merge(start, window_end)
@@ -673,7 +845,7 @@ async def read(
                 and known_hash
                 and ranged_fresh
                 and ranged_entry is not None
-                and known_hash == ranged_entry.content_hash
+                and hash_matches(known_hash, ranged_entry.content_hash)
             ):
                 cache.metrics.record(
                     "read", _ranged_metrics(ranged_entry.tokens, 0, from_cache=True)
@@ -684,7 +856,7 @@ async def read(
                         "tool": "read",
                         "path": path,
                         "unchanged": True,
-                        "content_hash": ranged_entry.content_hash,
+                        "content_hash": short_hash(ranged_entry.content_hash),
                         "lines": {"total": len(lines)},
                     },
                     max_response_tokens,
@@ -758,20 +930,27 @@ async def read(
                     _stamp_ranged_possession(diff_payload, ranged_hash, covered, len(lines))
                     return _finalize_payload(diff_payload, max_response_tokens)
 
-            # Format with line numbers like the built-in Read tool. Generator
-            # expression avoids materializing the intermediate list; `selected`
-            # may be thousands of lines on partial reads of large files.
-            #
             # Only the line terminator is stripped, never trailing whitespace
             # within the line. A window covering the whole file mints a
             # claimable `content_hash`, and that claim is only true if the
             # caller can reconstruct the bytes it is vouching for — rstrip()
             # silently dropped trailing spaces and tabs, certifying possession
             # of content that was never sent.
-            content = "\n".join(
-                f"{i:6d}\t{line.removesuffix(chr(10)).removesuffix(chr(13))}"
-                for i, line in enumerate(selected, start=start + 1)
-            )
+            #
+            # The number gutter is opt-in. It measured ~17% of a window on real
+            # source, and `lines` already carries the range, so the caller can
+            # map any offset into the window without paying per line. Generator
+            # expressions avoid materializing the intermediate list; `selected`
+            # may be thousands of lines on partial reads of large files.
+            if line_numbers:
+                content = "\n".join(
+                    f"{i:6d}\t{line.removesuffix(chr(10)).removesuffix(chr(13))}"
+                    for i, line in enumerate(selected, start=start + 1)
+                )
+            else:
+                content = "\n".join(
+                    line.removesuffix(chr(10)).removesuffix(chr(13)) for line in selected
+                )
             # Bill only the slice actually returned; the rest of the file is saved
             # versus a naive full read.
             ranged_returned = count_tokens(content)
@@ -812,8 +991,8 @@ async def read(
         # a file and nothing after it.
         abs_path = str(Path(path).expanduser().resolve())
         prior_entry = await cache.get(abs_path)
-        caller_has_current = (
-            bool(known_hash) and prior_entry is not None and known_hash == prior_entry.content_hash
+        caller_has_current = prior_entry is not None and hash_matches(
+            known_hash, prior_entry.content_hash
         )
         result = await asyncio.wait_for(
             smart_read(
@@ -850,7 +1029,7 @@ async def read(
             # locally whether a ranged re-read is worth it.
             payload["unchanged"] = True
             if entry is not None:
-                payload["content_hash"] = entry.content_hash
+                payload["content_hash"] = short_hash(entry.content_hash)
                 # smart_read returns either the full content (small files) or
                 # an "// File unchanged" marker (large files). Reuse the bytes
                 # if we already have them; only re-fetch from cache otherwise.
@@ -875,9 +1054,9 @@ async def read(
         # `file_hash` and cannot be redeemed as a possession claim.
         if entry is not None and "content_hash" not in payload:
             if result.truncated:
-                payload["file_hash"] = _PARTIAL_HASH_PREFIX + entry.content_hash
+                payload["file_hash"] = _PARTIAL_HASH_PREFIX + short_hash(entry.content_hash)
             else:
-                payload["content_hash"] = entry.content_hash
+                payload["content_hash"] = short_hash(entry.content_hash)
         # A diff and a summary are not the file. Whatever the response mode,
         # the payload has to say which one it carries — otherwise the caller
         # has to sniff the bytes for `@@` headers to find out what it holds.
@@ -973,7 +1152,7 @@ _MAX_ENCODED_IMAGE_BYTES: int = _parse_max_encoded_image_bytes()
 # the serialized SQLite executor (it reads bytes via the default loop executor),
 # so it has nothing to serialize against and need not queue behind other tools.
 @mcp.tool(
-    output_schema=output_schema(ReadImageResponse),
+    output_schema=register_response_model("read_image", ReadImageResponse),
     meta={"version": _pkg_version("semantic-cache-mcp")},
 )
 async def read_image(
@@ -1110,7 +1289,7 @@ async def read_image(
     return ToolResult(content=[text_block, image_block], structured_content=metadata)
 
 
-@mcp.tool(output_schema=output_schema(StatsResponse))
+@mcp.tool(output_schema=register_response_model("stats", StatsResponse))
 @_serialized
 async def stats(
     ctx: Context,
@@ -1283,14 +1462,16 @@ async def stats(
         ]
         return ToolResult(content="\n".join(lines), structured_content=structured_payload)
 
-    # debug — full raw dump
+    # debug — full raw dump. Serialized compactly: `indent=2` is 15-25% pure
+    # whitespace tokens on a nested dict, and this dump exists to be read by
+    # whatever is measuring, not laid out.
     return ToolResult(
-        content=f"```json\n{json.dumps(cache_stats, indent=2)}\n```",
+        content=f"```json\n{json.dumps(cache_stats, separators=(',', ':'))}\n```",
         structured_content=structured_payload,
     )
 
 
-@mcp.tool(output_schema=output_schema(ClearResponse))
+@mcp.tool(output_schema=register_response_model("clear", ClearResponse))
 @_serialized
 async def clear(
     ctx: Context,
@@ -1321,7 +1502,7 @@ async def clear(
     return _finalize_payload(payload, max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(DeleteResponse))
+@mcp.tool(output_schema=register_response_model("delete", DeleteResponse))
 @_serialized
 async def delete(
     ctx: Context,
@@ -1425,7 +1606,7 @@ async def delete(
         _raise_tool_error("delete", str(e), max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(WriteResponse))
+@mcp.tool(output_schema=register_response_model("write", WriteResponse))
 @_serialized
 async def write(
     ctx: Context,
@@ -1520,7 +1701,7 @@ async def write(
             base_held = (
                 not append
                 or result.previous_hash is None
-                or (known_hash is not None and known_hash == result.previous_hash)
+                or hash_matches(known_hash, result.previous_hash)
             )
             _stamp_result_hash(
                 payload, result.content_hash, caller_holds=base_held and not auto_format
@@ -1573,7 +1754,7 @@ async def write(
         )
 
 
-@mcp.tool(output_schema=output_schema(EditResponse))
+@mcp.tool(output_schema=register_response_model("edit", EditResponse))
 @_serialized
 async def edit(
     ctx: Context,
@@ -1674,7 +1855,7 @@ async def edit(
         # caller that held the pre-edit content — it knows what it replaced — and
         # a formatter pass rewrites the result beyond what it asked for.
         if not dry_run:
-            base_held = known_hash is not None and known_hash == result.previous_hash
+            base_held = hash_matches(known_hash, result.previous_hash)
             _stamp_result_hash(
                 payload, result.content_hash, caller_holds=base_held and not auto_format
             )
@@ -1726,7 +1907,7 @@ async def edit(
         _raise_tool_error("edit", "Internal error occurred while editing file", max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(EditPreviewResponse))
+@mcp.tool(output_schema=register_response_model("edit_preview", EditPreviewResponse))
 @_serialized
 async def edit_preview(
     ctx: Context,
@@ -1828,7 +2009,7 @@ async def edit_preview(
     return _finalize_payload(payload, max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(BatchEditResponse))
+@mcp.tool(output_schema=register_response_model("batch_edit", BatchEditResponse))
 @_serialized
 async def batch_edit(
     ctx: Context,
@@ -1972,7 +2153,7 @@ async def batch_edit(
         # cache untouched. Derivable only for a caller that held the pre-edit
         # content and did not hand the result to a formatter.
         if not dry_run and result.succeeded > 0:
-            base_held = known_hash is not None and known_hash == result.previous_hash
+            base_held = hash_matches(known_hash, result.previous_hash)
             _stamp_result_hash(
                 payload, result.content_hash, caller_holds=base_held and not auto_format
             )
@@ -2032,7 +2213,7 @@ async def batch_edit(
         )
 
 
-@mcp.tool(output_schema=output_schema(SearchResponse))
+@mcp.tool(output_schema=register_response_model("search", SearchResponse))
 @_serialized
 async def search(
     ctx: Context,
@@ -2043,8 +2224,9 @@ async def search(
 ) -> dict[str, Any]:
     """Find cached files by keyword relevance (BM25 ranking).
 
-    Searches only files already in the cache — seed them first with
-    `read`/`batch_read` (thin results usually mean too few files are cached).
+    Searches only files already in the cache — index them first with `warm`,
+    which returns counts rather than content (thin results usually mean too
+    few files are cached).
     Ranks by BM25 term relevance, so multi-word and keyword queries work
     well; matching is lexical, not embedding-based, so synonyms won't match a
     word that isn't present. Terms are OR'd — a word the corpus happens not to
@@ -2079,8 +2261,17 @@ async def search(
         cache.metrics.record("search", result)
 
         match_payload: list[dict[str, Any]] = []
+        root = shared_root(
+            [m.path for m in result.matches],
+            str(state.client_root) if state.client_root else None,
+        )
         for m in result.matches:
-            item: dict[str, Any] = {"path": m.path, "similarity": round(m.similarity, 4)}
+            # Two decimals of a normalized rank score: the extra digits change
+            # no decision and cost ~2 tokens each.
+            item: dict[str, Any] = {
+                "path": relativize(m.path, root),
+                "similarity": round(m.similarity, 2),
+            }
             if mode in _MODE_NORMAL:
                 item["tokens"] = m.tokens
             if show_preview or mode == _MODE_DEBUG:
@@ -2092,14 +2283,15 @@ async def search(
             "tool": "search",
             "matches": match_payload,
         }
-        # Echoing `query` back is wasteful — the caller just sent it.
-        # Only include it in debug mode for traceability.
+        if root is not None:
+            payload["root"] = root
+        # `count` is not emitted: it is `len(matches)`, and the array is right
+        # there. Echoing `query` back is wasteful for the same reason — the
+        # caller just sent it — so it is kept for debug traceability only.
         if mode in _MODE_NORMAL:
-            payload["count"] = len(match_payload)
             payload["cached_files"] = result.cached_files
         if mode == _MODE_DEBUG:
             payload["query"] = query
-            payload["files_searched"] = result.files_searched
             payload["k"] = k
             payload["directory"] = directory
             payload["show_preview"] = show_preview
@@ -2116,7 +2308,7 @@ async def search(
         _raise_tool_error("search", str(e), max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(BatchReadResponse))
+@mcp.tool(output_schema=register_response_model("batch_read", BatchReadResponse))
 @_serialized
 async def batch_read(
     ctx: Context,
@@ -2127,8 +2319,9 @@ async def batch_read(
 ) -> dict[str, Any]:
     """Read several files at once under a shared token budget.
 
-    The efficient way to seed the cache before `search`/`grep`, and cheaper
-    than many single `read` calls. Every file is returned in full unless you
+    Cheaper than many single `read` calls. To make files searchable without
+    reading them at all, use `warm` instead — this tool returns their text.
+    Every file is returned in full unless you
     prove you still hold it: pass `known_hashes` and each proven file collapses
     to an `unchanged` count, or to a diff when it moved on disk. Each file sent
     in full comes back with its `content_hash` — keep those and pass them next
@@ -2242,7 +2435,7 @@ async def batch_read(
                 # Only exact deliveries carry a hash — pass it back as a
                 # `known_hashes` entry next time to skip re-sending this file.
                 if f.content_hash is not None:
-                    item["content_hash"] = f.content_hash
+                    item["content_hash"] = short_hash(f.content_hash)
                 if mode == _MODE_DEBUG:
                     item["tokens"] = f.tokens
                     item["from_cache"] = f.from_cache
@@ -2280,7 +2473,200 @@ async def batch_read(
         _raise_tool_error("batch_read", str(e), max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(GlobResponse))
+@mcp.tool(output_schema=register_response_model("warm", WarmResponse))
+@_serialized
+async def warm(
+    ctx: Context,
+    paths: str,
+    max_files: int = 200,
+) -> dict[str, Any]:
+    """Index files into the cache so `grep` and `search` can see them, returning counts only.
+
+    `grep` and `search` read only cached files, and every other way to cache a
+    file returns its text. Warming a tree with `batch_read` therefore costs the
+    whole tree in tokens before the first search runs. This costs a few dozen
+    tokens however many files it indexes: no content, no previews, no paths for
+    the files that succeeded — just how many were indexed, how many were
+    already current, and how many were not.
+
+    Anything not indexed is counted in `skipped`, and the first few come back
+    under `failures` with a reason (`not_found`, `not_a_file`, `binary`,
+    `too_large`, `unreadable`, `timeout`). If a cap stopped the walk early you
+    get `truncated` or `incomplete` rather than a short count that looks
+    complete.
+
+    Use it before searching an unfamiliar tree, then `grep` for the exact
+    string or `search` for the concept, and `read` only what those name.
+
+    Args:
+        paths: Files to index — a comma-separated list, a JSON array, or glob
+            patterns (expanded for you, e.g. `src/**/*.py`).
+        max_files: Cap on files indexed in this call. Matches beyond it are
+            left out and flagged with `truncated`.
+    """
+    state = await _tool_call_state(ctx)
+    cache = state.cache
+    max_response_tokens = state.max_response_tokens
+
+    if not 1 <= max_files <= _WARM_MAX_FILES:
+        _raise_tool_error(
+            "warm",
+            f"max_files must be between 1 and {_WARM_MAX_FILES}, got {max_files}",
+            max_response_tokens,
+        )
+
+    try:
+        path_list = _resolve_path_list(paths, state)
+    except json.JSONDecodeError as e:
+        _raise_tool_error(
+            "warm",
+            f"paths must be a comma-separated list or a JSON array: {e}",
+            max_response_tokens,
+        )
+    if not path_list:
+        _raise_tool_error(
+            "warm", "paths is empty — name at least one file or glob", max_response_tokens
+        )
+
+    remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
+        state,
+        "warm",
+        _forward_kwargs(overrides={"paths": json.dumps(path_list)}),
+        timeout=_TOOL_TIMEOUT * 2,
+    )
+    if remote_result is not None:
+        return remote_result
+
+    import time  # noqa: PLC0415  # module-local, matching _expand_globs_detailed
+
+    # Ask for one more than the cap so a full page can be told apart from an
+    # overflowing one; without it a caller whose tree is exactly `max_files`
+    # long would be warned of a truncation that never happened.
+    try:
+        expanded, glob_truncated = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                cache._io_executor, _expand_globs_detailed, path_list, max_files + 1
+            ),
+            timeout=_EXPAND_GLOBS_TIMEOUT + 1,
+        )
+    except TimeoutError:
+        logger.warning("warm: glob expansion exceeded hard timeout; using raw paths")
+        expanded, glob_truncated = path_list, True
+
+    truncated = glob_truncated or len(expanded) > max_files
+    targets = expanded[:max_files]
+
+    warmed = 0
+    already_current = 0
+    skipped = 0
+    tokens_indexed = 0
+    total_bytes = 0
+    incomplete = False
+    failures: list[dict[str, str]] = []
+
+    def _skip(path: str, reason: str) -> None:
+        """Count a file that will not be indexed, and name it while there is room."""
+        nonlocal skipped
+        skipped += 1
+        if len(failures) < _WARM_MAX_FAILURES_REPORTED:
+            failures.append({"path": path, "reason": reason})
+
+    deadline = time.monotonic() + _TOOL_TIMEOUT * 2
+
+    for raw_path in targets:
+        if time.monotonic() > deadline:
+            incomplete = True
+            break
+
+        candidate = Path(raw_path).expanduser()
+        try:
+            st = await astat(candidate, cache._io_executor)
+        except FileNotFoundError:
+            _skip(raw_path, "not_found")
+            continue
+        except OSError:
+            _skip(raw_path, "unreadable")
+            continue
+
+        if not stat_module.S_ISREG(st.st_mode):
+            _skip(raw_path, "not_a_file")
+            continue
+        if st.st_size > _WARM_MAX_FILE_BYTES:
+            _skip(raw_path, "too_large")
+            continue
+        if total_bytes + st.st_size > _WARM_MAX_TOTAL_BYTES:
+            # Stop rather than skip: the budget is spent, and every remaining
+            # file would report the same reason. `incomplete` says so once.
+            incomplete = True
+            break
+
+        abs_path = str(candidate.resolve())
+        entry = await cache.get(abs_path)
+        if entry is not None and entry.mtime >= st.st_mtime:
+            already_current += 1
+            tokens_indexed += entry.tokens
+            continue
+
+        try:
+            result = await asyncio.wait_for(
+                smart_read(
+                    cache=cache,
+                    path=str(candidate),
+                    diff_mode=False,
+                    force_full=True,
+                    refresh_cache=False,  # smart_read still refreshes when stale
+                    # Indexing needs the real bytes; a summary would make grep
+                    # answer for text the file does not contain.
+                    summarize=False,
+                ),
+                timeout=_TOOL_TIMEOUT,
+            )
+        except TimeoutError:
+            _skip(raw_path, "timeout")
+            continue
+        except (OSError, ValueError):
+            _skip(raw_path, "unreadable")
+            continue
+
+        if result.is_binary:
+            _skip(raw_path, "binary")
+            continue
+
+        warmed += 1
+        tokens_indexed += result.tokens_original
+        total_bytes += st.st_size
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "tool": "warm",
+        "warmed": warmed,
+        "already_current": already_current,
+        "skipped": skipped,
+        "tokens_indexed": tokens_indexed,
+    }
+    if failures:
+        payload["failures"] = failures
+    # Both caps can fire in one call, and each names a different remedy, so the
+    # hints are joined rather than one silently overwriting the other.
+    hints: list[str] = []
+    if truncated:
+        payload["truncated"] = True
+        hints.append(
+            f"more files matched than max_files={max_files}; raise it or narrow the pattern"
+        )
+    if incomplete:
+        payload["incomplete"] = True
+        hints.append(
+            "stopped on the time or byte budget before reaching every file; "
+            "warm the rest in smaller batches"
+        )
+    if hints:
+        payload["hint"] = "; ".join(hints)
+
+    return _finalize_payload(payload, max_response_tokens)
+
+
+@mcp.tool(output_schema=register_response_model("glob", GlobResponse))
 @_serialized
 async def glob(
     ctx: Context,
@@ -2320,11 +2706,17 @@ async def glob(
         )
         cache.metrics.record("glob", result)
         matches_payload: list[dict[str, Any]] = []
+        # Up to 1000 matches come back, each carrying the same absolute prefix.
+        # Name the directory once and report the rest relative to it.
+        root = shared_root(
+            [m.path for m in result.matches],
+            str(state.client_root) if state.client_root else None,
+        )
         # When all matches are uncached and we're not in debug mode, drop the
         # redundant `cached: false` field — saves ~13 chars per match.
         all_uncached = result.cached_count == 0 and mode != _MODE_DEBUG
         for m in result.matches:
-            item: dict[str, Any] = {"path": m.path}
+            item: dict[str, Any] = {"path": relativize(m.path, root)}
             if not all_uncached:
                 item["cached"] = m.cached
             if mode == _MODE_DEBUG:
@@ -2339,6 +2731,8 @@ async def glob(
             "total_matches": result.total_matches,
             "cached_count": result.cached_count,
         }
+        if root is not None:
+            payload["root"] = root
         # Echoing pattern/directory back is wasteful in compact mode; the
         # caller already knows what they sent.
         if mode in _MODE_NORMAL:
@@ -2356,7 +2750,42 @@ async def glob(
         _raise_tool_error("glob", str(e), max_response_tokens)
 
 
-@mcp.tool(output_schema=output_schema(GrepResponse))
+def _render_grep_lines(matches: list[dict[str, Any]], context_lines: int) -> list[str]:
+    """Render one file's matches as `"<n>:<text>"` / `"<n>-<text>"` strings.
+
+    Two savings live here. The per-match JSON object becomes a string, which
+    drops ~16 tokens of braces and repeated key names per match. And context
+    windows are merged instead of sliced fresh per match: with
+    `context_lines=3`, two matches two lines apart used to re-send the same
+    source line up to four times in one response.
+
+    A line that matched always wins over the same line delivered as another
+    match's context, so the `:` separator never understates a hit.
+    """
+    # line number -> (text, matched). Insertion order is irrelevant; the result
+    # is sorted by line number, which is also what makes the merge work.
+    rendered: dict[int, tuple[str, bool]] = {}
+
+    for match in matches:
+        line_number = int(match["line_number"])
+        if context_lines > 0:
+            before = match.get("before") or ()
+            # `before` is the contiguous run ending just above the match, so
+            # its first line is that many lines back.
+            for offset, text in enumerate(before, start=line_number - len(before)):
+                rendered.setdefault(offset, (text, False))
+            after = match.get("after") or ()
+            for offset, text in enumerate(after, start=line_number + 1):
+                rendered.setdefault(offset, (text, False))
+        rendered[line_number] = (str(match["line"]), True)
+
+    return [
+        f"{number}{_MATCH_SEPARATOR if matched else _CONTEXT_SEPARATOR}{text}"
+        for number, (text, matched) in sorted(rendered.items())
+    ]
+
+
+@mcp.tool(output_schema=register_response_model("grep", GrepResponse))
 @_serialized
 async def grep(
     ctx: Context,
@@ -2367,12 +2796,14 @@ async def grep(
     context_lines: int = 0,
     max_matches: int = 100,
     max_files: int = 50,
+    output: str = "matches",
 ) -> dict[str, Any]:
     """Search cached file contents for an exact string or regex.
 
     Fast, exact, line-numbered matching over files already in the cache — it
-    does NOT touch disk, so seed files first with `batch_read`/`read` (empty
-    results usually mean the files aren't cached). A pattern that is not a
+    does NOT touch disk, so index files first with `warm`, which costs a few
+    dozen tokens however many files it covers (empty results usually mean the
+    files aren't cached). A pattern that is not a
     valid regex is an error, never an empty result, so zero matches always
     means zero matches. For concept-level questions where you don't know the
     exact term, use `search` instead.
@@ -2380,6 +2811,10 @@ async def grep(
     Counts are complete unless the response says otherwise: if a cap stops the
     scan, `complete` comes back false with `limit_reached` naming which one, so
     `total_matches` is never mistaken for the total that exists.
+
+    Each file's hits come back as `"<line>:<text>"` strings under `lines`, with
+    context lines using `-` instead of `:`. Paths are relative to the `root`
+    the response names, when there is one worth naming.
 
     A repeated group wrapping an unbounded quantifier (`(a+)+`) is rejected
     rather than run — it can take exponential time and cannot be interrupted
@@ -2392,15 +2827,26 @@ async def grep(
             (matching every cached file beneath it), or a glob.
         fixed_string: Match `pattern` literally instead of as a regex.
         case_sensitive: Match case-sensitively.
-        context_lines: Lines of surrounding context to include per match,
-            returned as `before`/`after` on each match.
+        context_lines: Lines of surrounding context to include around each
+            match. Overlapping windows are merged, so no line is sent twice.
         max_matches: Cap on total matches returned across all files.
         max_files: Cap on the number of files returned.
+        output: How much to return — `matches` (default), `paths` for the
+            matching files without their lines, or `count` for the totals
+            alone.
     """
     state = await _tool_call_state(ctx)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
+    # Validated before forwarding, so a typo fails the same way in both
+    # runtimes and never silently falls back to a mode nobody asked for.
+    if output not in _GREP_OUTPUT_MODES:
+        _raise_tool_error(
+            "grep",
+            f"output must be one of {', '.join(_GREP_OUTPUT_MODES)}, got {output!r}",
+            max_response_tokens,
+        )
     remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
         state, "grep", _forward_kwargs(), timeout=_TOOL_TIMEOUT
     )
@@ -2445,61 +2891,76 @@ async def grep(
             # the budget existed to preserve.
             char_budget = max(1024, (max_response_tokens - 512) * _JSON_CHARS_PER_TOKEN)
 
-        # Build response
+        # Every path the store returns is absolute and fully resolved. Naming
+        # the directory they share once, and reporting the rest relative to it,
+        # roughly halves the bytes a path costs.
+        root = shared_root(
+            [file_result["path"] for file_result in results],
+            str(state.client_root) if state.client_root else None,
+        )
+
         files_payload: list[dict[str, Any]] = []
         truncated_matches = 0
         truncated_files = 0
         running_chars = 0
         budget_exceeded = False
+
         for file_result in results:
+            if output == "count":
+                # Nothing per-file goes out, so neither the rendering nor the
+                # budget walk has anything to protect. Truncation counters stay
+                # at zero — the answer is the totals, and they are complete.
+                continue
+            entry: dict[str, Any] = {"path": relativize(file_result["path"], root)}
+            if output == "paths":
+                files_payload.append(entry)
+                continue
             if budget_exceeded:
                 truncated_files += 1
                 truncated_matches += len(file_result["matches"])
                 continue
-            match_items: list[dict[str, Any]] = []
-            for m in file_result["matches"]:
-                item: dict[str, Any] = {
-                    "line_number": m["line_number"],
-                    "line": m["line"],
-                }
-                if context_lines > 0:
-                    if "before" in m:
-                        item["before"] = m["before"]
-                    if "after" in m:
-                        item["after"] = m["after"]
-                match_items.append(item)
-                if char_budget is not None:
-                    # Account for the JSON envelope each match carries, and for
-                    # context-line bytes when they are present.
-                    running_chars += len(m["line"]) + _MATCH_ENVELOPE_CHARS
+
+            matches = file_result["matches"]
+            kept = matches
+            if char_budget is not None:
+                # Charge each match its rendered line plus the string envelope,
+                # and stop at the first one that would cross the budget. Cutting
+                # here leaves the earlier matches in place; the payload-wide cap
+                # in `_finalize_payload` is the backstop, not the first line of
+                # defence.
+                for index, m in enumerate(matches):
+                    running_chars += len(m["line"]) + _LINE_ENVELOPE_CHARS
                     if context_lines > 0:
-                        for ctx_line in m.get("before", ()):
-                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
-                        for ctx_line in m.get("after", ()):
-                            running_chars += len(ctx_line) + _CONTEXT_ENVELOPE_CHARS
+                        for ctx_line in (*m.get("before", ()), *m.get("after", ())):
+                            running_chars += len(ctx_line) + _LINE_ENVELOPE_CHARS
                     if running_chars > char_budget:
                         budget_exceeded = True
-                        # Count remaining matches in this file as truncated
-                        remaining = file_result["matches"][len(match_items) :]
-                        truncated_matches += len(remaining)
+                        # Keep at least one match: a file listed with no lines
+                        # says nothing the `paths` mode would not have said.
+                        kept = matches[: max(1, index)]
+                        truncated_matches += len(matches) - len(kept)
                         break
-            files_payload.append(
-                {
-                    "path": file_result["path"],
-                    "count": len(match_items),
-                    "matches": match_items,
-                }
-            )
+
+            entry["lines"] = _render_grep_lines(kept, context_lines)
+            files_payload.append(entry)
 
         payload: dict[str, Any] = {
             "ok": True,
             "tool": "grep",
-            "pattern": pattern,
-            "path": path,
             "total_matches": total_matches,
             "files_matched": len(results),
-            "files": files_payload,
         }
+        if root is not None:
+            payload["root"] = root
+        if output != "count":
+            payload["files"] = files_payload
+        # Echoing the pattern and path back is wasteful — the caller just sent
+        # them — so they are kept for traceability only, matching `search` and
+        # `glob`. `_minimal_payload` still preserves `pattern` when present.
+        if mode in _MODE_NORMAL:
+            payload["pattern"] = pattern
+            if path is not None:
+                payload["path"] = path
         if truncated_matches > 0 or truncated_files > 0:
             payload["truncated_matches"] = truncated_matches
             payload["files_in_response"] = len(files_payload)
@@ -2514,10 +2975,8 @@ async def grep(
             payload["limit_reached"] = "max_matches" if results.truncated_matches else "max_files"
             if results.files_not_searched:
                 payload["files_not_searched"] = results.files_not_searched
-            payload["hint"] = (
-                "counts are a floor, not a total — raise max_matches/max_files, "
-                "or narrow the pattern or path"
-            )
+            # No prose here: `complete: false` and `limit_reached` already say
+            # the count is a floor and name the cap that stopped the scan.
         # Distinguish "no files cached under that path" from "no matches".
         # The audit found 22/29 empty greps fit the cache-miss shape, so the
         # caller should know whether to seed via batch_read/glob.
@@ -2525,7 +2984,7 @@ async def grep(
             has_cached = await cache._storage.has_cached_paths_under(path)
             if not has_cached:
                 payload["reason"] = "no_files_cached_under_path"
-                payload["hint"] = "use batch_read or glob to seed the cache"
+                payload["hint"] = "use warm to index this path, then grep again"
         if mode == _MODE_DEBUG:
             payload["fixed_string"] = fixed_string
             payload["case_sensitive"] = case_sensitive
@@ -2558,12 +3017,21 @@ _EXPAND_GLOBS_TIMEOUT = 5  # seconds — matches GLOB_TIMEOUT_SECONDS
 
 
 def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
-    """Expand glob patterns in path list. Non-glob paths pass through unchanged.
+    """Expand glob patterns in path list. Non-glob paths pass through unchanged."""
+    return _expand_globs_detailed(raw_paths, max_files)[0]
+
+
+def _expand_globs_detailed(raw_paths: list[str], max_files: int = 50) -> tuple[list[str], bool]:
+    """Expand globs, and say whether a limit cut the expansion short.
 
     Uses a deadline to prevent recursive ``**`` patterns from blocking
-    the caller for an unbounded amount of time.
+    the caller for an unbounded amount of time. The second element is True
+    when the deadline or ``max_files`` stopped the walk, so a caller can tell
+    "these are the matches" from "these are the first N matches".
     """
     import time  # noqa: PLC0415
+
+    truncated = False
 
     deadline = time.monotonic() + _EXPAND_GLOBS_TIMEOUT
     expanded: list[str] = []
@@ -2571,6 +3039,7 @@ def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
     for p in raw_paths:
         if time.monotonic() > deadline:
             logger.warning(f"Glob expansion timed out after {_EXPAND_GLOBS_TIMEOUT}s")
+            truncated = True
             break
         if any(c in p for c in glob_chars):
             try:
@@ -2602,10 +3071,12 @@ def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
                     for m in base.glob(pattern):
                         if time.monotonic() > deadline:
                             logger.warning(f"Glob pattern timed out: {pattern}")
+                            truncated = True
                             break
                         if m.is_file():
                             matches.append(str(m))
                             if len(matches) >= remaining:
+                                truncated = True
                                 break
                     matches.sort()
                     expanded.extend(matches)
@@ -2615,5 +3086,6 @@ def _expand_globs(raw_paths: list[str], max_files: int = 50) -> list[str]:
             expanded.append(p)
         if len(expanded) >= max_files:
             logger.debug(f"Glob expansion truncated at {max_files} files")
+            truncated = True
             break
-    return expanded[:max_files]
+    return expanded[:max_files], truncated or len(expanded) > max_files

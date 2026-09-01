@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,17 @@ def _payload(result) -> dict:  # noqa: ANN001
         sc = getattr(result, "structured_content", None)
         if isinstance(sc, dict):
             return sc
+        # Structured content is suppressed by default (see
+        # `server/_single_representation.py`), so the JSON arrives in the text
+        # block instead. It is the same payload, byte for byte.
+        text = "".join(getattr(b, "text", "") for b in getattr(result, "content", []))
+        if text:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
     if hasattr(data, "model_dump"):
         return data.model_dump(exclude_none=True)
     if isinstance(data, dict):

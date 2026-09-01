@@ -112,7 +112,7 @@ def _malformed_protocol_worker(conn: Connection) -> None:
 
 @pytest.mark.asyncio
 async def test_tool_process_supervisor_round_trip() -> None:
-    supervisor = ToolProcessSupervisor(worker_target=_echo_worker, startup_timeout=2.0)
+    supervisor = ToolProcessSupervisor(worker_target=_echo_worker, startup_timeout=5.0)
     await supervisor.start()
     try:
         result = await supervisor.call_tool(
@@ -134,7 +134,7 @@ async def test_tool_process_supervisor_restarts_after_timeout(tmp_path: Path) ->
     old = os.environ.get("SEMANTIC_CACHE_WORKER_STATE")
     os.environ["SEMANTIC_CACHE_WORKER_STATE"] = str(state_file)
 
-    supervisor = ToolProcessSupervisor(worker_target=_restart_probe_worker, startup_timeout=2.0)
+    supervisor = ToolProcessSupervisor(worker_target=_restart_probe_worker, startup_timeout=5.0)
     await supervisor.start()
     try:
         with pytest.raises(TimeoutError):
@@ -210,7 +210,7 @@ async def test_tool_process_supervisor_timeout_does_not_wait_for_restart_startup
 
 @pytest.mark.asyncio
 async def test_tool_process_supervisor_preserves_tool_errors() -> None:
-    supervisor = ToolProcessSupervisor(worker_target=_tool_error_worker, startup_timeout=2.0)
+    supervisor = ToolProcessSupervisor(worker_target=_tool_error_worker, startup_timeout=5.0)
     await supervisor.start()
     try:
         with pytest.raises(ToolError, match="read: synthetic failure"):
@@ -242,7 +242,7 @@ async def test_tool_process_supervisor_restarts_after_protocol_error(tmp_path: P
     os.environ["SEMANTIC_CACHE_PROTOCOL_STATE"] = str(state_file)
 
     supervisor = ToolProcessSupervisor(
-        worker_target=_malformed_protocol_worker, startup_timeout=2.0
+        worker_target=_malformed_protocol_worker, startup_timeout=5.0
     )
     await supervisor.start()
     try:

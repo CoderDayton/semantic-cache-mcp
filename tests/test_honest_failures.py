@@ -251,10 +251,15 @@ class TestRangedReadHashIsHonest:
         target.write_text(source)
 
         ctx = SimpleNamespace(lifespan_context={"cache": semantic_cache})
-        payload = await tools.read(ctx, str(target), offset=1)
 
-        assert "content_hash" in payload, "a whole-file window should mint a claimable hash"
-        body = payload["content"]
+        plain = await tools.read(ctx, str(target), offset=1)
+        assert "content_hash" in plain, "a whole-file window should mint a claimable hash"
+        # Without the gutter the body is the file itself, bar its final newline.
+        assert plain["content"] + "\n" == source
+
+        numbered = await tools.read(ctx, str(target), offset=1, line_numbers=True)
+        assert "content_hash" in numbered
+        body = numbered["content"]
         # Strip the "%6d\t" gutter back off and the original must return.
         recovered = "".join(line.split("\t", 1)[1] + "\n" for line in body.split("\n"))
         assert recovered == source

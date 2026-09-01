@@ -37,7 +37,7 @@
 
 Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that puts every file operation behind one cache. Re-reading a file you already hold costs a few tokens instead of the whole file, and search and grep run over that same corpus rather than the disk.
 
-Thirteen tools share the layer: `read`, `read_image`, `batch_read`, `write`, `edit`, `edit_preview`, `batch_edit`, `search`, `grep`, `glob`, `delete`, `clear`, `stats`.
+Fourteen tools share the layer: `read`, `read_image`, `batch_read`, `warm`, `write`, `edit`, `edit_preview`, `batch_edit`, `search`, `grep`, `glob`, `delete`, `clear`, `stats`.
 
 ---
 
@@ -45,9 +45,11 @@ Thirteen tools share the layer: `read`, `read_image`, `batch_read`, `write`, `ed
 
 **Reads stop costing tokens.** The first read hands back a `content_hash`. Send it back — `known_hash` on `read`, a `known_hashes` entry on `batch_read` — and the server replies `unchanged` without resending. A modified file returns a diff with changed line numbers; an oversized one collapses to a structure-preserving summary rather than a blind cut at a byte offset.
 
+Hashes travel as their first 16 hex characters — a claim is only ever checked against the entry for the path it names, so 64 bits separates two versions of one file with room to spare, and the full digest is still accepted. A shorter prefix is not: that would match every version at once.
+
 That echoed hash is the whole contract, and it is the only evidence the server has that a file is still in your context. A warm cache proves the *server* holds the file, never that you do — the store is on disk and outlives the process, the session, and your context window. A read without a matching hash always sends the file, so forgetting is safe: after a compaction, omit the hashes and get your files back in full.
 
-**Search and grep run on the cache, not the disk.** BM25 keyword search, glob, and grep all read the corpus that `read` and `batch_read` populate. An in-session result LRU collapses repeated queries to sub-millisecond hits.
+**Search and grep run on the cache, not the disk.** BM25 keyword search, glob, and grep all read the corpus that `read`, `batch_read` and `warm` populate — and `warm` fills it without returning a byte of content, so a whole tree becomes searchable for a few dozen tokens. An in-session result LRU collapses repeated queries to sub-millisecond hits.
 
 **Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, can run formatters, and refresh the cache atomically. A `dry_run` writes nothing and says so — the status becomes `would_create` / `would_update` / `would_edit` — so a preview is never mistaken for a completed write.
 
@@ -133,7 +135,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges. A partial or summarized read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
+| `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges, with the number gutter opt-in via `line_numbers=true` (it costs ~17% of a window, and the range is in `lines` regardless). `outline=true` returns one `line: signature` per definition instead of the text — the cheap first read of a large file, and a map rather than possession, so it reports `file_hash`. A partial or summarized read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
 | `read_image` | Image pass-through. Returns an MCP image content block (base64 + mime) so vision models see the pixels; sidecar metadata carries size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not extension. Bypasses the cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff; supports `append=true` and formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
 | `edit` | Exact edit against cached content, with scoped and line-range modes plus `dry_run=true`. Pass `known_hash` to get a claimable `content_hash` back and skip the read afterwards. For several edits to one file, use `batch_edit`. |
@@ -145,10 +147,11 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
+| `warm` | Index files into the cache so `grep` and `search` can see them, returning counts only — never content. Takes paths or globs. Every file left out is reported with a reason (`not_found`, `not_a_file`, `binary`, `too_large`, `unreadable`, `timeout`), and a cap that stops the walk sets `truncated` or `incomplete` rather than a short count that reads as complete. |
 | `batch_read` | Multi-file cache-aware read. Handles globs, priorities, token budgets, and diff/full routing. Returns each file's `content_hash`; pass them back as `known_hashes` to suppress the ones you still hold. |
-| `search` | Cache-only BM25 ranking of cached files. Terms join with `OR`, so a word your corpus lacks narrows the ranking instead of emptying the results. Seed likely files with `batch_read` first. |
-| `grep` | Cache-only exact search — regex or literal, with line numbers and optional context. Best for symbols and exact strings. An invalid, over-long, or catastrophically backtracking pattern is an error, never an empty result; use `fixed_string=true` for literal text. Responses state whether the scan completed, so a capped result is never read as a total. |
-| `glob` | File discovery plus cache coverage. Find candidates, then pass the paths to `batch_read`. |
+| `search` | Cache-only BM25 ranking of cached files. Terms join with `OR`, so a word your corpus lacks narrows the ranking instead of emptying the results. Previews centre on the matching term rather than the file's first 200 characters, so they show why the file ranked. Index likely files with `warm` first. |
+| `grep` | Cache-only exact search — regex or literal. Best for symbols and exact strings. Hits come back as `"<line>:<text>"` strings grouped by file, context lines as `"<line>-<text>"`, with overlapping context windows merged so no line is sent twice; paths are relative to the `root` the response names. `output="paths"` answers "which files mention X" and `output="count"` just the totals. An invalid, over-long, or catastrophically backtracking pattern is an error, never an empty result; use `fixed_string=true` for literal text. Responses state whether the scan completed, so a capped result is never read as a total. |
+| `glob` | File discovery plus cache coverage. Find candidates, then pass the paths to `warm` (to index them) or `batch_read` (to read them). |
 
 ### Management
 
@@ -252,13 +255,32 @@ Expands simple globs, honors `priority`, enforces `max_total_tokens`, and report
 </details>
 
 <details>
+<summary><strong>warm</strong>: make a tree searchable without reading it</summary>
+
+```
+warm paths="src/**/*.py"
+warm paths="src/a.py,src/b.py"
+warm paths="src/**/*" max_files=500
+```
+
+Indexes the files into the cache and returns counts — `warmed`, `already_current`, `skipped`, `tokens_indexed` — with no content, no previews, and no per-file paths for the ones that worked. Anything skipped comes back under `failures` with a reason, and a cap that stops the walk sets `truncated` or `incomplete`.
+
+The usual opening move on an unfamiliar tree: `warm`, then `grep` for the exact string or `search` for the concept, then `read` only what those name.
+
+</details>
+
+<details>
 <summary><strong>discovery</strong>: search, glob, grep</summary>
 
 ```
 search query="authentication middleware logic" k=5
 glob pattern="**/*.py" directory="./src" cached_only=true
 grep pattern="class Cache" path="src/**/*.py"
+grep pattern="content_hash" output="paths"
+grep pattern="TODO" output="count"
 ```
+
+A `grep` response names the shared directory once as `root` and reports each file's hits as `"<line>:<text>"` strings — measured at 37% fewer tokens than the per-match objects it replaced, and `glob` at 50%. `output="count"` turns a 2.6k-token answer into 77.
 
 </details>
 
@@ -277,6 +299,8 @@ grep pattern="class Cache" path="src/**/*.py"
 | `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before W-TinyLFU eviction |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
+| `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. Off by default: it duplicates the text block byte for byte, and clients disagree about which they forward, so leaving it on can double the cost of every file delivered. |
+| `SCMCP_PUBLISH_OUTPUT_SCHEMA` | `false` | Advertise per-tool output schemas in `tools/list`. Off by default: they were 11.5k of this server's 19.8k advertised tokens, paid on every request, and the Anthropic Messages API has no field to receive them. Turning this on forces `SCMCP_STRUCTURED_CONTENT` on too, since MCP requires structured content from any tool that declares a schema. |
 
 A malformed value falls back to the default and logs a warning naming the variable. See [docs/env_variables.md](docs/env_variables.md) for detail.
 

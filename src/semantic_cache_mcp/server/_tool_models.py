@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from ..config import PUBLISH_OUTPUT_SCHEMA
+
 
 class ToolResponseModel(BaseModel):
     """Base model that tolerates compact/truncated fallbacks."""
@@ -57,6 +59,12 @@ class ReadResponse(ToolResponseModel):
     # `file_hash` it is redeemable, because it names what the caller was sent.
     coverage_token: str | None = None
     total_lines: int | None = None
+    # Set by `read(outline=true)`: the body is a map of the file's definitions,
+    # not its text. `symbols` counts them, and `reason` says why a body is
+    # missing when none were recognized.
+    outline: bool | None = None
+    symbols: int | None = None
+    reason: str | None = None
 
 
 class ReadImageResponse(ToolResponseModel):
@@ -226,9 +234,11 @@ class SearchMatch(ToolResponseModel):
 class SearchResponse(ToolResponseModel):
     query: str | None = None
     matches: list[SearchMatch] | None = None
-    count: int | None = None
+    # Directory every `matches[].path` is relative to, named once instead of
+    # repeated on each entry. Absent when no prefix was worth reporting, in
+    # which case the paths are absolute.
+    root: str | None = None
     cached_files: int | None = None
-    files_searched: int | None = None
     k: int | None = None
     directory: str | None = None
     show_preview: bool | None = None
@@ -276,28 +286,44 @@ class GlobMatch(ToolResponseModel):
 class GlobResponse(ToolResponseModel):
     pattern: str | None = None
     directory: str | None = None
+    root: str | None = None
     matches: list[GlobMatch] | None = None
     total_matches: int | None = None
     cached_count: int | None = None
     total_cached_tokens: int | None = None
 
 
-class GrepMatch(ToolResponseModel):
-    line_number: int | None = None
-    line: str | None = None
-    before: list[str] | None = None
-    after: list[str] | None = None
+class WarmFailure(ToolResponseModel):
+    path: str | None = None
+    reason: str | None = None
+
+
+class WarmResponse(ToolResponseModel):
+    warmed: int | None = None
+    already_current: int | None = None
+    skipped: int | None = None
+    tokens_indexed: int | None = None
+    failures: list[WarmFailure] | None = None
+    # True when a cap stopped the walk before every named file was reached, so
+    # `warmed` is a floor and some files are still invisible to grep/search.
+    incomplete: bool | None = None
+    hint: str | None = None
 
 
 class GrepFile(ToolResponseModel):
     path: str | None = None
-    count: int | None = None
-    matches: list[GrepMatch] | None = None
+    # One entry per line delivered, rendered as `"<line>:<text>"` for a line
+    # that matched and `"<line>-<text>"` for a context line. A string instead
+    # of an object per match: the keys were ~16 tokens of pure envelope each.
+    # Absent in `output="paths"` mode.
+    lines: list[str] | None = None
 
 
 class GrepResponse(ToolResponseModel):
     pattern: str | None = None
     path: str | None = None
+    # Directory every `files[].path` is relative to, named once.
+    root: str | None = None
     total_matches: int | None = None
     files_matched: int | None = None
     files: list[GrepFile] | None = None
@@ -320,3 +346,31 @@ class GrepResponse(ToolResponseModel):
 def output_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Build an explicit FastMCP output schema with a stable title."""
     return model.model_json_schema(mode="serialization")
+
+
+# Tool name -> the model that declares its response shape. Populated at import
+# time by `register_response_model` as each tool is defined.
+#
+# The registry exists because the published output schema does not. Schemas are
+# the majority of this server's advertised bytes and the Messages API has no
+# field to receive them, so they stay off the wire — but the *contract* they
+# encoded is still worth enforcing, and the response-contract tests check
+# payload keys against these models rather than against `tools/list`.
+TOOL_RESPONSE_MODELS: dict[str, type[BaseModel]] = {}
+
+
+def register_response_model(tool: str, model: type[BaseModel]) -> dict[str, Any] | None:
+    """Declare *tool*'s response shape; return the schema only if it is published.
+
+    Raises:
+        ValueError: two different models were registered for one tool name,
+            which would leave the contract tests checking the wrong shape.
+    """
+    existing = TOOL_RESPONSE_MODELS.get(tool)
+    if existing is not None and existing is not model:
+        raise ValueError(
+            f"tool {tool!r} already declared response model {existing.__name__}; "
+            f"refusing to replace it with {model.__name__}"
+        )
+    TOOL_RESPONSE_MODELS[tool] = model
+    return output_schema(model) if PUBLISH_OUTPUT_SCHEMA else None
