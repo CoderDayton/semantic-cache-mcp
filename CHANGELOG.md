@@ -5,6 +5,101 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-09-01: A cache you can warm, an outline before the read, half-length hashes
+
+Two costs were being paid on every turn regardless of what any tool did, and
+neither showed up in any per-call measurement. The advertised tool list sits in
+the prompt prefix of every request, and output schemas were 11.5k of this
+server's 19.8k advertised tokens — paid whether or not a tool was ever called,
+and the Anthropic Messages API has no field to receive them. Separately, every
+tool result went out twice: once as a text block and once as `structuredContent`,
+byte for byte identical, measured at 8.8k + 8.9k tokens for a single 584-line
+file. Both defaults now pick the cheaper shape, and `SCMCP_PUBLISH_OUTPUT_SCHEMA`
+and `SCMCP_STRUCTURED_CONTENT` opt back in for a client that actually consumes
+structured output. The Pydantic response models stay either way — they remain the
+declared contract, enforced by `tests/test_response_contract.py`.
+
+The other half of this release is about the read that comes *before* you know
+what to read. Search and grep only see files the cache holds, so making a tree
+searchable meant reading it — paying for content in order to find out which
+content you wanted. `warm` breaks that: it indexes paths or globs and returns
+counts only, never a byte. The opening move on an unfamiliar tree becomes `warm`,
+then `grep` or `search`, then `read` only what those name.
+
+No cache-format change and no migration. A client that ignores the new
+parameters behaves as it did in 0.5.4.
+
+### Added
+
+- **`warm`** — index files into the cache so `grep` and `search` can see them,
+  returning `warmed`, `already_current`, `skipped` and `tokens_indexed` and no
+  content. Takes paths or globs. Every file left out is named with a reason
+  (`not_found`, `not_a_file`, `binary`, `too_large`, `unreadable`, `timeout`),
+  and a cap that stops the walk sets `truncated` or `incomplete` rather than a
+  short count that reads as complete. Bounded by a per-file size limit, a total
+  byte budget, and a deadline, so a careless glob cannot run away with the
+  process.
+- **`read(outline=true)`** — one `line: signature` per definition instead of the
+  file's text. The cheap first read of a large file: a map of where things are,
+  which is exactly why it reports `file_hash` and not a claimable
+  `content_hash`. Backed by `extract_outline`/`render_outline` in `core.text`,
+  pure and I/O-free like the rest of that layer.
+- **Line anchors on summaries.** A summary is non-contiguous, so a reader told to
+  re-read "specific sections" held no line number it could name and the follow-up
+  was a guess. Each kept segment now opens with `// L<start>-<end>`, a 1-based
+  inclusive range that feeds straight into `read(offset, limit)`. About 6 tokens
+  per segment, charged against the existing marker reserve.
+
+### Changed
+
+- **Content hashes travel as their first 16 hex characters.** A claim is only
+  ever checked against the entry for the path it names, so 64 bits separates two
+  versions of one file with room to spare. The full digest is still accepted; a
+  shorter prefix is not, since that would match every version of the file at
+  once. Stored hashes are unchanged — this is a wire form, not a storage change.
+- **A multi-file response names its shared directory once as `root`** and reports
+  paths relative to it, instead of repeating the common prefix on every entry.
+- **`grep` hits are `"<line>:<text>"` strings grouped by file**, context lines
+  `"<line>-<text>"`, with overlapping context windows merged so no line is sent
+  twice — 37% fewer tokens than the per-match objects they replace, and `glob`
+  50%. `output="count"` turns a 2.6k-token answer into 77.
+- **Ranged reads no longer number their lines by default.** The gutter costs ~17%
+  of a window and the range is reported in `lines` regardless; `line_numbers=true`
+  restores it.
+- **`search` previews centre on the matching term.** The stored preview was the
+  file's first 200 characters — for source, the module docstring and its imports,
+  which never says why the file ranked and is text the follow-up `read` returns
+  anyway.
+- **An over-budget response refits instead of being cut.** The trim now drops the
+  parts a caller can do without and keeps the answer, rather than truncating at a
+  boundary that could leave the result unreadable.
+
+### Fixed
+
+- **An over-budget `batch_read` could return files with their content silently
+  removed.** The budgeted refit assumed a `files` list was grep-shaped;
+  `batch_read`'s entries carry `content`/`status` and no `lines`, so every entry
+  was rewritten to bare `{"path": ...}` and the function returned before setting
+  `truncated` — handing back a list of paths that the caller had every reason to
+  read as the files it asked for.
+- **`read`'s tool description still promised numbered lines on a ranged read**
+  after the default changed, so a caller trusting it would misread every line
+  position in an unnumbered window.
+- **`warm` overwrote one hint with another** when both the `max_files` cap and the
+  byte/time budget fired, losing the `max_files` guidance.
+- **`grep(output="count")` rendered every file's lines and walked the character
+  budget** for a `files` array it never sends, and could report truncation of a
+  list the caller did not receive.
+- **An invalid `SCMCP_STRUCTURED_CONTENT` value logged its warning twice.**
+- **`warm`'s docstring promised every skipped file appears under `failures`**;
+  the list is capped at 20.
+- **Corrupted box-drawing characters in the `docs/architecture.md` diagrams**,
+  and the tool count there was still 13.
+- **Worker startup tests allowed 2s** for a macOS `spawn` plus a cold-cache
+  import of `server.tools` that alone measures 1135 ms, leaving under a second of
+  headroom on a shared CI runner. Raised to 5s, matching the one test in that
+  file that already used it.
+
 ## [0.5.4] - 2026-08-31: fastmcp 4.0.0
 
 The server is launched with `uvx`, so its dependencies resolve to the newest
@@ -971,6 +1066,8 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `cached_only=true` on `glob` to filter to already-cached files
 
 [Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...HEAD
+[0.5.5]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.0...v0.5.1
