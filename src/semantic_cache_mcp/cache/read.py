@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ..config import MAX_CONTENT_SIZE
 from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
-from ..core.hashing import hash_content
+from ..core.hashing import hash_content, hash_matches
 from ..logger import log_marker
 from ..types import BatchReadResult, CacheEntry, FileReadSummary, ReadResult
 from ..utils import aread_bytes, astat
@@ -409,7 +409,9 @@ async def batch_smart_read(
         if cached is None:
             return False
         claim = _claims.get(p) or _claims.get(resolved_map[p])
-        return claim is not None and claim == cached.content_hash
+        # `hash_matches` accepts the 16-character wire form or the full digest
+        # and nothing between, so a truncated claim buys nothing.
+        return hash_matches(claim, cached.content_hash)
 
     # Pre-fetch stat results through the executor so the estimation loop
     # doesn't block the event loop with synchronous syscalls (matters on
