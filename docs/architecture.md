@@ -30,7 +30,7 @@ src/semantic_cache_mcp/
 │   │   ├── __init__.py
 │   │   ├── _diff.py        # generate_diff, diff_with_stats, compute_delta, diff_stats
 │   │   └── _summarize.py   # summarize_semantic (TCRA-LLM based)
-│   └���─ tokenizer/          # BPE token counting (o200k_base)
+│   └── tokenizer/          # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
     ├── docstore/           # ContentStorage: vendored SQLite + FTS5 keyword store
@@ -68,7 +68,7 @@ Small file (< 8KB):
 
 Large file (≥ 8KB):
   ├── Parent document: page_content="", is_parent=True
-  └���─ Child documents (per CDC chunk):
+  └── Child documents (per CDC chunk):
       ├── page_content=chunk_text, chunk_index=0
       ├── page_content=chunk_text, chunk_index=1
       └── ...
