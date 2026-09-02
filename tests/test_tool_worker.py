@@ -344,4 +344,6 @@ async def test_batch_read_resolves_relative_paths_before_remote_dispatch(
         output_mode="compact",
         max_response_tokens=None,
         timeout=tools_mod._TOOL_TIMEOUT * 2,
+        # The worker has no session to ask for roots, so the server carries it.
+        client_root="/repo",
     )

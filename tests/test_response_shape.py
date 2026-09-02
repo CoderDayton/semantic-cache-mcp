@@ -30,7 +30,7 @@ from semantic_cache_mcp.cache import SemanticCache
 from semantic_cache_mcp.core import count_tokens
 from semantic_cache_mcp.server._paths import relativize, shared_root
 from semantic_cache_mcp.server.response import _minimal_payload, _response_overrides
-from semantic_cache_mcp.server.tools import glob, grep, search, warm
+from semantic_cache_mcp.server.tools import batch_read, glob, grep, search, warm
 
 _BODY = """import os
 
@@ -120,6 +120,38 @@ class TestSharedRoot:
     def test_a_sibling_with_a_shared_prefix_is_not_relativized(self) -> None:
         """`/a/bc` must not be read as living under `/a/b`."""
         assert relativize("/a/bc/x.py", "/a/b") == "/a/bc/x.py"
+
+
+class TestBatchReadPaths:
+    async def test_a_shared_root_is_reported_once(self, ctx: MagicMock, project: Path) -> None:
+        """`batch_read` lists many files under one directory — the case `root` is for."""
+        payload = await batch_read(ctx, str(project / "pkg" / "*.py"))
+
+        assert payload["root"] == str(project / "pkg")
+        for entry in payload["files"]:
+            assert not entry["path"].startswith("/")
+            assert Path(_absolute(payload, entry["path"])).is_file()
+
+    async def test_skipped_entries_share_the_root(self, ctx: MagicMock, project: Path) -> None:
+        payload = await batch_read(ctx, str(project / "pkg" / "*.py"), max_total_tokens=1)
+
+        assert payload["root"] == str(project / "pkg")
+        assert payload["files"] == []
+        for entry in payload["skipped"]:
+            assert Path(_absolute(payload, entry["path"])).is_file()
+
+    async def test_known_hashes_still_match_relativized_paths(
+        self, ctx: MagicMock, project: Path
+    ) -> None:
+        """A caller echoing the paths it was given, root-relative, must be understood."""
+        first = await batch_read(ctx, str(project / "pkg" / "*.py"))
+        claims = {f["path"]: f["content_hash"] for f in first["files"]}
+        # The claim is keyed the way the response named the file: relative to root.
+        second = await batch_read(
+            ctx, str(project / "pkg" / "*.py"), known_hashes=json.dumps(claims)
+        )
+        assert second["summary"]["unchanged_count"] == len(claims)
+        assert second["files"] == []
 
 
 class TestGrepPaths:
@@ -312,6 +344,45 @@ class TestGlobPaths:
         for match in payload["matches"]:
             assert Path(_absolute(payload, match["path"])).is_file()
 
+    async def test_relative_paths_are_much_cheaper(self, ctx: MagicMock, project: Path) -> None:
+        """README publishes ~50% off `glob`; nothing else measured it.
+
+        A glob response is almost entirely paths, so naming the directory once
+        is close to the whole saving. The share grows with the match count —
+        `root` is written once against a prefix removed from every entry — so
+        this measures it at a realistic 40 matches rather than the three the
+        other tests in this file use.
+        """
+        deep = project / "pkg" / "semantic_cache_mcp" / "storage" / "docstore"
+        deep.mkdir(parents=True, exist_ok=True)
+        for index in range(40):
+            (deep / f"module_{index}.py").write_text("x = 1\n")
+
+        payload = await glob(ctx, pattern="*.py", directory=str(deep))
+        assert len(payload["matches"]) == 40
+
+        shortened = count_tokens(json.dumps(payload))
+        absolute = count_tokens(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in {
+                        **payload,
+                        "root": None,
+                        "matches": [
+                            {**m, "path": _absolute(payload, m["path"])} for m in payload["matches"]
+                        ],
+                    }.items()
+                    if value is not None
+                }
+            )
+        )
+        # Measures 64% here; the floor is the 50% README.md publishes.
+        assert shortened <= absolute * 0.5, (
+            f"root/relative form saved {1 - shortened / absolute:.0%}, "
+            "under the 50% README.md publishes"
+        )
+
 
 class TestSearch:
     async def test_similarity_is_two_decimals(self, ctx: MagicMock, project: Path) -> None:
@@ -397,6 +468,18 @@ class TestGracefulTruncation:
 
         assert minimal["truncated"] is True
         assert len(minimal.get("files", [{}])[0].get("lines", [])) <= 1
+
+    def test_the_root_survives_a_trim(self) -> None:
+        """Relative paths without the root they hang off cannot be rebuilt."""
+        payload = {
+            "ok": True,
+            "tool": "grep",
+            "total_matches": 1,
+            "root": "/home/dev/project",
+            "files": [{"path": "a.py", "lines": ["1:hit"]}],
+        }
+        minimal = _minimal_payload(payload, 200)
+        assert minimal["root"] == "/home/dev/project"
 
     def test_without_a_budget_the_old_stripping_still_applies(self) -> None:
         minimal = _minimal_payload({"ok": True, "tool": "grep", "files": [{"path": "a.py"}]})

@@ -272,6 +272,8 @@ class BatchReadFile(ToolResponseModel):
 
 class BatchReadResponse(ToolResponseModel):
     summary: BatchReadSummary | None = None
+    # Directory every `files[].path` / `skipped[].path` is relative to, named once.
+    root: str | None = None
     skipped: list[BatchReadSkipped] | None = None
     files: list[BatchReadFile] | None = None
 

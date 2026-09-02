@@ -116,6 +116,8 @@ def _minimal_payload(payload: dict[str, Any], budget: int | None = None) -> dict
         "path1",
         "path2",
         "pattern",
+        # Relative `files[].path` entries are meaningless without it.
+        "root",
         "summary",
         "skipped",
         "files_read",
