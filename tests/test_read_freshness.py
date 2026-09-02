@@ -621,3 +621,74 @@ async def test_debug_mode_dry_run_omits_content_hash(ctx: MagicMock, tmp_path: P
         assert real.get("content_hash")  # real write surfaces it in debug too
         dry = _parse(await write(ctx, str(f), "x = 2\n", dry_run=True))
         assert "content_hash" not in dry
+
+
+# ---------------------------------------------------------------------------
+# mtime alone is not evidence of freshness
+# ---------------------------------------------------------------------------
+#
+# `cp -p`, `rsync -t`, `tar -x` and `touch -d` all land new bytes under an
+# mtime no newer than the one the cache recorded. A gate that reads
+# "cache is at least as new as disk" as "cache is current" then serves the
+# superseded text — and a mutation built on it writes that text back over
+# the real file.
+
+
+def _backdated_rewrite(f: Path, body: str) -> None:
+    """Replace *f*'s content while moving its mtime into the past."""
+    old = f.stat().st_mtime
+    f.write_text(body)
+    os.utime(f, (old - 100, old - 100))
+
+
+async def test_read_with_known_hash_detects_a_backdated_rewrite(
+    ctx: MagicMock, tmp_path: Path
+) -> None:
+    f = tmp_path / "backdated.py"
+    f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n")
+    first = _parse(await read(ctx, str(f)))
+
+    _backdated_rewrite(f, "\n".join(f"b_{i} = {i}" for i in range(60)) + "\n")
+
+    d = _parse(await read(ctx, str(f), known_hash=first["content_hash"]))
+    assert d.get("unchanged") is not True
+    assert d["content_hash"] != first["content_hash"]
+    assert "b_0 = 0" in d["content"]
+
+
+async def test_append_never_resurrects_stale_cache_over_a_backdated_rewrite(
+    ctx: MagicMock, tmp_path: Path
+) -> None:
+    f = tmp_path / "log.txt"
+    w = _parse(await write(ctx, str(f), "ORIGINAL\n"))
+
+    _backdated_rewrite(f, "REAL CURRENT CONTENT\n")
+
+    await write(ctx, str(f), "APPENDED\n", append=True, known_hash=w["content_hash"])
+    assert f.read_text() == "REAL CURRENT CONTENT\nAPPENDED\n"
+
+
+async def test_edit_uses_disk_after_a_backdated_rewrite(ctx: MagicMock, tmp_path: Path) -> None:
+    f = tmp_path / "edited.py"
+    f.write_text("x = 1\n")
+    await read(ctx, str(f))
+
+    _backdated_rewrite(f, "x = 1\ny = 2\n")
+
+    d = _parse(await edit(ctx, str(f), "y = 2", "y = 3"))
+    assert d["status"] == "edited"
+    assert f.read_text() == "x = 1\ny = 3\n"
+
+
+async def test_batch_edit_uses_disk_after_a_backdated_rewrite(
+    ctx: MagicMock, tmp_path: Path
+) -> None:
+    f = tmp_path / "batch.py"
+    f.write_text("x = 1\n")
+    await read(ctx, str(f))
+
+    _backdated_rewrite(f, "x = 1\ny = 2\n")
+
+    d = _parse(await batch_edit(ctx, str(f), '[["y = 2", "y = 3"]]'))
+    assert d["status"] == "edited"
+    assert f.read_text() == "x = 1\ny = 3\n"

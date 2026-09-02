@@ -38,6 +38,21 @@ MAX_RETURN_DIFF_TOKENS = 8000  # Hard cap for emitted diff payloads
 MAX_DIFF_TO_FULL_RATIO = 0.9  # Suppress diff payloads near full-content size
 
 
+def mtime_is_current(cached_mtime: float, disk_mtime: float) -> bool:
+    """Whether a cache entry's recorded mtime says the file has not moved.
+
+    The one no-I/O freshness signal, so every gate asks this and nothing else
+    compares mtimes by hand. It is exact equality, not ``>=``: a file whose
+    mtime went *backwards* was rewritten by something that preserves
+    timestamps — ``cp -p``, ``rsync -t``, ``tar -x``, ``touch -d`` — and that
+    is the strongest staleness signal a stat can give, not evidence of
+    freshness. Equal timestamps with different bytes are still possible on a
+    coarse-timestamp filesystem; a hash check is the only answer to that, and
+    every mutation path runs one.
+    """
+    return cached_mtime == disk_mtime
+
+
 # Formatter subprocess timeout. Honor SCMCP_FORMAT_TIMEOUT_S so users with
 # slow formatters (e.g. eslint on monorepos) can extend it without recompiling.
 # Bad values must not crash import; clamp to a sane minimum so a 0/negative
