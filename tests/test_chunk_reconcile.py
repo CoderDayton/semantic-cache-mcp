@@ -292,9 +292,9 @@ async def test_failed_store_marks_index_dirty(
     async def boom(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated DB failure")
 
-    # update_metadata runs last in reconcile, after rows are already mutated —
-    # the exact moment the index can diverge from the DB.
-    monkeypatch.setattr(storage._collection, "update_metadata", boom)
+    # The reconcile is the whole of the rewrite, so a failure inside it is the
+    # moment the index can diverge from the DB.
+    monkeypatch.setattr(storage._collection, "reconcile_chunks", boom)
 
     with pytest.raises(RuntimeError, match="simulated DB failure"):
         await storage.put(path, _big_text("edit2"), time.time())

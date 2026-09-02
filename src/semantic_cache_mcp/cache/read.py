@@ -14,7 +14,7 @@ from ..core.hashing import hash_content, hash_matches
 from ..logger import log_marker
 from ..types import BatchReadResult, CacheEntry, FileReadSummary, ReadResult
 from ..utils import aread_bytes, astat
-from ._helpers import _diff_context_lines, _is_binary_content
+from ._helpers import _diff_context_lines, _is_binary_content, mtime_is_current
 from .store import SemanticCache
 
 # Magic-byte prefixes for cheap mime sniffing when extension lookup fails.
@@ -146,7 +146,7 @@ async def smart_read(
     cached = await cache.get(str(file_path))
     mtime: float = (await astat(file_path, cache._io_executor)).st_mtime
 
-    if cached and diff_mode and not force_full and cached.mtime >= mtime:
+    if cached and diff_mode and not force_full and mtime_is_current(cached.mtime, mtime):
         await cache.record_access(str(file_path))
         unchanged_msg = f"// File unchanged: {path} ({cached.tokens} tokens cached)"
         msg_tokens = count_tokens(unchanged_msg)
@@ -222,13 +222,17 @@ async def smart_read(
     # grep/search kept indexing the superseded text.
     cache_is_fresh = False
     if cached and force_full and _content_hash() == cached.content_hash:
-        if cached.mtime < mtime:
+        # Any drift, in either direction: the gate below is exact equality, so
+        # an mtime left behind by a backdated rewrite of identical bytes would
+        # otherwise never match again and every later read would re-hash the
+        # file from disk.
+        if cached.mtime != mtime:
             await cache.update_mtime(str(file_path), mtime)
         cache_is_fresh = True
 
     # Strategy 1 & 2: Cached file (unchanged or diff)
     if cached and diff_mode and not force_full:
-        if cached.mtime >= mtime:
+        if mtime_is_current(cached.mtime, mtime):
             # File unchanged (mtime match)
             pass
         elif _content_hash() == cached.content_hash:
@@ -439,7 +443,7 @@ async def batch_smart_read(
         if cached:
             # Only a proven holder gets the marker-sized answer; everyone else
             # is quoted the real cost of re-sending the file.
-            if _caller_holds(p, cached) and cached.mtime >= st.st_mtime:
+            if _caller_holds(p, cached) and mtime_is_current(cached.mtime, st.st_mtime):
                 unchanged_msg = f"// File unchanged: {p} ({cached.tokens} tokens cached)"
                 return min(cached.tokens, count_tokens(unchanged_msg))
             return cached.tokens

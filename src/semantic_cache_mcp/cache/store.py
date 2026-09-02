@@ -15,7 +15,7 @@ from ..config import CACHE_DIR, TOOL_TIMEOUT
 from ..core import count_tokens
 from ..logger import log_marker
 from ..storage import ContentStorage, SQLiteStorage
-from ..storage.docstore import CONTENT_DB_PATH
+from ..storage.docstore import CONTENT_DB_PATH, ContentIntegrityError
 from ..types import CacheEntry
 from ..utils import DetachedExecutor
 from .metrics import SessionMetrics
@@ -354,8 +354,30 @@ class SemanticCache:
         happens on a code-point boundary, so the result may be slightly
         shorter than the cap. ``None`` returns the full content. See
         :meth:`ContentStorage.get_content` for the full contract.
+
+        Storage refuses to hand back a full reassembly that does not hash to
+        the entry it belongs to — a chunk set left incoherent by an
+        interrupted rewrite. That is recoverable rather than fatal: the file
+        itself is still on disk, so the poisoned rows are dropped and the
+        bytes are read from there. Only a file that is also gone from disk
+        turns into an error.
         """
-        return await self._storage.get_content(entry, max_bytes=max_bytes)
+        try:
+            return await self._storage.get_content(entry, max_bytes=max_bytes)
+        except ContentIntegrityError:
+            logger.warning(
+                "Cached chunks for %s do not match their content_hash; "
+                "dropping them and re-reading from disk",
+                entry.path,
+            )
+            await self.delete_path(entry.path)
+            # Bytes, then decode: `read_text` would translate CRLF to LF and
+            # raise on the non-UTF-8 files this cache stores with replacement
+            # characters — the recovered text has to be what was stored.
+            raw = await asyncio.get_running_loop().run_in_executor(
+                self._io_executor, Path(entry.path).read_bytes
+            )
+            return raw.decode("utf-8", errors="replace")
 
     async def record_access(self, path: str) -> None:
         await self._storage.record_access(path)

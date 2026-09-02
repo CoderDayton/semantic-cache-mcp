@@ -19,7 +19,7 @@ from ..types import (
     SearchResult,
 )
 from ..utils import aread_bytes, astat
-from ._helpers import _is_binary_content, _suppress_large_diff
+from ._helpers import _is_binary_content, _suppress_large_diff, mtime_is_current
 from .store import SemanticCache
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ async def _load_diff_input(
     cached = await cache.get(str(file_path))
     if cached is not None:
         file_mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        if cached.mtime >= file_mtime:
+        if mtime_is_current(cached.mtime, file_mtime):
             return cached, await cache.get_content(cached), True
 
     content = await _read_text_file(cache, file_path, display_path)
@@ -155,15 +155,17 @@ async def semantic_search(
         resolved_dir = Path(directory).expanduser().resolve()
 
     # BM25 keyword search via ContentStorage.
-    # Request extra results when directory filtering will reduce the set
-    storage = cache._storage
-    search_k = k * 3 if resolved_dir else k
     # User queries are free-text keywords, not the FTS5 query DSL; sanitize so
     # operator characters are matched literally instead of returning nothing or
     # raising (see _sanitize_fts_query). An empty sanitized query yields no rows.
+    # The directory goes to the store, which applies it as a SQL prefix before
+    # `LIMIT`, so the ranking returns `k` usable rows rather than `k` global
+    # ones the loop below would mostly discard. The `is_relative_to` check
+    # further down stays as the authority on what "under this directory" means.
+    storage = cache._storage
+    sanitized = _sanitize_fts_query(query)
     results = await storage.search_by_query(
-        query=_sanitize_fts_query(query),
-        k=search_k,
+        query=sanitized, k=k, path_prefix=str(resolved_dir) if resolved_dir else None
     )
 
     if not results:

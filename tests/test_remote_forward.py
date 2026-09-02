@@ -65,6 +65,7 @@ class _FakeRemoteCache:
         output_mode: str,
         max_response_tokens: int | None,
         timeout: float,
+        client_root: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append((tool, kwargs))
         return {"ok": True, "tool": tool, "forwarded": True}

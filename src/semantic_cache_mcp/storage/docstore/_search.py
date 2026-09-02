@@ -32,12 +32,15 @@ async def search_by_query(
     query: str,
     k: int = 5,
     filter: dict | None = None,
+    path_prefix: str | None = None,
 ) -> list[tuple[str, str, float]]:
     """BM25 keyword search over cached content. FTS5 syntax supported."""
     if store._closed:
         return []
     try:
-        results = await store._collection.keyword_search(query, k=k * 2, filter=filter)
+        results = await store._collection.keyword_search(
+            query, k=k * 2, filter=filter, path_prefix=path_prefix
+        )
     except Exception as e:
         logger.warning(f"Keyword search failed: {e}")
         return []

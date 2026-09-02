@@ -1,8 +1,12 @@
 """Pytest wrapper for token savings benchmark.
 
-Runs the benchmark on a small file set (5 files) and asserts ≥80% savings
-for cached read phases. This ensures the README's "80%+ token reduction"
-claim is continuously verified in CI.
+Runs the benchmark on a small file set (5 files) and gates the savings the
+README advertises. The floors sit just under what the benchmark actually
+measures (99.8% on every phase at this file limit, 98.9% over the full
+corpus), because a floor 19 points below the published number defends
+nothing: a collapse from 99% to 81% would pass it silently. Each floor keeps
+only enough headroom for the corpus itself changing, since the benchmark
+reads this repo's own `src/`.
 """
 
 from __future__ import annotations
@@ -25,42 +29,45 @@ async def benchmark_results() -> dict[str, float]:
 
 
 def test_unchanged_reread_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 2: Unchanged re-reads should save ≥95% tokens."""
-    assert benchmark_results["unchanged"] >= 0.95, (
-        f"Unchanged re-read savings {benchmark_results['unchanged']:.1%} < 95%"
+    """Phase 2: an unchanged re-read sends a marker, not the file."""
+    assert benchmark_results["unchanged"] >= 0.99, (
+        f"Unchanged re-read savings {benchmark_results['unchanged']:.1%} < 99%"
     )
 
 
 def test_content_hash_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 3: Content hash (touch, mtime changed) should save ≥95% tokens."""
-    assert benchmark_results["content_hash"] >= 0.95, (
-        f"Content hash savings {benchmark_results['content_hash']:.1%} < 95%"
+    """Phase 3: a drifted mtime over identical bytes costs the same marker."""
+    assert benchmark_results["content_hash"] >= 0.99, (
+        f"Content hash savings {benchmark_results['content_hash']:.1%} < 99%"
     )
 
 
 def test_small_edits_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 4: Mixed changed/unchanged should save ≥80% tokens."""
-    assert benchmark_results["small_edits"] >= 0.80, (
-        f"Small edits savings {benchmark_results['small_edits']:.1%} < 80%"
+    """Phase 4: real edits in 30% of files come back as diffs."""
+    assert benchmark_results["small_edits"] >= 0.95, (
+        f"Small edits savings {benchmark_results['small_edits']:.1%} < 95%"
     )
 
 
 def test_batch_read_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 5: Batch read should save ≥80% tokens."""
-    assert benchmark_results["batch_read"] >= 0.80, (
-        f"Batch read savings {benchmark_results['batch_read']:.1%} < 80%"
+    """Phase 5: a whole-corpus batch_read with hashes echoed back."""
+    assert benchmark_results["batch_read"] >= 0.95, (
+        f"Batch read savings {benchmark_results['batch_read']:.1%} < 95%"
     )
 
 
 def test_search_savings(benchmark_results: dict[str, float]) -> None:
-    """Phase 6: Search previews should save ≥50% vs full file reads."""
-    assert benchmark_results["search"] >= 0.50, (
-        f"Search savings {benchmark_results['search']:.1%} < 50%"
+    """Phase 6: previews instead of full reads. The loosest floor of the six —
+    preview size tracks where the matching term lands, so it moves with the
+    corpus more than the hash-driven phases do."""
+    assert benchmark_results["search"] >= 0.90, (
+        f"Search savings {benchmark_results['search']:.1%} < 90%"
     )
 
 
 def test_overall_savings(benchmark_results: dict[str, float]) -> None:
-    """Overall savings across phases 2-6 should meet the 80% claim."""
-    assert benchmark_results["overall"] >= 0.80, (
-        f"Overall savings {benchmark_results['overall']:.1%} < 80%"
+    """Phases 2-6 aggregate: the README's headline number."""
+    assert benchmark_results["overall"] >= 0.97, (
+        f"Overall savings {benchmark_results['overall']:.1%} < 97%, "
+        "which is the number README.md publishes"
     )

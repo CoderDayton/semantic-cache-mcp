@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..core import count_tokens, diff_with_stats
 from ..core.hashing import hash_content
-from ..types import BatchEditResult, EditResult, SingleEditOutcome, WriteResult
+from ..types import BatchEditResult, CacheEntry, EditResult, SingleEditOutcome, WriteResult
 from ..utils import aread_bytes, aread_head, aread_text, astat, awrite_atomic
 from ..utils._async_io import (
     _atomic_write_sync as _atomic_write,  # noqa: F401 — re-exported for tests
@@ -38,6 +38,38 @@ MAX_BATCH_EDITS = 50
 # Cap on line numbers quoted back in an ambiguous-anchor error. Enough to see
 # the shape of the duplication without spending the response budget on it.
 _MAX_REPORTED_MATCH_LINES = 10
+
+
+async def _current_text(
+    cache: SemanticCache, file_path: Path, cached: CacheEntry | None
+) -> tuple[str, bool]:
+    """The file's current text, and whether the cache entry still describes it.
+
+    Every mutation starts from this. Disk is always read and hashed: the bytes
+    are about to be rewritten, so a stale base is not a token cost but data
+    loss — an append built on superseded text writes that text back over the
+    real file. mtime is not consulted; a timestamp-preserving rewrite
+    (``cp -p``, ``rsync -t``, ``tar -x``) leaves it looking current over
+    different bytes. When the hash matches, the cached text is returned so the
+    entry's chunk manifest stays the base for an incremental re-store, and a
+    drifted mtime is folded into the entry.
+    """
+    # Read bytes and decode, never `read_text`: text mode translates CRLF to
+    # LF, so the text would neither hash to the stored `content_hash` (which
+    # covers the file's real bytes) nor survive being written back — every
+    # edit of a CRLF file would silently convert it to LF.
+    disk_bytes = await aread_bytes(file_path, cache._io_executor)
+    try:
+        disk_text = disk_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        disk_text = disk_bytes.decode("utf-8", errors="replace")
+        logger.warning(f"File {file_path} contains non-UTF-8 characters")
+    if cached is None or hash_content(disk_text) != cached.content_hash:
+        return disk_text, False
+    mtime = (await astat(file_path, cache._io_executor)).st_mtime
+    if cached.mtime != mtime:
+        await cache.update_mtime(str(file_path), mtime)
+    return await cache.get_content(cached), True
 
 
 async def smart_write(
@@ -95,7 +127,6 @@ async def smart_write(
     old_content: str | None = None
     from_cache = False
     created = not file_path.exists()
-    mtime: float | None = None
 
     if not created:
         # Check for binary file. Only the sniff window is read — the existing
@@ -109,37 +140,8 @@ async def smart_write(
         except OSError as e:
             raise PermissionError(f"Cannot read existing file: {e}") from e
 
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
-
-        # Try to get content from cache first (saves tokens!)
         cached = await cache.get(str(file_path))
-        if cached:
-            if cached.mtime >= mtime:
-                old_content = await cache.get_content(cached)
-                from_cache = True
-                logger.debug(f"Using cached content for diff: {path}")
-            else:
-                # mtime changed — check content hash before falling back to disk
-                try:
-                    disk_bytes = await aread_bytes(file_path, cache._io_executor)
-                    if hash_content(disk_bytes) == cached.content_hash:
-                        await cache.update_mtime(str(file_path), mtime)
-                        old_content = await cache.get_content(cached)
-                        from_cache = True
-                        logger.debug(f"Content hash match for diff: {path}")
-                # Fall through to the disk read below on any failure.
-                except Exception:  # nosec B110
-                    pass
-
-        # Fall back to disk read
-        if old_content is None:
-            try:
-                old_content = await aread_text(file_path, executor=cache._io_executor)
-            except UnicodeDecodeError:
-                old_content = await aread_text(
-                    file_path, errors="replace", executor=cache._io_executor
-                )
-                logger.warning(f"File {path} contains non-UTF-8 characters")
+        old_content, from_cache = await _current_text(cache, file_path, cached)
 
     # Append mode: concatenate new content onto existing
     if append and old_content is not None:
@@ -367,38 +369,8 @@ async def smart_edit(
     # Try to get content from cache first (huge token savings!)
     if timer is not None:
         timer.enter("cache_lookup")
-    content: str
-    from_cache = False
-    mtime: float | None = None
     cached = await cache.get(str(file_path))
-
-    if cached:
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        if cached.mtime >= mtime:
-            content = await cache.get_content(cached)
-            from_cache = True
-            logger.debug(f"Using cached content for edit: {path}")
-        else:
-            # mtime changed — check content hash before falling back to disk
-            try:
-                disk_content = await aread_text(file_path, executor=cache._io_executor)
-            except UnicodeDecodeError:
-                disk_content = await aread_text(
-                    file_path, errors="replace", executor=cache._io_executor
-                )
-            if hash_content(disk_content) == cached.content_hash:
-                await cache.update_mtime(str(file_path), mtime)
-                content = await cache.get_content(cached)
-                from_cache = True
-                logger.debug(f"Content hash match for edit: {path}")
-            else:
-                content = disk_content
-    else:
-        # No cache entry, read from disk
-        try:
-            content = await aread_text(file_path, executor=cache._io_executor)
-        except UnicodeDecodeError:
-            content = await aread_text(file_path, errors="replace", executor=cache._io_executor)
+    content, from_cache = await _current_text(cache, file_path, cached)
 
     # Validate content size
     if len(content) > MAX_EDIT_SIZE:
@@ -640,39 +612,8 @@ async def smart_batch_edit(
     except OSError as e:
         raise PermissionError(f"Cannot read file: {e}") from e
 
-    # Get content (from cache if possible)
-    content: str
-    from_cache = False
-    mtime: float | None = None
     cached = await cache.get(str(file_path))
-
-    if cached:
-        mtime = (await astat(file_path, cache._io_executor)).st_mtime
-        if cached.mtime >= mtime:
-            content = await cache.get_content(cached)
-            from_cache = True
-        else:
-            # mtime changed — check content hash before falling back to disk
-            try:
-                disk_content = await aread_text(file_path, executor=cache._io_executor)
-            except UnicodeDecodeError:
-                disk_content = await aread_text(
-                    file_path, errors="replace", executor=cache._io_executor
-                )
-                logger.warning(f"File {path} contains non-UTF-8 characters")
-            if hash_content(disk_content) == cached.content_hash:
-                await cache.update_mtime(str(file_path), mtime)
-                content = await cache.get_content(cached)
-                from_cache = True
-            else:
-                content = disk_content
-    else:
-        # No cache entry, read from disk
-        try:
-            content = await aread_text(file_path, executor=cache._io_executor)
-        except UnicodeDecodeError:
-            content = await aread_text(file_path, errors="replace", executor=cache._io_executor)
-            logger.warning(f"File {path} contains non-UTF-8 characters")
+    content, from_cache = await _current_text(cache, file_path, cached)
 
     # Same character-count ceiling `edit` enforces; without it batch_edit was
     # the one mutation path with no upper bound on the text it would process.

@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-02: Freshness that a timestamp cannot fake, a search that stays in your project
+
+Two assumptions in this server were wrong in the same way: both trusted a signal
+that is cheap to read instead of the one that is true.
+
+The first was `mtime`. Four paths accepted a cache entry as current when its
+recorded `mtime` was at least the file's, with no hash check — and one of those
+paths was the base text for `write(append=true)`, `edit` and `batch_edit`. Any
+rewrite that preserves timestamps satisfies that gate over different bytes:
+`cp -p`, `rsync -t`, `tar -x`, `touch -d`, a checkout that restores mtimes. An
+append then built on superseded text and wrote it back over the real file. That
+is not a stale cache costing tokens, it is data loss, and it needed no race to
+happen. Freshness is now exact equality — a file whose mtime moved *backwards*
+was rewritten by exactly the tools above, so a backwards jump is the strongest
+staleness signal a `stat` can give, not evidence of freshness — and every
+mutation reads and hashes disk before it writes, because the bytes are about to
+be replaced.
+
+The second was the shape of the store. The docstore is one file shared by every
+project the client has ever opened, and it always has been; `grep` with a
+relative pattern and `search` with no directory both ranked across all of it. In
+this repo, `grep(pattern="^##", path="CHANGELOG.md")` returned two other
+projects' changelogs and never reached this one before the match cap. Both tools
+are now anchored to the client root by default, which is the rule `grep`'s path
+filter already implied, and an explicit absolute path or directory still reaches
+anywhere.
+
+The rest is integrity work on chunked files: content reassembled from chunk rows
+is now checked against the hash it claims to be, and the rewrite that produces
+those rows is one transaction instead of three.
+
+No cache-format change and no migration.
+
+### Changed
+
+- **`search` with no `directory` means the current project**, not every project
+  in the store. The directory now reaches SQL as a path-prefix clause, so
+  `LIMIT` returns results that are already in scope — filtering after the
+  ranking would spend result slots on files the caller cannot use and return a
+  handful of matches, or none, while plenty existed.
+- **`grep` with a relative `path`, or none, is anchored to the client root.** An
+  absolute path is unchanged and still searches wherever it points.
+- **`batch_read` names its shared directory once as `root`** and reports
+  `files[]` and `skipped[]` paths relative to it, the mechanism 0.5.5 introduced
+  for other multi-file responses. The saving grows with the number of entries;
+  measured at 64% of the path tokens removed across a 40-entry response.
+- **Tool descriptions no longer restate the hash rules on every tool.** The
+  mechanics are in the server instructions, which are sent once; each docstring
+  keeps only its own exceptions. The advertised surface drops from 9,436 to
+  8,791 tokens, paid on every request whether or not a tool is called.
+
+### Fixed
+
+- **`write(append=true)`, `edit` and `batch_edit` could write superseded content
+  back over a file.** They took their base text from the cache whenever the
+  recorded `mtime` was at least the file's, which any timestamp-preserving
+  rewrite satisfies. Every mutation now reads disk and compares hashes; the
+  cached text is used only when it provably matches, so an incremental re-store
+  still reuses the chunk manifest.
+- **`read` served cached content after a timestamp-preserving rewrite**, for the
+  same reason, on the fast path, the strategy branch and `estimate_min_tokens`.
+- **Chunked content was reassembled without being verified.** `get_content`
+  joined a file's child rows and returned them with no comparison to the
+  `content_hash` they claimed. A missing or duplicated row produced wrong
+  content under a hash that says otherwise — the failure this server exists to
+  make impossible. The join is now checked, and the cache recovers by dropping
+  the rows and re-reading from disk.
+- **An interrupted chunk rewrite left a blend of two file versions.** The
+  reconcile was three separate store calls: delete, insert, re-tag. Interrupted
+  between the last two it left a chunk set that looks healthy — in one probe, 80
+  children numbered 0..79 with no gaps or duplicates — totalling 166,000 bytes
+  for a 164,000-byte file, matching neither version's hash. It is now one
+  transaction, which also costs one IO-thread hop instead of three.
+- **`grep` could report `no_files_cached_under_path` against a fully warm
+  cache.** The client root was taken verbatim from the roots URI while every
+  cached path is stored resolved, so behind a symlinked checkout the prefix test
+  failed for every document.
+- **A closed store or a missing entry was reported as a hash mismatch** and
+  silently dropped the cached path, because the new integrity check shared
+  `ValueError` with two unrelated storage errors.
+- **A file whose mtime drifted without its content changing was re-read and
+  re-hashed on every access**, since the entry was only healed when the drift
+  went one direction.
+- **`batch_read` in debug mode mixed absolute and relative paths** in one
+  response, having relativized `files[]` but not `summary.unchanged`.
+- **Pre-push hooks passed code that CI rejects.** `mypy` was advisory, and
+  `ruff` ran with an `--ignore` list that existed only in the hook, so the
+  configuration the hook enforced was not the one in `pyproject.toml`. Both now
+  run exactly what CI runs.
+
 ## [0.5.5] - 2026-09-01: A cache you can warm, an outline before the read, half-length hashes
 
 Two costs were being paid on every turn regardless of what any tool did, and
@@ -1066,6 +1156,7 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `cached_only=true` on `glob` to filter to already-cached files
 
 [Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...HEAD
+[0.6.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.5...v0.6.0
 [0.5.5]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.2...v0.5.3

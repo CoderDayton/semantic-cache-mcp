@@ -1181,3 +1181,49 @@ class TestPostWriteMtimeRefresh:
         assert entry is not None
         assert entry.mtime == f.stat().st_mtime
         assert entry.mtime > old
+
+
+class TestCrlfLineEndings:
+    """A mutation must not rewrite a file's line endings behind the caller's back.
+
+    Every mutation re-reads the file to check the cache against disk. Reading
+    it in text mode collapses CRLF to LF, so the base text neither hashes to
+    the stored `content_hash` nor round-trips through the write.
+    """
+
+    async def test_edit_preserves_crlf(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "crlf.txt"
+        f.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_edit(semantic_cache_no_embeddings, str(f), "beta", "delta")
+
+        assert f.read_bytes() == b"alpha\r\ndelta\r\ngamma\r\n"
+
+    async def test_batch_edit_preserves_crlf(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "crlf_batch.txt"
+        f.write_bytes(b"alpha\r\nbeta\r\n")
+        await smart_read(semantic_cache_no_embeddings, str(f))
+
+        await smart_batch_edit(
+            semantic_cache_no_embeddings, str(f), [("alpha", "one"), ("beta", "two")]
+        )
+
+        assert f.read_bytes() == b"one\r\ntwo\r\n"
+
+    async def test_append_preserves_crlf_and_reports_the_real_previous_hash(
+        self, semantic_cache_no_embeddings: SemanticCache, temp_dir: Path
+    ) -> None:
+        f = temp_dir / "crlf_append.txt"
+        f.write_bytes(b"alpha\r\n")
+        first = await smart_read(semantic_cache_no_embeddings, str(f))
+
+        result = await smart_write(semantic_cache_no_embeddings, str(f), "beta\r\n", append=True)
+
+        assert f.read_bytes() == b"alpha\r\nbeta\r\n"
+        # The base the append extended is the file as it really is on disk.
+        assert result.previous_hash == first.content_hash

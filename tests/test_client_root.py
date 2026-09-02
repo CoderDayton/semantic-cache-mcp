@@ -46,7 +46,11 @@ def _ctx_without_back_channel() -> Any:
 class TestResolveClientRoot:
     async def test_first_file_root_becomes_the_client_root(self) -> None:
         ctx = _ctx_with_roots("file:///home/user/project")
-        assert await tools._resolve_client_root(ctx) == Path("/home/user/project")
+        # Compared against the resolved form, not the literal URI path: cached
+        # document paths are stored resolved, so the root has to be too or the
+        # prefix test misses every one of them. On macOS `/home` is a firmlink
+        # to `/System/Volumes/Data/home`, which makes the difference visible.
+        assert await tools._resolve_client_root(ctx) == Path("/home/user/project").resolve()
 
     async def test_non_file_roots_are_ignored(self) -> None:
         ctx = _ctx_with_roots("https://example.com/repo")

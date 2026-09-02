@@ -11,6 +11,7 @@ import traceback
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any
 
 from fastmcp.exceptions import ToolError
@@ -28,6 +29,9 @@ _WORKER_TIMEOUT_SENTINEL = 24 * 60 * 60.0
 @dataclass(slots=True)
 class _WorkerContext:
     lifespan_context: dict[str, Any]
+    # The client's project root, carried over from the server process: the
+    # worker has no MCP session to ask, so this is the only way it learns it.
+    client_root: Path | None = None
 
 
 _PROTOCOL_ERROR = "Worker protocol error"
@@ -81,6 +85,7 @@ class ToolProcessSupervisor:
         output_mode: str,
         max_response_tokens: int | None,
         timeout: float,
+        client_root: str | None = None,
     ) -> Any:
         async with self._lock:
             if not self._is_running():
@@ -94,6 +99,7 @@ class ToolProcessSupervisor:
                 "kwargs": kwargs,
                 "output_mode": output_mode,
                 "max_response_tokens": max_response_tokens,
+                "client_root": client_root,
             }
             started = time.perf_counter()
             log_marker(
@@ -356,6 +362,7 @@ async def _tool_worker_main_async(conn: Connection) -> None:
                     kwargs=dict(request["kwargs"]),
                     output_mode=str(request["output_mode"]),
                     max_response_tokens=request.get("max_response_tokens"),
+                    client_root=request.get("client_root"),
                 )
             except ToolError as exc:
                 log_marker(
@@ -411,6 +418,7 @@ async def _dispatch_tool_request(
     kwargs: dict[str, Any],
     output_mode: str,
     max_response_tokens: int | None,
+    client_root: str | None = None,
 ) -> Any:
     import semantic_cache_mcp.server.tools as tools_mod
 
@@ -418,6 +426,9 @@ async def _dispatch_tool_request(
     if fn is None:
         raise RuntimeError(f"Unknown tool: {tool}")
 
-    ctx = _WorkerContext(lifespan_context={"cache": cache})
+    ctx = _WorkerContext(
+        lifespan_context={"cache": cache},
+        client_root=Path(client_root) if client_root else None,
+    )
     with _response_overrides(output_mode, max_response_tokens):
         return await fn(ctx, **kwargs)

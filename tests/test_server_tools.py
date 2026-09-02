@@ -987,7 +987,8 @@ class TestBatchReadTool:
         d = _parse(await batch_read(ctx, paths, priority=priority))
         files = d.get("files", [])
         if files:
-            assert files[0]["path"] == str(py_file)
+            # Paths come back relative to the `root` the response names.
+            assert os.path.join(d.get("root", ""), files[0]["path"]) == str(py_file)
 
     async def test_priority_parameter_json_array(
         self, ctx: MagicMock, sample_file: Path, py_file: Path
@@ -1228,6 +1229,77 @@ class TestGrepTool:
 
         assert d["total_matches"] == 1
         assert d["files"][0]["path"].endswith("sim/finetune.py")
+
+    async def test_search_is_anchored_to_the_client_root(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        """`search` shares the store with every project, and shared it too."""
+        import semantic_cache_mcp.server.tools as tools_mod
+        from semantic_cache_mcp.server.tools import search as search_tool
+
+        mine = tmp_path / "proj" / "notes.md"
+        theirs = tmp_path / "other" / "notes.md"
+        for f in (theirs, mine):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("authentication middleware token\n")
+            await smart_read(tmp_cache, str(f))
+
+        saved = (tools_mod._client_root, tools_mod._client_root_resolved)
+        tools_mod._client_root = tmp_path / "proj"
+        tools_mod._client_root_resolved = True
+        try:
+            scoped = _parse(await search_tool(ctx, "authentication middleware"))
+            reaching_out = _parse(
+                await search_tool(ctx, "authentication middleware", directory=str(tmp_path))
+            )
+        finally:
+            tools_mod._client_root, tools_mod._client_root_resolved = saved
+
+        def _paths(payload: dict[str, Any]) -> list[str]:
+            root = payload.get("root", "")
+            return sorted(os.path.join(root, m["path"]) for m in payload["matches"])
+
+        assert _paths(scoped) == [str(mine)]
+        # An explicit directory above the root still reaches both.
+        assert _paths(reaching_out) == sorted([str(mine), str(theirs)])
+
+    async def test_grep_is_anchored_to_the_client_root(
+        self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
+    ) -> None:
+        """The docstore is shared across every project the client ever opened.
+
+        A relative filter — or no filter — must mean "in this project", not
+        "anywhere in the cache"; otherwise `grep(path="CHANGELOG.md")` spends
+        its match cap on other repos' files and never reaches this one.
+        """
+        import semantic_cache_mcp.server.tools as tools_mod
+
+        mine = tmp_path / "proj" / "CHANGELOG.md"
+        theirs = tmp_path / "other" / "CHANGELOG.md"
+        for f in (theirs, mine):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("## heading\n")
+            await smart_read(tmp_cache, str(f))
+
+        saved = (tools_mod._client_root, tools_mod._client_root_resolved)
+        tools_mod._client_root = tmp_path / "proj"
+        tools_mod._client_root_resolved = True
+        try:
+            by_name = _parse(await grep(ctx, "heading", fixed_string=True, path="CHANGELOG.md"))
+            unfiltered = _parse(await grep(ctx, "heading", fixed_string=True))
+            absolute = _parse(await grep(ctx, "heading", fixed_string=True, path=str(theirs)))
+            outside = _parse(await grep(ctx, "heading", fixed_string=True, path="other/"))
+        finally:
+            tools_mod._client_root, tools_mod._client_root_resolved = saved
+
+        assert [f["path"] for f in by_name["files"]] == [str(mine)]
+        assert [f["path"] for f in unfiltered["files"]] == [str(mine)]
+        # An absolute filter still reaches files outside the project.
+        assert [f["path"] for f in absolute["files"]] == [str(theirs)]
+        # A relative filter naming a directory outside the root is a miss, and
+        # the explanation must not claim the (globally warm) cache is cold for it.
+        assert outside["total_matches"] == 0
+        assert outside["reason"] == "no_files_cached_under_path"
 
 
 # ===========================================================================

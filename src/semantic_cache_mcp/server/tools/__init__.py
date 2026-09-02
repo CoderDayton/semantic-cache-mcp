@@ -32,7 +32,7 @@ from ...cache import (
     smart_read,
     smart_write,
 )
-from ...cache._helpers import _diff_context_lines, _PhaseTimer
+from ...cache._helpers import _diff_context_lines, _PhaseTimer, mtime_is_current
 from ...cache.read import _DIFF_MAX_RATIO, _DIFF_MIN_TOKENS, _sniff_image_mime
 from ...config import MAX_CONTENT_SIZE, TOOL_TIMEOUT
 from ...core import (
@@ -189,7 +189,12 @@ async def _resolve_client_root(ctx: Context) -> Path | None:
             if roots:
                 uri = str(roots[0].uri)
                 if uri.startswith("file://"):
-                    _client_root = Path(uri[7:])
+                    # Resolved, because every cached document path is stored
+                    # resolved. A root reached through a symlink (macOS
+                    # `/tmp`, a symlinked checkout) would otherwise prefix
+                    # nothing in the store, and the `within` scoping that
+                    # `grep` applies would hide the whole project.
+                    _client_root = Path(uri[7:]).resolve()
                     logger.debug(f"Client root: {_client_root}")
         except Exception:
             logger.debug("Could not resolve client roots", exc_info=True)
@@ -234,12 +239,8 @@ def _resolve_path_list(raw: str, state: _ToolCallState) -> list[str]:
     return [state.resolve(path) for path in _parse_path_list(raw)]
 
 
-def _parse_known_hashes(raw: str, state: _ToolCallState) -> dict[str, str]:
-    """Parse a caller's ``path -> content_hash`` possession claims.
-
-    Keys are resolved exactly as ``paths`` is, so a claim lands on the file it
-    names however the caller spelled it.
-    """
+def _parse_known_hashes(raw: str) -> dict[str, str]:
+    """Parse a caller's ``path -> content_hash`` possession claims, keys as spelled."""
     text = raw.strip()
     if not text:
         return {}
@@ -249,7 +250,29 @@ def _parse_known_hashes(raw: str, state: _ToolCallState) -> dict[str, str]:
         raise ValueError(f"known_hashes must be a JSON object of path -> content_hash: {e}") from e
     if not isinstance(parsed, dict):
         raise ValueError("known_hashes must be a JSON object of path -> content_hash")
-    return {state.resolve(str(p)): str(h) for p, h in parsed.items() if h}
+    return {str(p): str(h) for p, h in parsed.items() if h}
+
+
+def _anchor_known_hashes(
+    claims: dict[str, str], batch: list[str], root: str | None, state: _ToolCallState
+) -> dict[str, str]:
+    """Land each claim on the batch file it names.
+
+    A key is resolved exactly as ``paths`` is. A key the caller copied from a
+    previous response is relative to the ``root`` that response named, which
+    is not always the project root, so a key that resolves to nothing in the
+    batch is also tried under this batch's root.
+    """
+    in_batch = set(batch)
+    anchored: dict[str, str] = {}
+    for raw_key, claimed in claims.items():
+        resolved = state.resolve(raw_key)
+        if resolved not in in_batch and root and not Path(raw_key).expanduser().is_absolute():
+            under_root = os.path.join(root, raw_key)
+            if under_root in in_batch:
+                resolved = under_root
+        anchored[resolved] = claimed
+    return anchored
 
 
 def _get_tool_lock() -> asyncio.Lock:
@@ -283,11 +306,15 @@ def _is_remote_runtime(value: Any) -> bool:
 
 
 async def _tool_call_state(ctx: Context) -> _ToolCallState:
+    # The worker's context carries the root the server process resolved; it
+    # has no session of its own to ask.
+    carried = getattr(ctx, "client_root", None)
+    client_root = carried if isinstance(carried, Path) else await _resolve_client_root(ctx)
     return _ToolCallState(
         cache=ctx.lifespan_context["cache"],
         mode=_response_mode(),
         max_response_tokens=_response_token_cap(),
-        client_root=await _resolve_client_root(ctx),
+        client_root=client_root,
     )
 
 
@@ -342,6 +369,7 @@ async def _maybe_call_remote_tool(
                 output_mode=state.mode,
                 max_response_tokens=state.max_response_tokens,
                 timeout=timeout,
+                client_root=str(state.client_root) if state.client_root else None,
             ),
         )
     except TimeoutError:
@@ -553,7 +581,7 @@ async def _outline_read(
         except OSError:
             st = None
 
-    if entry is not None and st is not None and entry.mtime >= st.st_mtime:
+    if entry is not None and st is not None and mtime_is_current(entry.mtime, st.st_mtime):
         full_text: str = await cache.get_content(entry)
         full_tokens: int = entry.tokens
         from_cache = True
@@ -640,39 +668,27 @@ async def read(
 ) -> dict[str, Any]:
     """Read a file, returning as few tokens as possible. For 2+ files, use `batch_read`.
 
-    The first read returns the file's full content plus a `content_hash`
-    (lines come back as-is; a ranged read numbers them only with
-    `line_numbers=true`).
-    Echo that hash back as `known_hash` and a later read of an unchanged file
-    answers `"unchanged": true` with no body; a changed file returns a unified
-    diff. Omit it and the file is always sent in full. Reading also caches the
-    file so `grep`, `search`, and `batch_read` can see it.
+    The first read returns the file's full content plus a `content_hash`. Echo
+    it back as `known_hash` on every later read: an unchanged file then answers
+    `"unchanged": true` with no body, a changed one returns a unified diff, and
+    without it the file is always sent in full. Reading also caches the file so
+    `grep`, `search`, and `batch_read` can see it.
 
-    Whenever you re-read a file you have read before, pass back `known_hash`
-    (the `content_hash` from your last read of it). It is the server's only
-    proof that you still hold the content, so use it every time you can; the
-    server then skips re-sending unchanged bytes. Use `offset`/`limit` to read
-    or recover an exact line range, for example after a large file was
-    summarized. A read that returns only part of a file — a line range, or a
-    summary of a large one — reports its hash as `file_hash` (prefixed
-    `partial:`) rather than `content_hash`: it identifies the file across reads
-    but is not proof you hold it, and cannot be redeemed as `known_hash`.
-
-    A ranged read also returns a `coverage_token` recording the lines it just
-    sent you. Pass that back as `known_hash` on your next ranged read of the
-    file: a window you already hold answers `unchanged` instead of being
-    re-sent, and a new window widens the token's coverage. Once the windows add
-    up to the whole file you are handed a claimable `content_hash` for it.
+    Use `offset`/`limit` to read an exact line range, for example after a large
+    file was summarized. A read that returns only part of a file — a line
+    range, or a summary — reports `file_hash` (prefixed `partial:`) rather than
+    `content_hash`, and it cannot be redeemed as `known_hash`. A ranged read
+    also returns a `coverage_token`: pass it back as `known_hash` on your next
+    ranged read and a window you already hold answers `unchanged`; once the
+    windows cover the whole file you get a claimable `content_hash`.
 
     For a large or unfamiliar file, `outline=true` is the cheap first read: one
-    line per class/function as `<line>: <signature>`, typically a small fraction
-    of the file, and every number is an `offset` you can read next. An outline
-    is a map, not the file, so it comes back as `file_hash`.
+    line per class/function as `<line>: <signature>`, and every number is an
+    `offset` you can read next. An outline is a map, not the file, so it comes
+    back as `file_hash`.
 
-    What the body holds is always labelled: `is_diff` marks a unified diff and
-    `truncated` marks a summary, so you never have to infer it from the bytes.
-    A binary file returns metadata instead of content; for images use
-    `read_image`.
+    `is_diff` marks a unified diff and `truncated` marks a summary. A binary
+    file returns metadata instead of content; for images use `read_image`.
 
     Args:
         path: File path (absolute, or relative to the project root). Use an
@@ -757,7 +773,7 @@ async def read(
             ranged_fresh = (
                 ranged_entry is not None
                 and ranged_st is not None
-                and ranged_entry.mtime >= ranged_st.st_mtime
+                and mtime_is_current(ranged_entry.mtime, ranged_st.st_mtime)
             )
 
             # A coverage token names the version its windows came from, so it is
@@ -1628,16 +1644,12 @@ async def write(
     `dry_run` writes nothing and says so: the status is
     `would_create`/`would_update` and `dry_run: true` comes back with it.
     Writing refreshes the cache so later reads, `grep`, and `search` see the
-    new text. The response carries the new `content_hash`;
-    pass it back as `read`'s `known_hash`, or as a `batch_read` `known_hashes`
-    entry, to get `unchanged` instead of re-reading the file you just wrote.
-    Missing parent directories are created unless `create_parents=false`.
+    new text.
 
-    A full write supplies the whole file, so its hash is yours to keep. An
-    append only adds a tail, so pass `known_hash` to show you held the rest —
-    without it you get `file_hash` instead, since you cannot vouch for a file
-    you have only seen the end of. `auto_format` reports `file_hash` too: the
-    formatter's output is not what you sent.
+    A full write supplies the whole file, so the `content_hash` it returns is
+    claimable. An append only adds a tail: pass `known_hash` to show you held
+    the rest, or you get `file_hash` instead. `auto_format` reports `file_hash`
+    too — the formatter's output is not what you sent.
 
     Args:
         path: File path to create or replace (absolute, or relative to root).
@@ -1786,12 +1798,9 @@ async def edit(
     with it. For several edits to
     one file use `batch_edit`; for a full rewrite use `write`.
 
-    Pass `known_hash` — the hash you hold for this file — and the response
-    carries the new `content_hash`, so you never need a read after an edit just
-    to learn what the file now contains: you held the old text and you know what
-    you replaced. Without it (or with `auto_format`, whose output is not what
-    you asked for) the result comes back as `file_hash`, which cannot be
-    redeemed as `known_hash` — editing a file is not the same as having read it.
+    Pass `known_hash` and the response carries a claimable `content_hash`, so
+    no read is needed afterwards. Without it, or with `auto_format`, you get
+    `file_hash` instead — editing a file is not the same as having read it.
 
     Args:
         path: File path to modify (absolute, or relative to root).
@@ -2037,10 +2046,9 @@ async def batch_edit(
     - `{"old": ..., "new": ..., "start_line": ..., "end_line": ...}` — object form.
 
     Prefer line-range entries when you already have line numbers from `read`.
-    Pass `known_hash` — the hash you hold for this file — and the response
-    carries the new `content_hash`, so you need no read afterwards to learn what
-    the file now contains. Without it (or with `auto_format`) the result comes
-    back as `file_hash`, which cannot be redeemed as `known_hash`.
+    Pass `known_hash` and the response carries a claimable `content_hash`, so
+    no read is needed afterwards; without it, or with `auto_format`, you get
+    `file_hash` instead.
 
     Args:
         path: File path to modify (absolute, or relative to root).
@@ -2233,17 +2241,24 @@ async def search(
     contain costs you ranking, not the whole result set. For an exact string or
     regex use `grep`; to pull more of the repo into the cache use `batch_read`.
     Returns matches with a normalized 0–1 relevance score (best match = 1.0)
-    and a short preview.
+    and a short preview. The cache is shared across projects, so a search with
+    no `directory` ranks the current project only; name one to look elsewhere.
 
     Args:
         query: Keywords to rank by. Natural-language phrasing is fine, but
             ranking is on the individual words.
         k: Maximum number of matches to return.
-        directory: Restrict matches to files under this directory.
+        directory: Restrict matches to files under this directory. Defaults to
+            the project root.
         show_preview: Include a short preview line for each match.
     """
     state = await _tool_call_state(ctx)
-    directory = state.resolve(directory) if directory else None
+    # The store holds every project the client has ever opened. An unscoped
+    # search means this one — the rule `grep`'s path filter already follows.
+    if directory:
+        directory = state.resolve(directory)
+    elif state.client_root:
+        directory = str(state.client_root)
     cache = state.cache
     mode = state.mode
     max_response_tokens = state.max_response_tokens
@@ -2321,15 +2336,14 @@ async def batch_read(
 
     Cheaper than many single `read` calls. To make files searchable without
     reading them at all, use `warm` instead — this tool returns their text.
-    Every file is returned in full unless you
-    prove you still hold it: pass `known_hashes` and each proven file collapses
-    to an `unchanged` count, or to a diff when it moved on disk. Each file sent
-    in full comes back with its `content_hash` — keep those and pass them next
-    time. A file large enough to come back summarized carries none: a summary is
-    not the file, so it cannot be vouched for. Smallest files are read first, and
-    a file too big for the remaining budget is listed under `skipped` while
-    smaller ones keep being read — so one large file cannot starve the rest of
-    the batch. Recover anything skipped with `read` using `offset`/`limit`.
+    Pass `known_hashes` and each file you still hold collapses to an
+    `unchanged` count, or to a diff when it moved on disk; the rest come back
+    in full with their `content_hash`. A file large enough to come back
+    summarized carries none: a summary is not the file. Smallest files are read
+    first, and a file too big for the remaining budget is listed under
+    `skipped` while smaller ones keep being read. Recover anything skipped with
+    `read` using `offset`/`limit`. Paths are relative to the `root` the
+    response names, when there is one worth naming.
 
     Args:
         paths: The files to read — a comma-separated list, a JSON array, or
@@ -2351,9 +2365,11 @@ async def batch_read(
         path_list = _resolve_path_list(paths, state)
         priority_list = _resolve_path_list(priority, state) if priority.strip() else None
         try:
-            hash_claims = _parse_known_hashes(known_hashes, state)
+            raw_claims = _parse_known_hashes(known_hashes)
         except ValueError as e:
             _raise_tool_error("batch_read", str(e), max_response_tokens)
+        # Claims are forwarded as spelled: they are anchored against the
+        # expanded batch, and the globs expand in the worker.
         remote_result: dict[str, Any] | None = await _maybe_call_remote_tool(
             state,
             "batch_read",
@@ -2361,7 +2377,6 @@ async def batch_read(
                 overrides={
                     "paths": json.dumps(path_list),
                     "priority": json.dumps(priority_list) if priority_list else "",
-                    "known_hashes": json.dumps(hash_claims) if hash_claims else "",
                 }
             ),
             timeout=_TOOL_TIMEOUT * 2,
@@ -2381,6 +2396,12 @@ async def batch_read(
             )
         except TimeoutError:
             logger.warning("Glob expansion exceeded hard timeout; using raw paths")
+
+        # A batch is many paths under one directory — the case `root` exists
+        # for. Named once here, and every `files[]`/`skipped[]` path is
+        # reported relative to it.
+        root = shared_root(path_list, str(state.client_root) if state.client_root else None)
+        hash_claims = _anchor_known_hashes(raw_claims, path_list, root, state)
 
         result = await asyncio.wait_for(
             batch_smart_read(
@@ -2405,13 +2426,15 @@ async def batch_read(
         if result.unchanged_paths:
             summary["unchanged_count"] = len(result.unchanged_paths)
             if mode == _MODE_DEBUG:
-                summary["unchanged"] = result.unchanged_paths
+                # Same `root` the file entries hang off, so one rule rebuilds
+                # every path in the response.
+                summary["unchanged"] = [relativize(p, root) for p in result.unchanged_paths]
 
         skipped_items: list[dict[str, Any]] = []
         file_items: list[dict[str, Any]] = []
         for f in result.files:
             if f.status == "skipped":
-                skipped_item: dict[str, Any] = {"path": f.path}
+                skipped_item: dict[str, Any] = {"path": relativize(f.path, root)}
                 if f.est_tokens is not None:
                     skipped_item["est_tokens"] = f.est_tokens
                 if mode == _MODE_DEBUG:
@@ -2422,7 +2445,7 @@ async def batch_read(
                 continue
             else:
                 # full, diff, truncated — entries with actual content
-                item: dict[str, Any] = {"path": f.path, "status": f.status}
+                item: dict[str, Any] = {"path": relativize(f.path, root), "status": f.status}
                 if f.path in result.contents:
                     item["content"] = result.contents[f.path]
                 if f.status == "truncated":
@@ -2446,6 +2469,8 @@ async def batch_read(
             "tool": "batch_read",
             "summary": summary,
         }
+        if root is not None:
+            payload["root"] = root
         if skipped_items:
             summary["hint"] = "Use read with offset/limit for skipped files."
             payload["skipped"] = skipped_items
@@ -2482,12 +2507,9 @@ async def warm(
 ) -> dict[str, Any]:
     """Index files into the cache so `grep` and `search` can see them, returning counts only.
 
-    `grep` and `search` read only cached files, and every other way to cache a
-    file returns its text. Warming a tree with `batch_read` therefore costs the
-    whole tree in tokens before the first search runs. This costs a few dozen
-    tokens however many files it indexes: no content, no previews, no paths for
-    the files that succeeded — just how many were indexed, how many were
-    already current, and how many were not.
+    Costs a few dozen tokens however many files it indexes: no content, no
+    previews, no paths for the files that succeeded — just how many were
+    indexed, how many were already current, and how many were not.
 
     Anything not indexed is counted in `skipped`, and the first few come back
     under `failures` with a reason (`not_found`, `not_a_file`, `binary`,
@@ -2602,7 +2624,7 @@ async def warm(
 
         abs_path = str(candidate.resolve())
         entry = await cache.get(abs_path)
-        if entry is not None and entry.mtime >= st.st_mtime:
+        if entry is not None and mtime_is_current(entry.mtime, st.st_mtime):
             already_current += 1
             tokens_indexed += entry.tokens
             continue
@@ -2814,7 +2836,9 @@ async def grep(
 
     Each file's hits come back as `"<line>:<text>"` strings under `lines`, with
     context lines using `-` instead of `:`. Paths are relative to the `root`
-    the response names, when there is one worth naming.
+    the response names, when there is one worth naming. The cache is shared
+    across projects, so a relative `path` — or none — searches only the
+    current project; an absolute `path` reaches files anywhere.
 
     A repeated group wrapping an unbounded quantifier (`(a+)+`) is rejected
     rather than run — it can take exponential time and cannot be interrupted
@@ -2861,10 +2885,16 @@ async def grep(
         # Bounded like every other tool. The pattern comes from the caller and
         # `re` has no interrupt, so the scan runs off the event loop (see
         # `_grep.grep`); that is what lets this timeout actually fire.
+        # The store holds every project the client ever opened. A relative
+        # filter, or none, means this project; only an absolute one may leave it.
+        within: str | None = None
+        if state.client_root and (path is None or not Path(path).expanduser().is_absolute()):
+            within = str(state.client_root)
         results = await asyncio.wait_for(
             cache._storage.grep(
                 pattern,
                 path=path,
+                within=within,
                 fixed_string=fixed_string,
                 case_sensitive=case_sensitive,
                 context_lines=context_lines,
@@ -2980,8 +3010,8 @@ async def grep(
         # Distinguish "no files cached under that path" from "no matches".
         # The audit found 22/29 empty greps fit the cache-miss shape, so the
         # caller should know whether to seed via batch_read/glob.
-        if total_matches == 0 and path is not None:
-            has_cached = await cache._storage.has_cached_paths_under(path)
+        if total_matches == 0 and (path is not None or within is not None):
+            has_cached = await cache._storage.has_cached_paths_under(path, within=within)
             if not has_cached:
                 payload["reason"] = "no_files_cached_under_path"
                 payload["hint"] = "use warm to index this path, then grep again"
