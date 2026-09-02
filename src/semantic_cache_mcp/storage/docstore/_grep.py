@@ -92,6 +92,7 @@ async def grep(
     pattern: str,
     *,
     path: str | None = None,
+    within: str | None = None,
     fixed_string: bool = False,
     case_sensitive: bool = True,
     context_lines: int = 0,
@@ -102,7 +103,8 @@ async def grep(
 
     Unlike search, returns line numbers and context, not ranked scores. The
     result carries whether ``max_matches``/``max_files`` cut the scan short, so
-    a capped count is never mistaken for a complete one.
+    a capped count is never mistaken for a complete one. ``within`` confines
+    the scan to files under one directory, whatever ``path`` says.
     """
     if store._closed:
         return GrepResults()
@@ -147,7 +149,9 @@ async def grep(
     # "functionHelper". A None result means the prefilter cannot be
     # trusted for this pattern (complex regex, vocabulary unavailable,
     # or too broad); the caller then does a full scan, always correct.
-    candidates = await sound_candidates(store, pattern, fixed_string=fixed_string, path_filter=path)
+    candidates = await sound_candidates(
+        store, pattern, fixed_string=fixed_string, path_filter=path, within=within
+    )
     files: dict[str, list[tuple[int, str]]] = {}
     if candidates is not None:
         # Vocabulary expansion makes the candidate set exact: empty means
@@ -161,7 +165,7 @@ async def grep(
             if meta.get(_META_IS_PARENT, False):
                 continue  # Parent docs have empty content
             doc_path = meta.get(_META_PATH, "")
-            if not doc_path or not path_matches(doc_path, path_filter=path):
+            if not doc_path or not path_matches(doc_path, path_filter=path, within=within):
                 continue
             chunk_idx = meta.get(_META_CHUNK_INDEX, 0)
             files.setdefault(doc_path, []).append((chunk_idx, text))
@@ -400,6 +404,7 @@ async def sound_candidates(
     *,
     fixed_string: bool,
     path_filter: str | None,
+    within: str | None = None,
 ) -> list[str] | None:
     """Exact candidate paths for grep, or ``None`` to force a full scan.
 
@@ -456,7 +461,7 @@ async def sound_candidates(
         doc_path = meta.get(_META_PATH, "")
         if not doc_path or doc_path in seen:
             continue
-        if not path_matches(doc_path, path_filter=path_filter):
+        if not path_matches(doc_path, path_filter=path_filter, within=within):
             continue
         seen.add(doc_path)
         candidates.append(doc_path)
@@ -504,7 +509,7 @@ async def load_files(
     return files
 
 
-def path_matches(path: str, *, path_filter: str | None) -> bool:
+def path_matches(path: str, *, path_filter: str | None, within: str | None = None) -> bool:
     """Match exact paths, relative suffixes, basenames, directories, and globs.
 
     A directory names every file beneath it. Without that case a caller who
@@ -512,11 +517,20 @@ def path_matches(path: str, *, path_filter: str | None) -> bool:
     also what decides the empty-result explanation — an answer blaming a cache
     that is already warm. The remedy it suggests (seed the cache) cannot work,
     because the files are in there; only appending `/*` would have helped.
+
+    ``within`` is a directory the path must sit under, checked before the
+    filter. The store is shared by every project the client has ever opened,
+    so a relative filter has to be anchored somewhere or `CHANGELOG.md` names
+    every changelog in the cache — and spends the match cap on the wrong ones.
     """
+    normalized_path = path.replace("\\", "/")
+    if within:
+        root = within.replace("\\", "/").rstrip("/")
+        if not normalized_path.startswith(f"{root}/"):
+            return False
     if not path_filter:
         return True
 
-    normalized_path = path.replace("\\", "/")
     normalized_filter = path_filter.replace("\\", "/")
     has_glob = any(ch in normalized_filter for ch in "*?[")
 

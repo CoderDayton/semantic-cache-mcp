@@ -30,9 +30,25 @@ from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CHUNK_THRESHOLD", "StorageMode", "CONTENT_DB_PATH", "ContentStorage"]
+__all__ = [
+    "CHUNK_THRESHOLD",
+    "StorageMode",
+    "CONTENT_DB_PATH",
+    "ContentIntegrityError",
+    "ContentStorage",
+]
 
 CONTENT_DB_PATH = CACHE_DIR / "docstore.db"
+
+
+class ContentIntegrityError(ValueError):
+    """A reassembled chunk set does not hash to the entry it belongs to.
+
+    Distinct from the other ``ValueError``s this module raises (closed
+    storage, no rows for the path) because it alone is recoverable by
+    dropping the rows and re-reading the file from disk.
+    """
+
 
 # Metadata keys stored with each document
 _META_PATH = "path"
@@ -619,9 +635,12 @@ class ContentStorage:
         A small edit to a large file thus rewrites ~1 chunk instead of all of
         them — the write-amplification this design exists to remove.
 
-        Non-atomic across its three store calls, which is fine for a cache: a
-        crash mid-reconcile leaves an entry whose content_hash no longer matches
-        disk, and the next read transparently re-puts it.
+        The drop, the insert and the metadata refresh go to the store as one
+        transaction. Split across three, an interruption between them commits
+        a chunk set blended from two versions that still looks healthy —
+        indices 0..n-1, no gaps, no duplicates — and only the file's own hash
+        disagrees. Together they either land whole or leave the previous
+        version untouched.
         """
         existing_child_ids: list[int] = []
         pool: defaultdict[str, deque[int]] = defaultdict(deque)
@@ -658,19 +677,14 @@ class ContentStorage:
         # Drop stale rows, insert only genuinely-new chunks (the sole FTS work),
         # then refresh metadata for the parent and every reused child (text
         # untouched → their FTS rows are never re-tokenized).
-        if leftover:
-            await self._collection.delete_by_ids(leftover)
-        new_ids: list[int] = []
-        if insert_texts:
-            ids = await self._collection.add_texts(
-                texts=insert_texts,
-                metadatas=insert_metas,
-                parent_ids=[parent_id] * len(insert_texts),
-            )
-            new_ids = list(ids) if ids else []
-        await self._collection.update_metadata(
-            [(parent_id, self._parent_meta(plan, base_meta)), *reused_updates]
+        ids = await self._collection.reconcile_chunks(
+            delete_ids=leftover,
+            insert_texts=insert_texts,
+            insert_metas=insert_metas,
+            parent_id=parent_id,
+            meta_updates=[(parent_id, self._parent_meta(plan, base_meta)), *reused_updates],
         )
+        new_ids: list[int] = list(ids) if ids else []
         logger.debug(
             f"Reconciled {path}: {plan.total} chunks "
             f"({len(reused_ids)} reused, {len(new_ids)} new, {len(leftover)} dropped)"
@@ -714,7 +728,22 @@ class ContentStorage:
         children.sort(key=lambda r: r[1].get(_META_CHUNK_INDEX, 0))
 
         if max_bytes is None:
-            return "".join(r[2] for r in children)
+            joined = "".join(r[2] for r in children)
+            # A chunked file is rewritten by a reconcile that is deliberately
+            # not atomic, so a crash can leave a child row missing, doubled, or
+            # numbered under two different plans at once. Sorting and joining
+            # whatever is there then yields text that is neither version — and
+            # it would go out under the parent's unchanged `content_hash`,
+            # which the caller can redeem. The hash the entry was stored with
+            # is the one thing that says which bytes these are meant to be, so
+            # it is checked before they are handed to anyone. Digests are
+            # memoized on the buffer, so a re-read of the same text pays once.
+            if hash_content(joined) != entry.content_hash:
+                raise ContentIntegrityError(
+                    f"cached content for {entry.path} does not match its content_hash; "
+                    "the chunk set is incoherent and the file must be re-read from disk"
+                )
+            return joined
 
         parts: list[str] = []
         total = 0
@@ -799,9 +828,16 @@ class ContentStorage:
         query: str,
         k: int = 5,
         filter: dict | None = None,
+        path_prefix: str | None = None,
     ) -> list[tuple[str, str, float]]:
-        """BM25 keyword search over cached content. FTS5 syntax supported."""
-        return await _search.search_by_query(self, query, k=k, filter=filter)
+        """BM25 keyword search over cached content. FTS5 syntax supported.
+
+        ``path_prefix`` restricts the ranking to one directory, so a scoped
+        search never spends a result slot on another project's files.
+        """
+        return await _search.search_by_query(
+            self, query, k=k, filter=filter, path_prefix=path_prefix
+        )
 
     # -------------------------------------------------------------------------
     # Grep — regex/literal content search across cached files
@@ -813,17 +849,20 @@ class ContentStorage:
     # enough that newly-cached files appear quickly.
     _HAS_CACHED_TTL_S = 5.0
 
-    async def has_cached_paths_under(self, path_filter: str | None) -> bool:
+    async def has_cached_paths_under(
+        self, path_filter: str | None, *, within: str | None = None
+    ) -> bool:
         """Return True if any cached document matches `path_filter`.
 
         Used by the grep tool to distinguish "no files cached under path"
         from "pattern produced no matches". `None`/empty filter is treated
-        as "anything cached" — short-circuits on the first non-parent doc.
+        as "anything cached" (under `within`, when given) — short-circuits on
+        the first non-parent doc.
         """
         if self._closed:
             return False
 
-        key = path_filter or ""
+        key = f"{within or ''}\x00{path_filter or ''}"
         ttl_cache: dict[str, tuple[float, bool]] = self._has_cached_cache
         now = time.monotonic()
         entry = ttl_cache.get(key)
@@ -837,11 +876,13 @@ class ContentStorage:
         paths = await self._collection.distinct_paths(
             path_key=_META_PATH, is_parent_key=_META_IS_PARENT
         )
-        if not path_filter:
+        if not path_filter and not within:
             result = bool(paths)
         else:
             matcher = _grep.path_matches
-            result = any(matcher(doc_path, path_filter=path_filter) for doc_path in paths)
+            result = any(
+                matcher(doc_path, path_filter=path_filter, within=within) for doc_path in paths
+            )
         ttl_cache[key] = (now, result)
         # Bound memory: keep the map small — bursty wrong paths typically
         # share a small alphabet of distinct keys.
@@ -855,6 +896,7 @@ class ContentStorage:
         pattern: str,
         *,
         path: str | None = None,
+        within: str | None = None,
         fixed_string: bool = False,
         case_sensitive: bool = True,
         context_lines: int = 0,
@@ -872,6 +914,7 @@ class ContentStorage:
             self,
             pattern,
             path=path,
+            within=within,
             fixed_string=fixed_string,
             case_sensitive=case_sensitive,
             context_lines=context_lines,

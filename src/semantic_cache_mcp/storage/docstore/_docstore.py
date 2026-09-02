@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -42,6 +43,22 @@ _AUTO_VACUUM_INCREMENTAL = 2
 # Defense-in-depth: table names are module constants, never user input, but
 # validate anyway since they are interpolated into SQL.
 _SAFE_TABLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+# The ESCAPE character for a LIKE prefix match. Backslash is a plain character
+# to SQLite — it has no string escapes — so it needs no doubling in the SQL.
+_LIKE_ESCAPE = "\\"
+
+
+def _like_prefix(prefix: str) -> str:
+    """A LIKE pattern matching exactly the strings starting with *prefix*.
+
+    ``%`` and ``_`` are wildcards, and a directory is free to contain either,
+    so both are escaped along with the escape character itself.
+    """
+    for char in (_LIKE_ESCAPE, "%", "_"):
+        prefix = prefix.replace(char, _LIKE_ESCAPE + char)
+    return prefix + "%"
 
 
 def _validate_table_name(name: str) -> None:
@@ -144,6 +161,12 @@ class DocStore:
         return self._conn
 
     # ------------------------------------------------------------------ writes
+    #
+    # Each ``_*_locked`` helper runs the statements alone, assuming the caller
+    # already holds ``self._lock`` and has a transaction open. That split is
+    # what lets several of them share one transaction: ``with self._conn:``
+    # does not nest — the inner exit commits — so a composite write cannot be
+    # built by calling the public methods.
     def add_texts(
         self,
         texts: Sequence[str],
@@ -153,22 +176,31 @@ class DocStore:
         """Insert documents (text + JSON metadata + optional parent). Returns ids."""
         if not texts:
             return []
+        with self._lock, self._conn:
+            return self._add_texts_locked(texts, metadatas, parent_ids)
+
+    def _add_texts_locked(
+        self,
+        texts: Sequence[str],
+        metadatas: Sequence[dict],
+        parent_ids: Sequence[int | None] | None = None,
+    ) -> list[int]:
+        if not texts:
+            return []
         parents = list(parent_ids) if parent_ids else [None] * len(texts)
         meta_strs = [json.dumps(m, separators=(",", ":")) for m in metadatas]
         rows = list(zip(texts, meta_strs, parents, strict=True))
         placeholders = ",".join(["(?, ?, ?)"] * len(rows))
         flat = [v for row in rows for v in row]
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                f"INSERT INTO {_TABLE}(text, metadata, parent_id) "
-                f"VALUES {placeholders} RETURNING id",
-                flat,
-            )
-            # RETURNING row order is unspecified in SQLite; ids are AUTOINCREMENT,
-            # so sorting recovers insertion order and keeps ids aligned with texts
-            # for the FTS rowid sync below.
-            ids = sorted(int(r[0]) for r in cursor.fetchall())
-            self._upsert_fts_rows(ids, texts)
+        cursor = self._conn.execute(
+            f"INSERT INTO {_TABLE}(text, metadata, parent_id) VALUES {placeholders} RETURNING id",
+            flat,
+        )
+        # RETURNING row order is unspecified in SQLite; ids are AUTOINCREMENT,
+        # so sorting recovers insertion order and keeps ids aligned with texts
+        # for the FTS rowid sync below.
+        ids = sorted(int(r[0]) for r in cursor.fetchall())
+        self._upsert_fts_rows(ids, texts)
         return ids
 
     def _upsert_fts_rows(self, ids: Sequence[int], texts: Sequence[str]) -> None:
@@ -191,18 +223,24 @@ class DocStore:
         ids = list(ids)
         if not ids:
             return []
-        placeholders = ",".join("?" for _ in ids)
         with self._lock, self._conn:
-            existing = [
-                r[0]
-                for r in self._conn.execute(
-                    f"SELECT id FROM {_TABLE} WHERE id IN ({placeholders})", tuple(ids)
-                ).fetchall()
-            ]
-            if existing:
-                eph = ",".join("?" for _ in existing)
-                self._conn.execute(f"DELETE FROM {_TABLE} WHERE id IN ({eph})", tuple(existing))
-                self._delete_fts_rows(existing)
+            return self._delete_by_ids_locked(ids)
+
+    def _delete_by_ids_locked(self, ids: Sequence[int]) -> list[int]:
+        ids = list(ids)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        existing = [
+            r[0]
+            for r in self._conn.execute(
+                f"SELECT id FROM {_TABLE} WHERE id IN ({placeholders})", tuple(ids)
+            ).fetchall()
+        ]
+        if existing:
+            eph = ",".join("?" for _ in existing)
+            self._conn.execute(f"DELETE FROM {_TABLE} WHERE id IN ({eph})", tuple(existing))
+            self._delete_fts_rows(existing)
         return existing
 
     def update_metadata(self, updates: list[tuple[int, dict[str, Any]]]) -> int:
@@ -210,33 +248,91 @@ class DocStore:
         if not updates:
             return 0
         with self._lock, self._conn:
-            ids = [u[0] for u in updates]
-            placeholders = ",".join(["?"] * len(ids))
-            rows = self._conn.execute(
-                f"SELECT id, metadata FROM {_TABLE} WHERE id IN ({placeholders})", ids
-            ).fetchall()
-            current = {r[0]: (json.loads(r[1]) if r[1] else {}) for r in rows}
-            data: list[tuple[str, int]] = []
-            for doc_id, meta_updates in updates:
-                if doc_id in current:
-                    meta = current[doc_id]
-                    meta.update(meta_updates)
-                    data.append((json.dumps(meta, separators=(",", ":")), doc_id))
-            if data:
-                self._conn.executemany(f"UPDATE {_TABLE} SET metadata = ? WHERE id = ?", data)
-            return len(data)
+            return self._update_metadata_locked(updates)
+
+    def _update_metadata_locked(self, updates: list[tuple[int, dict[str, Any]]]) -> int:
+        if not updates:
+            return 0
+        ids = [u[0] for u in updates]
+        placeholders = ",".join(["?"] * len(ids))
+        rows = self._conn.execute(
+            f"SELECT id, metadata FROM {_TABLE} WHERE id IN ({placeholders})", ids
+        ).fetchall()
+        current = {r[0]: (json.loads(r[1]) if r[1] else {}) for r in rows}
+        data: list[tuple[str, int]] = []
+        for doc_id, meta_updates in updates:
+            if doc_id in current:
+                meta = current[doc_id]
+                meta.update(meta_updates)
+                data.append((json.dumps(meta, separators=(",", ":")), doc_id))
+        if data:
+            self._conn.executemany(f"UPDATE {_TABLE} SET metadata = ? WHERE id = ?", data)
+        return len(data)
+
+    def reconcile_chunks(
+        self,
+        *,
+        delete_ids: Sequence[int],
+        insert_texts: Sequence[str],
+        insert_metas: Sequence[dict],
+        parent_id: int,
+        meta_updates: list[tuple[int, dict[str, Any]]],
+    ) -> list[int]:
+        """Drop, insert and re-tag a file's chunk rows in one transaction.
+
+        Rewriting a chunked file is three statements that are only meaningful
+        together. Run apart, an interruption between them commits a chunk set
+        that is a blend of two versions — and one that looks entirely healthy,
+        since the surviving rows still number 0..n-1 with no gaps or
+        duplicates. Only the file's own hash gives it away. One transaction
+        means the rewrite either lands whole or leaves the previous version
+        exactly as it was, and it costs one hop through the IO thread instead
+        of three.
+        """
+        with self._lock, self._conn:
+            self._delete_by_ids_locked(delete_ids)
+            new_ids = self._add_texts_locked(
+                insert_texts, insert_metas, [parent_id] * len(insert_texts)
+            )
+            self._update_metadata_locked(meta_updates)
+        return new_ids
 
     # ------------------------------------------------------------------- reads
     def keyword_search(
-        self, query: str, k: int, filter_dict: dict[str, Any] | None = None
+        self,
+        query: str,
+        k: int,
+        filter_dict: dict[str, Any] | None = None,
+        path_prefix: str | None = None,
     ) -> list[tuple[Document, float]]:
-        """BM25 keyword search via FTS5. Returns ``(Document, score)`` best-first."""
+        """BM25 keyword search via FTS5. Returns ``(Document, score)`` best-first.
+
+        ``path_prefix`` restricts the search to documents under one directory.
+        It belongs in SQL rather than in the caller: ``LIMIT`` applies after the
+        ``WHERE``, so a caller filtering afterwards has to over-fetch and guess
+        how far, and still comes up short when another project dominates the
+        store. Here the ranking never spends a slot on a file the caller cannot
+        use.
+        """
         if not query.strip():
             return []
         filter_clause = ""
         filter_params: list[Any] = []
         if filter_dict:
             filter_clause, filter_params = self.build_filter_clause(filter_dict, "ti.metadata")
+        prefix_clause = ""
+        prefix_params: list[Any] = []
+        if path_prefix:
+            # LIKE, not a bare comparison, because SQLite has no prefix operator
+            # — so the directory's own `%` and `_` have to be escaped or they
+            # act as wildcards and match a sibling project. The trailing
+            # separator is what makes it a directory match: without it
+            # `/project` also matches `/project_evil`.
+            prefix_clause = f"AND json_extract(ti.metadata, ?) LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
+            prefix_params = [
+                '$."path"',
+                _like_prefix(path_prefix.rstrip(os.sep) + os.sep),
+            ]
         # FTS5 MATCH + bm25() ranking. The FROM aliases the FTS table as `f`
         # (used for the rowid JOIN) while bm25()/MATCH reference it by name —
         # this exact shape is lifted from simplevecdb and is FTS5-correct.
@@ -246,10 +342,11 @@ class DocStore:
             JOIN {_TABLE} ti ON ti.id = f.rowid
             WHERE {_FTS} MATCH ?
             {filter_clause}
+            {prefix_clause}
             ORDER BY score ASC
             LIMIT ?
         """
-        params = (query,) + tuple(filter_params) + (k,)
+        params = (query,) + tuple(filter_params) + tuple(prefix_params) + (k,)
         try:
             with self._lock:
                 rows = self._conn.execute(sql, params).fetchall()
@@ -509,9 +606,13 @@ class AsyncDocStore:
         return await self._run(self._store.add_texts, texts, metadatas, parent_ids)
 
     async def keyword_search(
-        self, query: str, k: int, filter: dict[str, Any] | None = None
+        self,
+        query: str,
+        k: int,
+        filter: dict[str, Any] | None = None,
+        path_prefix: str | None = None,
     ) -> list[tuple[Document, float]]:
-        return await self._run(self._store.keyword_search, query, k, filter)
+        return await self._run(self._store.keyword_search, query, k, filter, path_prefix)
 
     async def get_documents(
         self, filter_dict: dict[str, Any] | None = None
@@ -560,6 +661,27 @@ class AsyncDocStore:
 
     async def update_metadata(self, updates: list[tuple[int, dict[str, Any]]]) -> int:
         return await self._run(self._store.update_metadata, updates)
+
+    async def reconcile_chunks(
+        self,
+        *,
+        delete_ids: Sequence[int],
+        insert_texts: Sequence[str],
+        insert_metas: Sequence[dict],
+        parent_id: int,
+        meta_updates: list[tuple[int, dict[str, Any]]],
+    ) -> list[int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._store.reconcile_chunks(
+                delete_ids=delete_ids,
+                insert_texts=insert_texts,
+                insert_metas=insert_metas,
+                parent_id=parent_id,
+                meta_updates=meta_updates,
+            ),
+        )
 
     async def save(self) -> None:
         return await self._run(self._store.save)
