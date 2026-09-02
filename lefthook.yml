@@ -2,25 +2,25 @@
 # Install: npm install -g @evilmartians/lefthook && lefthook install
 # Or: brew install lefthook && lefthook install
 
+# Every check here runs the same command CI runs, and blocks on the same
+# result. A hook that passes what CI will fail is worse than no hook: it moves
+# the discovery to the pull request. Lint rules come from pyproject.toml alone
+# — no CLI --ignore list — so there is one place to change them.
+#
+# The split is by cost, not by strictness: pre-commit runs the fast checks on
+# every commit, pre-push runs types and the suite once before the code leaves.
 pre-commit:
   parallel: false
   commands:
     ruff-check:
       glob: "*.py"
-      run: uv run python -m ruff check src/ tests/ --fix --ignore E501,N806,SIM108,SIM102,F841,B904,B905,UP028,W293,UP040,E402,C416
+      run: uv run python -m ruff check src/ tests/ --fix
       stage_fixed: true
 
     ruff-format:
       glob: "*.py"
       run: uv run python -m ruff format src/ tests/
       stage_fixed: true
-
-    mypy:
-      glob: "*.py"
-      run: uv run python -m mypy src/ || echo "Mypy found type errors (non-blocking)"
-      skip:
-        - merge
-        - rebase
 
     bandit:
       glob: "*.py"
@@ -39,7 +39,7 @@ pre-push:
         - rebase
 
     type-check:
-      run: uv run python -m mypy src/ || echo "Mypy found type errors (non-blocking)"
+      run: uv run python -m mypy src/
       skip:
         - merge
         - rebase
