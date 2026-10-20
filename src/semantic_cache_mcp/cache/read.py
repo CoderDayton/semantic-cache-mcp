@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from ..config import MAX_CONTENT_SIZE
-from ..core import count_tokens, generate_diff, summarize_semantic, truncate_semantic
+from ..core import count_tokens, generate_diff, large_file_map
 from ..core.hashing import hash_content, hash_matches
 from ..logger import log_marker
 from ..types import BatchReadResult, CacheEntry, FileReadSummary, ReadResult
@@ -113,14 +113,14 @@ async def smart_read(
     diff_mode: bool = True,
     force_full: bool = False,
     refresh_cache: bool = True,
-    summarize: bool = True,
+    map_oversized: bool = True,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
 
     Strategies (in order of token savings):
     1. File unchanged (mtime match) -> "// No changes" (99% reduction)
     2. File changed -> unified diff (80-95% reduction)
-    3. Large file -> smart truncation (50-80% reduction)
+    3. Large file -> outline, or head/tail sample (see `large_file_map`)
     4. New file -> full content with caching for future reads
     """
     file_path = Path(path).expanduser().resolve()
@@ -317,38 +317,27 @@ async def smart_read(
                     content_hash=_content_hash(),
                 )
 
-    # Strategy 3 & 4: Full read (semantic summarization if large)
     truncated = False
     final_content = content
+    total_lines: int | None = None
 
-    # Line-addressed reads (offset/limit) pass summarize=False: they must slice
-    # literal disk lines, so summarizing here would fabricate line numbers and a
-    # false total. Full-file reads keep summarization for large files.
-    if summarize and len(content) > max_size:
-        # Use semantic summarization to preserve important content. Runs in the
-        # executor — summarizing a large file is CPU-heavy and would otherwise
-        # block the event loop.
-        try:
-            started = time.perf_counter()
-            log_marker(logger, "summarize.begin", path=path, chars=len(content))
+    if map_oversized and len(content) > max_size:
+        started = time.perf_counter()
+        log_marker(logger, "map.begin", path=path, chars=len(content))
 
-            def _summarize() -> str:
-                return summarize_semantic(content, max_size, embed_fn=None)
+        def _map() -> str:
+            return large_file_map(content, filename=file_path.name, count_fn=count_tokens)
 
-            loop = asyncio.get_running_loop()
-            final_content = await loop.run_in_executor(cache._io_executor, _summarize)
-            log_marker(
-                logger,
-                "summarize.end",
-                path=path,
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
-            )
-            truncated = True
-        except Exception as e:
-            log_marker(logger, "summarize.fail", path=path, error=type(e).__name__)
-            logger.warning(f"Semantic summarization failed: {e}, using fallback truncation")
-            final_content = truncate_semantic(content, max_size)
-            truncated = True
+        loop = asyncio.get_running_loop()
+        final_content = await loop.run_in_executor(cache._io_executor, _map)
+        log_marker(
+            logger,
+            "map.end",
+            path=path,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        truncated = True
+        total_lines = len(content.splitlines())
 
     should_refresh_cache = refresh_cache or not cache_is_fresh
     if should_refresh_cache:
@@ -369,6 +358,7 @@ async def smart_read(
         truncated=truncated,
         compression_ratio=len(final_content) / len(content) if content else 1.0,
         content_hash=_content_hash(),
+        total_lines=total_lines,
     )
 
 

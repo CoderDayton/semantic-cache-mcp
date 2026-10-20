@@ -295,4 +295,48 @@ def render_outline(outline: Outline) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["Outline", "OutlineEntry", "extract_outline", "render_outline"]
+_SAMPLE_LINES = 20
+_SAMPLE_CHARS = 2000
+
+
+def _sample_block(lines: list[str], start: int, end: int) -> str:
+    text = "\n".join(lines[start:end])
+    if len(text) > _SAMPLE_CHARS:
+        text = text[:_SAMPLE_CHARS] + "\n// [clipped]"
+    return f"// L{start + 1}-{end}\n{text}"
+
+
+def large_file_map(
+    content: str,
+    *,
+    filename: str | None = None,
+    max_entries: int = _DEFAULT_MAX_ENTRIES,
+    max_tokens: int | None = 4000,
+    count_fn: Callable[[str], int] | None = None,
+) -> str:
+    """What a full read of an oversized file returns instead of its text.
+
+    The rendered outline when the file has definitions; otherwise its first and
+    last ``_SAMPLE_LINES`` lines under `// L<a>-<b>` anchors. Every line number
+    is a 1-based line of ``content``.
+    """
+    outline = extract_outline(
+        content,
+        filename=filename,
+        max_entries=max_entries,
+        max_tokens=max_tokens,
+        count_fn=count_fn,
+    )
+    if outline.entries:
+        return render_outline(outline)
+
+    lines = content.splitlines()
+    n = len(lines)
+    if n <= 2 * _SAMPLE_LINES:
+        return _sample_block(lines, 0, n)
+    return "\n".join(
+        (_sample_block(lines, 0, _SAMPLE_LINES), _sample_block(lines, n - _SAMPLE_LINES, n))
+    )
+
+
+__all__ = ["Outline", "OutlineEntry", "extract_outline", "large_file_map", "render_outline"]

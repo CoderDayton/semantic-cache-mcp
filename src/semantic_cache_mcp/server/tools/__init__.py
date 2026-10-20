@@ -504,12 +504,6 @@ def _binary_read_payload(path: str, result: Any) -> dict[str, Any]:
     }
 
 
-# A partial or summarized read reports the file's hash under `file_hash`, and
-# never as a bare content hash: a caller echoing it back as `known_hash` would
-# be claiming possession of a file it saw only part of. Namespacing the value
-# makes that claim impossible to make by accident instead of merely discouraged
-# in prose, while still letting the caller compare it across reads to notice the
-# file moved.
 _PARTIAL_HASH_PREFIX = "partial:"
 
 
@@ -595,9 +589,7 @@ async def _outline_read(
                 diff_mode=False,
                 force_full=True,
                 refresh_cache=False,  # smart_read still refreshes when stale
-                # An outline maps the real file. Summarizing first would map a
-                # digest and hand back line numbers belonging to nothing.
-                summarize=False,
+                map_oversized=False,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -674,9 +666,11 @@ async def read(
     without it the file is always sent in full. Reading also caches the file so
     `grep`, `search`, and `batch_read` can see it.
 
-    Use `offset`/`limit` to read an exact line range, for example after a large
-    file was summarized. A read that returns only part of a file — a line
-    range, or a summary — reports `file_hash` (prefixed `partial:`) rather than
+    A file larger than `max_size` returns a map instead of its text: the
+    outline below, or for a file with no definitions its first and last lines
+    under `// L<a>-<b>` anchors, flagged `truncated` with `total_lines`. Use
+    `offset`/`limit` to read the exact lines it names. A read that returns only
+    part of a file — a line range, or a map — reports `file_hash` (prefixed `partial:`) rather than
     `content_hash`, and it cannot be redeemed as `known_hash`. A ranged read
     also returns a `coverage_token`: pass it back as `known_hash` on your next
     ranged read and a window you already hold answers `unchanged`; once the
@@ -687,14 +681,14 @@ async def read(
     `offset` you can read next. An outline is a map, not the file, so it comes
     back as `file_hash`.
 
-    `is_diff` marks a unified diff and `truncated` marks a summary. A binary
+    `is_diff` marks a unified diff and `truncated` marks a map. A binary
     file returns metadata instead of content; for images use `read_image`.
 
     Args:
         path: File path (absolute, or relative to the project root). Use an
             absolute path for files outside the project root.
-        max_size: Byte threshold above which the file is semantically
-            summarized; recover exact lines afterward with `offset`/`limit`.
+        max_size: Byte threshold above which a map of the file is returned
+            instead of its text; read exact lines with `offset`/`limit`.
         offset: 1-based first line for a ranged read; omit or pass 0 to start
             from the first line.
         limit: Number of lines to return starting at `offset`.
@@ -812,7 +806,7 @@ async def read(
                         diff_mode=False,  # Line ranges bypass diff mode
                         force_full=True,
                         refresh_cache=False,  # smart_read still refreshes when stale
-                        summarize=False,  # Line ranges need literal lines, not a summary
+                        map_oversized=False,
                     ),
                     timeout=_TOOL_TIMEOUT,
                 )
@@ -1064,10 +1058,6 @@ async def read(
             # cache here — that was the path that handed back whole files
             # regardless of the budget the caller asked for.
             payload["content"] = result.content
-        # Always surface the current hash so the caller can echo it back as
-        # known_hash on its next read and skip a re-send. A summarized read
-        # delivered a digest rather than the file, so its hash goes out under
-        # `file_hash` and cannot be redeemed as a possession claim.
         if entry is not None and "content_hash" not in payload:
             if result.truncated:
                 payload["file_hash"] = _PARTIAL_HASH_PREFIX + short_hash(entry.content_hash)
@@ -1080,17 +1070,15 @@ async def read(
             payload["is_diff"] = True
         if result.truncated:
             payload["truncated"] = True
+            if result.total_lines is not None:
+                payload["total_lines"] = result.total_lines
         if mode in _MODE_NORMAL and result.truncated:
-            # Truncated reads use semantic summarization — the returned
-            # content is non-contiguous, so line numbers don't map to the
-            # original file. Don't hint a specific offset; instead tell
-            # the caller to use offset/limit to read specific line ranges.
             total_tokens = entry.tokens if entry else result.tokens_original
             payload["total_tokens"] = total_tokens
             payload["hint"] = (
-                f"File was semantically summarized ({total_tokens} tokens total). "
-                f"Use read with offset=<line> and limit=<n> to read specific "
-                f"sections of the original file."
+                f"File exceeds max_size ({total_tokens} tokens); content is a map "
+                f"of it, not its text. Every line number is an offset: read "
+                f"with offset=<line> and limit=<n> for exact lines."
             )
         if mode == _MODE_DEBUG:
             payload["from_cache"] = result.from_cache
@@ -1965,12 +1953,7 @@ async def edit_preview(
                 diff_mode=False,
                 force_full=True,
                 refresh_cache=False,
-                # Anchors and their line numbers only mean anything against the
-                # literal file. Summarizing first made this tool answer
-                # "found: false" for text that is in the file, and quote line
-                # numbers belonging to the summary — a confident wrong answer to
-                # the one question it exists to settle.
-                summarize=False,
+                map_oversized=False,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -2338,8 +2321,8 @@ async def batch_read(
     reading them at all, use `warm` instead — this tool returns their text.
     Pass `known_hashes` and each file you still hold collapses to an
     `unchanged` count, or to a diff when it moved on disk; the rest come back
-    in full with their `content_hash`. A file large enough to come back
-    summarized carries none: a summary is not the file. Smallest files are read
+    in full with their `content_hash`. A file over `max_size` comes back
+    as a map (see `read`) and carries none: a map is not the file. Smallest files are read
     first, and a file too big for the remaining budget is listed under
     `skipped` while smaller ones keep being read. Recover anything skipped with
     `read` using `offset`/`limit`. Paths are relative to the `root` the
@@ -2637,9 +2620,7 @@ async def warm(
                     diff_mode=False,
                     force_full=True,
                     refresh_cache=False,  # smart_read still refreshes when stale
-                    # Indexing needs the real bytes; a summary would make grep
-                    # answer for text the file does not contain.
-                    summarize=False,
+                    map_oversized=False,
                 ),
                 timeout=_TOOL_TIMEOUT,
             )

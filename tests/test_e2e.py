@@ -183,10 +183,10 @@ class TestLargeFiles:
         assert result.truncated is True
         assert len(result.content) <= 50_000
 
-    async def test_large_file_preserves_structure(
+    async def test_large_file_returns_outline(
         self, semantic_cache: SemanticCache, temp_dir: Path
     ) -> None:
-        """Truncation should preserve code structure."""
+        """An oversized code file comes back as its outline."""
         # Create large Python file
         large_py = temp_dir / "large.py"
         content = '"""Module docstring."""\n\n'
@@ -196,8 +196,9 @@ class TestLargeFiles:
 
         result = await smart_read(semantic_cache, str(large_py), max_size=10_000)
 
-        # Should preserve docstring at top
-        assert '"""Module docstring."""' in result.content
+        assert result.truncated is True
+        assert result.content.startswith("3: def func_0():\n6: def func_1():")
+        assert "pass" not in result.content
 
 
 class TestEdgeCases:

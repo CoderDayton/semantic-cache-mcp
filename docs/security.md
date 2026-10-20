@@ -91,7 +91,7 @@ All inputs are validated before I/O:
 
 ### Local Processing
 
-Keyword search (BM25) and summarization run entirely on the local machine. There is no model download and no inference service, and no file content is sent to any external API.
+Keyword search (BM25) and outlining run entirely on the local machine. There is no model download and no inference service, and no file content is sent to any external API.
 
 ---
 

@@ -66,13 +66,11 @@ Since 0.5.3 a ranged read earns a `coverage_token` on the same terms, redeemable
 
 **Aggregate (phases 2 to 6): 98.9% token reduction.**
 
-Phase 1 is the no-cache baseline and used to sit at exactly 0.0%. It returns
-5.9% fewer tokens than the corpus holds because one file
-(`server/tools/__init__.py`) exceeds `MAX_CONTENT_SIZE` and comes back
-summarised — a first read of an oversized file is not a cache saving, and
-should not be read as one. It is also why the cold-read and `batch_read`
-latency rows are higher than they were in 0.5.2: that one file is summarised on
-every unproven pass.
+Phase 1 is the no-cache baseline. It returns 23.7% fewer tokens than the corpus
+holds because one file (`server/tools/__init__.py`) exceeds `MAX_CONTENT_SIZE`
+and comes back as its outline — a first read of an oversized file is not a
+cache saving, and should not be read as one. That one file is outlined on every
+unproven pass, including cold reads and `batch_read`.
 
 Phase 6 costs more than it did in 0.5.1 (98.6% vs. 99.7%), and deliberately so:
 `search` now joins query terms with `OR`, so a query returns the files that match
@@ -90,7 +88,7 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 | Diff (changed) | 80 to 95% | File modified since last cache, and the caller holds the base content; emitted as unified diff |
 | No possession proof | 0% | Caller sent no matching hash — the file is returned in full, served from cache when fresh |
 | Search previews | ~100% | `search` returns 200-char previews, never full files |
-| Summarised | 50 to 80% | File exceeds `MAX_CONTENT_SIZE`; semantic skeleton retained |
+| Mapped | ~97% | File exceeds `MAX_CONTENT_SIZE`; outline returned, or first/last 20 lines when it has no definitions |
 
 ---
 
@@ -105,7 +103,7 @@ All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw outp
 | Single unchanged read (fast path) | **1.1 ms** | 1.1 ms | mtime check + cache hit; **no disk I/O** |
 | Single diff read (changed file) | 0.7 ms | 0.9 ms | Hash check + unified diff |
 | Unchanged re-read (41 files) | 19.5 ms | 22.7 ms | Whole-corpus pass |
-| Cold read (41 files, total) | n/a | n/a | 100 ms for a single unrepeated pass (~2.4 ms/file), including summarising the one file over `MAX_CONTENT_SIZE` |
+| Cold read (41 files, total) | n/a | n/a | 100 ms for a single unrepeated pass (~2.4 ms/file), including outlining the one file over `MAX_CONTENT_SIZE` |
 
 The cold-read total is one pass, not a distribution — it is the only row here
 with n=1, and it moves ±20% between runs. Treat it as an order of magnitude.
@@ -265,7 +263,6 @@ stayed the same. The optimisations below still land directly in the table above:
 | Char/4 fast-exit in `_finalize_payload` | `server/response.py` | Response shaping is sub-microsecond on small payloads |
 | Char-budget grep truncation | `server/tools/__init__.py` | Large grep results stay under the response cap |
 | Pre-stored search previews | `storage/docstore/__init__.py` | No re-slicing of chunked content at query time |
-| `include_markers=False` default | `core/text/_summarize.py` | Summarisation no longer wastes tokens on `[N lines omitted]` markers |
 | Shared line index across a batch (0.5.3) | `cache/_helpers.py`, `cache/write.py` | `batch_edit` rebuilt the line table once per edit; a 30-edit batch on a 20K-line file dropped 1210 ms → 656 ms |
 | Metadata-only projections (0.5.3) | `storage/docstore/_docstore.py` | `get_stats` and `has_cached_paths_under` were loading every cached file's text to read one field: 11.0 → 5.6 ms and 12.6 → 3.1 ms |
 | Bounded hash-cache retention (0.5.3) | `core/hashing/_blake.py` | The LRUs are keyed on the buffer they hashed, so entry counts were a memory bound of ~1.2 GB; sized to ~96 MB worst case, keeping the 1.6–3.1× hit speedup |

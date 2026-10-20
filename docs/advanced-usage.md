@@ -208,16 +208,14 @@ print(f"Lifetime saved:     {lifetime['tokens_saved']}")
 
 ## Advanced Algorithms
 
-### Semantic Summarization
+### Large-File Map
 
 ```python
-from semantic_cache_mcp.core import summarize_semantic
+from semantic_cache_mcp.core import large_file_map
 
-# Summarization scores segments on its own; no embedding function is needed.
-summary = summarize_semantic(
-    content=large_file_content,
-    max_size=10000,
-)
+# The outline (`<line>: <signature>`), or the first and last 20 lines under
+# `// L<a>-<b>` anchors when the file has no definitions.
+file_map = large_file_map(large_file_content, filename="module.py")
 ```
 
 ### Delta Compression
@@ -276,9 +274,9 @@ print(f"Cleared {cleared} entries")
 | `tokens_original`  | `int`         | Original token count                           |
 | `tokens_returned`  | `int`         | Tokens in the returned content                 |
 | `tokens_saved`     | `int`         | Tokens saved vs returning full content         |
-| `truncated`        | `bool`        | Whether content was truncated/summarized       |
+| `truncated`        | `bool`        | Whether content is a map of an oversized file  |
 | `compression_ratio`| `float`       | Size ratio (returned / original)               |
-| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or summarized one. A ranged read also carries a signed `coverage_token` naming the delivered lines, which *is* redeemable as `known_hash` for those lines |
+| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or mapped one. A ranged read also carries a signed `coverage_token` naming the delivered lines, which *is* redeemable as `known_hash` for those lines |
 | `semantic_match`   | `str \| None` | Unused; always `None` since the embedding layer was removed |
 
 ### WriteResult

@@ -18,9 +18,7 @@ from semantic_cache_mcp.cache import SemanticCache, find_edit_anchors
 from semantic_cache_mcp.cache.read import smart_read
 from semantic_cache_mcp.cache.write import smart_batch_edit
 
-# Bigger than MAX_CONTENT_SIZE * 10 (the ceiling edit_preview reads under), so
-# the summarizer would engage if the read did not opt out of it.
-_OVER_SUMMARIZE_THRESHOLD_LINES = 20_000
+_OVER_MAP_THRESHOLD_LINES = 20_000
 
 
 class TestBatchEditReportsWhatItDid:
@@ -191,17 +189,17 @@ class TestGrepReportsTruncation:
 
 
 class TestAnchorProbeReadsTheFile:
-    """edit_preview locates anchors in the literal file, never in a summary."""
+    """edit_preview locates anchors in the literal file, never in a map."""
 
-    async def test_anchor_past_the_summarize_threshold_is_found_at_its_real_line(
+    async def test_anchor_past_the_map_threshold_is_found_at_its_real_line(
         self, semantic_cache: SemanticCache, temp_dir: Path
     ) -> None:
         anchor = "UNIQUE_ANCHOR_TOKEN = 1"
         head = "\n".join(
-            f"# head filler {i} pad pad pad pad" for i in range(_OVER_SUMMARIZE_THRESHOLD_LINES)
+            f"# head filler {i} pad pad pad pad" for i in range(_OVER_MAP_THRESHOLD_LINES)
         )
         tail = "\n".join(
-            f"# tail filler {i} pad pad pad pad" for i in range(_OVER_SUMMARIZE_THRESHOLD_LINES)
+            f"# tail filler {i} pad pad pad pad" for i in range(_OVER_MAP_THRESHOLD_LINES)
         )
         target = temp_dir / "huge.py"
         target.write_text(f"{head}\n{anchor}\n{tail}\n")
@@ -214,7 +212,7 @@ class TestAnchorProbeReadsTheFile:
             diff_mode=False,
             force_full=True,
             refresh_cache=False,
-            summarize=False,
+            map_oversized=False,
         )
 
         assert result.truncated is False
@@ -222,14 +220,14 @@ class TestAnchorProbeReadsTheFile:
         assert count == 1
         assert line_numbers == [expected_line]
 
-    async def test_edit_preview_tool_passes_summarize_false(self) -> None:
+    async def test_edit_preview_tool_passes_map_oversized_false(self) -> None:
         """Guard the wiring itself — the bug was one default, not the algorithm."""
         import inspect
 
         from semantic_cache_mcp.server import tools
 
         source = inspect.getsource(tools.edit_preview)
-        assert "summarize=False" in source
+        assert "map_oversized=False" in source
 
 
 class TestRangedReadHashIsHonest:

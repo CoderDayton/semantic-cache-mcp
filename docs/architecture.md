@@ -26,10 +26,10 @@ src/semantic_cache_mcp/
 │   │   ├── _gear.py        # Serial HyperCDC (Gear hash rolling window)
 │   │   └── _simd.py        # SIMD-accelerated parallel CDC
 │   ├── hashing/            # BLAKE3/BLAKE2b content hashing and keyed MACs
-│   ├── text/               # Diff generation and semantic summarization
+│   ├── text/               # Diff generation and structural outline
 │   │   ├── __init__.py
 │   │   ├── _diff.py        # generate_diff, diff_with_stats, compute_delta, diff_stats
-│   │   └── _summarize.py   # summarize_semantic (TCRA-LLM based)
+│   │   └── _outline.py     # extract_outline, render_outline, large_file_map
 │   └── tokenizer/          # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
     ├── __init__.py
@@ -169,22 +169,16 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 - Delta compression: store only changed lines (10 to 100x smaller for small edits to large files)
 - `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow. A middle tier keeps the per-hunk `@@` headers (which regions changed and by how much) when a diff is over budget but has few hunks, so the caller can fetch specifics with a ranged `read`; beyond a hunk cap it falls back to a bare count summary
 
-#### `_summarize.py`: Semantic Summarization
+#### `_outline.py`: Outline and Large-File Map
 
-Based on TCRA-LLM (arXiv:2310.15556). Preserves structural integrity when files exceed the size budget:
+`extract_outline` scans line by line for definition forms and returns each with its 1-based line number; `render_outline` prints them as `<line>: <signature>`. It serves `read(outline=true)`.
 
-**Algorithm:**
-1. Split file at semantic boundaries (function/class definitions, paragraphs)
-2. Score each segment:
-   - **Position score**: U-shaped curve, highest at the start and end, lowest in the middle
-   - **Density score**: unique token ratio + syntax character density + non-whitespace ratio
-3. Greedily select highest-scoring segments that fit the budget
-4. Always preserve the first segment (docstrings, imports, module header)
-5. Reassemble selected segments in original order; `# ... [N lines omitted] ...` markers
-   are emitted only when `SummarizationConfig.include_markers=True` (default `False`
-   since 0.4.6, because markers added no LLM-visible value and consumed token budget)
+`large_file_map` is what a full read of a file over `max_size` returns instead of the text:
 
-**Result:** 50 to 80% token savings on large files versus simple truncation, while preserving the code skeleton and intent.
+1. The rendered outline, capped at 2000 entries and 4000 tokens (deepest entries dropped first, with an omitted count).
+2. If no definitions are found: the first and last 20 lines under `// L<a>-<b>` anchors, each side clipped to 2000 characters.
+
+The output is deterministic, delivers no file body, and every line number is a valid `offset`. The read reports `truncated`, `total_lines` and a `partial:` `file_hash`.
 
 ---
 
@@ -196,8 +190,8 @@ The server runs a single asyncio event loop. Blocking operations are offloaded t
 
 | Executor | Workers | Used for |
 |----------|---------|----------|
-| **IO executor** | 1 | All `ContentStorage` reads and writes. Single-threaded so the one SQLite connection is never touched concurrently |
-| **Default executor** | N (OS-dependent) | `summarize_semantic()` and other CPU-bound work |
+| **IO executor** | 1 | All `ContentStorage` reads and writes, and `large_file_map()`. Single-threaded so the one SQLite connection is never touched concurrently |
+| **Default executor** | N (OS-dependent) | Other CPU-bound work |
 | **Async subprocess** | n/a | `_format_file()` (ruff, prettier, etc.) |
 
 Storage operations run on a dedicated single-thread executor so the single SQLite connection is only ever used from one thread, which keeps writes serialized and safe.

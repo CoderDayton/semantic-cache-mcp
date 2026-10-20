@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `read` returns a map of a file over `max_size` instead of a semantic summary. The map is the file's outline, or for a file with no definitions its first and last 20 lines under `// L<a>-<b>` anchors. Every line number is a valid `offset`. The response reports `total_lines`.
+- `batch_read` returns the same map for an oversized file.
+- Removed the semantic summarizer (`core.summarize_semantic`, `core.truncate_with_summarization`, `SummarizationConfig`) and its tests.
+- Internal: `smart_read` keyword `summarize` renamed to `map_oversized`. `ReadResult` gains `total_lines`.
+
 ## [0.6.0] - 2026-09-02: Freshness that a timestamp cannot fake, a search that stays in your project
 
 Two assumptions in this server were wrong in the same way: both trusted a signal

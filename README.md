@@ -135,7 +135,7 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges, with the number gutter opt-in via `line_numbers=true` (it costs ~17% of a window, and the range is in `lines` regardless). `outline=true` returns one `line: signature` per definition instead of the text — the cheap first read of a large file, and a map rather than possession, so it reports `file_hash`. A partial or summarized read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
+| `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges, with the number gutter opt-in via `line_numbers=true` (it costs ~17% of a window, and the range is in `lines` regardless). `outline=true` returns one `line: signature` per definition instead of the text — the cheap first read of a large file, and a map rather than possession, so it reports `file_hash`. A file over `max_size` returns the same outline (or, with no definitions, its first and last 20 lines under `// L<a>-<b>` anchors), flagged `truncated` with `total_lines`. A partial or mapped read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
 | `read_image` | Image pass-through. Returns an MCP image content block (base64 + mime) so vision models see the pixels; sidecar metadata carries size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not extension. Bypasses the cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
 | `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff; supports `append=true` and formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
 | `edit` | Exact edit against cached content, with scoped and line-range modes plus `dry_run=true`. Pass `known_hash` to get a claimable `content_hash` back and skip the read afterwards. For several edits to one file, use `batch_edit`. |
@@ -376,7 +376,7 @@ Measured on this project's 41 source files (**212,499 tokens**), i9-13900K, ext4
 | Batch read | All files via `batch_read`, 200K budget | 99.3% |
 | Search previews | 5 queries × k=5, previews vs full reads | 98.6% |
 | Small edits | Real ~5% line changes in 30% of files | 98.1% |
-| Cold read | First read, no cache; one file exceeds `MAX_CONTENT_SIZE` and returns summarised, which is not a cache saving | 5.9% |
+| Cold read | First read, no cache; one file exceeds `MAX_CONTENT_SIZE` and returns its outline, which is not a cache saving | 23.7% |
 
 ### Latency: **unchanged reads ~1 ms; repeat searches < 0.01 ms**
 
@@ -389,9 +389,9 @@ Measured on this project's 41 source files (**212,499 tokens**), i9-13900K, ext4
 | Edit (scoped find/replace) | 3.1 ms | cached content, plus the atomic write's fsync |
 | Grep (literal `def `) | 1.5 ms | FTS5 over cached corpus |
 | Grep (regex) | 3.4 ms | compiled once |
-| Batch read (41 files, diff mode) | 45.6 ms | chunk + tokenize changed files; one summarises each full pass |
+| Batch read (41 files, diff mode) | 45.6 ms | chunk + tokenize changed files; one is outlined each full pass |
 | Unchanged re-read (41 files) | 19.5 ms | whole-corpus pass |
-| Cold read (41 files, total) | 100 ms | single unrepeated pass: I/O, tokenisation, one summarisation |
+| Cold read (41 files, total) | 100 ms | single unrepeated pass: I/O, tokenisation, one outline |
 | Write (200-line file) | 2.7 ms | creates + caches, durable before it returns |
 
 Run them yourself. Pin `TMPDIR` to a real disk — the default `/tmp` is usually tmpfs, which discards `fsync` and reports write latency ~40% low:
@@ -443,6 +443,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks,
 Built with [FastMCP 4.0+](https://github.com/jlowin/fastmcp) and:
 
 - SQLite with FTS5 for keyword (BM25) full-text search, vendored as a small built-in store
-- Semantic summarization based on TCRA-LLM ([arXiv:2310.15556](https://arxiv.org/abs/2310.15556))
 - BLAKE3 cryptographic hashing for content freshness
 - W-TinyLFU frequency-aware cache eviction

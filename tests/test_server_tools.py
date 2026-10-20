@@ -283,10 +283,8 @@ class TestReadTool:
         """Regression: line-addressed reads of a file larger than max_size must
         return literal disk lines with real line numbers and a true total.
 
-        Previously the offset/limit path sliced over semantically summarized
-        content, so `total` reported the summarized line count and the emitted
-        line numbers did not match disk — agents saw read/grep disagree and
-        mistook fresh-but-summarized output for a stale cache.
+        A ranged read slices the literal file, so `total` is the true line count
+        and the emitted line numbers match what grep reports on disk.
         """
         from semantic_cache_mcp.config import MAX_CONTENT_SIZE
 
@@ -299,11 +297,9 @@ class TestReadTool:
             )
             + "\n"
         )
-        # Must exceed max_size so summarization would otherwise trigger.
         assert big.stat().st_size > MAX_CONTENT_SIZE
 
         d = _parse(await read(ctx, str(big), offset=5400, limit=3, line_numbers=True))
-        # True total, not the summarized line count.
         assert d["lines"]["total"] == n_lines
         # The window is the actual disk lines 5400-5402 with real line numbers.
         assert "line_05400 = 5400" in d["content"]
@@ -1580,7 +1576,7 @@ class TestReadSizeBudget:
     """`max_size` bounds the body of every read of a file, not only the first.
 
     The cache-hit path used to hand back the whole entry, so a caller that
-    asked for a 4 KB digest got 4 KB once and the entire file on every read
+    asked for a 4 KB map got 4 KB once and the entire file on every read
     after that — the reads where the budget matters most.
     """
 
@@ -1591,9 +1587,7 @@ class TestReadSizeBudget:
         second = _parse(await read(ctx, str(large_file), max_size=_BUDGET))
 
         on_disk = large_file.stat().st_size
-        assert len(first["content"]) < on_disk, "cold read should be summarized"
-        # The repeat read is a summary of the same file, so it lands in the
-        # same size class as the first — not the 10x jump to the full file.
+        assert len(first["content"]) < on_disk, "cold read should be mapped"
         assert len(second["content"]) <= len(first["content"]) * 2
         assert len(second["content"]) < on_disk / 2
 
@@ -1613,7 +1607,7 @@ class TestReadSizeBudget:
         assert not third.get("unchanged")
         assert "content" in third
 
-    async def test_summarized_read_is_labelled_truncated(
+    async def test_mapped_read_is_labelled_truncated(
         self, ctx: MagicMock, large_file: Path
     ) -> None:
         d = _parse(await read(ctx, str(large_file), max_size=_BUDGET))

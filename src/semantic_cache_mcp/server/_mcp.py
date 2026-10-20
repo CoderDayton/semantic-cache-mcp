@@ -116,7 +116,7 @@ changed. With it, you never need a read after an edit to learn what the file \
 now contains.
 
 A hash reported as `file_hash` (prefixed `partial:`) came from a partial or \
-summarized read. It identifies the file across reads but is not proof you hold \
+mapped read. It identifies the file across reads but is not proof you hold \
 it, and is never accepted as `known_hash`.
 
 A ranged read (`offset`/`limit`) instead returns a `coverage_token` recording \

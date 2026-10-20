@@ -90,11 +90,8 @@ _SCENARIOS: list[tuple[str, Any, type[BaseModel], _Setup]] = [
         ReadResponse,
         lambda d, f, c: {"path": str(f), "offset": 1, "limit": 1},
     ),
-    # A file over `max_size` comes back summarized: `truncated`, `hint`,
-    # `total_tokens` and a `partial:`-prefixed `file_hash` instead of a
-    # claimable `content_hash`.
     (
-        "read/summarized",
+        "read/mapped",
         read,
         ReadResponse,
         lambda d, f, c: {"path": str(d / "large.py"), "max_size": 1024},

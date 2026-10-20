@@ -456,11 +456,11 @@ class TestReadLargeFile:
     async def test_10k_line_file_no_timeout(self, cache: SemanticCache, large_py: Path) -> None:
         """10K+ line file should complete without timeout.
         NOTE: 10K-line file exceeds MAX_CONTENT_SIZE (100KB) so it gets
-        truncated via semantic summarization. This is expected behavior."""
+        truncated to a map. This is expected behavior."""
         start = time.monotonic()
         result = await smart_read(cache, str(large_py))
         elapsed = time.monotonic() - start
-        assert elapsed < 120.0  # macOS CI summarizes 134K tokens on first run; generous bound
+        assert elapsed < 120.0
         assert result.tokens_original > 0
         # Large file exceeds MAX_CONTENT_SIZE, so truncation is expected
         if result.truncated:

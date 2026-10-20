@@ -358,41 +358,19 @@ class TestContentStorageSearchHybrid:
 
 
 class TestFitContentToMaxSize:
-    """Smart_read large file path triggers summarization."""
+    """Smart_read large file path returns a map of the file."""
 
-    async def test_large_file_triggers_summarization(self, tmp_path: Path) -> None:
+    async def test_large_file_returns_map(self, tmp_path: Path) -> None:
         cache = _make_cache(tmp_path)
-        # Create file > MAX_CONTENT_SIZE (default 100K) to trigger summarization
         big_file = tmp_path / "big.txt"
-        # Use a small max_size to trigger summarization on smaller content
         content = "This is a meaningful sentence about software engineering.\n" * 500
         big_file.write_text(content)
 
-        with patch("semantic_cache_mcp.cache.read.summarize_semantic", return_value="summary"):
-            result = await smart_read(cache, str(big_file), max_size=100)
+        result = await smart_read(cache, str(big_file), max_size=100)
 
         assert result.truncated is True
-
-    async def test_large_file_summarization_exception_fallback(self, tmp_path: Path) -> None:
-        cache = _make_cache(tmp_path)
-        big_file = tmp_path / "big2.txt"
-        content = "Line of content.\n" * 500
-        big_file.write_text(content)
-
-        with (
-            patch(
-                "semantic_cache_mcp.cache.read.summarize_semantic",
-                side_effect=Exception("fail"),
-            ),
-            patch(
-                "semantic_cache_mcp.cache.read.truncate_semantic",
-                return_value="truncated",
-            ),
-        ):
-            result = await smart_read(cache, str(big_file), max_size=100)
-
-        assert result.truncated is True
-        assert result.content == "truncated"
+        assert result.total_lines == 500
+        assert result.content.startswith("// L1-20\n")
 
 
 class TestSmartReadEdgeCases:

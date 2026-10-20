@@ -183,7 +183,7 @@ async def test_truncated_read_then_reread_returns_content(ctx: MagicMock, tmp_pa
 
     d1 = _parse(await read(ctx, str(big), max_size=200))
     assert "content" in d1
-    assert len(d1["content"]) < len(body)  # summarized, not the whole file
+    assert len(d1["content"]) < len(body)
 
     d2 = _parse(await read(ctx, str(big), max_size=200))
     assert d2.get("unchanged") is not True

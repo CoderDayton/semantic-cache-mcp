@@ -42,6 +42,7 @@ class ReadResult:
     # callers surface it without an extra cache-entry lookup. None for
     # binary fallbacks.
     content_hash: ContentHash | None = None
+    total_lines: int | None = None
 
 
 @dataclass(slots=True)
