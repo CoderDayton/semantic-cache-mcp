@@ -15,8 +15,8 @@ The numbers below were captured on:
 | **Python** | 3.13 |
 | **Filesystem** | ext4 on NVMe SSD — **not tmpfs**, see below |
 | **Search** | BM25 keyword (FTS5), no embedding model |
-| **Corpus** | 41 source files, **212,499 tokens**, 250 documents |
-| **Version** | `0.5.3` |
+| **Corpus** | 44 source files, **228,943 tokens**, 263 documents |
+| **Version** | `0.6.0` + unreleased (`5276331`) |
 
 > **The filesystem is part of the measurement.** The suite works in a
 > `tempfile.TemporaryDirectory`, which follows `TMPDIR` — and on most Linux
@@ -24,7 +24,7 @@ The numbers below were captured on:
 > there reports a write latency the durable path never actually achieves. Since
 > 0.5.3 `awrite_atomic` flushes the file *and* its parent directory before the
 > rename, so the write path now costs a real disk round-trip and the difference
-> is no longer noise: **+1.1 ms per write, +1.1 ms per edit** on this machine.
+> is no longer noise: **+1.2 ms per write, +1.0 ms per edit** on this machine.
 > Every latency number on this page is from an ext4/NVMe run; the tmpfs column
 > in [Write + edit](#write--edit) is kept only to show what the durability
 > guarantee costs.
@@ -47,7 +47,7 @@ uv run python benchmarks/benchmark_token_savings.py --json tok.json
 
 ## Token Savings
 
-Each phase reads the same 41-file corpus through `smart_read` / `batch_smart_read` / `semantic_search` and reports tokens emitted vs. tokens that would have been read in the absence of the cache.
+Each phase reads the same 44-file corpus through `smart_read` / `batch_smart_read` / `semantic_search` and reports tokens emitted vs. tokens that would have been read in the absence of the cache.
 
 Every saving below is earned by a caller that echoes back the `content_hash` it was given (`known_hash` on `read`, `known_hashes` on `batch_read`). Since 0.5.2 that is a hard requirement, not an optimization: a caller that cannot prove it still holds a file is sent the file. The phases model an agent that keeps its hashes, which is the flow the numbers describe.
 
@@ -55,18 +55,18 @@ Since 0.5.3 a ranged read earns a `coverage_token` on the same terms, redeemable
 
 | # | Phase | Trigger | Tokens returned | Original | Savings |
 |---|-------|---------|----------------:|---------:|--------:|
-| 1 | Cold read | First read, no cache (baseline) | 200,039 | 212,499 | 5.9% |
-| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,535 | 212,499 | **99.3%** |
-| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,535 | 212,499 | **99.3%** |
-| 4 | Small edits (12/41 changed) | Real ~5% line changes on 30% of files | 3,999 | 212,829 | **98.1%** |
-| 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 2,929 | 114,682 | 97.4% |
-| 4b |  → unchanged files | Fast path | 1,070 | 98,147 | 98.9% |
-| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus, echoing the hashes phase 4 returned | 1,537 | 212,829 | **99.3%** |
-| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 1,753 | 129,550 | **98.6%** |
+| 1 | Cold read | First read, no cache (baseline) | 175,045 | 228,943 | 23.5% |
+| 2 | Unchanged re-read | mtime match, **fast path skips disk I/O** | 1,691 | 228,943 | **99.3%** |
+| 3 | Content hash | mtime drifted (e.g. `git checkout`), BLAKE3 still matches | 1,691 | 228,943 | **99.3%** |
+| 4 | Small edits (13/44 changed) | Real ~5% line changes on 30% of files | 4,211 | 229,172 | **98.2%** |
+| 4a |  → changed files only | Returned as unified diff (bare hunks, no file headers) | 3,022 | 85,437 | 96.5% |
+| 4b |  → unchanged files | Fast path | 1,189 | 143,735 | 99.2% |
+| 5 | Batch read (200K budget) | `batch_smart_read` over the whole corpus, echoing the hashes phase 4 returned | 1,692 | 229,172 | **99.3%** |
+| 6 | Search previews | 5 keyword queries × k=5, previews vs. full reads | 1,806 | 130,075 | **98.6%** |
 
 **Aggregate (phases 2 to 6): 98.9% token reduction.**
 
-Phase 1 is the no-cache baseline. It returns 23.7% fewer tokens than the corpus
+Phase 1 is the no-cache baseline. It returns 23.5% fewer tokens than the corpus
 holds because one file (`server/tools/__init__.py`) exceeds `MAX_CONTENT_SIZE`
 and comes back as its outline — a first read of an oversized file is not a
 cache saving, and should not be read as one. That one file is outlined on every
@@ -94,16 +94,16 @@ The CI test [`tests/test_benchmark_token_savings.py`](../tests/test_benchmark_to
 
 ## Latency
 
-All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw output. Cold-read totals include disk I/O and tokenisation for the entire corpus. Every phase, including search and grep, runs against the same fixed 41-file corpus, so scan latency does not grow with the benchmark's iteration count.
+All numbers are p50 unless otherwise noted; p95/p99 are reported in the raw output. Cold-read totals include disk I/O and tokenisation for the entire corpus. Every phase, including search and grep, runs against the same fixed 44-file corpus, so scan latency does not grow with the benchmark's iteration count.
 
 ### Cache read
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Single unchanged read (fast path) | **1.1 ms** | 1.1 ms | mtime check + cache hit; **no disk I/O** |
-| Single diff read (changed file) | 0.7 ms | 0.9 ms | Hash check + unified diff |
-| Unchanged re-read (41 files) | 19.5 ms | 22.7 ms | Whole-corpus pass |
-| Cold read (41 files, total) | n/a | n/a | 100 ms for a single unrepeated pass (~2.4 ms/file), including outlining the one file over `MAX_CONTENT_SIZE` |
+| Single unchanged read (fast path) | **1.3 ms** | 3.6 ms | mtime check + cache hit; **no disk I/O** |
+| Single diff read (changed file) | 0.8 ms | 1.6 ms | Hash check + unified diff |
+| Unchanged re-read (44 files) | 25.9 ms | 28.5 ms | Whole-corpus pass |
+| Cold read (44 files, total) | n/a | n/a | 106 ms for a single unrepeated pass (~2.4 ms/file), including outlining the one file over `MAX_CONTENT_SIZE` |
 
 The cold-read total is one pass, not a distribution — it is the only row here
 with n=1, and it moves ±20% between runs. Treat it as an order of magnitude.
@@ -112,7 +112,7 @@ with n=1, and it moves ±20% between runs. Treat it as an order of magnitude.
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| `batch_read` (41 files, diff mode) | 45.6 ms | 49.7 ms |
+| `batch_read` (44 files, diff mode) | 43.5 ms | 44.7 ms |
 
 ### Write + edit
 
@@ -123,8 +123,8 @@ bytes it points at.
 
 | Operation | p50 (ext4/NVMe) | p95 (ext4/NVMe) | p50 (tmpfs) | Cost of durability |
 |-----------|----:|----:|----:|----:|
-| Write (200-line file) | **2.7 ms** | 2.8 ms | 1.6 ms | +1.07 ms |
-| Edit (scoped find/replace) | **3.1 ms** | 3.2 ms | 2.0 ms | +1.12 ms |
+| Write (200-line file) | **3.0 ms** | 6.0 ms | 1.8 ms | +1.22 ms |
+| Edit (scoped find/replace) | **3.1 ms** | 3.3 ms | 2.1 ms | +1.03 ms |
 
 Two `fsync` calls per write is the price of the atomic-write guarantee, and it
 is charged once per mutation regardless of file size. It is not tunable: a
@@ -135,26 +135,26 @@ power cut while the cache still reports it as committed.
 
 | Operation | p50 (ext4/NVMe) | p95 (ext4/NVMe) | p50 (tmpfs) |
 |-----------|----:|----:|----:|
-| Chunked write (72 KB, ~25 chunks) | 3.9 ms | 7.4 ms | 3.0 ms |
-| Chunked write (360 KB, ~125 chunks) | 11.3 ms | 19.5 ms | 8.8 ms |
+| Chunked write (72 KB, ~25 chunks) | 4.1 ms | 8.1 ms | 3.2 ms |
+| Chunked write (360 KB, ~125 chunks) | 13.0 ms | 16.7 ms | 9.7 ms |
 | Chunked re-read (72 KB, record_access fan-out) | 0.9 ms | 0.9 ms | 0.9 ms |
 
 ### Search
 
 | Operation | p50 | p95 | Notes |
 |-----------|----:|----:|-------|
-| Search k=5 (cache **miss**) | 1.4 ms | n/a | BM25 keyword search (FTS5) |
+| Search k=5 (cache **miss**) | 1.5 ms | n/a | BM25 keyword search (FTS5) |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | < 0.01 ms | In-session result LRU |
 | Search k=10 (cache hit) | < 0.01 ms | < 0.01 ms | |
 
-The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm 0.007 ms vs. cold 6.8 ms over 5 queries — about 960× faster).
+The in-session search cache delivers a **hundreds-fold speedup** on repeated queries (warm 0.010 ms vs. cold 7.6 ms over 5 queries — about 770× faster).
 
 ### Grep
 
 | Operation | p50 | p95 |
 |-----------|----:|----:|
-| Literal (`def `) | 1.5 ms | 1.7 ms |
-| Regex (`class\s+\w+`) | 3.4 ms | 3.5 ms |
+| Literal (`def `) | 1.6 ms | 2.4 ms |
+| Regex (`class\s+\w+`) | 3.8 ms | 4.0 ms |
 
 Since 0.5.3 a pattern whose shape can backtrack catastrophically (a repeatable
 group wrapping an unbounded quantifier, e.g. `(a+)+$`) is rejected before
@@ -168,14 +168,14 @@ group wrapping an unbounded quantifier, e.g. `(a+)+$`) is rejected before
 | Payload | p50 | p95 |
 |---------|----:|----:|
 | Small (single match, 25K cap) | < 0.01 ms | < 0.01 ms |
-| Large (40 files × 5 matches) | 0.02 ms | 0.03 ms |
+| Large (40 files × 5 matches) | 0.02 ms | 0.02 ms |
 
 ### Tokenizer
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Tokeniser (~108 KB) | 0.19 ms | Warm BPE encode |
-| Tokeniser (~494 KB, all files) | 0.21 ms | Merge cache amortises full sweeps |
+| Tokeniser (~127 KB) | 0.19 ms | Warm BPE encode |
+| Tokeniser (~519 KB, all files) | 0.22 ms | Merge cache amortises full sweeps |
 
 ---
 
