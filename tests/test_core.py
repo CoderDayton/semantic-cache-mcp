@@ -14,11 +14,9 @@ from semantic_cache_mcp.core.hashing import (
     keyed_hash,
 )
 from semantic_cache_mcp.core.text import (
-    diff_stats,
     diff_with_stats,
     generate_diff,
     rebase_diff_hunks,
-    truncate_smart,
 )
 
 
@@ -265,9 +263,31 @@ class TestDiffWithStats:
 
     @pytest.mark.parametrize("label,old,new", CASES, ids=[c[0] for c in CASES])
     def test_matches_separate_calls(self, label: str, old: str, new: str) -> None:
-        diff, stats = diff_with_stats(old, new)
+        diff, _ = diff_with_stats(old, new)
         assert diff == generate_diff(old, new)
-        assert stats == diff_stats(old, new)
+
+    def test_stats_for_an_equal_length_replace(self) -> None:
+        _, stats = diff_with_stats("a\nb\nc\n", "a\nB\nc\n")
+        assert stats == {
+            "insertions": 0,
+            "deletions": 0,
+            "modifications": 1,
+            "delta_size_bytes": 34,
+            "original_size": 6,
+            "compression_ratio": 34 / 6,
+        }
+
+    def test_stats_for_an_insert(self) -> None:
+        _, stats = diff_with_stats("a\nb\n", "a\nx\nb\n")
+        assert stats["insertions"] == 1
+        assert stats["deletions"] == 0
+        assert stats["modifications"] == 0
+        assert stats["delta_size_bytes"] == 34
+
+    def test_stats_from_empty_has_zero_ratio(self) -> None:
+        _, stats = diff_with_stats("", "something\n")
+        assert stats["original_size"] == 0
+        assert stats["compression_ratio"] == 0
 
     @pytest.mark.parametrize("context", [0, 1, 2, 3])
     def test_matches_at_all_context_widths(self, context: int) -> None:
@@ -277,40 +297,35 @@ class TestDiffWithStats:
         assert diff == generate_diff(old, new, context_lines=context)
 
 
-class TestSmartTruncation:
-    """Tests for smart truncation."""
+class TestMissingTrailingNewline:
+    """A last line without ``\\n`` must not run into the next diff line."""
 
-    def test_small_content_unchanged(self) -> None:
-        """Small content should not be truncated."""
-        content = "Short content\n"
-        result = truncate_smart(content, max_size=1000)
-        assert result == content
+    MARK = "\\ No newline at end of file\n"
 
-    def test_large_content_truncated(self) -> None:
-        """Large content should be truncated."""
-        lines = [f"Line {i}\n" for i in range(200)]
-        content = "".join(lines)
-        result = truncate_smart(content, max_size=500)
-        assert len(result) <= 500
-        assert "truncated" in result.lower() or "TRUNCATED" in result
+    @pytest.mark.parametrize("fn", ["generate_diff", "diff_with_stats"])
+    def test_changed_last_line_on_both_sides(self, fn: str) -> None:
+        diff = _diff(fn, "x = 1", "x = 2")
+        assert diff == f"@@ -1 +1 @@\n-x = 1\n{self.MARK}+x = 2\n{self.MARK}"
 
-    def test_preserves_top_lines(self) -> None:
-        """Truncation should preserve top lines."""
-        lines = [f"Line {i}\n" for i in range(200)]
-        content = "".join(lines)
-        result = truncate_smart(content, max_size=2000, keep_top=10)
-        assert "Line 0" in result
-        assert "Line 9" in result
+    @pytest.mark.parametrize("fn", ["generate_diff", "diff_with_stats"])
+    def test_newline_added_after_the_old_last_line(self, fn: str) -> None:
+        diff = _diff(fn, "a\nb", "a\nb\nc")
+        assert diff == f"@@ -1,2 +1,3 @@\n a\n-b\n{self.MARK}+b\n+c\n{self.MARK}"
 
-    def test_preserves_bottom_lines(self) -> None:
-        """Truncation should preserve bottom lines."""
-        lines = [f"Line {i}\n" for i in range(200)]
-        content = "".join(lines)
-        result = truncate_smart(content, max_size=2000, keep_top=10, keep_bottom=10)
-        assert "Line 199" in result
-        assert "Line 190" in result
+    @pytest.mark.parametrize("fn", ["generate_diff", "diff_with_stats"])
+    def test_unchanged_last_line_as_context(self, fn: str) -> None:
+        diff = _diff(fn, "a\nb", "x\nb")
+        assert diff == f"@@ -1,2 +1,2 @@\n-a\n+x\n b\n{self.MARK}"
 
-    def test_empty_content(self) -> None:
-        """Empty content should return empty."""
-        result = truncate_smart("", max_size=1000)
-        assert result == ""
+    @pytest.mark.parametrize("fn", ["generate_diff", "diff_with_stats"])
+    def test_every_line_has_a_diff_prefix(self, fn: str) -> None:
+        diff = _diff(fn, "one\ntwo", "one\nTWO\nthree")
+        for line in diff.splitlines():
+            assert line[:1] in {" ", "+", "-", "@", "\\"}, f"bad diff line {line!r}"
+        assert diff.endswith("\n")
+
+
+def _diff(fn: str, old: str, new: str) -> str:
+    if fn == "generate_diff":
+        return generate_diff(old, new)
+    return diff_with_stats(old, new)[0]

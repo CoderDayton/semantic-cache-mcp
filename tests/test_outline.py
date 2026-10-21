@@ -8,6 +8,8 @@ the outline saved.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from semantic_cache_mcp.core.text import Outline, extract_outline, render_outline
@@ -114,6 +116,12 @@ class TestOtherLanguages:
             ("a.rs", "impl Widget {\n}\n", "impl Widget"),
             ("a.sh", "deploy() {\n  echo hi\n}\n", "deploy"),
             ("a.md", "# Title\n\nbody\n", "# Title"),
+            ("a.ts", "export class Foo {\n}\n", "class Foo"),
+            ("a.ts", "export default class Bar {\n}\n", "class Bar"),
+            ("a.ts", "export abstract class Base {\n}\n", "class Base"),
+            ("a.ts", "abstract class Shape {\n}\n", "class Shape"),
+            ("a.luau", "local function helper(a)\nend\n", "local function helper"),
+            ("a.lua", "local function f()\nend\n", "local function f"),
         ],
     )
     def test_recognizes_common_definition_forms(
@@ -123,6 +131,42 @@ class TestOtherLanguages:
         assert any(expected in e.text for e in outline.entries), (
             f"{filename}: {expected!r} missing from {[e.text for e in outline.entries]}"
         )
+
+    TS_CLASS = (
+        "export class Store {\n"
+        "  constructor(private db: Db) {}\n"
+        "  async load(id: string): Promise<void> {\n"
+        "  }\n"
+        "  static create() {\n"
+        "  }\n"
+        "  get size(): number {\n"
+        "  }\n"
+        "  run<T>(x: T): T {\n"
+        "    if (x) {\n"
+        "    }\n"
+        "    for (const a of b) {\n"
+        "    }\n"
+        "    while (x) {\n"
+        "    }\n"
+        "    switch (x) {\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def test_class_methods_are_symbols(self) -> None:
+        texts = [e.text.strip() for e in extract_outline(self.TS_CLASS, filename="a.ts").entries]
+        for expected in ("constructor(", "async load(", "static create(", "get size(", "run<T>("):
+            assert any(t.startswith(expected) for t in texts), f"{expected!r} missing: {texts}"
+
+    def test_control_flow_is_not_a_method(self) -> None:
+        texts = [e.text.strip() for e in extract_outline(self.TS_CLASS, filename="a.ts").entries]
+        for keyword in ("if ", "for ", "while ", "switch "):
+            assert not any(t.startswith(keyword) for t in texts), f"{keyword!r} listed: {texts}"
+
+    def test_call_with_a_callback_is_not_a_method(self) -> None:
+        source = "it('works', function () {\n});\ndescribe(\"x\", () => {\n});\n"
+        assert extract_outline(source, filename="a.test.js").entries == ()
 
 
 class TestCommentsAreNotSymbols:
@@ -141,6 +185,22 @@ class TestCommentsAreNotSymbols:
     def test_hash_heading_is_a_symbol_only_in_markdown(self) -> None:
         assert extract_outline("# Title\n", filename="notes.md").entries
         assert not extract_outline("# Title\n", filename="mod.py").entries
+
+    @pytest.mark.parametrize("fence", ["```", "~~~"])
+    def test_markdown_code_fences_hold_no_symbols(self, fence: str) -> None:
+        source = (
+            "# Title\n\n"
+            f"{fence}bash\n# install\nnpm i\n{fence}\n\n"
+            f"{fence}python\ndef ghost():\n    pass\n{fence}\n\n"
+            "## Next\n"
+        )
+        texts = [e.text for e in extract_outline(source, filename="README.md").entries]
+        assert texts == ["# Title", "## Next"]
+
+    def test_markdown_fence_closes_only_on_its_own_marker(self) -> None:
+        source = "```\n~~~\n# not a heading\n```\n# Real\n"
+        texts = [e.text for e in extract_outline(source, filename="a.md").entries]
+        assert texts == ["# Real"]
 
 
 class TestDegenerateInput:
@@ -231,6 +291,12 @@ class TestPathological:
         source = "def f(" + "a" * 200_000 + "):\n    pass\n"
         outline = extract_outline(source, filename="mod.py")
         assert outline.entries[0].line == 1
+
+    def test_overlapping_repeats_on_a_long_line_stay_fast(self) -> None:
+        source = "public" + " " * 200_000 + "a" * 200_000 + "\n"
+        started = time.perf_counter()
+        extract_outline(source, filename="A.java")
+        assert time.perf_counter() - started < 1.0
 
     def test_deeply_nested_parens_are_bounded(self) -> None:
         source = "def f(" + "(" * 5000 + "\n" * 10

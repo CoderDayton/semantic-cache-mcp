@@ -218,18 +218,6 @@ from semantic_cache_mcp.core import large_file_map
 file_map = large_file_map(large_file_content, filename="module.py")
 ```
 
-### Delta Compression
-
-```python
-from semantic_cache_mcp.core import compute_delta, apply_delta
-
-delta = compute_delta(old_content, new_content)
-# For a 15KB file with 5 changed lines: ~245 bytes (98% compression)
-
-recovered = apply_delta(old_content, delta)
-assert recovered == new_content
-```
-
 ---
 
 ## Direct Cache Operations

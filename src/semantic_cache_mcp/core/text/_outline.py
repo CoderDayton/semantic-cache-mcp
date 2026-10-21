@@ -33,6 +33,8 @@ _MAX_ENTRY_CHARS = 400
 # trusting the caller to have bounded it.
 _MAX_SCAN_LINES = 500_000
 
+_MATCH_CHARS = 1000
+
 _DEFAULT_MAX_ENTRIES = 2000
 
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown", ".mdx"})
@@ -42,14 +44,12 @@ _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown", ".mdx"})
 # Markdown, so it is decided per filename in `_is_comment`.
 _COMMENT_PREFIXES = ("//", "/*", "*/", "--", "<!--", ";;")
 
-# One anchored pattern per definition form. Every quantifier is bounded: these
-# run against attacker-shaped input (any file the caller names), and an
-# unbounded repeat inside a group is how a scan becomes a hang.
 _PATTERNS: tuple[str, ...] = (
     # Python / Ruby / generic
     r"(?:async\s+)?def\s+\w+",
-    r"class\s+\w+",
+    r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+\w+",
     r"module\s+\w+",
+    r"local\s+function\s+\w+",
     # JavaScript / TypeScript
     r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b",
     r"(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(?:interface|enum|namespace)\s+\w+",
@@ -66,12 +66,16 @@ _PATTERNS: tuple[str, ...] = (
     r"(?:public|private|protected|internal)\s+[\w<>\[\],.\s]{0,80}\w+\s*\(",
     # Shell function
     r"\w+\s*\(\s*\)\s*\{",
+    r"(?!(?:if|for|foreach|while|switch|catch|with|return|function|else|do|lock|using|fixed"
+    r"|synchronized)\b)(?:(?:static|async|get|set|override|readonly)\s+){0,3}\*?\w+\s*"
+    r"(?:<[^>]{0,80}>)?\s*\([^)'\"`]{0,120}\)\s*(?::[^{;=]{0,80})?\{",
     # Clojure / Elixir
     r"(?:defn?|defmodule|defmacro|defp)\s+\S",
 )
 
 _SIGNATURE_RE = re.compile("|".join(f"(?:{p})" for p in _PATTERNS))
 _MARKDOWN_HEADING_RE = re.compile(r"#{1,6}\s+\S")
+_FENCE_RE = re.compile(r"```|~~~")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,17 +166,27 @@ def _scan(content: str, *, markdown: bool) -> tuple[list[OutlineEntry], int]:
     lines = content.splitlines()
     total_lines = len(lines)
     entries: list[OutlineEntry] = []
+    fence: str | None = None
 
     for index, line in enumerate(lines[:_MAX_SCAN_LINES]):
         stripped = line.strip()
         if not stripped:
             continue
+        if markdown:
+            marker = _FENCE_RE.match(stripped)
+            if fence is None and marker:
+                fence = marker.group(0)[0]
+                continue
+            if fence is not None:
+                if marker and marker.group(0)[0] == fence:
+                    fence = None
+                continue
         if _is_comment(stripped, markdown=markdown):
             continue
         if markdown and _MARKDOWN_HEADING_RE.match(stripped):
             entries.append(OutlineEntry(line=index + 1, text=stripped, depth=0))
             continue
-        if _SIGNATURE_RE.match(stripped):
+        if _SIGNATURE_RE.match(stripped[:_MATCH_CHARS]):
             entries.append(_build_entry(lines, index))
 
     return entries, total_lines

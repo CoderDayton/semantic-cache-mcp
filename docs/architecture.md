@@ -28,7 +28,7 @@ src/semantic_cache_mcp/
 │   ├── hashing/            # BLAKE3/BLAKE2b content hashing and keyed MACs
 │   ├── text/               # Diff generation and structural outline
 │   │   ├── __init__.py
-│   │   ├── _diff.py        # generate_diff, diff_with_stats, compute_delta, diff_stats
+│   │   ├── _diff.py        # generate_diff, diff_with_stats, rebase_diff_hunks
 │   │   └── _outline.py     # extract_outline, render_outline, large_file_map
 │   └── tokenizer/          # BPE token counting (o200k_base)
 └── storage/                # Persistence layer
@@ -161,12 +161,12 @@ GPT-4o compatible (o200k_base) BPE tokenizer.
 
 ### Text (`core/text/`)
 
-#### `_diff.py`: Diff and Delta Compression
+#### `_diff.py`: Unified Diffs
 
-- Unified diffs via Python `difflib` with diff statistics (insertions, deletions, modifications)
-- `diff_with_stats()`: computes the unified diff and its statistics from a single line-matcher pass, shared by the write/edit/batch-edit and compare paths that need both (the output matches calling `generate_diff` and `diff_stats` separately)
+- Unified diffs via Python `difflib`, without the `---`/`+++` file headers. A last line with no line terminator is followed by `\ No newline at end of file`, as in `git diff`
+- `diff_with_stats()`: computes the unified diff and its statistics (insertions, deletions, modifications) from a single line-matcher pass, shared by the write/edit/batch-edit and compare paths that need both. Its diff text matches `generate_diff`
+- `rebase_diff_hunks()`: shifts a slice's hunk headers onto whole-file line numbers
 - Adaptive context width: files under 100 lines use 2 lines of diff context instead of 3, where the extra line is a large share of a small payload; larger files keep 3
-- Delta compression: store only changed lines (10 to 100x smaller for small edits to large files)
 - `_suppress_large_diff()` (in `cache/_helpers.py`): caps diff output at a token budget to prevent context overflow. A middle tier keeps the per-hunk `@@` headers (which regions changed and by how much) when a diff is over budget but has few hunks, so the caller can fetch specifics with a ranged `read`; beyond a hunk cap it falls back to a bare count summary
 
 #### `_outline.py`: Outline and Large-File Map

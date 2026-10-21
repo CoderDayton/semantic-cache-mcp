@@ -1,211 +1,18 @@
-"""Delta compression, semantic truncation, and diff utilities."""
+"""Unified diffs and diff statistics."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from difflib import SequenceMatcher, unified_diff
-from itertools import chain
 
-# ---------------------------------------------------------------------------
-# Delta compression
-# ---------------------------------------------------------------------------
+_NO_NEWLINE_MARK = "\\ No newline at end of file\n"
 
 
-@dataclass
-class DiffDelta:
-    """Compact diff for files that change minimally (10-100x smaller than storing both texts)."""
-
-    old_hash: str  # Hash of original text
-    new_hash: str  # Hash of updated text
-    insertions: list[tuple[int, str]]  # (line_number, content)
-    deletions: list[tuple[int, str]]  # (line_number, content)
-    modifications: list[tuple[int, str, str]]  # (line_number, old, new)
-    size_bytes: int  # Compressed size in bytes
-
-
-def compute_delta(old: str, new: str) -> DiffDelta:
-    from ..hashing import hash_content  # noqa: PLC0415
-
-    old_lines = old.splitlines(keepends=True)
-    new_lines = new.splitlines(keepends=True)
-
-    # Truncate to 16 chars for compact storage — still collision-free at this scale
-    old_hash = hash_content(old)[:16]
-    new_hash = hash_content(new)[:16]
-
-    sm = SequenceMatcher(None, old_lines, new_lines)
-    opcodes = sm.get_opcodes()
-
-    insertions = []
-    deletions = []
-    modifications = []
-
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "replace":
-            # Could be modification or deletion+insertion
-            if i2 - i1 == j2 - j1:
-                # Line-by-line modification
-                for i, j in zip(range(i1, i2), range(j1, j2), strict=True):
-                    modifications.append((i, old_lines[i].rstrip(), new_lines[j].rstrip()))
-            else:
-                # Treat as deletion + insertion
-                for i in range(i1, i2):
-                    deletions.append((i, old_lines[i]))
-                for j in range(j1, j2):
-                    insertions.append((j, new_lines[j]))
-        elif tag == "delete":
-            for i in range(i1, i2):
-                deletions.append((i, old_lines[i]))
-        elif tag == "insert":
-            for j in range(j1, j2):
-                insertions.append((j, new_lines[j]))
-
-    # Estimate compressed size
-    size_bytes = len(old_hash) + len(new_hash)
-    size_bytes += sum(len(s) for _, s in chain(insertions, deletions))
-    for _, old_s, new_s in modifications:
-        size_bytes += len(old_s) + len(new_s)
-
-    return DiffDelta(
-        old_hash=old_hash,
-        new_hash=new_hash,
-        insertions=insertions,
-        deletions=deletions,
-        modifications=modifications,
-        size_bytes=size_bytes,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Semantic-aware truncation
-# ---------------------------------------------------------------------------
-
-# Regex patterns for semantic boundaries (Python/TypeScript/Go)
-_SEMANTIC_PATTERNS = {
-    "python": [
-        r"^\s*class\s+\w+",
-        r"^\s*def\s+\w+",
-        r"^\s*@\w+",
-        r"^\s*if\s+__name__",
-    ],
-    "typescript": [
-        r"^\s*(export\s+)?(class|interface|type|function)",
-        r"^\s*(export\s+)?const\s+\w+",
-        r"^\s*async\s+function",
-    ],
-    "go": [
-        r"^\s*type\s+\w+",
-        r"^\s*func\s+(\(.*?\)\s+)?\w+",
-        r"^\s*func\s+init",
-    ],
-}
-
-
-def _detect_language(content: str) -> str:
-    if "import " in content and "def " in content:
-        return "python"
-    elif "interface" in content or "export" in content:
-        return "typescript"
-    elif "func " in content and "package " in content:
-        return "go"
-    return "generic"
-
-
-def _find_semantic_boundaries(lines: list[str], language: str) -> list[int]:
-    patterns = _SEMANTIC_PATTERNS.get(language, [])
-    if not patterns:
-        return []
-
-    boundaries = [0]  # Always include start
-    combined_pattern = "|".join(f"({p})" for p in patterns)
-    regex = re.compile(combined_pattern)
-
-    for i, line in enumerate(lines):
-        if regex.match(line):
-            boundaries.append(i)
-
-    boundaries.append(len(lines))  # Always include end
-    return sorted(set(boundaries))
-
-
-def truncate_semantic(
-    content: str,
-    max_size: int,
-    keep_top: int = 10,
-    keep_bottom: int = 5,
-) -> str:
-    """Truncate at semantic boundaries (class/function defs) rather than arbitrary line numbers."""
-    if len(content) <= max_size:
-        return content
-
-    lines = content.splitlines(keepends=True)
-    n_lines = len(lines)
-
-    if n_lines <= keep_top + keep_bottom:
-        return content[: max_size - 20] + "\n// [TRUNCATED]"
-
-    language = _detect_language(content)
-    boundaries = _find_semantic_boundaries(lines, language)
-
-    # Find best cut point in top section
-    top_cutoff = keep_top
-    for b in boundaries:
-        if b <= keep_top:
-            top_cutoff = b
-        else:
-            break
-
-    # Find best cut point in bottom section
-    bottom_start = n_lines - keep_bottom
-    bottom_cutoff = bottom_start
-    for b in reversed(boundaries):
-        if b >= bottom_start:
-            bottom_cutoff = b
-        else:
-            break
-
-    top_content = "".join(lines[:top_cutoff])
-    bottom_content = "".join(lines[bottom_cutoff:]) if bottom_cutoff < n_lines else ""
-    truncation_msg = (
-        f"\n\n// ... [{n_lines - top_cutoff - (n_lines - bottom_cutoff)} lines truncated] ...\n\n"
-    )
-
-    total = len(top_content) + len(truncation_msg) + len(bottom_content)
-    if total > max_size:
-        return content[: max_size - 20] + "\n// [TRUNCATED]"
-
-    return f"{top_content}{truncation_msg}{bottom_content}"
-
-
-def truncate_smart(
-    content: str,
-    max_size: int,
-    keep_top: int = 80,
-    keep_bottom: int = 40,
-    use_semantic: bool = True,
-) -> str:
-    if use_semantic:
-        return truncate_semantic(content, max_size, keep_top, keep_bottom)
-
-    if len(content) <= max_size:
-        return content
-
-    lines = content.splitlines(keepends=True)
-    n_lines = len(lines)
-
-    if n_lines <= keep_top + keep_bottom:
-        return content[: max_size - 20] + "\n// [TRUNCATED]"
-
-    top_content = "".join(lines[:keep_top])
-    bottom_content = "".join(lines[-keep_bottom:]) if keep_bottom > 0 else ""
-    truncation_msg = f"\n\n// ... [{n_lines - keep_top - keep_bottom} lines truncated] ...\n\n"
-
-    total = len(top_content) + len(truncation_msg) + len(bottom_content)
-    if total > max_size:
-        return content[: max_size - 20] + "\n// [TRUNCATED]"
-
-    return f"{top_content}{truncation_msg}{bottom_content}"
+def _terminate(line: str) -> str:
+    """Return a diff line ending in a line break, adding the marker if it had none."""
+    if line.splitlines()[0] == line:
+        return line + "\n" + _NO_NEWLINE_MARK
+    return line
 
 
 def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
@@ -219,7 +26,7 @@ def generate_diff(old: str, new: str, context_lines: int = 3) -> str:
     # numbers, so the headers are pure token overhead on every diff.
     if len(diff) >= 2 and diff[0].startswith("--- ") and diff[1].startswith("+++ "):
         diff = diff[2:]
-    result = "".join(diff)
+    result = "".join(_terminate(line) for line in diff)
     return result if result else "// No changes"
 
 
@@ -248,11 +55,6 @@ def rebase_diff_hunks(diff: str, line_offset: int) -> str:
     return _HUNK_HEADER_RE.sub(_shift, diff)
 
 
-# ---------------------------------------------------------------------------
-# Utility: diff statistics
-# ---------------------------------------------------------------------------
-
-
 def _format_range_unified(start: int, stop: int) -> str:
     """Format a unified-diff hunk range (mirrors difflib's private helper)."""
     beginning = start + 1
@@ -264,19 +66,23 @@ def _format_range_unified(start: int, stop: int) -> str:
     return f"{beginning},{length}"
 
 
-def diff_with_stats(old: str, new: str, context_lines: int = 3) -> tuple[str, dict]:
-    """Compute ``generate_diff()`` and ``diff_stats()`` in one matcher pass.
+_DELTA_HEADER_BYTES = 32
 
-    Call sites that need both previously ran the (quadratic) SequenceMatcher
-    twice over the same inputs; this shares the memoized opcodes. Output is
-    identical to calling the two functions separately.
+
+def diff_with_stats(old: str, new: str, context_lines: int = 3) -> tuple[str, dict]:
+    """Return ``generate_diff()``'s text and change statistics from one matcher pass.
+
+    The diff text is identical to ``generate_diff(old, new, context_lines)``.
+    Stats count changed lines: an equal-length replace is ``modifications``,
+    any other change is ``insertions``/``deletions``. ``delta_size_bytes`` is
+    the changed text's size plus a fixed header; ``compression_ratio`` is that
+    over ``original_size``, or 0 when ``old`` is empty.
     """
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
 
     sm = SequenceMatcher(None, old_lines, new_lines)
 
-    # Stats: the same accounting as compute_delta, counts and sizes only.
     insertions = deletions = modifications = 0
     content_bytes = 0
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -297,9 +103,7 @@ def diff_with_stats(old: str, new: str, context_lines: int = 3) -> tuple[str, di
             insertions += j2 - j1
             content_bytes += sum(len(s) for s in new_lines[j1:j2])
 
-    # compute_delta counts two 16-char truncated hashes into size_bytes;
-    # keep the same constant so the stats match diff_stats() exactly.
-    size_bytes = 32 + content_bytes
+    size_bytes = _DELTA_HEADER_BYTES + content_bytes
     original_size = len(old.encode()) if old else 0
     stats = {
         "insertions": insertions,
@@ -321,26 +125,12 @@ def diff_with_stats(old: str, new: str, context_lines: int = 3) -> tuple[str, di
         parts.append(f"@@ -{range1} +{range2} @@\n")
         for gtag, gi1, gi2, gj1, gj2 in group:
             if gtag == "equal":
-                parts.extend(" " + line for line in old_lines[gi1:gi2])
+                parts.extend(_terminate(" " + line) for line in old_lines[gi1:gi2])
                 continue
             if gtag in ("replace", "delete"):
-                parts.extend("-" + line for line in old_lines[gi1:gi2])
+                parts.extend(_terminate("-" + line) for line in old_lines[gi1:gi2])
             if gtag in ("replace", "insert"):
-                parts.extend("+" + line for line in new_lines[gj1:gj2])
+                parts.extend(_terminate("+" + line) for line in new_lines[gj1:gj2])
     diff_text = "".join(parts)
 
     return (diff_text if diff_text else "// No changes", stats)
-
-
-def diff_stats(old: str, new: str) -> dict:
-    delta = compute_delta(old, new)
-    original_size = len(old.encode()) if old else 0
-
-    return {
-        "insertions": len(delta.insertions),
-        "deletions": len(delta.deletions),
-        "modifications": len(delta.modifications),
-        "delta_size_bytes": delta.size_bytes,
-        "original_size": original_size,
-        "compression_ratio": delta.size_bytes / original_size if original_size else 0,
-    }
