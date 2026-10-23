@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -61,8 +62,11 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
         p.write_text(payload + f"file={i}\n")
         paths.append(str(p))
 
+    runtime_dir = Path(tempfile.mkdtemp(prefix="scmcp-", dir="/tmp"))
     env = os.environ.copy()
     env["SEMANTIC_CACHE_DIR"] = str(runtime_cache)
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    env["SCMCP_IDLE_TIMEOUT"] = "1"
     env["TOOL_TIMEOUT"] = "0.2"
     env["TOOL_OUTPUT_MODE"] = "debug"
     env["LOG_LEVEL"] = "WARNING"
@@ -89,6 +93,7 @@ async def test_stdio_timeout_returns_error_and_next_call_succeeds(tmp_path: Path
                 {"paths": json.dumps(paths), "max_total_tokens": 200_000},
             )
         second = await client.call_tool("stats", {}, raise_on_error=False)
+    shutil.rmtree(runtime_dir, ignore_errors=True)
 
     first_body = _flatten_tool_result(first)
     second_body = _flatten_tool_result(second)

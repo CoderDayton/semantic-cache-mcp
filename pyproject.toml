@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-semantic-cache-mcp = "semantic_cache_mcp.server:main"
+semantic-cache-mcp = "semantic_cache_mcp.launcher:main"
 
 [build-system]
 requires = ["hatchling"]

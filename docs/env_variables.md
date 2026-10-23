@@ -44,6 +44,17 @@ actually consumes structured output.
 | `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. It duplicates the text block byte for byte (measured at 8.8k + 8.9k tokens for one 584-line file), and clients disagree about which they forward, so a client that forwards both charges the model twice for every file. Accepts `1/true/yes/on` and `0/false/no/off`; anything else logs a warning and keeps the default. |
 | `SCMCP_PUBLISH_OUTPUT_SCHEMA` | `false` | Advertise per-tool output schemas in `tools/list`. They were 11.5k of this server's 19.8k advertised tokens, and the Anthropic Messages API has no field to receive them. The Pydantic response models stay either way — they remain the declared contract, enforced by `tests/test_response_contract.py`. Turning this on forces `SCMCP_STRUCTURED_CONTENT` on as well, because MCP requires structured content from any tool that declares a schema; the server logs a warning when it does so. |
 
+## Shared Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCMCP_SHARED_SERVER` | `true` | The command relays to one shared daemon per user and configuration, starting it when needed. `0/false/no/off` serves in-process, one server per client. See [architecture.md](architecture.md#process-model). |
+| `SCMCP_SHARED_TRANSPORT` | `unix` | `unix`: a Unix socket in a `0700` directory. `tcp`: a random loopback port, with a token from a `0600` port file required on every connection. Windows always uses `tcp`; any other value means `unix`. |
+| `SCMCP_IDLE_TIMEOUT` | `600` | Seconds a shared daemon stays up with no client connected. A malformed value keeps the default. |
+| `XDG_RUNTIME_DIR` | *(system temp dir)* | POSIX: parent of the private `semantic-cache-mcp-<uid>/` directory holding daemon endpoints. Windows uses `%LOCALAPPDATA%\semantic-cache-mcp\run\`. |
+
+Changing any configuration variable, `PATH`, `HOME`, `USERPROFILE`, or any `SCMCP_` variable gives a client its own daemon, so a setting never leaks between clients.
+
 ## Example: MCP Server Config with Custom Env
 
 ```json

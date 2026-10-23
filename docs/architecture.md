@@ -193,6 +193,18 @@ The output is deterministic, delivers no file body, and every line number is a v
 
 ---
 
+## Process Model
+
+The console command (`launcher.py`) imports almost nothing. Unless `SCMCP_SHARED_SERVER` is off, it connects to the daemon, sends one JSON preamble line (`{"cwd": ..., "token": ...}`) and waits up to 10 s for the daemon's `{"scmcp": "ready"}` line. Only then does it copy stdin to the socket and the socket to stdout, until either side closes. A connection dropped before `ready` (a daemon shutting down closes the connections still in its backlog) is retried once, which starts a fresh daemon. When no daemon is listening it starts one (`python -m semantic_cache_mcp.server serve`, detached: a new session on POSIX, `DETACHED_PROCESS` on Windows) and waits up to 60 s for the endpoint, or until the new daemon exits with an error. Any failure before `ready` falls back to the in-process server.
+
+The daemon (`server/_daemon.py`) holds an exclusive lock on its endpoint's lock file (`flock` on POSIX, `msvcrt.locking` on Windows), so a second daemon for the same endpoint exits after waiting 0.5 s for it. The wait covers a launcher probing the lock at the same instant. It enters the FastMCP lifespan once, so one `ToolProcessSupervisor`, tool worker and cache serve every connection. Each connection is read through the SDK's `stdio_server` adapter and run as its own `Server.run`, which reuses the reference-counted lifespan. The preamble's directory becomes `CONNECTION_CWD` for that connection's tasks. The client root is cached per MCP session (a `WeakKeyDictionary` keyed by the session), never per process.
+
+- **Key:** a hash of the version, the install location and every configuration variable (`PATH`, `HOME`, `USERPROFILE` and `SCMCP_*` included), so the transport is part of it too.
+- **`unix` endpoint** (POSIX default): `<runtime dir>/semantic-cache-mcp-<uid>/<key>.sock`. The directory must be owned by the user with mode `0700`; the socket is `0600`. The preamble carries no token: the directory's permissions are the access check.
+- **`tcp` endpoint** (Windows, or `SCMCP_SHARED_TRANSPORT=tcp`): a random `127.0.0.1` port. The daemon writes `{"port", "token"}` atomically to `<key>.port` (mode `0600`; on Windows under `%LOCALAPPDATA%\semantic-cache-mcp\run\`, whose ACL admits only the user). The token is 32 random bytes per daemon. A connection whose preamble token does not match (`hmac.compare_digest`) is closed before any MCP message is read, since any local user can reach a loopback port. The launcher trusts a port file only while the endpoint lock is held. A free lock means the daemon died, and the port may now belong to another process.
+- **Idle exit:** after `SCMCP_IDLE_TIMEOUT` seconds with no connection, or on SIGTERM/SIGINT (POSIX only), the daemon stops accepting, removes its socket or port file and releases the lock, so a new daemon can start at once. Then it finishes the connections still open and closes the lifespan.
+- **Concurrency:** `_serialized` and the single worker run one tool call at a time across all clients.
+
 ## Threading Model & Graceful Shutdown
 
 ### Thread Pools

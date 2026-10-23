@@ -300,6 +300,9 @@ A `grep` response names the shared directory once as `root` and reports each fil
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before W-TinyLFU eviction |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
 | `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. Off by default: it duplicates the text block byte for byte, and clients disagree about which they forward, so leaving it on can double the cost of every file delivered. |
+| `SCMCP_SHARED_SERVER` | `true` | Serve every client from one shared daemon per user and configuration. `false` runs a server per client, in-process. See [Shared server](#shared-server). |
+| `SCMCP_SHARED_TRANSPORT` | `unix` | How the command reaches the daemon: `unix` (Unix socket) or `tcp` (loopback port plus token). Windows always uses `tcp`. |
+| `SCMCP_IDLE_TIMEOUT` | `600` | Seconds a shared daemon waits with no client before it exits |
 | `SCMCP_PUBLISH_OUTPUT_SCHEMA` | `false` | Advertise per-tool output schemas in `tools/list`. Off by default: they were 11.5k of this server's 19.8k advertised tokens, paid on every request, and the Anthropic Messages API has no field to receive them. Turning this on forces `SCMCP_STRUCTURED_CONTENT` on too, since MCP requires structured content from any tool that declares a schema. |
 
 A malformed value falls back to the default and logs a warning naming the variable. See [docs/env_variables.md](docs/env_variables.md) for detail.
@@ -333,6 +336,17 @@ A malformed value falls back to the default and logs a warning naming the variab
 ```
 
 **Cache location:** `~/.cache/semantic-cache-mcp/` (Linux), `~/Library/Caches/semantic-cache-mcp/` (macOS), `%LOCALAPPDATA%\semantic-cache-mcp\` (Windows). Override with `SEMANTIC_CACHE_DIR`.
+
+### Shared server
+
+`semantic-cache-mcp` is a thin relay. It connects to one daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer. With 4 clients, that measured 384 MB in 7 processes, against 1,204 MB in 12 when each client ran its own server.
+
+- Each client keeps its own MCP session, so roots and relative paths work as before. A client that names no root resolves relative paths against the directory it launched the command from.
+- Clients share a daemon only when they run the same build with the same configuration: every variable above, `PATH`, `HOME` (`USERPROFILE` on Windows), and anything prefixed `SCMCP_`.
+- On Linux and macOS the daemon listens on a Unix socket in `$XDG_RUNTIME_DIR/semantic-cache-mcp-<uid>/` (or the system temp directory), mode `0700`. The command refuses a directory that anyone else can enter.
+- On Windows (or with `SCMCP_SHARED_TRANSPORT=tcp`) it listens on a random `127.0.0.1` port. It writes the port and a random token to a `.port` file in `%LOCALAPPDATA%\semantic-cache-mcp\run\` (the same `0700` directory on POSIX), and drops any connection that does not send the token.
+- If the daemon cannot start, the command serves in-process instead. Tool calls still run one at a time, now across all clients.
+- `semantic-cache-mcp serve` runs the daemon in the foreground.
 
 ---
 
