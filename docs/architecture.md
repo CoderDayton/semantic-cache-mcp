@@ -150,12 +150,20 @@ bytes rather than by entry count.
 
 ### Tokenizer (`core/tokenizer.py`)
 
-GPT-4o compatible (o200k_base) BPE tokenizer.
+GPT-4o (o200k_base) BPE tokenizer; counts match tiktoken exactly.
 
-- **O(N log M)** priority-queue merge vs O(N²) naive
-- Merge results memoized to skip repeated BPE sequences
-- Single-byte tokens skip BPE entirely (fast path)
-- Files > 50KB use sampling for O(1) estimate
+- o200k's pre-tokenizer ported to stdlib `re`, its `\p{..}` classes built from
+  `unicodedata` over the BMP only, since `re` scans classes above U+FFFF range
+  by range. Each character above U+FFFF is matched through a BMP stand-in of
+  the same category; ASCII text uses ASCII classes. Both patterns are built
+  when the tokenizer loads
+- **O(N log M)** priority-queue merge; a pair ranks as its concatenation's token id
+- Merge results and the last 8 counts are memoized; the count memo keys on the
+  text's hash and length, so it holds no text
+- Texts over 256,000 characters are estimated from 16 evenly spaced windows.
+  Such files are always above `max_size`, so the estimate only feeds metrics
+- `tokens_exceed(text, limit)` counts exactly but stops at `limit`; the
+  `max_response_tokens` checks use it
 
 ---
 

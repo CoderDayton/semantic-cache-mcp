@@ -112,7 +112,7 @@ class TestSuppressLargeDiff:
 
     def test_large_diff_tokens_suppressed(self) -> None:
         # Create a diff that exceeds MAX_RETURN_DIFF_TOKENS (8000)
-        big_diff = ("+added line\n" * 1000) + ("-removed line\n" * 1000)
+        big_diff = ("+added line\n" * 2000) + ("-removed line\n" * 2000)
         result = _suppress_large_diff(big_diff, 50_000)
         assert result is not None
         assert "diff suppressed" in result

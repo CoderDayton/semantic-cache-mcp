@@ -8,6 +8,7 @@ from ._bpe import (
     _tokenizer_loaded,
     count_tokens,
     get_tokenizer,
+    tokens_exceed,
 )
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "TOKENIZER_CACHE_DIR",
     "count_tokens",
     "get_tokenizer",
+    "tokens_exceed",
     "_ensure_tokenizer",
     "_tokenizer",
     "_tokenizer_loaded",

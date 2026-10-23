@@ -517,3 +517,21 @@ class TestRenderResponse:
         # payload or fully truncated marker), not slip through full content.
         parsed = json.loads(rendered)
         assert parsed.get("content") != cjk_content, "dense content slipped past the token cap"
+
+    def test_token_cap_enforced_when_tokens_outnumber_chars(self) -> None:
+        """Byte-level tokens let one emoji cost several tokens, so chars <= cap
+        does not mean the payload fits."""
+        import json
+
+        from semantic_cache_mcp.core.tokenizer import count_tokens, get_tokenizer
+        from semantic_cache_mcp.server.response import _render_response
+
+        if get_tokenizer() is None:
+            pytest.skip("Tokenizer not available")
+        emoji = "".join(chr(0x1F300 + i) for i in range(120))
+        payload = {"ok": True, "content": emoji, "path": "/x"}
+        rendered = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        cap = len(rendered)
+        assert count_tokens(rendered) > cap
+        parsed = json.loads(_render_response(payload, max_response_tokens=cap))
+        assert parsed.get("content") != emoji

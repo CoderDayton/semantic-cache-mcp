@@ -174,8 +174,8 @@ group wrapping an unbounded quantifier, e.g. `(a+)+$`) is rejected before
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Tokeniser (~127 KB) | 0.19 ms | Warm BPE encode |
-| Tokeniser (~519 KB, all files) | 0.22 ms | Merge cache amortises full sweeps |
+| Tokeniser (~127 KB) | 6.39 ms | Exact count, count memo cleared; 0.002 ms on a memo hit |
+| Tokeniser (~514 KB, all files) | 3.13 ms | Sampled estimate (above 256,000 chars), 2.4% under exact; 0.002 ms on a memo hit |
 
 ---
 

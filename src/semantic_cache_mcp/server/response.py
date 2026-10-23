@@ -10,7 +10,7 @@ from typing import Any, Never
 from fastmcp.exceptions import ToolError
 
 from ..config import TOOL_MAX_RESPONSE_TOKENS, TOOL_OUTPUT_MODE
-from ..core import count_tokens
+from ..core.tokenizer import tokens_exceed
 
 _MODE_NORMAL = {"normal", "debug"}
 _MODE_DEBUG = "debug"
@@ -198,22 +198,15 @@ def _finalize_payload(payload: dict[str, Any], max_response_tokens: int | None) 
 
     if max_response_tokens is not None and max_response_tokens > 0:
         rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-        # tokens <= chars for any BPE tokenizer (no token spans zero chars),
-        # so len <= max_response_tokens is a safe fast-pass that skips BPE.
-        # Anything larger must be measured: density varies (CJK/emoji can
-        # approach 1 token per char), and the token cap is the source of truth.
-        if len(rendered) > max_response_tokens and count_tokens(rendered) > max_response_tokens:
+        if tokens_exceed(rendered, max_response_tokens):
             body = _minimal_payload(body, max_response_tokens)
             rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-            if len(rendered) > max_response_tokens and count_tokens(rendered) > max_response_tokens:
+            if tokens_exceed(rendered, max_response_tokens):
                 # The refit overshot anyway; fall back to the bare form rather
                 # than ship a payload over the cap the caller set.
                 body = _minimal_payload(body)
                 rendered = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-                if (
-                    len(rendered) > max_response_tokens
-                    and count_tokens(rendered) > max_response_tokens
-                ):
+                if tokens_exceed(rendered, max_response_tokens):
                     body = {"ok": False, "truncated": True}
 
     return body
@@ -235,7 +228,7 @@ def _tool_error_message(tool: str, message: str, max_response_tokens: int | None
     if (
         max_response_tokens is not None
         and max_response_tokens > 0
-        and count_tokens(text) > max_response_tokens
+        and tokens_exceed(text, max_response_tokens)
     ):
         text = f"{tool}: error truncated by max_response_tokens"
     return text
