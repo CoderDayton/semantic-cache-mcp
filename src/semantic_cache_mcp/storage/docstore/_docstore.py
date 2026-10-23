@@ -44,6 +44,8 @@ _GRAM_FILES = "gram_files"
 PATH_KEY = "path"
 CONTENT_HASH_KEY = "content_hash"
 
+WAL_SIZE_LIMIT = 16 * 1024 * 1024
+
 # PRAGMA auto_vacuum mode 2. Freed pages go on a free list that
 # ``PRAGMA incremental_vacuum`` can hand back to the filesystem, instead of
 # being retained and reused (mode 0), which pins the file at its high-water
@@ -107,6 +109,7 @@ class DocStore:
         # so only a store created before 0.5.3 ever pays for the VACUUM.
         self._enable_incremental_vacuum()
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT}")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
         self.grams_enabled = self._create_gram_tables()
@@ -818,6 +821,19 @@ class DocStore:
             except sqlite3.Error as exc:
                 logger.debug(f"wal_checkpoint failed: {exc}")
 
+    def _truncate_wal(self) -> None:
+        """Checkpoint the whole WAL and cut the file to zero bytes.
+
+        Other processes sharing the store keep it open, so SQLite's own
+        cleanup at last close never runs. A reader mid-transaction makes this
+        wait up to one second, then give up and leave the WAL as it is.
+        """
+        try:
+            self._conn.execute("PRAGMA busy_timeout=1000")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error as exc:
+            logger.debug(f"wal truncate failed: {exc}")
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -825,6 +841,7 @@ class DocStore:
             self._closed = True
             try:
                 self._conn.commit()
+                self._truncate_wal()
                 self._conn.close()
             except sqlite3.Error as exc:
                 logger.debug(f"DocStore close error: {exc}")
