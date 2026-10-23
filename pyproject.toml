@@ -1,6 +1,6 @@
 [project]
 name = "semantic-cache-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP file cache for AI coding agents: re-reads cost ~40 tokens, changed files return diffs, grep and BM25 search over the cache"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -86,7 +86,7 @@
 - **Note:** the merge only runs on a clean shutdown. A store whose server is repeatedly `SIGKILL`ed never gets one, and will drift upward again. The shared daemon's idle exit and `SIGTERM` are clean shutdowns.
 
 **`docstore.db-wal` is far larger than the database**
-- **Cause (fixed in the release after 0.6.0):** the WAL grew without bound while another process held a read snapshot. One live store had a 126 MB WAL next to a 22 MB database.
+- **Cause (fixed in 0.7.0):** the WAL grew without bound while another process held a read snapshot. One live store had a 126 MB WAL next to a 22 MB database.
 - **Now:** the WAL is capped at 16 MB and truncated on close. A reader mid-transaction can delay the truncate by up to 1 s, after which the WAL is left as it is until the next close.
 
 **Glob timeout**

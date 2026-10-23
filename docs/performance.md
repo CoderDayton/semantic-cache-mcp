@@ -16,7 +16,7 @@ The numbers below were captured on:
 | **Filesystem** | ext4 on NVMe SSD — **not tmpfs**, see below |
 | **Search** | BM25 keyword (FTS5), no embedding model |
 | **Corpus** | 48 source files, **131,899 tokens**, 287 documents |
-| **Version** | `0.6.0` + unreleased (`e65c5bf`) |
+| **Version** | `0.7.0` (measured at `e65c5bf`) |
 
 Latency rows are the per-row median of three ext4 runs; the tmpfs column is one
 run. Token counts are exact o200k counts, matching tiktoken. Before `571937a`

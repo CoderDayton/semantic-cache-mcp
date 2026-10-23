@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-23: One server for every client, counts that match the model
+
+Every client used to start its own server: its own tool worker, its own cache
+in memory, all writing one SQLite file. The command is now a thin relay to one
+daemon per user and configuration, so four clients cost 385 MB in 7 processes
+instead of 1,201 MB in 12, and a second client connects in about 31 ms. Each
+client keeps its own MCP session and its own project root. The daemon starts on
+demand, exits when idle, and falls back to serving in-process whenever it
+cannot start. `SCMCP_SHARED_SERVER=0` restores the old behavior.
+
+Token counts were estimates that ran about 1.7× high. They are now exact o200k
+counts, matching tiktoken, and `max_response_tokens` is enforced against them.
+
+Cached reads are about 7× faster behind an indexed path column, `grep` narrows
+its candidates with a trigram index, and a file reverted to a version the
+caller still holds answers `unchanged`.
+
+**Breaking:** the semantic summarizer and the unused diff helpers are gone from
+`core` (see Changed). An oversized `read` returns a map instead of a summary.
+The console entry point moved to `semantic_cache_mcp.launcher:main`.
+
+Existing caches upgrade themselves: the `path` column is added and backfilled
+on first open, and the trigram index fills in as `grep` scans files. Nothing to
+run by hand.
+
 ### Added
 
 - **One shared server for every client.** The `semantic-cache-mcp` command is now a thin relay: it connects to a per-user daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer; with 4 clients that measured 385 MB in 7 processes, against 1,201 MB in 12. Each client keeps its own MCP session, so roots and relative paths resolve per client, and a client that sends no roots resolves against the directory it launched the command from.
@@ -1187,7 +1212,8 @@ Complete storage backend rewrite from compressed chunks (SQLiteStorage) to raw t
 - `append=true` on `write` for chunked large file writes
 - `cached_only=true` on `glob` to filter to already-cached files
 
-[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.5...v0.6.0
 [0.5.5]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/CoderDayton/semantic-cache-mcp/compare/v0.5.3...v0.5.4
