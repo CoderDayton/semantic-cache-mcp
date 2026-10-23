@@ -20,7 +20,9 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...core.hashing import hash_content
 from . import _META_CHUNK_INDEX, _META_IS_PARENT, _META_PATH
+from ._grams import gram_query, required_literals
 
 if TYPE_CHECKING:
     from . import ContentStorage
@@ -48,12 +50,8 @@ GREP_VOCAB_TERM_CAP = 256
 # Cap on BM25 rows fetched. If the match hits this cap the result may be
 # truncated and can no longer be trusted as complete — full scan instead.
 GREP_PREFILTER_FETCH_CAP = 1000
-# Regex metacharacters that can make an extracted token non-mandatory:
-# alternation, zero-allowing quantifiers, and character classes — a run like
-# [abcd] yields the token "abcd" though the class matches only one character.
-# Their presence in a regex pattern disqualifies the token-AND prefilter;
-# fixed-string patterns are immune because there the characters are literal.
-GREP_UNSAFE_REGEX_CHARS = frozenset("|?*{[")
+GREP_LOAD_BATCH = 500
+GREP_INDEX_BATCH_CHARS = 256_000
 
 # Quantifiers that let their target repeat two or more times. Applied to a group
 # that already contains an unbounded quantifier, these are what make a pattern
@@ -105,6 +103,10 @@ async def grep(
     result carries whether ``max_matches``/``max_files`` cut the scan short, so
     a capped count is never mistaken for a complete one. ``within`` confines
     the scan to files under one directory, whatever ``path`` says.
+
+    Candidates come from the trigram index (every file holding all required
+    trigrams, plus every file not yet indexed, which this call then indexes),
+    else from the BM25 prefilter, else from a full scan.
     """
     if store._closed:
         return GrepResults()
@@ -141,18 +143,33 @@ async def grep(
                 f"Pass fixed_string=True to match it literally."
             ) from e
 
-    # Sound BM25 prefilter. Each required literal token is expanded to
-    # the FTS5 vocabulary terms that contain it as a substring, then
-    # BM25-matched. The candidate set stays complete even though FTS5's
-    # unicode61 tokenizer keeps compound identifiers whole —
-    # grep("function") still finds a file whose only hit is inside
-    # "functionHelper". A None result means the prefilter cannot be
-    # trusted for this pattern (complex regex, vocabulary unavailable,
-    # or too broad); the caller then does a full scan, always correct.
+    files: dict[str, list[tuple[int, str]]] = {}
+    indexed = await gram_candidates(
+        store,
+        pattern,
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        path_filter=path,
+        within=within,
+    )
+    if indexed is not None:
+        paths, unindexed = indexed
+        if not paths:
+            return GrepResults()
+        files = await load_files(store, paths)
+        results = scan_files(
+            files,
+            compiled,
+            context_lines=context_lines,
+            max_matches=max_matches,
+            max_files=max_files,
+        )
+        await index_loaded(store, files, unindexed)
+        return results
+
     candidates = await sound_candidates(
         store, pattern, fixed_string=fixed_string, path_filter=path, within=within
     )
-    files: dict[str, list[tuple[int, str]]] = {}
     if candidates is not None:
         # Vocabulary expansion makes the candidate set exact: empty means
         # nothing matches, non-empty is complete — no full scan needed.
@@ -341,10 +358,90 @@ def required_tokens(pattern: str, *, fixed_string: bool) -> list[str] | None:
     enough to be selective. ``None`` routes the caller to a full scan, which is
     always correct.
     """
-    if not fixed_string and any(c in GREP_UNSAFE_REGEX_CHARS for c in pattern):
+    literals = required_literals(pattern, fixed_string=fixed_string)
+    if literals is None:
         return None
-    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", pattern) if len(t) >= GREP_TOKEN_MIN_LEN]
+    tokens = [
+        token
+        for literal in literals
+        for token in re.findall(r"[A-Za-z0-9]+", literal)
+        if len(token) >= GREP_TOKEN_MIN_LEN
+    ]
     return tokens or None
+
+
+async def gram_candidates(
+    store: ContentStorage,
+    pattern: str,
+    *,
+    fixed_string: bool,
+    case_sensitive: bool,
+    path_filter: str | None,
+    within: str | None,
+) -> tuple[list[str], dict[str, str]] | None:
+    """``(paths to scan, {unindexed path: its content hash})`` from the
+    trigram index, or None when the index cannot narrow this pattern."""
+    literals = required_literals(pattern, fixed_string=fixed_string)
+    query = gram_query(literals, case_sensitive=case_sensitive) if literals else None
+    if query is None:
+        return None
+    try:
+        rows = await store._collection.gram_candidates(query)
+    except Exception as exc:
+        logger.debug(f"grep trigram lookup failed: {exc}; falling back")
+        return None
+    if rows is None:
+        return None
+    paths: list[str] = []
+    unindexed: dict[str, str] = {}
+    for doc_path, unindexed_hash in rows:
+        if path_matches(doc_path, path_filter=path_filter, within=within):
+            paths.append(doc_path)
+            if unindexed_hash is not None:
+                unindexed[doc_path] = unindexed_hash
+    return paths, unindexed
+
+
+async def index_loaded(
+    store: ContentStorage,
+    files: dict[str, list[tuple[int, str]]],
+    hashes: dict[str, str],
+) -> None:
+    """Index the loaded text of each path in *hashes* whose text hashes to
+    the content hash its entry had.
+
+    Text that fails the check (chunks rewritten mid-grep, or an incoherent
+    chunk set) stays unindexed, so it is scanned on every grep instead.
+
+    Entries are written in batches of about ``GREP_INDEX_BATCH_CHARS``
+    characters, each its own IO-thread job, so other storage calls queue
+    between batches rather than behind the whole corpus. A file larger than
+    the budget is a batch of its own.
+    """
+    batch: list[tuple[str, str, str]] = []
+    size = 0
+    for doc_path, expected in hashes.items():
+        chunks = files.get(doc_path)
+        if chunks is None:
+            continue
+        text = "".join(chunk for _, chunk in sorted(chunks, key=lambda c: c[0]))
+        if hash_content(text) != expected:
+            continue
+        if batch and size + len(text) > GREP_INDEX_BATCH_CHARS:
+            await _write_grams(store, batch)
+            batch, size = [], 0
+        batch.append((doc_path, expected, text))
+        size += len(text)
+    await _write_grams(store, batch)
+
+
+async def _write_grams(store: ContentStorage, entries: list[tuple[str, str, str]]) -> None:
+    if not entries:
+        return
+    try:
+        await store._collection.index_grams(entries)
+    except Exception as exc:
+        logger.debug(f"grep trigram indexing failed: {exc}")
 
 
 def vocab_expand(
@@ -484,9 +581,13 @@ async def load_files(
         return files
 
     try:
-        docs = await store._collection.get_documents(
-            filter_dict={_META_PATH: list(paths)},
-        )
+        docs = []
+        for start in range(0, len(paths), GREP_LOAD_BATCH):
+            docs.extend(
+                await store._collection.get_documents(
+                    filter_dict={_META_PATH: list(paths[start : start + GREP_LOAD_BATCH])},
+                )
+            )
     except Exception as e:
         logger.debug(f"Batched grep lookup failed ({len(paths)} paths): {e}")
         for path in paths:

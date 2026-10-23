@@ -242,10 +242,10 @@ class TestVersionUpkeep:
         old = _source("A")
         await storage.put("/f.py", old, 1.0)
         await storage.put("/f.py", _source("B"), 2.0)
-        await storage._collection.delete_versions(["/f.py"], orphaned_only=True)
+        await storage._collection.forget_paths(["/f.py"], orphaned_only=True)
         assert await storage.version_text("/f.py", hash_content(old)) == old
         await storage._delete_by_path("/f.py")
-        await storage._collection.delete_versions(["/f.py"], orphaned_only=True)
+        await storage._collection.forget_paths(["/f.py"], orphaned_only=True)
         assert await storage.version_text("/f.py", hash_content(old)) is None
 
     async def test_a_path_change_moves_the_indexed_column(self, tmp_path: Path) -> None:

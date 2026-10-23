@@ -52,7 +52,8 @@ src/semantic_cache_mcp/
 
 The storage backend is a small SQLite store with FTS5, vendored into the package as `DocStore`. It holds text and metadata only:
 
-- **FTS5 full-text search.** BM25 keyword ranking powers `search` and `grep`
+- **FTS5 full-text search.** BM25 keyword ranking powers `search`, and `grep`'s fallback prefilter
+- **Grep trigram index.** A contentless FTS5 `trigram` table (`grams`, keyed by `gram_files`) holds each file's whole text with positions, so a phrase query is an exact substring test across chunk boundaries. Each row records the content hash it was built from. `put` never touches it: `grep` scans every file whose row is missing or stale, then indexes the ones whose loaded text hashes to their entry. Rows are dropped with their path on delete, eviction or clear. Needs SQLite 3.43+; without it `grep` uses the BM25 prefilter
 - **Raw text storage.** File contents are stored as plain text in `page_content`, with no compression
 - **Indexed paths.** Each row's `path` sits in its own indexed column as well as in the metadata JSON, so a lookup by path never scans the table. A store created without the column gains and backfills it on open. Other metadata filters go through `json_extract`
 - **Head rows.** The row with no `parent_id` (a chunked file's parent, or the only row of any other file) carries the fields that change on reads: `mtime` and `access_history`. `get`, `record_access` and `update_mtime` read or write that one row and never load chunk text
@@ -377,9 +378,16 @@ matching four terms above one matching a single term.
 
 ### Grep
 
-`grep` runs the same corpus through a sound BM25 prefilter (required literal
-tokens expanded to the FTS5 vocabulary terms containing them) and then a
-compiled `re` pattern over the candidates. A pattern that cannot be used is an
+`grep` pulls the literal runs every match must contain from the pattern
+(`_grams.required_literals`; a pattern with `|?*{[`, or a letter or digit
+escape other than `\b \B \d \D \s \S \w \W \A \Z`, has none) and asks the trigram index for the files holding all of them, plus every
+file not yet indexed. Then it runs a compiled `re` pattern over those
+candidates. A case-insensitive query uses only the ASCII runs of each literal,
+and both index and query map dotless/dotted I, long s and the Kelvin sign to
+their ASCII partner, the letters `re.IGNORECASE` equates with ASCII but SQLite's
+fold does not. Without the index, or for a pattern it cannot narrow, a sound
+BM25 prefilter (required tokens expanded to the FTS5 vocabulary terms containing
+them) or a full scan takes its place. A pattern that cannot be used is an
 error, not an empty answer: an invalid regex, or one over `GREP_MAX_PATTERN_LEN`
 (1,000 characters, which bounds the ReDoS surface), raises `ValueError` and the
 tool layer surfaces it. Returning `[]` made a typo'd pattern indistinguishable

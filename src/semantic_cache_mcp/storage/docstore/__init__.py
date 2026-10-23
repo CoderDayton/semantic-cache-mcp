@@ -25,7 +25,7 @@ from ...core.hashing import hash_chunk, hash_content, hash_matches
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
 from ...types import CacheEntry
-from ._docstore import PATH_KEY, AsyncDocStore, DocStore
+from ._docstore import CONTENT_HASH_KEY, PATH_KEY, AsyncDocStore, DocStore
 from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class ContentIntegrityError(ValueError):
 _META_PATH = PATH_KEY
 _META_CHUNK_INDEX = "chunk_index"
 _META_TOTAL_CHUNKS = "total_chunks"
-_META_CONTENT_HASH = "content_hash"
+_META_CONTENT_HASH = CONTENT_HASH_KEY
 _META_MTIME = "mtime"
 _META_TOKENS = "tokens"
 _META_CREATED_AT = "created_at"
@@ -1045,7 +1045,7 @@ class ContentStorage:
             if doc_ids:
                 sync_coll.delete_by_ids(doc_ids)
                 sync_coll.save()
-        sync_coll.delete_versions(None)
+        sync_coll.forget_paths(None)
         index = getattr(self, "_index", None)
         if index is not None:
             index.clear()
@@ -1062,14 +1062,14 @@ class ContentStorage:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._io_executor, self._db.clear)
         else:
-            await self._collection.delete_versions(None)
+            await self._collection.forget_paths(None)
         self._index.clear()
         return count
 
     async def delete_path(self, path: str) -> int:
         """Delete cached documents for one path. Returns docs removed."""
         removed = await self._delete_by_path(path)
-        await self._collection.delete_versions([path])
+        await self._collection.forget_paths([path])
         if removed > 0:
             await self._collection.save()
         return removed
@@ -1189,7 +1189,7 @@ class ContentStorage:
             # eviction-need rather than leaking them silently.
             self._index.mark_dirty()
             raise
-        await self._collection.delete_versions([path for path, _ in victims], orphaned_only=True)
+        await self._collection.forget_paths([path for path, _ in victims], orphaned_only=True)
         await self._collection.save()
         logger.info(
             f"Cache eviction: removed {len(victims)} files "

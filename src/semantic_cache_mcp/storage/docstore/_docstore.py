@@ -31,13 +31,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._grams import prefold
+
 logger = logging.getLogger(__name__)
 
 _TABLE = "documents"
 _FTS = "documents_fts"
 _VERSIONS = "versions"
+_GRAMS = "grams"
+_GRAM_FILES = "gram_files"
 
 PATH_KEY = "path"
+CONTENT_HASH_KEY = "content_hash"
 
 # PRAGMA auto_vacuum mode 2. Freed pages go on a free list that
 # ``PRAGMA incremental_vacuum`` can hand back to the filesystem, instead of
@@ -104,6 +109,31 @@ class DocStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
+        self.grams_enabled = self._create_gram_tables()
+
+    def _create_gram_tables(self) -> bool:
+        """Create grep's trigram index, keyed by ``gram_files.id``.
+
+        Returns False on an SQLite without the ``trigram`` tokenizer or
+        contentless deletes (both present from 3.43); grep then falls back to
+        its BM25 prefilter.
+        """
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_GRAM_FILES} ("
+                    "id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, content_hash TEXT NOT NULL)"
+                )
+                self._conn.execute(
+                    f"CREATE VIRTUAL TABLE IF NOT EXISTS {_GRAMS} USING fts5("
+                    "text, content='', contentless_delete=1, "
+                    "tokenize='trigram case_sensitive 0')"
+                )
+                self._conn.execute(f"SELECT rowid FROM {_GRAMS} LIMIT 0").fetchall()
+        except sqlite3.OperationalError as exc:
+            logger.info(f"grep trigram index unavailable: {exc}")
+            return False
+        return True
 
     def _enable_incremental_vacuum(self) -> None:
         """Make freed pages returnable to the filesystem, once per store.
@@ -392,29 +422,101 @@ class DocStore:
                     return None
         return None
 
-    def delete_versions(self, paths: Sequence[str] | None, *, orphaned_only: bool = False) -> None:
-        """Drop the kept versions of *paths*, or of every path when None.
+    def forget_paths(self, paths: Sequence[str] | None, *, orphaned_only: bool = False) -> None:
+        """Drop the kept versions and grep index rows of *paths*, or of every
+        path when None.
 
         ``orphaned_only`` spares a path that has document rows again, so a
-        write that landed after the caller chose the path keeps its versions.
+        write that landed after the caller chose the path keeps its data.
         """
-        orphaned = (
-            f" AND NOT EXISTS (SELECT 1 FROM {_TABLE} d WHERE d.path = {_VERSIONS}.path)"
-            if orphaned_only
-            else ""
-        )
         with self._lock, self._conn:
             if paths is None:
-                self._conn.execute(f"DELETE FROM {_VERSIONS} WHERE 1=1{orphaned}")
+                self._forget_where("1=1", [], orphaned_only)
                 return
             paths = list(paths)
             for start in range(0, len(paths), 500):
                 batch = paths[start : start + 500]
-                self._conn.execute(
-                    f"DELETE FROM {_VERSIONS} "
-                    f"WHERE path IN ({','.join('?' for _ in batch)}){orphaned}",
-                    batch,
+                self._forget_where(
+                    f"path IN ({','.join('?' for _ in batch)})", batch, orphaned_only
                 )
+
+    def _forget_where(self, where: str, params: list[str], orphaned_only: bool) -> None:
+        tables = [_VERSIONS, _GRAM_FILES] if self.grams_enabled else [_VERSIONS]
+        for table in tables:
+            cond = where
+            if orphaned_only:
+                cond += f" AND NOT EXISTS (SELECT 1 FROM {_TABLE} d WHERE d.path = {table}.path)"
+            if table == _GRAM_FILES:
+                self._conn.execute(
+                    f"DELETE FROM {_GRAMS} WHERE rowid IN "
+                    f"(SELECT id FROM {_GRAM_FILES} WHERE {cond})",
+                    params,
+                )
+            self._conn.execute(f"DELETE FROM {table} WHERE {cond}", params)
+
+    def gram_candidates(self, query: str) -> list[tuple[str, str | None]] | None:
+        """``(path, unindexed_hash)`` for every file grep must scan for a
+        trigram MATCH *query*, in document order; None when the index is
+        unavailable.
+
+        A file whose index row matches its current content hash is listed only
+        when it contains every trigram, with ``unindexed_hash`` None. A file
+        with no row, or a stale one, is always listed, with its current content
+        hash, so a missing row can never hide a match.
+        """
+        if not self.grams_enabled:
+            return None
+        head_hash = f"json_extract(d.metadata, '$.\"{CONTENT_HASH_KEY}\"')"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT d.path, CASE WHEN f.content_hash IS {head_hash} THEN NULL "
+                f"ELSE {head_hash} END "
+                f"FROM {_TABLE} d LEFT JOIN {_GRAM_FILES} f ON f.path = d.path "
+                "WHERE d.parent_id IS NULL AND d.path IS NOT NULL AND ("
+                f"f.content_hash IS NOT {head_hash} OR f.id IN "
+                f"(SELECT rowid FROM {_GRAMS} WHERE {_GRAMS} MATCH ?)) "
+                "ORDER BY d.id",
+                (query,),
+            ).fetchall()
+        found: dict[str, str | None] = {}
+        for path, unindexed_hash in rows:
+            found.setdefault(path, unindexed_hash)
+        return list(found.items())
+
+    def index_grams(self, entries: Sequence[tuple[str, str, str]]) -> None:
+        """Index ``(path, content_hash, text)`` for grep, replacing each
+        path's previous row. An entry whose hash is no longer the path's head
+        hash (deleted, evicted or rewritten since grep loaded it) is skipped,
+        so no row outlives the forget that ran for its path."""
+        if not self.grams_enabled or not entries:
+            return
+        head_hash = f"json_extract(metadata, '$.\"{CONTENT_HASH_KEY}\"')"
+        with self._lock, self._conn:
+            for path, content_hash, text in entries:
+                current = self._conn.execute(
+                    f"SELECT 1 FROM {_TABLE} WHERE path = ? AND parent_id IS NULL "
+                    f"AND {head_hash} = ? LIMIT 1",
+                    (path, content_hash),
+                ).fetchone()
+                if current is not None:
+                    self._index_gram(path, content_hash, text)
+
+    def _index_gram(self, path: str, content_hash: str, text: str) -> None:
+        row = self._conn.execute(f"SELECT id FROM {_GRAM_FILES} WHERE path = ?", (path,)).fetchone()
+        if row is None:
+            gram_id = self._conn.execute(
+                f"INSERT INTO {_GRAM_FILES}(path, content_hash) VALUES (?, ?)",
+                (path, content_hash),
+            ).lastrowid
+        else:
+            gram_id = row[0]
+            self._conn.execute(f"DELETE FROM {_GRAMS} WHERE rowid = ?", (gram_id,))
+            self._conn.execute(
+                f"UPDATE {_GRAM_FILES} SET content_hash = ? WHERE id = ?", (content_hash, gram_id)
+            )
+        self._conn.execute(
+            f"INSERT INTO {_GRAMS}(rowid, text) VALUES (?, ?)", (gram_id, prefold(text))
+        )
 
     # ------------------------------------------------------------------- reads
     def keyword_search(
@@ -660,7 +762,7 @@ class DocStore:
             count = self._conn.execute(f"SELECT COUNT(*) FROM {_TABLE}").fetchone()[0]
             self._conn.execute(f"DELETE FROM {_TABLE}")
             self._conn.execute(f"DELETE FROM {_FTS}")
-            self._conn.execute(f"DELETE FROM {_VERSIONS}")
+            self._forget_where("1=1", [], orphaned_only=False)
         return int(count)
 
     def optimize(self) -> None:
@@ -680,6 +782,8 @@ class DocStore:
             try:
                 with self._conn:
                     self._conn.execute(f"INSERT INTO {_FTS}({_FTS}) VALUES('optimize')")
+                    if self.grams_enabled:
+                        self._conn.execute(f"INSERT INTO {_GRAMS}({_GRAMS}) VALUES('optimize')")
             except sqlite3.Error as exc:
                 logger.debug(f"fts optimize failed: {exc}")
 
@@ -791,12 +895,18 @@ class AsyncDocStore:
     ) -> tuple[str, str] | None:
         return await self._run(self._store.find_version, path, matches)
 
-    async def delete_versions(
+    async def forget_paths(
         self, paths: Sequence[str] | None, *, orphaned_only: bool = False
     ) -> None:
         await self._run(
-            functools.partial(self._store.delete_versions, orphaned_only=orphaned_only), paths
+            functools.partial(self._store.forget_paths, orphaned_only=orphaned_only), paths
         )
+
+    async def gram_candidates(self, query: str) -> list[tuple[str, str | None]] | None:
+        return await self._run(self._store.gram_candidates, query)
+
+    async def index_grams(self, entries: Sequence[tuple[str, str, str]]) -> None:
+        await self._run(self._store.index_grams, entries)
 
     async def distinct_paths(self, *, path_key: str, is_parent_key: str) -> list[str]:
         loop = asyncio.get_running_loop()

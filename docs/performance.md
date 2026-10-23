@@ -156,6 +156,24 @@ The in-session search cache delivers a **hundreds-fold speedup** on repeated que
 | Literal (`def `) | 1.6 ms | 2.4 ms |
 | Regex (`class\s+\w+`) | 3.8 ms | 4.0 ms |
 
+On a 197-file, 4.8 MB store, median of 7 runs, the trigram index against the
+BM25 prefilter it falls back to:
+
+| Pattern | BM25 prefilter | Trigram index |
+|---------|---------------:|--------------:|
+| `zz_not_present_anywhere` (miss) | 13.4 ms | 4.7 ms |
+| `content_hash` (11 files) | 17.3 ms | 8.1 ms |
+| `TODO` (9 files) | 12.8 ms | 10.2 ms |
+| `def \w+\(` | 22.7 ms | 19.1 ms |
+| `function` (93 files) | 23.0 ms | 20.7 ms |
+| `\bparse` (35 files) | 32.2 ms | 31.7 ms |
+
+The index adds 8.4 MB to that store (19.4 → 27.8 MB). The first grep after an
+upgrade indexes every file it scans: 246 ms there, once, written in batches of
+about 256K characters (20 batches, none holding the store lock over 18 ms). Positions are what make
+a phrase an exact substring test; without them (`detail=none`, 0.8 MB) `parse`
+admits 59 candidate files instead of 35.
+
 Since 0.5.3 a pattern whose shape can backtrack catastrophically (a repeatable
 group wrapping an unbounded quantifier, e.g. `(a+)+$`) is rejected before
 `re.compile`, in ~0.01 ms, rather than being compiled and run. See
