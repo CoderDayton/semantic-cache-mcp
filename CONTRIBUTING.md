@@ -7,38 +7,52 @@
 git clone https://github.com/CoderDayton/semantic-cache-mcp.git
 cd semantic-cache-mcp
 
-# Install dependencies
-uv sync
+# Install dependencies plus the dev tools (pytest, ruff, mypy, bandit).
+# Plain `uv sync` omits the `dev` extra and removes them.
+uv sync --extra dev
 
-# Install pre-commit hooks (lefthook)
-uv run lefthook install
+# Install git hooks. lefthook is a standalone binary, not a Python dependency:
+# `npm install -g @evilmartians/lefthook` or `brew install lefthook`
+lefthook install
 
 # Verify everything works
-uv run python -m pytest
+uv run pytest -q
 ```
+
+Runtime dependencies are only `blake3`, `fastmcp>=4.0.0,<5` and `numpy`. Do not add one without a strong reason.
 
 ## Development Commands
 
 ```bash
-uv run ruff check src/ tests/        # Lint
-uv run ruff format src/ tests/       # Format
-uv run python -m mypy src/           # Type check
-uv run python -m pytest              # Tests
-uv run python -m pytest --cov        # Tests + coverage
-uv run python -m bandit -r src/      # Security scan
+uv run ruff check src/ tests/                  # Lint
+uv run ruff format src/ tests/                 # Format
+uv run mypy src/                               # Type check
+uv run pytest -q                               # Tests (add a path or -k <expr> for a subset)
+uv run bandit -c pyproject.toml -r src/        # Security scan
+uv run python benchmarks/benchmark_performance.py  # Benchmarks
 ```
 
-The pre-commit hooks (lefthook) run ruff-check, ruff-format, mypy, and bandit automatically on every commit. Tests run on push.
+Git hooks (lefthook):
+
+| Hook | Runs |
+|------|------|
+| `pre-commit` | ruff-check (`--fix`), ruff-format, bandit |
+| `commit-msg` | Conventional Commits check |
+| `pre-push` | `pytest tests/ -x -q`, mypy |
+
+CI runs the same commands (`ruff format --check` instead of `ruff format`).
 
 ## Architecture
 
 See `docs/architecture.md` for the full package layout.
 
 **Rules:**
-- `core/` must remain **stateless and I/O-free** — no file reads, no DB access, no subprocess calls
-- New algorithms belong in the appropriate sub-package (`chunking/`, `text/`, `hashing/`)
-- New MCP tools go in `server/tools.py` only; business logic stays in `cache/`
-- `storage/` is a swappable backend — `core/` must never import from it
+- `core/` must remain **stateless and I/O-free** — no file reads, no DB access, no subprocess calls. The one exception is the tokenizer's one-time BPE download, primed at server startup; do not add more
+- New algorithms belong in the appropriate sub-package (`chunking/`, `text/`, `hashing/`, `tokenizer/`)
+- New MCP tools go in `server/tools/` (`__init__.py`) only; business logic stays in `cache/`. Callers go through the `SemanticCache` facade, never straight to `storage/`
+- `core/` must never import from `storage/`
+- Storage is one SQLite connection serialized through a single IO thread; keep it that way
+- Search is BM25 keyword ranking over SQLite FTS5. There are no embeddings or vectors
 
 ## Code Standards
 
@@ -71,13 +85,13 @@ if TYPE_CHECKING:
 - **Imports:** absolute, sorted by ruff (isort compatible)
 - **Docstrings:** Google style; explain *why*, not *what*
 - **Classes:** use `__slots__` for memory efficiency on data-heavy classes
-- **Complexity:** max cyclomatic complexity 10 (ruff enforced)
+- **Lint rules:** `E F I N W UP B C4 SIM`, configured in `pyproject.toml` only; no CLI `--ignore` lists
 
 ### Performance
 
 This is a performance-critical project. When touching hot paths (chunking, hashing, tokenization, diffing):
 
-- Profile before and after with `cProfile`: `python -m cProfile -o out.prof script.py`
+- Profile before and after with `cProfile`: `uv run python -m cProfile -o out.prof benchmarks/benchmark_performance.py` (see `docs/performance.md#profiling` — profiling the server itself only sees the forwarding process)
 - Document algorithmic complexity with O(N) notation in comments
 - Use `@lru_cache` for pure functions called repeatedly
 - Batch operations over loops where possible
@@ -86,7 +100,7 @@ This is a performance-critical project. When touching hot paths (chunking, hashi
 ### Security
 
 - All inputs validated before I/O
-- No `# type: ignore` — fix the underlying type issue
+- Avoid `# type: ignore` — fix the underlying type issue. Where unavoidable, use a specific code (`warn_unused_ignores` is on)
 - No bare `except:` — catch specific exception types
 - Size limits enforced for write/edit (10MB max)
 - Parameterized queries only — no string interpolation for SQL data
@@ -95,26 +109,23 @@ This is a performance-critical project. When touching hot paths (chunking, hashi
 
 ```python
 # tests/test_*.py — pytest discovers all files matching this pattern
+# `semantic_cache` is a fixture in tests/conftest.py (SemanticCache on a temp DB)
 
-import pytest
-from semantic_cache_mcp.cache import smart_read, SemanticCache
+from semantic_cache_mcp.cache import SemanticCache, smart_read
 
-@pytest.fixture
-def cache(tmp_path):
-    return SemanticCache(db_path=tmp_path / "cache.db")
-
-def test_read_unchanged_returns_message(cache, tmp_path):
+async def test_second_read_comes_from_cache(semantic_cache: SemanticCache, tmp_path):
     path = tmp_path / "file.py"
     path.write_text("content")
-    smart_read(cache, str(path))          # prime cache
-    result = smart_read(cache, str(path)) # second read
-    assert "unchanged" in result.content
-    assert result.tokens_saved > 0
+    first = await smart_read(semantic_cache, str(path))   # primes the cache
+    second = await smart_read(semantic_cache, str(path))
+    assert first.from_cache is False
+    assert second.from_cache is True
 ```
 
 - `asyncio_mode = "auto"` — all async tests work without `@pytest.mark.asyncio`
-- Mock disk I/O for unit tests; use `tmp_path` fixture for integration tests
-- Property-based tests for: hashing (determinism), chunking (boundary stability), tokenization (byte-level correctness)
+- Shared fixtures live in `tests/conftest.py`; tests are flat files under `tests/`
+- Use the `tmp_path` / `temp_dir` fixtures for anything that touches disk
+- Cover determinism for hashing, boundary stability for chunking, and byte-level correctness for tokenization
 
 ## Commit Conventions
 
@@ -132,8 +143,13 @@ Enforced by the `commit-msg` lefthook:
 | `refactor` | Code change with no behavior change              |
 | `docs`     | Documentation only                               |
 | `test`     | Adding or updating tests                         |
-| `build`    | Build system, deps, CI                           |
+| `style`    | Formatting only                                  |
+| `build`    | Build system, deps                               |
+| `ci`       | CI configuration                                 |
 | `chore`    | Maintenance (config, tooling)                    |
+| `revert`   | Revert a previous commit                         |
+
+Keep the subject short and imperative. No AI attribution trailers.
 
 **Examples:**
 
@@ -155,10 +171,11 @@ test: add property tests for chunk boundary stability
 
 2. **Run the full pipeline** before opening a PR:
    ```bash
-   uv run python -m pytest --cov
+   uv run pytest tests/
    uv run ruff check src/ tests/
-   uv run python -m mypy src/
-   uv run python -m bandit -r src/
+   uv run ruff format --check src/ tests/
+   uv run mypy src/
+   uv run bandit -c pyproject.toml -r src/
    ```
 
 3. **Commit** using conventional commits
@@ -170,10 +187,10 @@ test: add property tests for chunk boundary stability
 
 ### PR Checklist
 
-- [ ] Tests pass (`uv run python -m pytest`)
-- [ ] No lint errors (`uv run ruff check src/`)
-- [ ] No type errors (`uv run python -m mypy src/`)
-- [ ] No security issues (`uv run python -m bandit -r src/`)
+- [ ] Tests pass (`uv run pytest tests/`)
+- [ ] No lint or format errors (`uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`)
+- [ ] No type errors (`uv run mypy src/`)
+- [ ] No security issues (`uv run bandit -c pyproject.toml -r src/`)
 - [ ] Docstrings updated for any changed public functions
 - [ ] `core/` changes are still I/O-free (grep for `open(`, `sqlite3`, `subprocess`)
 - [ ] Performance impact considered; benchmarks included if touching hot paths

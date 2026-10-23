@@ -136,8 +136,8 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 | Tool | Description |
 |------|-------------|
 | `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges, with the number gutter opt-in via `line_numbers=true` (it costs ~17% of a window, and the range is in `lines` regardless). `outline=true` returns one `line: signature` per definition instead of the text — the cheap first read of a large file, and a map rather than possession, so it reports `file_hash`. A file over `max_size` returns the same outline (or, with no definitions, its first and last 20 lines under `// L<a>-<b>` anchors), flagged `truncated` with `total_lines`. A partial or mapped read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
-| `read_image` | Image pass-through. Returns an MCP image content block (base64 + mime) so vision models see the pixels; sidecar metadata carries size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not extension. Bypasses the cache. Capped at 5 MiB (`SCMCP_MAX_IMAGE_BYTES`). |
-| `write` | Full-file create or replace with cache refresh. Returns creation status or an overwrite diff; supports `append=true` and formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
+| `read_image` | Image pass-through. Returns an MCP image content block (base64 + mime) so vision models see the pixels; sidecar metadata carries size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not extension. Bypasses the cache. Capped at 5 MiB raw (`SCMCP_MAX_IMAGE_BYTES`) and 5,000,000 bytes base64-encoded (`SCMCP_MAX_ENCODED_IMAGE_BYTES`). |
+| `write` | Full-file create or replace with cache refresh. Returns `created` or `updated`, with the diff against the previous content only when `show_diff=true`; creates missing parent directories (`create_parents=true`), and supports `dry_run`, `append=true` and formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
 | `edit` | Exact edit against cached content, with scoped and line-range modes plus `dry_run=true`. Pass `known_hash` to get a claimable `content_hash` back and skip the read afterwards. For several edits to one file, use `batch_edit`. |
 | `batch_edit` | Many exact edits to one file, applied atomically, with per-edit success reporting. Takes `known_hash` on the same terms as `edit`. An ambiguous anchor, an anchor inside another edit's line range, and two overlapping ranges are each rejected rather than silently resolved; every reported success is verified against the text it produced. |
 | `edit_preview` | Read-only probe returning match count, line numbers, and context snippets for a candidate `old_string`. Confirms anchor uniqueness before a costly `edit`. |
@@ -147,9 +147,9 @@ Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
 
 | Tool | Description |
 |------|-------------|
-| `warm` | Index files into the cache so `grep` and `search` can see them, returning counts only — never content. Takes paths or globs. Every file left out is reported with a reason (`not_found`, `not_a_file`, `binary`, `too_large`, `unreadable`, `timeout`), and a cap that stops the walk sets `truncated` or `incomplete` rather than a short count that reads as complete. |
+| `warm` | Index files into the cache so `grep` and `search` can see them, returning counts only — never content. Takes paths or globs, up to `max_files` per call (default 200, maximum 2,000). Every file left out is reported with a reason (`not_found`, `not_a_file`, `binary`, `too_large`, `unreadable`, `timeout`), and a cap that stops the walk sets `truncated` or `incomplete` rather than a short count that reads as complete. |
 | `batch_read` | Multi-file cache-aware read. Handles globs, priorities, token budgets, and diff/full routing. Returns each file's `content_hash`; pass them back as `known_hashes` to suppress the ones you still hold. |
-| `search` | Cache-only BM25 ranking of cached files. Terms join with `OR`, so a word your corpus lacks narrows the ranking instead of emptying the results. Previews centre on the matching term rather than the file's first 200 characters, so they show why the file ranked. Index likely files with `warm` first. |
+| `search` | Cache-only BM25 ranking of cached files. Terms join with `OR`, so a word your corpus lacks narrows the ranking instead of emptying the results. Returns `k` matches (default 10) from the current project, or from `directory` when given. Previews are opt-in (`show_preview=true`) and centre on the matching term rather than the file's first 200 characters, so they show why the file ranked. Index likely files with `warm` first. |
 | `grep` | Cache-only exact search — regex or literal. Best for symbols and exact strings. Hits come back as `"<line>:<text>"` strings grouped by file, context lines as `"<line>-<text>"`, with overlapping context windows merged so no line is sent twice; paths are relative to the `root` the response names. `output="paths"` answers "which files mention X" and `output="count"` just the totals. An invalid, over-long, or catastrophically backtracking pattern is an error, never an empty result; use `fixed_string=true` for literal text. Responses state whether the scan completed, so a capped result is never read as a total. |
 | `glob` | File discovery plus cache coverage. Find candidates, then pass the paths to `warm` (to index them) or `batch_read` (to read them). |
 
@@ -178,7 +178,7 @@ read path="/src/app.py" offset=120 limit=80    # lines 120 to 199 only
 |-------|----------|------------|
 | First read | Full content plus a `content_hash` | Normal |
 | Unchanged | `unchanged: true`, when you pass back a matching `known_hash` | A few tokens |
-| Modified | Unified diff only | 5 to 20% of original |
+| Modified | Unified diff only, when you pass back the `known_hash` of the version you hold. Files under 200 tokens, and diffs not smaller than 90% of the file, come back in full | 5 to 20% of original |
 
 </details>
 
@@ -273,7 +273,7 @@ The usual opening move on an unfamiliar tree: `warm`, then `grep` for the exact 
 <summary><strong>discovery</strong>: search, glob, grep</summary>
 
 ```
-search query="authentication middleware logic" k=5
+search query="authentication middleware logic" k=5 show_preview=true
 glob pattern="**/*.py" directory="./src" cached_only=true
 grep pattern="class Cache" path="src/**/*.py"
 grep pattern="content_hash" output="paths"
@@ -292,13 +292,17 @@ A `grep` response names the shared directory once as `root` and reports each fil
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
+| `LOG_DIR` | `<cache dir>/logs` | Directory for the dated log files |
 | `TOOL_OUTPUT_MODE` | `compact` | Response detail (`compact`, `normal`, `debug`) |
 | `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
 | `TOOL_TIMEOUT` | `30` | Seconds before a tool call times out (auto-resets executor) |
-| `MAX_CONTENT_SIZE` | `100000` | Max bytes returned by read operations |
+| `MAX_CONTENT_SIZE` | `100000` | Default `max_size` for `read`: bytes above which a file returns a map (outline or head/tail) instead of its text |
 | `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before W-TinyLFU eviction |
 | `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
+| `SCMCP_MAX_IMAGE_BYTES` | `5242880` | Raw size cap for `read_image` (5 MiB) |
+| `SCMCP_MAX_ENCODED_IMAGE_BYTES` | `5000000` | Base64-encoded size cap for `read_image` |
+| `SCMCP_FORMAT_TIMEOUT_S` | `15` | Seconds a formatter may run for `auto_format` (minimum 1) |
 | `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. Off by default: it duplicates the text block byte for byte, and clients disagree about which they forward, so leaving it on can double the cost of every file delivered. |
 | `SCMCP_SHARED_SERVER` | `true` | Serve every client from one shared daemon per user and configuration. `false` runs a server per client, in-process. See [Shared server](#shared-server). |
 | `SCMCP_SHARED_TRANSPORT` | `unix` | How the command reaches the daemon: `unix` (Unix socket) or `tcp` (loopback port plus token). Windows always uses `tcp`. |
@@ -335,7 +339,7 @@ A malformed value falls back to the default and logs a warning naming the variab
 }
 ```
 
-**Cache location:** `~/.cache/semantic-cache-mcp/` (Linux), `~/Library/Caches/semantic-cache-mcp/` (macOS), `%LOCALAPPDATA%\semantic-cache-mcp\` (Windows). Override with `SEMANTIC_CACHE_DIR`.
+**Cache location:** `$XDG_CACHE_HOME/semantic-cache-mcp/` or `~/.cache/semantic-cache-mcp/` (Linux), `~/Library/Caches/semantic-cache-mcp/` (macOS), `%LOCALAPPDATA%\semantic-cache-mcp\` (Windows). Override with `SEMANTIC_CACHE_DIR`.
 
 ### Shared server
 
@@ -371,6 +375,8 @@ A malformed value falls back to the default and logs a warning naming the variab
  │ no I/O   │    │ +update  │
  └──────────┘    └──────────┘
 ```
+
+The percentages apply to a caller that echoes its hashes. `stat()` finds the file unchanged, but the server answers `unchanged` only for a matching `known_hash`; a diff is sent only to a caller whose hash proves it holds the previous bytes; any other read gets full content. A file under 200 tokens is sent in full rather than as a diff.
 
 `search` is cached on the same principle. An in-session LRU keyed on `(query, k, directory)` returns warm hits in ~10 µs, and misses fall through to BM25. Every cache mutation (`put`, `clear`, `delete_path`, `update_mtime`) bumps the LRU, so callers never see a result that predates a write.
 
@@ -440,7 +446,7 @@ See [docs/performance.md](docs/performance.md) for full methodology.
 ```bash
 git clone https://github.com/CoderDayton/semantic-cache-mcp.git
 cd semantic-cache-mcp
-uv sync
+uv sync --extra dev
 uv run pytest
 ```
 

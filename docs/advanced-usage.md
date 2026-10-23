@@ -2,6 +2,17 @@
 
 ## Programmatic API
 
+Every `smart_*` function, `semantic_search`, `compare_files`, `batch_smart_read`,
+`glob_with_cache_status`, and the data methods of `SemanticCache` are coroutines.
+The snippets below show the calls only; run them inside `asyncio.run(main())`.
+
+The functions here work on paths and mtimes. The possession rules (`unchanged`
+and diffs only for a caller that echoes a matching `known_hash`, `partial:`
+file hashes, `coverage_token`, line ranges) are enforced by the MCP tool layer,
+which picks `diff_mode`/`force_full` per call. Calling `smart_read` directly with
+`diff_mode=True` answers from the cache by mtime, so only do that when your
+caller really holds the previous content.
+
 ```python
 from semantic_cache_mcp.cache import (
     SemanticCache,
@@ -18,20 +29,35 @@ from semantic_cache_mcp.cache import (
 # Initialize cache
 cache = SemanticCache()
 
-# Smart read, diffs by default
-result = smart_read(cache, path="/path/to/file.py", diff_mode=True)
+# Smart read: unchanged marker or diff when the file is already cached
+result = await smart_read(cache, path="/path/to/file.py", diff_mode=True)
 print(f"Tokens saved: {result.tokens_saved}")
 print(f"From cache:   {result.from_cache}")
 print(f"Is diff:      {result.is_diff}")
 
-# After context compression: force full content
-result = smart_read(cache, path="/path/to/file.py", diff_mode=False)
+# Caller holds nothing: force full content
+result = await smart_read(cache, path="/path/to/file.py", diff_mode=False, force_full=True)
 
-# Read a specific line range (no full file load)
-result = smart_read(cache, path="/path/to/file.py", offset=80, limit=40)
+# Diff against text the caller proved it holds (e.g. an older stored version);
+# full content when the diff would not be smaller
+held = await cache.held_version("/path/to/file.py", claim="<content_hash>")
+result = await smart_read(
+    cache, path="/path/to/file.py",
+    base_content=held, diff_mode=False, force_full=True, refresh_cache=False,
+)
+
+# A file over max_size comes back as a map, not its text: the outline, or the
+# first and last 20 lines under `// L<a>-<b>` anchors. Pass map_oversized=False
+# to get the whole file regardless of size.
+result = await smart_read(cache, path="/path/to/big.py", max_size=100_000)
+if result.truncated:
+    print(f"Map of {result.total_lines} lines")
+
+# Line ranges (offset/limit) are a tool-layer feature of `read`; the function
+# above has no such parameters. Slice result.content yourself.
 
 # Smart write, returns diff on overwrite, creates if new
-write_result = smart_write(
+write_result = await smart_write(
     cache=cache,
     path="/path/to/file.py",
     content="new file content",
@@ -44,12 +70,12 @@ print(f"Tokens saved: {write_result.tokens_saved}")
 print(f"Hash:         {write_result.content_hash}")
 
 # Append mode: write large files in chunks
-smart_write(cache, path="/tmp/out.py", content="# chunk 1\n")
-smart_write(cache, path="/tmp/out.py", content="# chunk 2\n", append=True)
-smart_write(cache, path="/tmp/out.py", content="# chunk 3\n", append=True, auto_format=True)
+await smart_write(cache, path="/tmp/out.py", content="# chunk 1\n")
+await smart_write(cache, path="/tmp/out.py", content="# chunk 2\n", append=True)
+await smart_write(cache, path="/tmp/out.py", content="# chunk 3\n", append=True, auto_format=True)
 
-# smart_edit Mode A: full-file find/replace (existing behavior)
-edit_result = smart_edit(
+# smart_edit Mode A: full-file find/replace
+edit_result = await smart_edit(
     cache=cache,
     path="/path/to/file.py",
     old_string="old_value",
@@ -63,7 +89,7 @@ print(f"Tokens saved:     {edit_result.tokens_saved}")
 
 # smart_edit Mode B: scoped find/replace within a line range
 # Useful when read() gave you line numbers, so a shorter old_string suffices
-edit_result = smart_edit(
+edit_result = await smart_edit(
     cache=cache,
     path="/path/to/file.py",
     old_string="pass",       # matched only within lines 42 to 42
@@ -75,7 +101,7 @@ print(f"Lines modified: {edit_result.line_numbers}")  # absolute line numbers
 
 # smart_edit Mode C: direct line replacement (maximum token savings)
 # No old_string needed; replaces the entire range unconditionally
-edit_result = smart_edit(
+edit_result = await smart_edit(
     cache=cache,
     path="/path/to/file.py",
     old_string=None,
@@ -85,7 +111,7 @@ edit_result = smart_edit(
 )
 
 # smart_batch_edit, 2+ independent edits; accepts 2-tuples (Mode A) or 4-tuples (Modes B/C)
-multi_result = smart_batch_edit(
+multi_result = await smart_batch_edit(
     cache=cache,
     path="/path/to/file.py",
     edits=[
@@ -106,8 +132,8 @@ print(f"Failed:    {multi_result.failed}")
 # whose anchor was consumed by an earlier one in the batch fails with that
 # reason instead of being counted as applied.
 
-# 2-tuples (old, new) are also accepted for backward compatibility
-multi_result = smart_batch_edit(
+# 2-tuples (old, new) are also accepted (Mode A only)
+multi_result = await smart_batch_edit(
     cache=cache,
     path="/path/to/file.py",
     edits=[("old1", "new1"), ("old2", "new2")],
@@ -117,7 +143,9 @@ multi_result = smart_batch_edit(
 # Must seed the cache first with smart_read / batch_smart_read
 # Query terms are quoted (never parsed as FTS5 operators) and joined with OR,
 # so a word the corpus lacks narrows the ranking instead of emptying the results.
-search_result = semantic_search(
+# directory=None searches the whole cache; the MCP `search` tool anchors it to the
+# client root instead.
+search_result = await semantic_search(
     cache=cache,
     query="authentication logic",
     k=5,
@@ -129,7 +157,7 @@ for match in search_result.matches:
 # Compare two files (returns a unified diff)
 # Not exposed as an MCP tool — the agent-facing surface is read/write/edit/grep.
 # It is supported programmatic API and is not going away.
-diff_result = compare_files(
+diff_result = await compare_files(
     cache=cache,
     path1="/path/to/old.py",
     path2="/path/to/new.py",
@@ -137,13 +165,14 @@ diff_result = compare_files(
 )
 print(diff_result.diff_content)
 
-# Batch read with glob expansion
-batch_result = batch_smart_read(
+# Batch read. Paths are literal; the MCP `batch_read` tool expands globs before
+# calling this, so list matches yourself first (glob_with_cache_status below).
+batch_result = await batch_smart_read(
     cache=cache,
-    paths=["/src/a.py", "/src/b.py", "/src/*.py"],  # glob patterns supported
+    paths=["/src/a.py", "/src/b.py"],
     max_total_tokens=30000,
-    priority=["/src/a.py"],   # a.py read first regardless of size
-    diff_mode=True,           # set False after context compression
+    priority=["/src/a.py"],   # a.py read first, but still bound by the budget
+    diff_mode=True,           # False: never diff or answer unchanged
     # Possession proof: only files whose hash you echo here can come back as
     # `unchanged` or as a diff. Everything else is sent in full, so omitting
     # this after a compaction is always safe.
@@ -156,10 +185,10 @@ print(f"Unchanged:     {batch_result.unchanged_paths}")
 # Skipped files include est_tokens for budget planning
 for f in batch_result.files:
     if f.status == "skipped" and f.est_tokens:
-        print(f"  {f.path}: ~{f.est_tokens} tokens (use smart_read with offset/limit)")
+        print(f"  {f.path}: ~{f.est_tokens} tokens (read it alone or raise max_total_tokens)")
 
 # Glob with cache status
-glob_result = glob_with_cache_status(
+glob_result = await glob_with_cache_status(
     cache=cache,
     pattern="**/*auth*.py",
     directory="/src",
@@ -175,11 +204,12 @@ print(f"Cached: {glob_result.cached_count}")
 
 ```python
 from pathlib import Path
-from semantic_cache_mcp.storage.docstore import ContentStorage
 from semantic_cache_mcp.cache import SemanticCache
 
-# Use a custom database path
+# Use a custom database path (default: docstore.db in the cache directory)
 cache = SemanticCache(db_path=Path("/tmp/my-cache.db"))
+# ... use it, then release the database
+cache.close()
 ```
 
 ---
@@ -187,7 +217,7 @@ cache = SemanticCache(db_path=Path("/tmp/my-cache.db"))
 ## Monitoring Cache Performance
 
 ```python
-stats = cache.get_stats()
+stats = await cache.get_stats()
 print(f"Files cached:       {stats['files_cached']}")
 print(f"Total tokens:       {stats['total_tokens_cached']}")
 print(f"DB size (MB):       {stats['db_size_mb']}")
@@ -218,6 +248,18 @@ from semantic_cache_mcp.core import large_file_map
 file_map = large_file_map(large_file_content, filename="module.py")
 ```
 
+### Token Counting
+
+```python
+from semantic_cache_mcp.core import count_tokens
+from semantic_cache_mcp.core.tokenizer import tokens_exceed
+
+n = count_tokens(text)            # exact o200k count (matches tiktoken)
+big = tokens_exceed(text, 4000)   # stops counting at the limit
+```
+
+Counts are exact up to 256K characters; longer text is sampled from 16 windows.
+
 ---
 
 ## Direct Cache Operations
@@ -232,19 +274,23 @@ file_map = large_file_map(large_file_content, filename="module.py")
 
 ```python
 # Store a file manually
-cache.put(
+await cache.put(
     path="/path/to/file.py",
     content="file content here",
     mtime=1234567890.0,
 )
 
 # Retrieve a cached entry
-entry = cache.get("/path/to/file.py")
+entry = await cache.get("/path/to/file.py")
 if entry:
-    content = cache.get_content(entry)
+    content = await cache.get_content(entry)
+
+# A past version the caller proves it holds, by its content_hash (or None).
+# The store keeps the last 4 versions per path (2,000 in total).
+old_text = await cache.held_version("/path/to/file.py", "<content_hash>")
 
 # Clear all entries
-cleared = cache.clear()
+cleared = await cache.clear()
 print(f"Cleared {cleared} entries")
 ```
 
@@ -263,9 +309,12 @@ print(f"Cleared {cleared} entries")
 | `tokens_returned`  | `int`         | Tokens in the returned content                 |
 | `tokens_saved`     | `int`         | Tokens saved vs returning full content         |
 | `truncated`        | `bool`        | Whether content is a map of an oversized file  |
+| `total_lines`      | `int \| None` | Line count of the whole file; set only when `truncated` (a map) |
+| `is_binary`        | `bool`        | Binary file: `content` is empty, `size`/`mime` describe it |
+| `size`             | `int \| None` | Byte size; binary files only                   |
+| `mime`             | `str \| None` | Guessed MIME type; binary files only           |
 | `compression_ratio`| `float`       | Size ratio (returned / original)               |
-| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or mapped one. A ranged read also carries a signed `coverage_token` naming the delivered lines, which *is* redeemable as `known_hash` for those lines |
-| `semantic_match`   | `str \| None` | Unused; always `None` since the embedding layer was removed |
+| `content_hash`     | `str \| None` | BLAKE3 digest of the content this result reflects; `None` for binary fallbacks. The tool layer surfaces it as `content_hash` for a full read, and as `partial:`-prefixed `file_hash` for a ranged or mapped one. The tool layer also attaches a signed `coverage_token` to a ranged read; it names the delivered lines and *is* redeemable as `known_hash` for those lines |
 
 ### WriteResult
 
@@ -281,6 +330,7 @@ print(f"Cleared {cleared} entries")
 | `content_hash` | `str`         | BLAKE3 hex digest                        |
 | `previous_hash`| `str \| None` | Digest of the content the write started from; `None` when the file was created. The tool layer matches it against `known_hash` to decide whether an append is claimable |
 | `from_cache`   | `bool`        | Whether old content came from cache      |
+| `dry_run`      | `bool`        | `True` when nothing was written          |
 
 ### EditResult
 
@@ -296,6 +346,7 @@ print(f"Cleared {cleared} entries")
 | `content_hash`     | `str`      | BLAKE3 hex digest of new content     |
 | `previous_hash`    | `str \| None` | Digest of the pre-edit content     |
 | `from_cache`       | `bool`     | Whether content came from cache      |
+| `dry_run`          | `bool`     | `True` when nothing was written      |
 
 ### BatchEditResult
 
@@ -311,13 +362,18 @@ print(f"Cleared {cleared} entries")
 | `content_hash` | `str`                   | BLAKE3 hex digest of final content   |
 | `previous_hash`| `str \| None`           | Digest of the pre-edit content       |
 | `from_cache`   | `bool`                  | Whether content came from cache      |
+| `dry_run`      | `bool`                  | `True` when nothing was written      |
 
 ### SearchResult
 
 | Field          | Type                | Description                              |
 |----------------|---------------------|------------------------------------------|
-| `matches`      | `list[SearchMatch]` | Ranked matches with path + similarity    |
-| `cached_files` | `int`               | Total files searched                     |
+| `query`        | `str`               | The query as given                       |
+| `matches`      | `list[SearchMatch]` | Ranked matches (see below)               |
+| `files_searched` | `int`             | Cached files searched (equals `cached_files`) |
+| `cached_files` | `int`               | Files in the cache                       |
+
+`SearchMatch`: `path` (`str`), `similarity` (`float`, BM25 score normalized so the top match is 1.0), `tokens` (`int`), `preview` (`str`).
 
 ### BatchReadResult / FileReadSummary
 
@@ -334,11 +390,11 @@ print(f"Cleared {cleared} entries")
 | Field       | Type        | Description                                                           |
 |-------------|-------------|-----------------------------------------------------------------------|
 | `path`      | `str`       | File path                                                             |
-| `tokens`    | `int`       | Tokens returned (0 for skipped/unchanged)                            |
+| `tokens`    | `int`       | Tokens returned (0 for skipped; the marker's size for unchanged)     |
 | `status`    | `str`       | `"full"`, `"diff"`, `"truncated"`, `"skipped"`, or `"unchanged"`    |
 | `from_cache`| `bool`      | Whether content came from cache                                       |
 | `est_tokens`| `int \| None` | Estimated tokens for skipped files (for budget planning)           |
-| `content_hash`| `str \| None` | Hash of the delivered content — pass it back in `known_hashes` next time. `None` when what was sent is not the file itself (skipped, or a summary of a large file) |
+| `content_hash`| `str \| None` | Hash of the delivered content — pass it back in `known_hashes` next time. `None` when what was sent is not the file itself (skipped, or a map of a large file) |
 
 ### DiffResult
 
@@ -361,6 +417,8 @@ print(f"Cleared {cleared} entries")
 | `total_matches`       | `int`           | Total files matched                   |
 | `cached_count`        | `int`           | Files already in cache                |
 | `total_cached_tokens` | `int`           | Total tokens of cached files          |
+
+`GlobMatch`: `path` (`str`), `cached` (`bool`), `tokens` (`int | None`), `mtime` (`float`).
 
 ---
 

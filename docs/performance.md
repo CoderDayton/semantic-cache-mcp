@@ -293,9 +293,9 @@ entries that `integrity-check` reports as clean.
 ### What the file actually does
 
 The table above is not what you see on disk, because SQLite keeps freed pages
-in the file and reuses them rather than returning them to the OS. Since 0.5.3
-the store is opened in incremental auto-vacuum mode and shutdown merges the
-index then hands the freed pages back. Driving a copy of that store through a
+in the file and reuses them rather than returning them to the OS. The store is
+opened in incremental auto-vacuum mode and shutdown merges the index then hands
+the freed pages back. Driving a copy of that store through a
 real `ContentStorage` open and close:
 
 | Step | File | Cost |
@@ -313,10 +313,17 @@ stops the index carrying the vocabulary of every file ever evicted, but SQLite
 retains the pages it frees and reuses them, so on its own it moved that store
 from 139.2 MB to 139.2 MB. Only the vacuum hands pages back — and a bare
 `PRAGMA incremental_vacuum` reclaims exactly one page per step, so it has to be
-driven to completion or nothing measurably changes. A store created before
-0.5.3 pays the rewrite once, on its first open; the mode is recorded in the
-database header, so the check is self-describing, needs no marker file, and
-never repeats.
+driven to completion or nothing measurably changes. A store not yet in
+incremental mode pays the rewrite once, on its first open; the mode is recorded
+in the database header, so the check is self-describing, needs no marker file,
+and never repeats.
+
+**The write-ahead log is bounded separately.** `journal_size_limit` caps the
+`-wal` file at 16 MB (`WAL_SIZE_LIMIT`), and `close()` runs
+`wal_checkpoint(TRUNCATE)` so a clean shutdown leaves no log behind. Other
+processes sharing the store keep it open, so SQLite's own cleanup at last close
+never runs; the truncate waits up to one second for a reader, then leaves the
+log as it is.
 
 Age-based pruning is deliberately absent. The store is bounded by
 `MAX_CACHE_ENTRIES` (10,000 files) through W-TinyLFU, and that bound has room
@@ -342,8 +349,8 @@ stayed the same. The optimisations below still land directly in the table above:
 | Adaptive diff context (2 lines under 100-line files) | `core/text/_diff.py`, `cache/_helpers.py` | Small-file diffs carry less context overhead; suppressed diffs keep per-hunk headers |
 | In-session search-result LRU | `cache/search.py`, `cache/store.py` | Repeat-query hits at < 0.01 ms |
 | Drop `// Stats:` line from diff content | `cache/read.py` | ~15 tokens trimmed per changed file in phase 4 |
-| Char/4 fast-exit in `_finalize_payload` | `server/response.py` | Response shaping is sub-microsecond on small payloads |
-| Char-budget grep truncation | `server/tools/__init__.py` | Large grep results stay under the response cap |
+| Char-length fast-exit in `tokens_exceed` (used by `_finalize_payload`) | `core/tokenizer/_bpe.py`, `server/response.py` | Payloads of at most `limit // 4` characters skip token counting, so response shaping is sub-microsecond on small payloads |
+| Char-budget grep truncation | `server/response.py` | Large grep results stay under the response cap |
 | Pre-stored search previews | `storage/docstore/__init__.py` | No re-slicing of chunked content at query time |
 | Shared line index across a batch (0.5.3) | `cache/_helpers.py`, `cache/write.py` | `batch_edit` rebuilt the line table once per edit; a 30-edit batch on a 20K-line file dropped 1210 ms → 656 ms |
 | Metadata-only projections (0.5.3) | `storage/docstore/_docstore.py` | `get_stats` and `has_cached_paths_under` were loading every cached file's text to read one field: 11.0 → 5.6 ms and 12.6 → 3.1 ms |
@@ -356,7 +363,10 @@ stayed the same. The optimisations below still land directly in the table above:
 
 | Decision | Effect |
 |----------|--------|
-| Single-thread `DetachedExecutor` for storage I/O | All blocking storage I/O (SQLite reads and writes) routes through one thread, so the single connection is never touched concurrently. |
+| One shared daemon per endpoint | Every client's `semantic-cache-mcp` process relays to one daemon holding one cache and one tool worker. Calls from all clients pass through the same tool lock, so they run one at a time. |
+| Tool worker subprocess (`ToolProcessSupervisor`) | Cache tools run in a spawned worker process; the server process forwards each call and restarts the worker on timeout or failure. |
+| `_serialized` tool lock | One `asyncio.Lock` admits one cache-touching tool call at a time, with no acquisition timeout. `read_image` skips it. |
+| Single-thread `DetachedExecutor` for storage I/O | Inside the worker, all blocking storage I/O (SQLite reads and writes, via `AsyncDocStore._run`) routes through one thread, so the single connection is never touched concurrently. |
 | `asyncio.gather()` in `batch_smart_read` | Cache lookups and stat pre-fetch run in parallel; smart-read calls themselves serialise on the single executor. |
 | Cache-aware short-circuit in `smart_read` | Skips `aread_bytes` and `count_tokens` on the unchanged fast path. |
 | Async subprocess for formatters | `_format_file` doesn't freeze the event loop. |
@@ -367,9 +377,9 @@ stayed the same. The optimisations below still land directly in the table above:
 ## Profiling
 
 ```bash
-# CPU profiling
-python -m cProfile -o profile.prof -m semantic_cache_mcp
-python -m pstats profile.prof
+# CPU profiling: run the cache in-process through the benchmark harness
+uv run python -m cProfile -o profile.prof benchmarks/benchmark_performance.py
+uv run python -m pstats profile.prof
 
 # Memory profiling
 pip install memory-profiler
@@ -389,6 +399,12 @@ uv run python benchmarks/benchmark_token_savings.py --json tok.json
 ```
 
 `--samples` includes raw per-iteration timings for distribution analysis.
+
+Profile the benchmark or a script that calls the cache directly, not the
+server. `semantic-cache-mcp` relays to a shared daemon (`SCMCP_SHARED_SERVER=0`
+serves in-process instead), and either way tool calls run in a spawned worker
+process, so `python -m cProfile -m semantic_cache_mcp.server` sees only the
+forwarding process.
 
 ---
 
