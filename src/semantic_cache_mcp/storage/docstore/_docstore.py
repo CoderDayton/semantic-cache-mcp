@@ -16,6 +16,7 @@ funnels every call through one IO thread).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -23,7 +24,8 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+import zlib
+from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 _TABLE = "documents"
 _FTS = "documents_fts"
+_VERSIONS = "versions"
+
+PATH_KEY = "path"
 
 # PRAGMA auto_vacuum mode 2. Freed pages go on a free list that
 # ``PRAGMA incremental_vacuum`` can hand back to the filesystem, instead of
@@ -141,15 +146,53 @@ class DocStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text TEXT NOT NULL,
                     metadata TEXT,
-                    parent_id INTEGER
+                    parent_id INTEGER,
+                    path TEXT
                 )
                 """
             )
+            self._add_path_column()
             self._conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_parent "
                 f"ON {_TABLE}(parent_id) WHERE parent_id IS NOT NULL"
             )
+            self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_path ON {_TABLE}(path)")
             self._conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS {_FTS} USING fts5(text)")
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_VERSIONS} (
+                    path TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    body BLOB NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE (path, content_hash)
+                )
+                """
+            )
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{_VERSIONS}_created ON {_VERSIONS}(created_at)"
+            )
+
+    def _add_path_column(self) -> None:
+        """Add and backfill the ``path`` column on a store created without it.
+
+        A path held only inside the metadata JSON can be matched by nothing but
+        a full-table scan, because the lookup binds its JSON path as a parameter
+        and SQLite will not use an expression index for that.
+        """
+        columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info({_TABLE})")}
+        if "path" in columns:
+            return
+        started = time.perf_counter()
+        self._conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN path TEXT")
+        self._conn.execute(
+            f"UPDATE {_TABLE} SET path = json_extract(metadata, ?)", (f'$."{PATH_KEY}"',)
+        )
+        logger.info(
+            "added the path column to %s in %.1f ms",
+            self._path.name,
+            (time.perf_counter() - started) * 1000,
+        )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -189,11 +232,13 @@ class DocStore:
             return []
         parents = list(parent_ids) if parent_ids else [None] * len(texts)
         meta_strs = [json.dumps(m, separators=(",", ":")) for m in metadatas]
-        rows = list(zip(texts, meta_strs, parents, strict=True))
-        placeholders = ",".join(["(?, ?, ?)"] * len(rows))
+        paths = [m.get(PATH_KEY) for m in metadatas]
+        rows = list(zip(texts, meta_strs, parents, paths, strict=True))
+        placeholders = ",".join(["(?, ?, ?, ?)"] * len(rows))
         flat = [v for row in rows for v in row]
         cursor = self._conn.execute(
-            f"INSERT INTO {_TABLE}(text, metadata, parent_id) VALUES {placeholders} RETURNING id",
+            f"INSERT INTO {_TABLE}(text, metadata, parent_id, path) "
+            f"VALUES {placeholders} RETURNING id",
             flat,
         )
         # RETURNING row order is unspecified in SQLite; ids are AUTOINCREMENT,
@@ -259,14 +304,14 @@ class DocStore:
             f"SELECT id, metadata FROM {_TABLE} WHERE id IN ({placeholders})", ids
         ).fetchall()
         current = {r[0]: (json.loads(r[1]) if r[1] else {}) for r in rows}
-        data: list[tuple[str, int]] = []
+        data: list[tuple[str, str | None, int]] = []
         for doc_id, meta_updates in updates:
             if doc_id in current:
                 meta = current[doc_id]
                 meta.update(meta_updates)
-                data.append((json.dumps(meta, separators=(",", ":")), doc_id))
+                data.append((json.dumps(meta, separators=(",", ":")), meta.get(PATH_KEY), doc_id))
         if data:
-            self._conn.executemany(f"UPDATE {_TABLE} SET metadata = ? WHERE id = ?", data)
+            self._conn.executemany(f"UPDATE {_TABLE} SET metadata = ?, path = ? WHERE id = ?", data)
         return len(data)
 
     def reconcile_chunks(
@@ -296,6 +341,80 @@ class DocStore:
             )
             self._update_metadata_locked(meta_updates)
         return new_ids
+
+    def put_version(
+        self,
+        path: str,
+        content_hash: str,
+        text: str,
+        *,
+        keep_per_path: int,
+        keep_total: int,
+    ) -> None:
+        """Keep *text* as a past version of *path*, zlib-compressed.
+
+        Only the newest *keep_per_path* versions of the path, and the newest
+        *keep_total* overall, are kept.
+        """
+        body = zlib.compress(text.encode("utf-8"))
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {_VERSIONS}(path, content_hash, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (path, content_hash, body, time.time()),
+            )
+            self._conn.execute(
+                f"DELETE FROM {_VERSIONS} WHERE rowid IN (SELECT rowid FROM {_VERSIONS} "
+                "WHERE path = ? ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                (path, keep_per_path),
+            )
+            self._conn.execute(
+                f"DELETE FROM {_VERSIONS} WHERE rowid IN (SELECT rowid FROM {_VERSIONS} "
+                "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                (keep_total,),
+            )
+
+    def find_version(self, path: str, matches: Callable[[str], bool]) -> tuple[str, str] | None:
+        """``(content_hash, text)`` of the kept version of *path* whose hash
+        satisfies *matches*, or None.
+
+        A body that fails to decompress or decode is treated as absent.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT content_hash, body FROM {_VERSIONS} WHERE path = ?", (path,)
+            ).fetchall()
+        for content_hash, body in rows:
+            if matches(content_hash):
+                try:
+                    return content_hash, zlib.decompress(body).decode("utf-8")
+                except (zlib.error, UnicodeDecodeError):
+                    return None
+        return None
+
+    def delete_versions(self, paths: Sequence[str] | None, *, orphaned_only: bool = False) -> None:
+        """Drop the kept versions of *paths*, or of every path when None.
+
+        ``orphaned_only`` spares a path that has document rows again, so a
+        write that landed after the caller chose the path keeps its versions.
+        """
+        orphaned = (
+            f" AND NOT EXISTS (SELECT 1 FROM {_TABLE} d WHERE d.path = {_VERSIONS}.path)"
+            if orphaned_only
+            else ""
+        )
+        with self._lock, self._conn:
+            if paths is None:
+                self._conn.execute(f"DELETE FROM {_VERSIONS} WHERE 1=1{orphaned}")
+                return
+            paths = list(paths)
+            for start in range(0, len(paths), 500):
+                batch = paths[start : start + 500]
+                self._conn.execute(
+                    f"DELETE FROM {_VERSIONS} "
+                    f"WHERE path IN ({','.join('?' for _ in batch)}){orphaned}",
+                    batch,
+                )
 
     # ------------------------------------------------------------------- reads
     def keyword_search(
@@ -328,11 +447,8 @@ class DocStore:
             # act as wildcards and match a sibling project. The trailing
             # separator is what makes it a directory match: without it
             # `/project` also matches `/project_evil`.
-            prefix_clause = f"AND json_extract(ti.metadata, ?) LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
-            prefix_params = [
-                '$."path"',
-                _like_prefix(path_prefix.rstrip(os.sep) + os.sep),
-            ]
+            prefix_clause = f"AND ti.path LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
+            prefix_params = [_like_prefix(path_prefix.rstrip(os.sep) + os.sep)]
         # FTS5 MATCH + bm25() ranking. The FROM aliases the FTS table as `f`
         # (used for the rowid JOIN) while bm25()/MATCH reference it by name —
         # this exact shape is lifted from simplevecdb and is FTS5-correct.
@@ -399,19 +515,37 @@ class DocStore:
         return [(int(r[0]), json.loads(r[1]) if r[1] else {}) for r in rows]
 
     def distinct_paths(self, *, path_key: str, is_parent_key: str) -> list[str]:
-        """Distinct non-parent document paths, extracted and de-duplicated in SQL.
+        """Distinct non-parent document paths, de-duplicated in SQL.
 
         Returns bare strings. Callers that only match paths were decoding every
         document's whole metadata JSON in Python to reach one field, which cost
         more than the query itself.
         """
+        if path_key != PATH_KEY:
+            raise ValueError(f"paths are indexed under {PATH_KEY!r}, not {path_key!r}")
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT DISTINCT json_extract(metadata, ?) FROM {_TABLE} "
+                f"SELECT DISTINCT path FROM {_TABLE} "
                 "WHERE COALESCE(json_extract(metadata, ?), 0) != 1",
-                (f'$."{path_key}"', f'$."{is_parent_key}"'),
+                (f'$."{is_parent_key}"',),
             ).fetchall()
         return [r[0] for r in rows if r[0]]
+
+    def head_metadata(self, path: str) -> tuple[int, dict[str, Any]] | None:
+        """``(id, metadata)`` of the row carrying *path*'s file-level fields.
+
+        That is the parent of a chunked file and the only row of any other, the
+        one row at the path with no ``parent_id``. Chunk text is never read.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT id, metadata FROM {_TABLE} "
+                "WHERE path = ? AND parent_id IS NULL ORDER BY id LIMIT 1",
+                (path,),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row[0]), json.loads(row[1]) if row[1] else {}
 
     def get_document_ids(self) -> list[int]:
         """Every document id — the cheapest projection there is."""
@@ -439,12 +573,11 @@ class DocStore:
         def _path(key: str) -> str:
             return f'$."{key}"'
 
+        if path_key != PATH_KEY:
+            raise ValueError(f"paths are indexed under {PATH_KEY!r}, not {path_key!r}")
         with self._lock:
             files_row = self._conn.execute(
-                f"SELECT COUNT(DISTINCT json_extract(metadata, ?)) FROM {_TABLE} "
-                "WHERE json_extract(metadata, ?) IS NOT NULL "
-                "AND json_extract(metadata, ?) != ''",
-                (_path(path_key),) * 3,
+                f"SELECT COUNT(DISTINCT path) FROM {_TABLE} WHERE path IS NOT NULL AND path != ''"
             ).fetchone()
             tokens_row = self._conn.execute(
                 f"SELECT COALESCE(SUM(json_extract(metadata, ?)), 0) FROM {_TABLE} "
@@ -490,6 +623,16 @@ class DocStore:
             # Quote the path label so a literal key like "a.b" matches the
             # top-level member, not the nested path a -> b. The path string is
             # passed as a bound parameter, never interpolated into SQL.
+            if key == PATH_KEY and isinstance(value, (str, list)):
+                table, _, _column = metadata_column.rpartition(".")
+                path_column = f"{table}.path" if table else "path"
+                if isinstance(value, str):
+                    clauses.append(f"{path_column} = ?")
+                    params.append(value)
+                else:
+                    clauses.append(f"{path_column} IN ({','.join('?' for _ in value)})")
+                    params.extend(value)
+                continue
             json_path = f'$."{key}"'
             text_extract = f"json_extract({metadata_column}, ?)"
 
@@ -517,6 +660,7 @@ class DocStore:
             count = self._conn.execute(f"SELECT COUNT(*) FROM {_TABLE}").fetchone()[0]
             self._conn.execute(f"DELETE FROM {_TABLE}")
             self._conn.execute(f"DELETE FROM {_FTS}")
+            self._conn.execute(f"DELETE FROM {_VERSIONS}")
         return int(count)
 
     def optimize(self) -> None:
@@ -626,6 +770,33 @@ class AsyncDocStore:
 
     async def get_document_ids(self) -> list[int]:
         return await self._run(self._store.get_document_ids)
+
+    async def head_metadata(self, path: str) -> tuple[int, dict[str, Any]] | None:
+        return await self._run(self._store.head_metadata, path)
+
+    async def put_version(
+        self, path: str, content_hash: str, text: str, *, keep_per_path: int, keep_total: int
+    ) -> None:
+        await self._run(
+            functools.partial(
+                self._store.put_version, keep_per_path=keep_per_path, keep_total=keep_total
+            ),
+            path,
+            content_hash,
+            text,
+        )
+
+    async def find_version(
+        self, path: str, matches: Callable[[str], bool]
+    ) -> tuple[str, str] | None:
+        return await self._run(self._store.find_version, path, matches)
+
+    async def delete_versions(
+        self, paths: Sequence[str] | None, *, orphaned_only: bool = False
+    ) -> None:
+        await self._run(
+            functools.partial(self._store.delete_versions, orphaned_only=orphaned_only), paths
+        )
 
     async def distinct_paths(self, *, path_key: str, is_parent_key: str) -> list[str]:
         loop = asyncio.get_running_loop()

@@ -203,6 +203,7 @@ async def smart_write(
             str(file_path),
             content,
             mtime,
+            previous=old_content,
         )
         action = "Created" if created else "Updated"
         if formatted:
@@ -528,6 +529,7 @@ async def smart_edit(
             str(file_path),
             new_content,
             mtime,
+            previous=content,
         )
         action = f"Edited ({replacements_made} replacement(s))"
         if formatted:
@@ -859,6 +861,7 @@ async def smart_batch_edit(
             str(file_path),
             new_content,
             mtime,
+            previous=original_content,
         )
         action = f"Multi-edit ({succeeded} succeeded, {failed} failed)"
         if formatted:

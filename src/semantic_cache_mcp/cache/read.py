@@ -106,6 +106,29 @@ _DIFF_MAX_RATIO = 0.9
 _DIFF_MIN_TOKENS = 200
 
 
+def _diff_result(
+    old_content: str, content: str, tokens_original: int, content_hash: str
+) -> ReadResult | None:
+    """A diff from *old_content* to *content*, or None when it would not pay."""
+    diff_content = generate_diff(
+        old_content, content, context_lines=_diff_context_lines(old_content)
+    )
+    diff_tokens = count_tokens(diff_content)
+    if tokens_original < _DIFF_MIN_TOKENS or diff_tokens >= tokens_original * _DIFF_MAX_RATIO:
+        return None
+    return ReadResult(
+        content=diff_content,
+        from_cache=True,
+        is_diff=True,
+        tokens_original=tokens_original,
+        tokens_returned=diff_tokens,
+        tokens_saved=tokens_original - diff_tokens,
+        truncated=False,
+        compression_ratio=len(diff_content) / len(content) if content else 1.0,
+        content_hash=content_hash,
+    )
+
+
 async def smart_read(
     cache: SemanticCache,
     path: str,
@@ -114,6 +137,7 @@ async def smart_read(
     force_full: bool = False,
     refresh_cache: bool = True,
     map_oversized: bool = True,
+    base_content: str | None = None,
 ) -> ReadResult:
     """Read file with intelligent caching and optimization.
 
@@ -122,6 +146,9 @@ async def smart_read(
     2. File changed -> unified diff (80-95% reduction)
     3. Large file -> outline, or head/tail sample (see `large_file_map`)
     4. New file -> full content with caching for future reads
+
+    ``base_content`` is text the caller proved it holds, such as a past
+    version named by its ``known_hash``; the read then diffs from it.
     """
     file_path = Path(path).expanduser().resolve()
 
@@ -285,37 +312,36 @@ async def smart_read(
         # File changed - generate diff with stats
         if cached is not None:
             old_content = await cache.get_content(cached)
-            diff_content = generate_diff(
-                old_content, content, context_lines=_diff_context_lines(old_content)
-            )
-            diff_tokens = count_tokens(diff_content)
+            diffed = _diff_result(old_content, content, tokens_original, _content_hash())
+            if diffed is not None:
+                await cache.refresh_path(str(file_path), content, mtime, previous=old_content)
+                return diffed
 
-            if (
-                tokens_original >= _DIFF_MIN_TOKENS
-                and diff_tokens < tokens_original * _DIFF_MAX_RATIO
-            ):
-                # Bare diff: the `is_diff`/`diff_state` fields and the `@@` hunk
-                # headers already mark it as a diff, so a prose prefix would just
-                # cost tokens.
-                result_content = diff_content
-                await cache.refresh_path(
-                    str(file_path),
-                    content,
-                    mtime,
-                )
+    if base_content is not None and hash_content(base_content) == _content_hash():
+        if refresh_cache or not cache_is_fresh:
+            await cache.refresh_path(str(file_path), content, mtime)
+        unchanged_msg = f"// File unchanged: {path} ({tokens_original} tokens cached)"
+        msg_tokens = count_tokens(unchanged_msg)
+        if msg_tokens >= tokens_original:
+            unchanged_msg, msg_tokens = content, tokens_original
+        return ReadResult(
+            content=unchanged_msg,
+            from_cache=True,
+            is_diff=False,
+            tokens_original=tokens_original,
+            tokens_returned=msg_tokens,
+            tokens_saved=tokens_original - msg_tokens,
+            truncated=False,
+            compression_ratio=len(unchanged_msg) / len(content) if content else 1.0,
+            content_hash=_content_hash(),
+        )
 
-                tokens_returned = count_tokens(result_content)
-                return ReadResult(
-                    content=result_content,
-                    from_cache=True,
-                    is_diff=True,
-                    tokens_original=tokens_original,
-                    tokens_returned=tokens_returned,
-                    tokens_saved=tokens_original - tokens_returned,
-                    truncated=False,
-                    compression_ratio=len(result_content) / len(content),
-                    content_hash=_content_hash(),
-                )
+    if base_content is not None:
+        diffed = _diff_result(base_content, content, tokens_original, _content_hash())
+        if diffed is not None and not (map_oversized and len(diffed.content) > max_size):
+            if refresh_cache or not cache_is_fresh:
+                await cache.refresh_path(str(file_path), content, mtime)
+            return diffed
 
     truncated = False
     final_content = content
@@ -493,13 +519,21 @@ async def batch_smart_read(
                 # force_full with refresh_cache=False keeps the existing index
                 # when the entry is already fresh: the re-send costs one disk
                 # read and no re-chunking.
+                claim = _claims.get(path) or _claims.get(resolved_map[path])
+                held = (
+                    await cache.held_version(resolved_map[path], claim)
+                    if claim and diff_mode
+                    else None
+                )
                 result = await smart_read(
                     cache,
                     path,
                     diff_mode=False,
                     force_full=True,
                     refresh_cache=False,
+                    base_content=held,
                 )
+                caller_holds = held is not None and hash_matches(claim, result.content_hash)
 
             if result.is_binary:
                 # Binary files are silently skipped from batch results; the

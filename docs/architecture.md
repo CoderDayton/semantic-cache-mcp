@@ -54,7 +54,9 @@ The storage backend is a small SQLite store with FTS5, vendored into the package
 
 - **FTS5 full-text search.** BM25 keyword ranking powers `search` and `grep`
 - **Raw text storage.** File contents are stored as plain text in `page_content`, with no compression
-- **Metadata filtering.** Path and chunk lookups go through JSON metadata columns
+- **Indexed paths.** Each row's `path` sits in its own indexed column as well as in the metadata JSON, so a lookup by path never scans the table. A store created without the column gains and backfills it on open. Other metadata filters go through `json_extract`
+- **Head rows.** The row with no `parent_id` (a chunked file's parent, or the only row of any other file) carries the fields that change on reads: `mtime` and `access_history`. `get`, `record_access` and `update_mtime` read or write that one row and never load chunk text
+- **Past versions.** A `versions` table keeps the last 4 versions of each path (2,000 overall), zlib-compressed. A version is kept when a `put` replaces content of at most `MAX_CONTENT_SIZE` bytes whose hash checks out, and dropped with its path on delete, eviction or clear
 - **Text-free projections.** `get_metadata`, `get_document_ids`, `distinct_paths`, `file_stats` and `count_files` read metadata without selecting the text column, so a caller inspecting one field does not re-materialize the cached corpus
 - **Shutdown compaction.** Closing merges the FTS5 index (discarding the delete markers a deletion leaves behind) and returns the freed pages to the filesystem. Stores are opened in incremental auto-vacuum mode; one created before 0.5.3 is rewritten once to enable it. See [performance.md](performance.md#cache-footprint-on-disk)
 
@@ -88,7 +90,7 @@ Each document carries metadata for cache management:
 | `tokens` | `int` | Token count (BPE o200k_base) |
 | `chunk_index` | `int` | Chunk ordering (-1 for parent) |
 | `total_chunks` | `int` | Number of chunks (1 for small files) |
-| `access_history` | `JSON` | Recent access timestamps, used by W-TinyLFU eviction |
+| `access_history` | `JSON` | Recent access timestamps, used by W-TinyLFU eviction. Head row only |
 | `is_parent` | `bool` | Parent document marker (large files only) |
 | `preview` | `str` | First ~200 chars of file content, pre-stored at index time so search results don't re-slice chunked `page_content` at query time |
 
@@ -262,6 +264,10 @@ therefore re-gates it on evidence the caller supplies — `known_hash` on `read`
 `known_hashes` entry on `batch_read`. Only a matching hash turns the fast path into
 an `unchanged` reply; without one the caller gets the file, cheaply, from cache.
 The same rule governs diffs, which are just as unusable without the base content.
+A claim that names a kept past version of the path, rather than the current
+entry, is the same proof for that version: the reply is a diff from those bytes,
+verified against the claimed hash before use, or `unchanged` when the file is
+back to exactly that version.
 
 Mutations answer to the same rule from the other direction: a tool hands back a
 claimable `content_hash` only when the caller could derive the result it just
@@ -308,7 +314,9 @@ Client ──→ batch_smart_read(paths, diff_mode=True, known_hashes={...})
    → unchanged or diff           force_full=True,
                                  refresh_cache=False)
                                → literal bytes, and the index
-                                 is left alone when already fresh
+                                 is left alone when already fresh;
+                                 a diff when the claim names a
+                                 kept past version
          └──────┬─────────────────────┘
                 │
          4. Return BatchReadResult with per-file status + content_hash

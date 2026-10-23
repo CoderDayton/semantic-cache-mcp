@@ -21,11 +21,11 @@ from ...config import (
     MAX_CACHE_ENTRIES,
 )
 from ...core.chunking import get_optimal_chunker
-from ...core.hashing import hash_chunk, hash_content
+from ...core.hashing import hash_chunk, hash_content, hash_matches
 from ...core.tokenizer import count_tokens
 from ...logger import log_marker
 from ...types import CacheEntry
-from ._docstore import AsyncDocStore, DocStore
+from ._docstore import PATH_KEY, AsyncDocStore, DocStore
 from ._tinylfu import TinyLFUIndex
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class ContentIntegrityError(ValueError):
 
 
 # Metadata keys stored with each document
-_META_PATH = "path"
+_META_PATH = PATH_KEY
 _META_CHUNK_INDEX = "chunk_index"
 _META_TOTAL_CHUNKS = "total_chunks"
 _META_CONTENT_HASH = "content_hash"
@@ -69,6 +69,9 @@ _PREVIEW_CHARS = 200
 # Safety cap: when CDC produces more than this many chunks, store the file as a
 # single unchunked document instead of exploding the doc table.
 _MAX_CHUNKS = 500
+
+_VERSIONS_PER_PATH = 4
+_MAX_VERSIONS = 2_000
 
 
 class StorageMode(enum.StrEnum):
@@ -356,20 +359,13 @@ class ContentStorage:
     # -------------------------------------------------------------------------
 
     async def get(self, path: str) -> CacheEntry | None:
-        """Return metadata for path. For chunked files, uses the parent document."""
+        """Return metadata for path, read from its head row alone."""
         if self._closed:
             return None
-        results = await self._find_docs_by_path(path)
-        if not results:
+        head = await self._head(path)
+        if head is None:
             return None
-
-        # Prefer parent doc metadata (has file-level tokens, hash, etc.)
-        # For single-doc files there is no parent, so use the only doc.
-        meta = results[0][1]
-        for _doc_id, m, _text in results:
-            if m.get(_META_IS_PARENT, False):
-                meta = m
-                break
+        meta = head[1]
 
         access_history = json.loads(meta.get(_META_ACCESS_HISTORY, "[]"))
 
@@ -387,8 +383,15 @@ class ContentStorage:
         path: str,
         content: str,
         mtime: float,
+        *,
+        previous: str | None = None,
     ) -> None:
-        """Store file as raw text. Large files (>8KB) are HyperCDC-chunked."""
+        """Store file as raw text. Large files (>8KB) are HyperCDC-chunked.
+
+        ``previous`` is text the caller believes is cached for *path*; when its
+        hash matches the entry it is kept as the past version without
+        reassembling the stored chunks.
+        """
         if self._closed:
             return
         started = time.perf_counter()
@@ -423,7 +426,8 @@ class ContentStorage:
         # Load the current docs for this path once. A chunked re-write reuses
         # the rows whose chunk bytes are unchanged (addressed by chunk_hash)
         # rather than deleting and re-indexing every chunk — the manifest design.
-        existing = await self._find_docs_by_path(path)
+        await self._keep_version(path, content_hash, previous)
+        existing = await self._find_docs_by_path(path, with_text=False)
         parent_id: int | None = None
         for doc_id, meta, _text in existing:
             if meta.get(_META_IS_PARENT, False):
@@ -496,6 +500,47 @@ class ContentStorage:
             path=path,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
         )
+
+    async def _keep_version(self, path: str, new_hash: str, previous: str | None) -> None:
+        """Keep the cached text of *path* as a past version before it is replaced.
+
+        Only text a diff could be served from is kept: at most
+        ``config.MAX_CONTENT_SIZE`` bytes, and only when its hash checks out.
+        A token spans at least one byte, so a token count above the limit rules
+        a file out before its text is loaded.
+        """
+        limit = config.MAX_CONTENT_SIZE
+        try:
+            entry = await self.get(path)
+            if entry is None or entry.content_hash == new_hash or entry.tokens > limit:
+                return
+            if previous is not None and hash_content(previous) == entry.content_hash:
+                text = previous
+            else:
+                text = await self.get_content(entry)
+            if len(text.encode("utf-8")) > limit:
+                return
+            await self._collection.put_version(
+                path,
+                entry.content_hash,
+                text,
+                keep_per_path=_VERSIONS_PER_PATH,
+                keep_total=_MAX_VERSIONS,
+            )
+        except Exception as exc:
+            logger.debug(f"could not keep the previous version of {path}: {exc}")
+
+    async def version_text(self, path: str, claim: str | None) -> str | None:
+        """A past version of *path* whose hash *claim* names, verified, or None."""
+        if self._closed or not claim:
+            return None
+        found = await self._collection.find_version(
+            path, lambda content_hash: hash_matches(claim, content_hash)
+        )
+        if found is None:
+            return None
+        content_hash, text = found
+        return text if hash_content(text) == content_hash else None
 
     async def _store_single(
         self,
@@ -573,17 +618,16 @@ class ContentStorage:
 
     def _child_meta(self, path: str, i: int, plan: _ChunkPlan, base_meta: dict) -> dict:
         """Metadata for chunk ``i`` — carries its own ``chunk_hash`` so a later
-        re-write can content-address it for reuse."""
+        re-write can content-address it for reuse. The fields that change on
+        every read (mtime, access history) live on the parent alone."""
         return {
             _META_PATH: path,
             _META_CHUNK_INDEX: i,
             _META_TOTAL_CHUNKS: plan.total,
             _META_CHUNK_HASH: plan.hashes[i],
             _META_CONTENT_HASH: base_meta[_META_CONTENT_HASH],
-            _META_MTIME: base_meta[_META_MTIME],
             _META_TOKENS: plan.token_estimates[i],
             _META_CREATED_AT: base_meta[_META_CREATED_AT],
-            _META_ACCESS_HISTORY: base_meta[_META_ACCESS_HISTORY],
             _META_STORAGE_MODE: StorageMode.CHUNKED.value,
             "line_start": plan.line_starts[i],
         }
@@ -763,23 +807,18 @@ class ContentStorage:
     async def record_access(self, path: str) -> None:
         if self._closed:
             return
-        results = await self._find_docs_by_path(path)
-        if not results:
+        head = await self._head(path)
+        if head is None:
             return
 
         now = time.time()
-
-        # All chunks of a single path share one access history (set together
-        # in put() and updated together here). Parse once, reserialize once,
-        # then fan the same string out to every chunk doc — avoids N×
-        # json.loads/dumps round-trips on every cached read.
-        first_meta = results[0][1]
+        head_id, head_meta = head
         # access_history is semi-trusted DB metadata: a corrupt or non-list
         # value must not crash a cache-hit read (record_access is awaited
         # bare on that path). Parse defensively and keep only numeric
         # entries, matching TinyLFUIndex._parse_history.
         try:
-            parsed = json.loads(first_meta.get(_META_ACCESS_HISTORY, "[]"))
+            parsed = json.loads(head_meta.get(_META_ACCESS_HISTORY, "[]"))
         except (ValueError, TypeError):
             parsed = []
         history: list[float] = (
@@ -787,13 +826,9 @@ class ContentStorage:
         )
         history.append(now)
         history = history[-ACCESS_HISTORY_SIZE:]
-        history_json = json.dumps(history)
-        updates: list[tuple[int, dict]] = [
-            (doc_id, {_META_ACCESS_HISTORY: history_json}) for doc_id, _meta, _text in results
-        ]
-
-        if updates:
-            await self._collection.update_metadata(updates)
+        await self._collection.update_metadata(
+            [(head_id, {_META_ACCESS_HISTORY: json.dumps(history)})]
+        )
         # Mirror the access into the in-memory index so eviction has up-to-
         # date frequency/recency without re-reading metadata. Skip while the
         # index is unloaded — the bootstrap will replay history from the DB.
@@ -808,16 +843,10 @@ class ContentStorage:
         """
         if self._closed:
             return
-        results = await self._find_docs_by_path(path)
-        if not results:
+        head = await self._head(path)
+        if head is None:
             return
-
-        updates: list[tuple[int, dict]] = []
-        for doc_id, _meta, _text in results:
-            updates.append((doc_id, {_META_MTIME: new_mtime}))
-
-        if updates:
-            await self._collection.update_metadata(updates)
+        await self._collection.update_metadata([(head[0], {_META_MTIME: new_mtime})])
 
     # -------------------------------------------------------------------------
     # Query-based search
@@ -1016,6 +1045,7 @@ class ContentStorage:
             if doc_ids:
                 sync_coll.delete_by_ids(doc_ids)
                 sync_coll.save()
+        sync_coll.delete_versions(None)
         index = getattr(self, "_index", None)
         if index is not None:
             index.clear()
@@ -1031,12 +1061,15 @@ class ContentStorage:
         if count > 0:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._io_executor, self._db.clear)
+        else:
+            await self._collection.delete_versions(None)
         self._index.clear()
         return count
 
     async def delete_path(self, path: str) -> int:
         """Delete cached documents for one path. Returns docs removed."""
         removed = await self._delete_by_path(path)
+        await self._collection.delete_versions([path])
         if removed > 0:
             await self._collection.save()
         return removed
@@ -1045,9 +1078,24 @@ class ContentStorage:
     # Internal helpers
     # -------------------------------------------------------------------------
 
-    async def _find_docs_by_path(self, path: str) -> list[tuple[int, dict, str]]:
-        """Return [(doc_id, metadata, text)] for all documents at path."""
+    async def _head(self, path: str) -> tuple[int, dict] | None:
         try:
+            return await self._collection.head_metadata(path)
+        except Exception as e:
+            logger.debug(f"Head lookup failed for {path}: {e}")
+            return None
+
+    async def _find_docs_by_path(
+        self, path: str, *, with_text: bool = True
+    ) -> list[tuple[int, dict, str]]:
+        """Return [(doc_id, metadata, text)] for all documents at path.
+
+        ``with_text=False`` skips the text column and returns ``""`` in its place.
+        """
+        try:
+            if not with_text:
+                metas = await self._collection.get_metadata(filter_dict={_META_PATH: path})
+                return [(doc_id, meta, "") for doc_id, meta in metas]
             docs = await self._collection.get_documents(
                 filter_dict={_META_PATH: path},
             )
@@ -1061,7 +1109,7 @@ class ContentStorage:
         return [(doc_id, meta, text) for doc_id, text, meta in docs]
 
     async def _delete_by_path(self, path: str) -> int:
-        results = await self._find_docs_by_path(path)
+        results = await self._find_docs_by_path(path, with_text=False)
         if not results:
             # Index may still hold a stale entry if a prior put failed mid-way.
             self._index.remove(path)
@@ -1141,6 +1189,7 @@ class ContentStorage:
             # eviction-need rather than leaking them silently.
             self._index.mark_dirty()
             raise
+        await self._collection.delete_versions([path for path, _ in victims], orphaned_only=True)
         await self._collection.save()
         logger.info(
             f"Cache eviction: removed {len(victims)} files "

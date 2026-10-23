@@ -1004,6 +1004,11 @@ async def read(
         caller_has_current = prior_entry is not None and hash_matches(
             known_hash, prior_entry.content_hash
         )
+        held_version = (
+            await cache.held_version(abs_path, known_hash)
+            if known_hash and not caller_has_current
+            else None
+        )
         result = await asyncio.wait_for(
             smart_read(
                 cache=cache,
@@ -1012,6 +1017,7 @@ async def read(
                 diff_mode=caller_has_current,
                 force_full=not caller_has_current,
                 refresh_cache=caller_has_current,
+                base_content=held_version,
             ),
             timeout=_TOOL_TIMEOUT,
         )
@@ -1023,11 +1029,12 @@ async def read(
             return _finalize_payload(_binary_read_payload(path, result), max_response_tokens)
 
         cache_fresh = result.from_cache and not result.is_diff
-        unchanged = cache_fresh and caller_has_current
+        holds_reverted = held_version is not None and hash_matches(known_hash, result.content_hash)
+        unchanged = cache_fresh and (caller_has_current or holds_reverted)
         # Re-read the entry now that the read has run: it seeds a file the cache
         # had never seen and refreshes one that moved on disk, so the pre-read
         # entry is the wrong thing to stamp a hash from.
-        entry = prior_entry if unchanged else await cache.get(abs_path)
+        entry = prior_entry if unchanged and caller_has_current else await cache.get(abs_path)
 
         payload = {
             "ok": True,

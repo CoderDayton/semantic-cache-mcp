@@ -265,6 +265,8 @@ class SemanticCache:
         path: str,
         content: str,
         mtime: float,
+        *,
+        previous: str | None = None,
     ) -> None:
         tokens = count_tokens(content)
         started = time.perf_counter()
@@ -274,7 +276,7 @@ class SemanticCache:
             path=path,
             tokens=tokens,
         )
-        await self._storage.put(path, content, mtime)
+        await self._storage.put(path, content, mtime, previous=previous)
         self._bump_search_cache()
         log_marker(
             logger,
@@ -299,6 +301,7 @@ class SemanticCache:
         mtime: float,
         *,
         timeout: float | None = None,
+        previous: str | None = None,
     ) -> bool:
         refresh_timeout = self._compute_refresh_timeout() if timeout is None else timeout
         started = time.perf_counter()
@@ -310,7 +313,7 @@ class SemanticCache:
         )
 
         async def _refresh() -> None:
-            await self.put(path, content, mtime)
+            await self.put(path, content, mtime, previous=previous)
 
         try:
             await asyncio.wait_for(_refresh(), timeout=refresh_timeout)
@@ -381,6 +384,10 @@ class SemanticCache:
 
     async def record_access(self, path: str) -> None:
         await self._storage.record_access(path)
+
+    async def held_version(self, path: str, claim: str | None) -> str | None:
+        """A past version of *path* the caller proves it holds by *claim*, or None."""
+        return await self._storage.version_text(path, claim)
 
     async def update_mtime(self, path: str, new_mtime: float) -> None:
         """Update cached mtime without re-storing content."""
