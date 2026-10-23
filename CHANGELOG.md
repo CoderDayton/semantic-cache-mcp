@@ -7,12 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **One shared server for every client.** The `semantic-cache-mcp` command is now a thin relay: it connects to a per-user daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer; with 4 clients that measured 385 MB in 7 processes, against 1,201 MB in 12. Each client keeps its own MCP session, so roots and relative paths resolve per client, and a client that sends no roots resolves against the directory it launched the command from.
+  - Clients share a daemon only when they run the same build with the same configuration: every config variable, `PATH`, `HOME`/`USERPROFILE`, and anything prefixed `SCMCP_`.
+  - Linux and macOS use a Unix socket in `$XDG_RUNTIME_DIR/semantic-cache-mcp-<uid>/` (mode `0700`); the command refuses a directory anyone else can enter.
+  - Windows, or `SCMCP_SHARED_TRANSPORT=tcp`, uses a random `127.0.0.1` port. The daemon writes the port and a fresh 256-bit token to a `0600` port file and drops any connection that does not send the token. The launcher trusts a port file only while the daemon's lock is held.
+  - The daemon answers each connection with a `ready` line before the relay starts, so a client that connects while a daemon shuts down retries once against a fresh one. Any failure before `ready` falls back to serving in-process.
+  - New variables: `SCMCP_SHARED_SERVER` (default `true`; `0` runs one server per client, as before), `SCMCP_SHARED_TRANSPORT` (`unix` or `tcp`), `SCMCP_IDLE_TIMEOUT` (default 600 s with no client before the daemon exits). `semantic-cache-mcp serve` runs the daemon in the foreground.
+- **Diffs from past versions.** The store keeps the last 4 versions of each path (2,000 overall), so a `known_hash` naming an older version gets a diff from that version, and a file reverted to a version the caller holds answers `unchanged`.
+- **Trigram index for `grep`.** A contentless FTS5 trigram table answers each literal in the pattern as an exact substring test, narrowing the files `grep` has to scan. Files missing from the index, or stale in it, are always scanned and then indexed in bounded batches, so writes pay nothing and a stale row never hides a match. On a 197-file store, a miss went 13.4 → 4.7 ms. The index adds about 8 MB to that store.
+
 ### Changed
 
 - `read` returns a map of a file over `max_size` instead of a semantic summary. The map is the file's outline, or for a file with no definitions its first and last 20 lines under `// L<a>-<b>` anchors. Every line number is a valid `offset`. The response reports `total_lines`.
 - `batch_read` returns the same map for an oversized file.
+- **Token counts are exact o200k counts, matching tiktoken**, up to 256K characters; above that they are sampled from 16 windows (0.1% under exact on this repo). Counts are memoized by hash. The old estimates ran about 1.7× high, so every reported token figure is lower for the same text.
+- **`max_response_tokens` is enforced exactly.** The check stops counting at the cap, and only skips counting a payload of at most `cap // 4` characters, since one character can cost up to 4 byte-level tokens. Emoji-dense responses no longer slip past the cap.
+- **Cached reads are about 7× faster.** Documents carry an indexed `path` column, backfilled on first open, so a by-path lookup is an index probe instead of a metadata scan; `get`, `record_access` and `update_mtime` touch only the head row. A single unchanged read went 1.27 → 0.17 ms, a 44-file re-read 21.4 → 7.4 ms.
+- **The outline finds more definitions:** TypeScript `export` and `abstract` classes, class methods, and Luau `local function`. Code inside Markdown fences is skipped, and per-line match length is capped.
+- **The WAL is capped at 16 MB and truncated on close.** It used to grow without bound while another process held a read snapshot; one live store had a 126 MB WAL next to a 22 MB database.
+- The console entry point is now `semantic_cache_mcp.launcher:main`, and `python -m semantic_cache_mcp.server` runs the same command.
 - Removed the semantic summarizer (`core.summarize_semantic`, `core.truncate_with_summarization`, `SummarizationConfig`) and its tests.
-- Internal: `smart_read` keyword `summarize` renamed to `map_oversized`. `ReadResult` gains `total_lines`.
+- Removed unused diff helpers from `core`: `truncate_semantic`, `truncate_smart`, `compute_delta`, `DiffDelta`, `diff_stats`.
+- Internal: `smart_read` keyword `summarize` renamed to `map_oversized`. `ReadResult` gains `total_lines`. The client root is cached per MCP session instead of per process.
+
+### Fixed
+
+- A diff now marks a last line without a trailing newline (`\ No newline at end of file`). Before, a change to that line produced a diff that could not be applied.
+- `grep` no longer misses matches for patterns whose required literal follows an escape, such as `\bparse`.
 
 ## [0.6.0] - 2026-09-02: Freshness that a timestamp cannot fake, a search that stays in your project
 
