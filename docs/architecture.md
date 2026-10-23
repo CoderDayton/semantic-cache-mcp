@@ -253,7 +253,7 @@ Client ──→ smart_read(path, diff_mode=True)
   return "unchanged"      aread_bytes(path) ──→ hash + decode
   no aread_bytes call             │
   (99% savings,           ┌───────┴────────────┐
-   ~1 ms latency)         ▼                    ▼
+   ~0.2 ms latency)       ▼                    ▼
                   hash matches cached    hash changed
                   update_mtime           generate diff
                   return "unchanged"     refresh_path + return diff
@@ -266,8 +266,8 @@ Client ──→ smart_read(path, diff_mode=True)
 
 **Why the fast path matters:** the unchanged case is the most common in interactive
 sessions (the LLM re-reads files it already has). Skipping `aread_bytes`, `count_tokens`,
-and the hash compute keeps single-file unchanged reads to **~1 ms** (vs ~2 ms when
-the disk read was unconditional in pre-0.4.6 builds).
+and the hash compute, plus an indexed lookup by path, keeps single-file unchanged
+reads to **~0.2 ms** in-process.
 
 **The possession gate (0.5.2).** The diagram above is `smart_read`, which answers
 from cache state alone. That answer is a claim about the *server*: the store is on

@@ -339,7 +339,7 @@ A malformed value falls back to the default and logs a warning naming the variab
 
 ### Shared server
 
-`semantic-cache-mcp` is a thin relay. It connects to one daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer. With 4 clients, that measured 384 MB in 7 processes, against 1,204 MB in 12 when each client ran its own server.
+`semantic-cache-mcp` is a thin relay. It connects to one daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer. With 4 clients, that measured 385 MB in 7 processes, against 1,201 MB in 12 when each client ran its own server. A client joins a running daemon in about 31 ms.
 
 - Each client keeps its own MCP session, so roots and relative paths work as before. A client that names no root resolves relative paths against the directory it launched the command from.
 - Clients share a daemon only when they run the same build with the same configuration: every variable above, `PATH`, `HOME` (`USERPROFILE` on Windows), and anything prefixed `SCMCP_`.
@@ -367,7 +367,7 @@ A malformed value falls back to the default and logs a warning naming the variab
  │ PATH     │    │ match    │      │ (80-95%) │      │  or full   │
  │ ~5 tok   │    │ ~5 tok   │      └──────────┘      └────────────┘
  │ (99%)    │    │ (99%)    │
- │ ~1 ms    │    │ ~1 ms    │
+ │ ~0.2 ms  │    │ ~1 ms    │
  │ no I/O   │    │ +update  │
  └──────────┘    └──────────┘
 ```
@@ -378,35 +378,37 @@ A malformed value falls back to the default and logs a warning naming the variab
 
 ## Performance
 
-Measured on this project's 44 source files (**228,943 tokens**), i9-13900K, ext4 on NVMe, corpus held fixed across phases. Every phase models a caller that keeps its hashes and echoes them back — that is what earns the savings.
+Measured on this project's 48 source files (**131,899 tokens**, exact o200k counts), i9-13900K, ext4 on NVMe, corpus held fixed across phases. Every phase models a caller that keeps its hashes and echoes them back — that is what earns the savings.
 
-### Token savings: **98.9%** overall (phases 2 to 6)
+### Token savings: **98.7%** overall (phases 2 to 6)
 
 | Phase | Scenario | Savings |
 |-------|----------|--------:|
-| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.9%** |
-| Unchanged re-read | mtime match, fast path skips disk I/O | 99.3% |
-| Content hash | mtime drifted, BLAKE3 still matches | 99.3% |
-| Batch read | All files via `batch_read`, 200K budget | 99.3% |
-| Search previews | 5 queries × k=5, previews vs full reads | 98.6% |
-| Small edits | Real ~5% line changes in 30% of files | 98.2% |
-| Cold read | First read, no cache; one file exceeds `MAX_CONTENT_SIZE` and returns its outline, which is not a cache saving | 23.5% |
+| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.7%** |
+| Unchanged re-read | mtime match, fast path skips disk I/O | 99.0% |
+| Content hash | mtime drifted, BLAKE3 still matches | 99.0% |
+| Batch read | All files via `batch_read`, 200K budget | 99.0% |
+| Search previews | 5 queries × k=5, previews vs full reads | 98.4% |
+| Small edits | Real ~5% line changes in 30% of files | 97.8% |
+| Cold read | First read, no cache; one file exceeds `MAX_CONTENT_SIZE` and returns its outline, which is not a cache saving | 21.4% |
 
-### Latency: **unchanged reads ~1 ms; repeat searches < 0.01 ms**
+### Latency: **unchanged reads 0.17 ms; repeat searches < 0.01 ms**
 
 | Operation | p50 | Notes |
 |-----------|----:|-------|
-| Single unchanged read (fast path) | **1.3 ms** | mtime + cache hit, no disk I/O |
-| Single diff read (changed file) | 0.8 ms | hash check + unified diff |
+| Single unchanged read (fast path) | **0.17 ms** | mtime + indexed cache hit, no disk I/O |
+| Single diff read (changed file) | 0.17 ms | hash check + unified diff |
 | Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU |
-| Search k=5 (cache **miss**) | 1.5 ms | BM25 keyword search |
-| Edit (scoped find/replace) | 3.1 ms | cached content, plus the atomic write's fsync |
-| Grep (literal `def `) | 1.6 ms | FTS5 over cached corpus |
-| Grep (regex) | 3.8 ms | compiled once |
-| Batch read (44 files, diff mode) | 43.5 ms | chunk + tokenize changed files; one is outlined each full pass |
-| Unchanged re-read (44 files) | 25.9 ms | whole-corpus pass |
-| Cold read (44 files, total) | 106 ms | single unrepeated pass: I/O, tokenisation, one outline |
-| Write (200-line file) | 3.0 ms | creates + caches, durable before it returns |
+| Search k=5 (cache **miss**) | 0.72 ms | BM25 keyword search |
+| Edit (scoped find/replace) | 2.5 ms | cached content, plus the atomic write's fsync |
+| Grep (literal `def `) | 2.2 ms | trigram index over cached corpus |
+| Grep (regex) | 2.2 ms | compiled once |
+| Batch read (48 files, diff mode) | 45.0 ms | chunk + tokenize changed files; one is outlined each full pass |
+| Unchanged re-read (48 files) | 8.2 ms | whole-corpus pass |
+| Cold read (48 files, total) | 130 ms | single unrepeated pass: I/O, tokenisation, one outline |
+| Write (200-line file) | 1.9 ms | creates + caches, durable before it returns |
+
+Through the real command over MCP stdio, an unchanged `read` round trip takes 1.3–1.6 ms, with or without the shared daemon. See [docs/performance.md](docs/performance.md#through-the-mcp-server).
 
 Run them yourself. Pin `TMPDIR` to a real disk — the default `/tmp` is usually tmpfs, which discards `fsync` and reports write latency ~40% low:
 
