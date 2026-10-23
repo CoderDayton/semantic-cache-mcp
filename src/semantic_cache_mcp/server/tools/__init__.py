@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import json
 import logging
 import os
 import stat as stat_module
 import warnings
+import weakref
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -159,13 +162,18 @@ _tool_lock_loop: asyncio.AbstractEventLoop | None = None
 _RemoteToolReturnT = TypeVar("_RemoteToolReturnT")
 
 
-# Cached client root — resolved once per session via the session's roots/list.
-_client_root: Path | None = None
-_client_root_resolved: bool = False
+_session_roots: weakref.WeakKeyDictionary[Any, Path | None] = weakref.WeakKeyDictionary()
+
+CONNECTION_CWD: ContextVar[Path | None] = ContextVar("connection_cwd", default=None)
+"""Working directory of the client behind the current connection, when the
+server process is not that client's child (the shared daemon). A client that
+names no root resolves relative paths against it, as it would against the
+working directory of a server it launched itself."""
 
 
 async def _resolve_client_root(ctx: Context) -> Path | None:
-    """Fetch and cache the MCP client's project root (first roots/list entry).
+    """The client's project root: its first ``file://`` root, else
+    :data:`CONNECTION_CWD`. The root is fetched once per MCP session.
 
     fastmcp 4.0 removed ``Context.list_roots``: the sessionless 2026-07-28 era has
     no back-channel for a server-initiated request. Handshake-era connections still
@@ -173,33 +181,48 @@ async def _resolve_client_root(ctx: Context) -> Path | None:
     getting an answer — no session, no back-channel, no roots — means the same
     thing here, and leaves relative paths resolving against the working directory.
     """
-    global _client_root, _client_root_resolved
-    if not _client_root_resolved:
-        try:
-            with warnings.catch_warnings():
-                # roots/list is deprecated as of 2026-07-28 (SEP-2577). The
-                # handshake-era back-channel is still the only way to ask, and
-                # the era that dropped it also drops the question. Filter only
-                # that one warning — `catch_warnings` mutates process-global
-                # state, and this block spans an await, so a blanket ignore
-                # would swallow warnings from concurrent tasks.
-                warnings.filterwarnings("ignore", category=MCPDeprecationWarning)
-                result = await ctx.session.list_roots()
-            roots = result.roots
-            if roots:
-                uri = str(roots[0].uri)
-                if uri.startswith("file://"):
-                    # Resolved, because every cached document path is stored
-                    # resolved. A root reached through a symlink (macOS
-                    # `/tmp`, a symlinked checkout) would otherwise prefix
-                    # nothing in the store, and the `within` scoping that
-                    # `grep` applies would hide the whole project.
-                    _client_root = Path(uri[7:]).resolve()
-                    logger.debug(f"Client root: {_client_root}")
-        except Exception:
-            logger.debug("Could not resolve client roots", exc_info=True)
-        _client_root_resolved = True
-    return _client_root
+    try:
+        session = getattr(ctx, "session", None)
+    except RuntimeError:
+        session = None
+    try:
+        if session is not None and session in _session_roots:
+            return _session_roots[session] or CONNECTION_CWD.get()
+    except TypeError:
+        session = None
+    root = await _fetch_client_root(ctx)
+    if session is not None:
+        with contextlib.suppress(TypeError):
+            _session_roots[session] = root
+    return root or CONNECTION_CWD.get()
+
+
+async def _fetch_client_root(ctx: Context) -> Path | None:
+    try:
+        with warnings.catch_warnings():
+            # roots/list is deprecated as of 2026-07-28 (SEP-2577). The
+            # handshake-era back-channel is still the only way to ask, and
+            # the era that dropped it also drops the question. Filter only
+            # that one warning — `catch_warnings` mutates process-global
+            # state, and this block spans an await, so a blanket ignore
+            # would swallow warnings from concurrent tasks.
+            warnings.filterwarnings("ignore", category=MCPDeprecationWarning)
+            result = await ctx.session.list_roots()
+        roots = result.roots
+        if roots:
+            uri = str(roots[0].uri)
+            if uri.startswith("file://"):
+                # Resolved, because every cached document path is stored
+                # resolved. A root reached through a symlink (macOS
+                # `/tmp`, a symlinked checkout) would otherwise prefix
+                # nothing in the store, and the `within` scoping that
+                # `grep` applies would hide the whole project.
+                root = Path(uri[7:]).resolve()
+                logger.debug(f"Client root: {root}")
+                return root
+    except Exception:
+        logger.debug("Could not resolve client roots", exc_info=True)
+    return None
 
 
 def _resolve_path(path: str, root: Path | None) -> str:

@@ -21,26 +21,29 @@ from semantic_cache_mcp.server import tools
 
 @pytest.fixture(autouse=True)
 def _reset_client_root() -> Any:
-    """`_resolve_client_root` caches process-wide; isolate each test from it."""
-    tools._client_root = None
-    tools._client_root_resolved = False
+    """`_resolve_client_root` caches per session; isolate each test from it."""
+    tools._session_roots.clear()
     yield
-    tools._client_root = None
-    tools._client_root_resolved = False
+    tools._session_roots.clear()
+
+
+class _Session:
+    def __init__(self, list_roots: Any) -> None:
+        self.list_roots = list_roots
 
 
 def _ctx_with_roots(*uris: str) -> Any:
     async def list_roots() -> ListRootsResult:
         return ListRootsResult(roots=[Root(uri=uri) for uri in uris])
 
-    return SimpleNamespace(session=SimpleNamespace(list_roots=list_roots))
+    return SimpleNamespace(session=_Session(list_roots))
 
 
 def _ctx_without_back_channel() -> Any:
     async def list_roots() -> ListRootsResult:
         raise RuntimeError("connection has no back-channel for server-initiated requests")
 
-    return SimpleNamespace(session=SimpleNamespace(list_roots=list_roots))
+    return SimpleNamespace(session=_Session(list_roots))
 
 
 class TestResolveClientRoot:
@@ -67,6 +70,16 @@ class TestResolveClientRoot:
         """Sessionless era and unit-test contexts alike: absent, not an error."""
         assert await tools._resolve_client_root(SimpleNamespace()) is None
 
+    async def test_a_session_property_that_raises_returns_none(self) -> None:
+        """fastmcp's `Context.session` raises RuntimeError when none is established."""
+
+        class _NoSession:
+            @property
+            def session(self) -> Any:
+                raise RuntimeError("session is not available")
+
+        assert await tools._resolve_client_root(_NoSession()) is None
+
     async def test_result_is_resolved_once_and_cached(self) -> None:
         calls = 0
 
@@ -75,10 +88,25 @@ class TestResolveClientRoot:
             calls += 1
             return ListRootsResult(roots=[Root(uri="file:///srv/app")])
 
-        ctx = SimpleNamespace(session=SimpleNamespace(list_roots=list_roots))
+        ctx = SimpleNamespace(session=_Session(list_roots))
         assert await tools._resolve_client_root(ctx) == Path("/srv/app")
         assert await tools._resolve_client_root(ctx) == Path("/srv/app")
         assert calls == 1
+
+    async def test_each_session_keeps_its_own_root(self) -> None:
+        first = _ctx_with_roots("file:///srv/one")
+        second = _ctx_with_roots("file:///srv/two")
+        assert await tools._resolve_client_root(first) == Path("/srv/one")
+        assert await tools._resolve_client_root(second) == Path("/srv/two")
+        assert await tools._resolve_client_root(first) == Path("/srv/one")
+
+    async def test_no_roots_falls_back_to_the_connection_cwd(self) -> None:
+        token = tools.CONNECTION_CWD.set(Path("/srv/launched-here"))
+        try:
+            assert await tools._resolve_client_root(_ctx_with_roots()) == Path("/srv/launched-here")
+            assert await tools._resolve_client_root(SimpleNamespace()) == Path("/srv/launched-here")
+        finally:
+            tools.CONNECTION_CWD.reset(token)
 
 
 class TestResolvePath:

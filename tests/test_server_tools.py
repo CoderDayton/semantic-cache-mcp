@@ -1230,7 +1230,6 @@ class TestGrepTool:
         self, ctx: MagicMock, tmp_path: Path, tmp_cache: SemanticCache
     ) -> None:
         """`search` shares the store with every project, and shared it too."""
-        import semantic_cache_mcp.server.tools as tools_mod
         from semantic_cache_mcp.server.tools import search as search_tool
 
         mine = tmp_path / "proj" / "notes.md"
@@ -1240,16 +1239,11 @@ class TestGrepTool:
             f.write_text("authentication middleware token\n")
             await smart_read(tmp_cache, str(f))
 
-        saved = (tools_mod._client_root, tools_mod._client_root_resolved)
-        tools_mod._client_root = tmp_path / "proj"
-        tools_mod._client_root_resolved = True
-        try:
-            scoped = _parse(await search_tool(ctx, "authentication middleware"))
-            reaching_out = _parse(
-                await search_tool(ctx, "authentication middleware", directory=str(tmp_path))
-            )
-        finally:
-            tools_mod._client_root, tools_mod._client_root_resolved = saved
+        ctx.client_root = tmp_path / "proj"
+        scoped = _parse(await search_tool(ctx, "authentication middleware"))
+        reaching_out = _parse(
+            await search_tool(ctx, "authentication middleware", directory=str(tmp_path))
+        )
 
         def _paths(payload: dict[str, Any]) -> list[str]:
             root = payload.get("root", "")
@@ -1268,7 +1262,6 @@ class TestGrepTool:
         "anywhere in the cache"; otherwise `grep(path="CHANGELOG.md")` spends
         its match cap on other repos' files and never reaches this one.
         """
-        import semantic_cache_mcp.server.tools as tools_mod
 
         mine = tmp_path / "proj" / "CHANGELOG.md"
         theirs = tmp_path / "other" / "CHANGELOG.md"
@@ -1277,16 +1270,11 @@ class TestGrepTool:
             f.write_text("## heading\n")
             await smart_read(tmp_cache, str(f))
 
-        saved = (tools_mod._client_root, tools_mod._client_root_resolved)
-        tools_mod._client_root = tmp_path / "proj"
-        tools_mod._client_root_resolved = True
-        try:
-            by_name = _parse(await grep(ctx, "heading", fixed_string=True, path="CHANGELOG.md"))
-            unfiltered = _parse(await grep(ctx, "heading", fixed_string=True))
-            absolute = _parse(await grep(ctx, "heading", fixed_string=True, path=str(theirs)))
-            outside = _parse(await grep(ctx, "heading", fixed_string=True, path="other/"))
-        finally:
-            tools_mod._client_root, tools_mod._client_root_resolved = saved
+        ctx.client_root = tmp_path / "proj"
+        by_name = _parse(await grep(ctx, "heading", fixed_string=True, path="CHANGELOG.md"))
+        unfiltered = _parse(await grep(ctx, "heading", fixed_string=True))
+        absolute = _parse(await grep(ctx, "heading", fixed_string=True, path=str(theirs)))
+        outside = _parse(await grep(ctx, "heading", fixed_string=True, path="other/"))
 
         assert [f["path"] for f in by_name["files"]] == [str(mine)]
         assert [f["path"] for f in unfiltered["files"]] == [str(mine)]
