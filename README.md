@@ -10,56 +10,60 @@
 <h1 align="center">Semantic Cache MCP</h1>
 
 <p align="center">
-  <a href="https://ko-fi.com/U7U01WTJF9">
-    <img
-      src="https://ko-fi.com/img/githubbutton_sm.svg"
-      alt="Support on Ko-fi"
-      height="36"
-    />
-  </a>
+  <strong>Stop paying for the same file twice.</strong><br />
+  An MCP file cache for AI coding agents: a re-read costs ~40 tokens instead of the whole file.
 </p>
 
 <p align="center">
-  <a href="https://www.python.org/downloads/" >
-    <img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" />
-  </a>
-  <a href="https://github.com/modelcontextprotocol/python-sdk">
-    <img src="https://img.shields.io/badge/FastMCP-4.0%2B-00A67E?style=for-the-badge" alt="FastMCP 4.0+" />
-  </a>
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" />
-  </a>
+  <a href="https://pypi.org/project/semantic-cache-mcp/"><img src="https://img.shields.io/pypi/v/semantic-cache-mcp?style=for-the-badge&color=3670A0" alt="PyPI version" /></a>
+  <a href="https://pypi.org/project/semantic-cache-mcp/"><img src="https://img.shields.io/pypi/dm/semantic-cache-mcp?style=for-the-badge&color=00A67E" alt="PyPI downloads" /></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.12%2B-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54" alt="Python 3.12+" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-D4A017?style=for-the-badge" alt="License: MIT" /></a>
 </p>
 
----
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/CoderDayton/semantic-cache-mcp"><img src="https://glama.ai/mcp/servers/CoderDayton/semantic-cache-mcp/badge" alt="Semantic Cache MCP on Glama" height="40" /></a>
+  &nbsp;
+  <a href="https://ko-fi.com/U7U01WTJF9"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support on Ko-fi" height="36" /></a>
+</p>
 
-**Cut your MCP client's token usage by ~98% on cached reads, with millisecond responses.**
-
-Semantic Cache MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that puts every file operation behind one cache. Re-reading a file you already hold costs a few tokens instead of the whole file, and search and grep run over that same corpus rather than the disk.
-
-Fourteen tools share the layer: `read`, `read_image`, `batch_read`, `warm`, `write`, `edit`, `edit_preview`, `batch_edit`, `search`, `grep`, `glob`, `delete`, `clear`, `stats`.
-
----
-
-## Why this exists
-
-**Reads stop costing tokens.** The first read hands back a `content_hash`. Send it back — `known_hash` on `read`, a `known_hashes` entry on `batch_read` — and the server replies `unchanged` without resending. A modified file returns a diff with changed line numbers; an oversized one collapses to a structure-preserving summary rather than a blind cut at a byte offset.
-
-Hashes travel as their first 16 hex characters — a claim is only ever checked against the entry for the path it names, so 64 bits separates two versions of one file with room to spare, and the full digest is still accepted. A shorter prefix is not: that would match every version at once.
-
-That echoed hash is the whole contract, and it is the only evidence the server has that a file is still in your context. A warm cache proves the *server* holds the file, never that you do — the store is on disk and outlives the process, the session, and your context window. A read without a matching hash always sends the file, so forgetting is safe: after a compaction, omit the hashes and get your files back in full.
-
-**Search and grep run on the cache, not the disk.** BM25 keyword search, glob, and grep all read the corpus that `read`, `batch_read` and `warm` populate — and `warm` fills it without returning a byte of content, so a whole tree becomes searchable for a few dozen tokens. An in-session result LRU collapses repeated queries to sub-millisecond hits.
-
-**Mutations are bounded by default.** `write`, `edit`, and `batch_edit` enforce size and match limits, can run formatters, and refresh the cache atomically. A `dry_run` writes nothing and says so — the status becomes `would_create` / `would_update` / `would_edit` — so a preview is never mistaken for a completed write.
+<!-- mcp-name: io.github.CoderDayton/semantic-cache-mcp -->
 
 ---
 
-## Installation
+Coding agents read the same files over and over: before an edit, after an edit, after every context compaction. A built-in `Read` sends the whole file each time.
 
-Add to Claude Code settings (`~/.claude.json`).
+Semantic Cache MCP replaces those reads with a cache that knows what your agent already holds. Measured on one 7,891-token source file:
 
-**Option 1**: `uvx`, always runs the latest version:
+| Read | Built-in `Read` | Semantic Cache MCP |
+|------|----------------:|-------------------:|
+| First read | 7,891 tokens | full file, plus a hash |
+| Re-read, file unchanged | 7,891 tokens | **77 tokens** |
+| Re-read after a one-line edit | 7,891 tokens | **137 tokens** (a diff) |
+
+Across a whole 48-file project the benchmark saves **98.7%** of re-read tokens, and an unchanged read returns in **0.17 ms**.
+
+It also gives your agent `grep`, keyword search and `glob` over the cache, safe edits with `dry_run`, and token-budgeted batch reads. 14 tools in all, three runtime dependencies, no API keys, no GPU.
+
+**Works with** Claude Code, Cursor, VS Code (Copilot), Codex, OpenCode, Claude Desktop, and any other MCP client that runs a local stdio server.
+
+---
+
+## Quick start
+
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/). Pick your client:
+
+<details open>
+<summary><strong>Claude Code</strong></summary>
+
+```bash
+claude mcp add semantic-cache --scope user -- uvx semantic-cache-mcp
+```
+
+</details>
+
+<details>
+<summary><strong>Cursor</strong>: <code>~/.cursor/mcp.json</code></summary>
 
 ```json
 {
@@ -72,29 +76,81 @@ Add to Claude Code settings (`~/.claude.json`).
 }
 ```
 
-**Option 2**: `uv tool install`:
+</details>
 
-```bash
-uv tool install semantic-cache-mcp
-```
+<details>
+<summary><strong>VS Code (Copilot)</strong>: <code>.vscode/mcp.json</code></summary>
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "semantic-cache": {
-      "command": "semantic-cache-mcp"
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["semantic-cache-mcp"]
     }
   }
 }
 ```
 
-Restart Claude Code.
+</details>
 
-### Block Native File Tools (Recommended)
+<details>
+<summary><strong>Codex</strong>: <code>~/.codex/config.toml</code></summary>
 
-Disable the client's built-in file tools so all file I/O routes through semantic-cache.
+```toml
+[mcp_servers.semantic-cache]
+command = "uvx"
+args = ["semantic-cache-mcp"]
+```
 
-**Claude Code** — `~/.claude/settings.json`:
+</details>
+
+<details>
+<summary><strong>OpenCode</strong>: <code>~/.config/opencode/opencode.json</code></summary>
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "semantic-cache": {
+      "type": "local",
+      "command": ["uvx", "semantic-cache-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Claude Desktop and other clients</strong>: <code>mcpServers</code> JSON</summary>
+
+```json
+{
+  "mcpServers": {
+    "semantic-cache": {
+      "command": "uvx",
+      "args": ["semantic-cache-mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+Restart the client. To pin a version instead of using uv's cached copy, install it once and point the client at the command:
+
+```bash
+uv tool install semantic-cache-mcp    # then use "command": "semantic-cache-mcp", no args
+```
+
+### Make your agent use it
+
+Agents reach for their built-in file tools by habit. Turn those off so every read goes through the cache.
+
+**Claude Code**: `~/.claude/settings.json`
 
 ```json
 {
@@ -104,11 +160,10 @@ Disable the client's built-in file tools so all file I/O routes through semantic
 }
 ```
 
-**OpenCode** — `~/.config/opencode/opencode.json`:
+**OpenCode**: `~/.config/opencode/opencode.json`
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
   "permission": {
     "read": "deny",
     "edit": "deny",
@@ -117,68 +172,79 @@ Disable the client's built-in file tools so all file I/O routes through semantic
 }
 ```
 
-### CLAUDE.md Configuration
-
-Add to `~/.claude/CLAUDE.md` to enforce semantic-cache globally:
+Then tell the agent why, in `CLAUDE.md`, `AGENTS.md` or your client's rules file:
 
 ```markdown
 ## Tools
 
-- MUST use `semantic-cache-mcp` instead of native I/O tools (98% token savings on cached reads)
+- Use `semantic-cache` for all file reads, writes, edits, grep and search instead of built-in file tools.
+- Keep each `content_hash` you receive and pass it back as `known_hash`, so re-reads cost a few tokens.
 ```
+
+---
+
+## How it works
+
+Every file the server sends comes with a `content_hash`. Your agent passes it back as `known_hash` on the next read, and the server answers based on what that proves:
+
+```mermaid
+flowchart LR
+    R["read(path, known_hash)"] --> M{"hash matches<br/>the file now?"}
+    M -- yes --> U["unchanged<br/>~40 tokens"]
+    M -- "no, older version" --> D["diff of changed lines"]
+    M -- "no hash" --> F["full file + content_hash"]
+    F -. "file over max_size" .-> O["outline map"]
+```
+
+- **No stale content.** Every read checks the file on disk (mtime, then a BLAKE3 hash). `unchanged` only answers when your hash matches the current bytes.
+- **Forgetting is safe.** The hash is the only proof the server accepts that a file is still in your context. After a compaction, read without the hash and you get the full file back.
+- **Diffs only when they help.** Files under 200 tokens, and diffs at least 90% of the file's size, come back in full.
+- **Large files become maps.** A file over `max_size` returns an outline of its definitions (or its first and last lines), not a blind cut at a byte offset. Read the part you need with `offset`/`limit`.
+- **Search runs on the cache.** `grep`, `search` and `glob` read the files the cache holds, not the disk. `warm` indexes a whole tree for a few dozen tokens, without sending any content.
+
+The cache is a local SQLite file, so it outlives restarts. One background daemon serves every client on your machine (see [Shared server](#shared-server)).
 
 ---
 
 ## Tools
 
-### Core
-
-| Tool | Description |
-|------|-------------|
-| `read` | Cache-aware single-file read: full content plus a `content_hash` on the first read, `unchanged` for a matching `known_hash`, a diff for a changed file. `offset`/`limit` recover exact line ranges, with the number gutter opt-in via `line_numbers=true` (it costs ~17% of a window, and the range is in `lines` regardless). `outline=true` returns one `line: signature` per definition instead of the text — the cheap first read of a large file, and a map rather than possession, so it reports `file_hash`. A file over `max_size` returns the same outline (or, with no definitions, its first and last 20 lines under `// L<a>-<b>` anchors), flagged `truncated` with `total_lines`. A partial or mapped read reports `file_hash` (prefixed `partial:`) — it identifies the file but is never proof you hold it. A ranged read also returns a signed `coverage_token` for the lines delivered: echo it back and a window you hold answers `unchanged`; windows covering the whole file mint a claimable `content_hash`. |
-| `read_image` | Image pass-through. Returns an MCP image content block (base64 + mime) so vision models see the pixels; sidecar metadata carries size and mime. Format verified by magic bytes (PNG, JPEG, GIF, TIFF, BMP, WebP), not extension. Bypasses the cache. Capped at 5 MiB raw (`SCMCP_MAX_IMAGE_BYTES`) and 5,000,000 bytes base64-encoded (`SCMCP_MAX_ENCODED_IMAGE_BYTES`). |
-| `write` | Full-file create or replace with cache refresh. Returns `created` or `updated`, with the diff against the previous content only when `show_diff=true`; creates missing parent directories (`create_parents=true`), and supports `dry_run`, `append=true` and formatters. A full write hands back a claimable `content_hash`; an append needs `known_hash` to earn one. |
-| `edit` | Exact edit against cached content, with scoped and line-range modes plus `dry_run=true`. Pass `known_hash` to get a claimable `content_hash` back and skip the read afterwards. For several edits to one file, use `batch_edit`. |
-| `batch_edit` | Many exact edits to one file, applied atomically, with per-edit success reporting. Takes `known_hash` on the same terms as `edit`. An ambiguous anchor, an anchor inside another edit's line range, and two overlapping ranges are each rejected rather than silently resolved; every reported success is verified against the text it produced. |
-| `edit_preview` | Read-only probe returning match count, line numbers, and context snippets for a candidate `old_string`. Confirms anchor uniqueness before a costly `edit`. |
-| `delete` | Single-path delete for a file or symlink, with cache eviction and `dry_run=true`. No globs, no recursion, no directory delete. |
-
-### Discovery
-
-| Tool | Description |
-|------|-------------|
-| `warm` | Index files into the cache so `grep` and `search` can see them, returning counts only — never content. Takes paths or globs, up to `max_files` per call (default 200, maximum 2,000). Every file left out is reported with a reason (`not_found`, `not_a_file`, `binary`, `too_large`, `unreadable`, `timeout`), and a cap that stops the walk sets `truncated` or `incomplete` rather than a short count that reads as complete. |
-| `batch_read` | Multi-file cache-aware read. Handles globs, priorities, token budgets, and diff/full routing. Returns each file's `content_hash`; pass them back as `known_hashes` to suppress the ones you still hold. |
-| `search` | Cache-only BM25 ranking of cached files. Terms join with `OR`, so a word your corpus lacks narrows the ranking instead of emptying the results. Returns `k` matches (default 10) from the current project, or from `directory` when given. Previews are opt-in (`show_preview=true`) and centre on the matching term rather than the file's first 200 characters, so they show why the file ranked. Index likely files with `warm` first. |
-| `grep` | Cache-only exact search — regex or literal. Best for symbols and exact strings. Hits come back as `"<line>:<text>"` strings grouped by file, context lines as `"<line>-<text>"`, with overlapping context windows merged so no line is sent twice; paths are relative to the `root` the response names. `output="paths"` answers "which files mention X" and `output="count"` just the totals. An invalid, over-long, or catastrophically backtracking pattern is an error, never an empty result; use `fixed_string=true` for literal text. Responses state whether the scan completed, so a capped result is never read as a total. |
-| `glob` | File discovery plus cache coverage. Find candidates, then pass the paths to `warm` (to index them) or `batch_read` (to read them). |
-
-### Management
-
-| Tool | Description |
-|------|-------------|
-| `stats` | Cache metrics, session usage (tokens saved, tool calls), and lifetime aggregates. |
-| `clear` | Reset all cache entries. |
-
----
-
-## Tool Reference
-
-The table above is the authoritative map; these are the common call shapes.
+| Tool | What it does |
+|------|--------------|
+| `read` | Cache-aware read: full file, `unchanged`, or a diff. `offset`/`limit` for line ranges, `outline=true` for a map of a large file. |
+| `batch_read` | Many files at once under a token budget, with globs and priorities. |
+| `read_image` | Sends an image to vision models as an MCP image block. |
+| `write` | Create or replace a file, with `dry_run`, `append` and formatters. |
+| `edit` | Exact find/replace, scoped to a line range, or a plain line-range replace. |
+| `batch_edit` | Many edits to one file, applied atomically. |
+| `edit_preview` | Shows where an `old_string` matches before you edit. |
+| `delete` | Deletes one file or symlink and drops it from the cache. |
+| `warm` | Indexes files for `grep` and `search`, and returns counts only. |
+| `grep` | Regex or literal search over cached files. |
+| `search` | BM25 keyword ranking of cached files. |
+| `glob` | Finds files and shows which are cached. |
+| `stats` | Tokens saved, cache size, and session metrics. |
+| `clear` | Empties the cache. |
 
 <details>
-<summary><strong>read</strong>: single file, automatic caching</summary>
+<summary><strong>read</strong>: details</summary>
 
 ```
-read path="/src/app.py"                        # automatic: full, unchanged, or diff
+read path="/src/app.py"                        # full, unchanged, or diff
+read path="/src/app.py" known_hash="847f..."   # prove you hold it
 read path="/src/app.py" offset=120 limit=80    # lines 120 to 199 only
+read path="/src/app.py" outline=true           # one line per definition
 ```
 
 | State | Response | Token cost |
 |-------|----------|------------|
 | First read | Full content plus a `content_hash` | Normal |
 | Unchanged | `unchanged: true`, when you pass back a matching `known_hash` | A few tokens |
-| Modified | Unified diff only, when you pass back the `known_hash` of the version you hold. Files under 200 tokens, and diffs not smaller than 90% of the file, come back in full | 5 to 20% of original |
+| Modified | A unified diff, when you pass back the `known_hash` of the version you hold | 5 to 20% of the file |
+| Over `max_size` | An outline (or the first and last 20 lines), flagged `truncated` with `total_lines` | A fraction of the file |
+
+- A partial or mapped read reports `file_hash` with a `partial:` prefix. It names the file but never counts as proof you hold it.
+- A ranged read returns a `coverage_token` for the lines sent. Pass it back as `known_hash`: a window you hold answers `unchanged`, and windows that add up to the whole file earn a full `content_hash`.
+- `line_numbers=true` adds a line-number gutter to a ranged read. It costs about 17% more tokens; the range is always in `lines`.
 
 </details>
 
@@ -189,48 +255,52 @@ read path="/src/app.py" offset=120 limit=80    # lines 120 to 199 only
 write path="/src/new.py" content="..."
 write path="/src/new.py" content="..." auto_format=true
 write path="/src/large.py" content="...chunk1..." append=false   # first chunk
-write path="/src/large.py" content="...chunk2..." append=true    # subsequent chunks
+write path="/src/large.py" content="...chunk2..." append=true    # later chunks
 ```
+
+Returns `created` or `updated`, and the diff only with `show_diff=true`. Creates missing parent directories with `create_parents=true`. A full write returns a usable `content_hash`; an append needs `known_hash` to earn one. With `dry_run=true` the status is `would_create` or `would_update` and nothing is written.
 
 </details>
 
 <details>
-<summary><strong>edit</strong>: find/replace with three modes</summary>
+<summary><strong>edit</strong>: three modes</summary>
 
 ```
-# Mode A: find/replace, searches the entire file
+# Mode A: find/replace across the file
 edit path="/src/app.py" old_string="def foo():" new_string="def foo(x: int):"
 edit path="/src/app.py" old_string="..." new_string="..." replace_all=true auto_format=true
 
-# Mode B: scoped find/replace, searches only within the line range (a shorter old_string works)
+# Mode B: find/replace inside a line range (a shorter old_string works)
 edit path="/src/app.py" old_string="pass" new_string="return x" start_line=42 end_line=42
 
-# Mode C: line replace, swaps the whole range with no old_string needed (most token savings)
+# Mode C: replace the whole range, no old_string needed (fewest tokens)
 edit path="/src/app.py" new_string="    return result\n" start_line=80 end_line=83
 ```
 
 | Mode | Parameters | Best for |
 |------|-----------|----------|
 | Find/replace | `old_string` + `new_string` | Unique strings, no line numbers known |
-| Scoped | `old_string` + `new_string` + `start_line`/`end_line` | Shorter context when `read` gave you line numbers |
-| Line replace | `new_string` + `start_line`/`end_line` | Maximum token savings when line numbers are known |
+| Scoped | `old_string` + `new_string` + `start_line`/`end_line` | Shorter anchors when `read` gave you line numbers |
+| Line replace | `new_string` + `start_line`/`end_line` | Fewest tokens when line numbers are known |
+
+Pass `known_hash` to get a usable `content_hash` back and skip the read afterwards.
 
 </details>
 
 <details>
-<summary><strong>batch_edit</strong>: multiple edits in one call</summary>
+<summary><strong>batch_edit</strong>: many edits in one call</summary>
 
 ```
-# Mode A: find/replace, [old, new]
+# Mode A: [old, new]
 batch_edit path="/src/app.py" edits='[["old1","new1"],["old2","new2"]]'
 
-# Mode B: scoped, [old, new, start_line, end_line]
+# Mode B: [old, new, start_line, end_line]
 batch_edit path="/src/app.py" edits='[["pass","return x",42,42]]'
 
-# Mode C: line replace, [null, new, start_line, end_line]
+# Mode C: [null, new, start_line, end_line]
 batch_edit path="/src/app.py" edits='[[null,"    return result\n",80,83]]'
 
-# Mixed modes in one call (object syntax also supported)
+# Mixed modes (object syntax also works)
 batch_edit path="/src/app.py" edits='[
   ["old1", "new1"],
   {"old": "pass", "new": "return x", "start_line": 42, "end_line": 42},
@@ -238,10 +308,12 @@ batch_edit path="/src/app.py" edits='[
 ]' auto_format=true
 ```
 
+All edits apply together or not at all, with a result per edit. An ambiguous anchor, an anchor inside another edit's range, and overlapping ranges are rejected, never guessed.
+
 </details>
 
 <details>
-<summary><strong>batch_read</strong>: multiple files with a token budget</summary>
+<summary><strong>batch_read</strong>: many files under a token budget</summary>
 
 ```
 batch_read paths="/src/a.py,/src/b.py" max_total_tokens=50000
@@ -250,37 +322,28 @@ batch_read paths="/src/*.py" max_total_tokens=30000
 batch_read paths="/src/a.py,/src/b.py" known_hashes='{"/src/a.py":"8f3c..."}'
 ```
 
-Expands simple globs, honors `priority`, enforces `max_total_tokens`, and reports skipped paths with recovery hints. Every file is returned in full unless you prove you still hold it: echo the delivered `content_hash` values back as `known_hashes` and the ones you hold collapse into an `unchanged` count.
+Expands simple globs, reads `priority` files first, stays under `max_total_tokens`, and lists skipped files with how to get them. Files you prove you hold through `known_hashes` collapse into an `unchanged` count.
 
 </details>
 
 <details>
-<summary><strong>warm</strong>: make a tree searchable without reading it</summary>
+<summary><strong>warm, grep, search, glob</strong>: find things</summary>
 
 ```
-warm paths="src/**/*.py"
-warm paths="src/a.py,src/b.py"
-warm paths="src/**/*" max_files=500
-```
-
-Indexes the files into the cache and returns counts — `warmed`, `already_current`, `skipped`, `tokens_indexed` — with no content, no previews, and no per-file paths for the ones that worked. Anything skipped comes back under `failures` with a reason, and a cap that stops the walk sets `truncated` or `incomplete`.
-
-The usual opening move on an unfamiliar tree: `warm`, then `grep` for the exact string or `search` for the concept, then `read` only what those name.
-
-</details>
-
-<details>
-<summary><strong>discovery</strong>: search, glob, grep</summary>
-
-```
-search query="authentication middleware logic" k=5 show_preview=true
-glob pattern="**/*.py" directory="./src" cached_only=true
+warm paths="src/**/*.py"                        # index a tree, returns counts only
+search query="authentication middleware" k=5 show_preview=true
 grep pattern="class Cache" path="src/**/*.py"
 grep pattern="content_hash" output="paths"
 grep pattern="TODO" output="count"
+glob pattern="**/*.py" directory="./src" cached_only=true
 ```
 
-A `grep` response names the shared directory once as `root` and reports each file's hits as `"<line>:<text>"` strings — measured at 37% fewer tokens than the per-match objects it replaced, and `glob` at 50%. `output="count"` turns a 2.6k-token answer into 77.
+The usual first move in an unfamiliar repo: `warm`, then `grep` for an exact string or `search` for a concept, then `read` only the files those name.
+
+- `warm` takes up to `max_files` per call (default 200, maximum 2,000) and reports every skipped file with a reason.
+- `grep` returns hits as `"<line>:<text>"` strings grouped by file, with paths relative to the `root` it names. An invalid or catastrophically backtracking pattern is an error, never an empty result. Use `fixed_string=true` for literal text.
+- `search` ranks with BM25 over the current project, or over `directory` when given. Terms join with `OR`. Previews are opt-in and centre on the matching term.
+- Every response says whether the scan finished, so a capped result never reads as a total.
 
 </details>
 
@@ -288,40 +351,30 @@ A `grep` response names the shared directory once as `root` and reports each fil
 
 ## Configuration
 
-### Environment Variables
+### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `LOG_DIR` | `<cache dir>/logs` | Directory for the dated log files |
 | `TOOL_OUTPUT_MODE` | `compact` | Response detail (`compact`, `normal`, `debug`) |
-| `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = disabled) |
-| `TOOL_TIMEOUT` | `30` | Seconds before a tool call times out (auto-resets executor) |
-| `MAX_CONTENT_SIZE` | `100000` | Default `max_size` for `read`: bytes above which a file returns a map (outline or head/tail) instead of its text |
-| `MAX_CACHE_ENTRIES` | `10000` | Max cache entries before W-TinyLFU eviction |
-| `SEMANTIC_CACHE_DIR` | *(platform)* | Override cache/database directory path |
+| `TOOL_MAX_RESPONSE_TOKENS` | `0` | Global response token cap (`0` = off) |
+| `TOOL_TIMEOUT` | `30` | Seconds before a tool call times out |
+| `MAX_CONTENT_SIZE` | `100000` | Default `max_size` for `read`: bytes above which a file returns a map instead of its text |
+| `MAX_CACHE_ENTRIES` | `10000` | Cached files kept before eviction |
+| `SEMANTIC_CACHE_DIR` | *(platform)* | Cache and database directory |
 | `SCMCP_MAX_IMAGE_BYTES` | `5242880` | Raw size cap for `read_image` (5 MiB) |
-| `SCMCP_MAX_ENCODED_IMAGE_BYTES` | `5000000` | Base64-encoded size cap for `read_image` |
+| `SCMCP_MAX_ENCODED_IMAGE_BYTES` | `5000000` | Base64 size cap for `read_image` |
 | `SCMCP_FORMAT_TIMEOUT_S` | `15` | Seconds a formatter may run for `auto_format` (minimum 1) |
-| `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. Off by default: it duplicates the text block byte for byte, and clients disagree about which they forward, so leaving it on can double the cost of every file delivered. |
-| `SCMCP_SHARED_SERVER` | `true` | Serve every client from one shared daemon per user and configuration. `false` runs a server per client, in-process. See [Shared server](#shared-server). |
-| `SCMCP_SHARED_TRANSPORT` | `unix` | How the command reaches the daemon: `unix` (Unix socket) or `tcp` (loopback port plus token). Windows always uses `tcp`. |
+| `SCMCP_STRUCTURED_CONTENT` | `false` | Also send each result as MCP `structuredContent`. Off because it duplicates the text block, which can double the cost of every file. |
+| `SCMCP_SHARED_SERVER` | `true` | Serve every client from one shared daemon. `false` runs a server per client. See [Shared server](#shared-server). |
+| `SCMCP_SHARED_TRANSPORT` | `unix` | `unix` (Unix socket) or `tcp` (loopback port plus token). Windows always uses `tcp`. |
 | `SCMCP_IDLE_TIMEOUT` | `600` | Seconds a shared daemon waits with no client before it exits |
-| `SCMCP_PUBLISH_OUTPUT_SCHEMA` | `false` | Advertise per-tool output schemas in `tools/list`. Off by default: they were 11.5k of this server's 19.8k advertised tokens, paid on every request, and the Anthropic Messages API has no field to receive them. Turning this on forces `SCMCP_STRUCTURED_CONTENT` on too, since MCP requires structured content from any tool that declares a schema. |
+| `SCMCP_PUBLISH_OUTPUT_SCHEMA` | `false` | Advertise per-tool output schemas in `tools/list`. Off because they cost 11.5k of the server's 19.8k advertised tokens on every request. Turning it on also turns on `SCMCP_STRUCTURED_CONTENT`. |
 
-A malformed value falls back to the default and logs a warning naming the variable. See [docs/env_variables.md](docs/env_variables.md) for detail.
+A malformed value logs a warning and keeps the default. An out-of-range value, such as `TOOL_TIMEOUT=0`, stops startup with `Configuration errors`. See [docs/env_variables.md](docs/env_variables.md).
 
-### Safety Limits
-
-| Limit | Value | Protects against |
-|-------|-------|-----------------|
-| `MAX_WRITE_SIZE` | 10 MB | Memory exhaustion via large writes |
-| `MAX_EDIT_SIZE` | 10 MB | Memory exhaustion via large file edits, in `edit` and `batch_edit` alike |
-| `MAX_MATCHES` | 10,000 | CPU exhaustion via unbounded `replace_all` |
-| `GREP_MAX_PATTERN_LEN` | 1,000 chars | Oversized `grep` regex source |
-| Regex shape check | — | Catastrophic backtracking ([details](docs/security.md#regular-expression-safety)) |
-
-### MCP Server Config
+Set them in your client's `env` block:
 
 ```json
 {
@@ -330,9 +383,7 @@ A malformed value falls back to the default and logs a warning naming the variab
       "command": "uvx",
       "args": ["semantic-cache-mcp"],
       "env": {
-        "LOG_LEVEL": "INFO",
-        "TOOL_OUTPUT_MODE": "compact",
-        "MAX_CONTENT_SIZE": "100000"
+        "MAX_CONTENT_SIZE": "200000"
       }
     }
   }
@@ -341,90 +392,82 @@ A malformed value falls back to the default and logs a warning naming the variab
 
 **Cache location:** `$XDG_CACHE_HOME/semantic-cache-mcp/` or `~/.cache/semantic-cache-mcp/` (Linux), `~/Library/Caches/semantic-cache-mcp/` (macOS), `%LOCALAPPDATA%\semantic-cache-mcp\` (Windows). Override with `SEMANTIC_CACHE_DIR`.
 
+### Safety limits
+
+| Limit | Value | Protects against |
+|-------|-------|-----------------|
+| `MAX_WRITE_SIZE` | 10M characters | Memory exhaustion from large writes |
+| `MAX_EDIT_SIZE` | 10M characters | Memory exhaustion from large edits, in `edit` and `batch_edit` |
+| `MAX_MATCHES` | 10,000 | CPU exhaustion from unbounded `replace_all` |
+| `GREP_MAX_PATTERN_LEN` | 1,000 chars | Oversized `grep` patterns |
+| Regex shape check | — | Catastrophic backtracking ([details](docs/security.md#regular-expression-safety)) |
+
+The server does not confine paths to a project: it can read and write anything your user account can. See [docs/security.md](docs/security.md).
+
 ### Shared server
 
-`semantic-cache-mcp` is a thin relay. It connects to one daemon and copies its stdio to it, starting the daemon when none is running. Every client then shares one cache, one tool worker and one database writer. With 4 clients, that measured 385 MB in 7 processes, against 1,201 MB in 12 when each client ran its own server. A client joins a running daemon in about 31 ms.
+The `semantic-cache-mcp` command is a thin relay to one background daemon, which it starts when none is running. Every client then shares one cache, one tool worker and one database writer. With 4 clients that measured 385 MB in 7 processes, against 1,201 MB in 12 with a server per client. A client joins a running daemon in about 31 ms.
 
 - Each client keeps its own MCP session, so roots and relative paths work as before. A client that names no root resolves relative paths against the directory it launched the command from.
 - Clients share a daemon only when they run the same build with the same configuration: every variable above, `PATH`, `HOME` (`USERPROFILE` on Windows), and anything prefixed `SCMCP_`.
-- On Linux and macOS the daemon listens on a Unix socket in `$XDG_RUNTIME_DIR/semantic-cache-mcp-<uid>/` (or the system temp directory), mode `0700`. The command refuses a directory that anyone else can enter.
-- On Windows (or with `SCMCP_SHARED_TRANSPORT=tcp`) it listens on a random `127.0.0.1` port. It writes the port and a random token to a `.port` file in `%LOCALAPPDATA%\semantic-cache-mcp\run\` (the same `0700` directory on POSIX), and drops any connection that does not send the token.
-- If the daemon cannot start, the command serves in-process instead. Tool calls still run one at a time, now across all clients.
+- On Linux and macOS the daemon listens on a Unix socket in `$XDG_RUNTIME_DIR/semantic-cache-mcp-<uid>/` (or the system temp directory), mode `0700`. The command refuses a directory anyone else can enter.
+- On Windows (or with `SCMCP_SHARED_TRANSPORT=tcp`) it listens on a random `127.0.0.1` port and writes the port and a random token to a `0600` `.port` file. A connection without the token is dropped.
+- If the daemon cannot start, the command serves in-process instead.
 - `semantic-cache-mcp serve` runs the daemon in the foreground.
-
----
-
-## How It Works
-
-```
-┌──────────┐     ┌────────────┐     ┌──────────────────────────┐
-│  Claude  │────▶│ smart_read │────▶│ stat() + cache lookup    │
-│   Code   │     │            │     │ (BEFORE any disk read)   │
-└──────────┘     └────────────┘     └──────────────────────────┘
-                        │
-       ┌────────────────┼─────────────────┬──────────────────┐
-       ▼                ▼                 ▼                  ▼
- ┌──────────┐    ┌──────────┐      ┌──────────┐      ┌────────────┐
- │ mtime    │    │ mtime    │      │ Changed  │      │ New /      │
- │ match    │    │ drift,   │      │ content  │      │ Large      │
- │ FAST     │    │ hash     │      │ → diff   │      │ → summary  │
- │ PATH     │    │ match    │      │ (80-95%) │      │  or full   │
- │ ~5 tok   │    │ ~5 tok   │      └──────────┘      └────────────┘
- │ (99%)    │    │ (99%)    │
- │ ~0.2 ms  │    │ ~1 ms    │
- │ no I/O   │    │ +update  │
- └──────────┘    └──────────┘
-```
-
-The percentages apply to a caller that echoes its hashes. `stat()` finds the file unchanged, but the server answers `unchanged` only for a matching `known_hash`; a diff is sent only to a caller whose hash proves it holds the previous bytes; any other read gets full content. A file under 200 tokens is sent in full rather than as a diff.
-
-`search` is cached on the same principle. An in-session LRU keyed on `(query, k, directory)` returns warm hits in ~10 µs, and misses fall through to BM25. Every cache mutation (`put`, `clear`, `delete_path`, `update_mtime`) bumps the LRU, so callers never see a result that predates a write.
 
 ---
 
 ## Performance
 
-Measured on this project's 48 source files (**131,899 tokens**, exact o200k counts), i9-13900K, ext4 on NVMe, corpus held fixed across phases. Every phase models a caller that keeps its hashes and echoes them back — that is what earns the savings.
+Measured on this project's 48 source files (**131,899 tokens**, exact o200k counts), i9-13900K, ext4 on NVMe. Every phase models an agent that passes its hashes back, which is what earns the savings.
 
-### Token savings: **98.7%** overall (phases 2 to 6)
+### Token savings: **98.7%** overall
 
-| Phase | Scenario | Savings |
-|-------|----------|--------:|
-| **Overall (cached, phases 2 to 6)** | **Aggregate token reduction** | **98.7%** |
-| Unchanged re-read | mtime match, fast path skips disk I/O | 99.0% |
-| Content hash | mtime drifted, BLAKE3 still matches | 99.0% |
-| Batch read | All files via `batch_read`, 200K budget | 99.0% |
-| Search previews | 5 queries × k=5, previews vs full reads | 98.4% |
-| Small edits | Real ~5% line changes in 30% of files | 97.8% |
-| Cold read | First read, no cache; one file exceeds `MAX_CONTENT_SIZE` and returns its outline, which is not a cache saving | 21.4% |
+| Scenario | Savings |
+|----------|--------:|
+| **All cached phases together** | **98.7%** |
+| Unchanged re-read (mtime match, no disk read) | 99.0% |
+| Re-read after mtime drift (hash still matches) | 99.0% |
+| `batch_read` of every file, 200K budget | 99.0% |
+| Search previews instead of full reads (5 queries × k=5) | 98.4% |
+| Small edits (~5% of lines in 30% of files) | 97.8% |
+| Cold first read (one oversized file returns its outline) | 21.4% |
 
-### Latency: **unchanged reads 0.17 ms; repeat searches < 0.01 ms**
+### Latency
 
-| Operation | p50 | Notes |
-|-----------|----:|-------|
-| Single unchanged read (fast path) | **0.17 ms** | mtime + indexed cache hit, no disk I/O |
-| Single diff read (changed file) | 0.17 ms | hash check + unified diff |
-| Search k=5 (cache **hit**) | **< 0.01 ms** | in-session LRU |
-| Search k=5 (cache **miss**) | 0.72 ms | BM25 keyword search |
-| Edit (scoped find/replace) | 2.5 ms | cached content, plus the atomic write's fsync |
-| Grep (literal `def `) | 2.2 ms | trigram index over cached corpus |
-| Grep (regex) | 2.2 ms | compiled once |
-| Batch read (48 files, diff mode) | 45.0 ms | chunk + tokenize changed files; one is outlined each full pass |
-| Unchanged re-read (48 files) | 8.2 ms | whole-corpus pass |
-| Cold read (48 files, total) | 130 ms | single unrepeated pass: I/O, tokenisation, one outline |
-| Write (200-line file) | 1.9 ms | creates + caches, durable before it returns |
+| Operation | p50 |
+|-----------|----:|
+| Unchanged read | **0.17 ms** |
+| Diff read (changed file) | 0.17 ms |
+| Search, repeated query | **< 0.01 ms** |
+| Search, new query (BM25) | 0.72 ms |
+| `grep` (trigram index) | 2.2 ms |
+| Write, 200-line file (durable) | 1.9 ms |
+| Edit, scoped find/replace (durable) | 2.5 ms |
+| Re-read of all 48 files | 8.2 ms |
+| `batch_read` of all 48 files | 45.0 ms |
+| Cold read of all 48 files | 130 ms |
 
-Through the real command over MCP stdio, an unchanged `read` round trip takes 1.3–1.6 ms, with or without the shared daemon. See [docs/performance.md](docs/performance.md#through-the-mcp-server).
+Through the real command over MCP stdio, an unchanged `read` round trip takes 1.3–1.6 ms. Methodology and how to run the benchmarks: [docs/performance.md](docs/performance.md).
 
-Run them yourself. Pin `TMPDIR` to a real disk — the default `/tmp` is usually tmpfs, which discards `fsync` and reports write latency ~40% low:
+---
 
-```bash
-TMPDIR="$HOME/.cache/scmcp-bench" \
-  uv run python benchmarks/benchmark_performance.py    # operation latency
-uv run python benchmarks/benchmark_token_savings.py    # token savings
-```
+## FAQ
 
-See [docs/performance.md](docs/performance.md) for full methodology.
+**Is the search "semantic" in the embeddings sense?**
+No. `search` is BM25 keyword ranking over SQLite FTS5, and `grep` is exact. That means no model to download, no GPU, and no API key. The name refers to the cache knowing which content your agent holds.
+
+**Can it serve stale content?**
+No. Every read checks the file on disk first. `unchanged` and diffs need a hash that matches what your agent last received, so a cache entry alone never stands in for the file.
+
+**What happens after my agent's context is compacted?**
+It reads without the hash and gets the full file. Nothing to reset.
+
+**Does it send my code anywhere?**
+No. Everything stays in a local SQLite file. The only network request is a one-time download of the o200k tokenizer file from OpenAI's public bucket, checked against a SHA-256 hash.
+
+**Does it work on Windows?**
+Yes. The shared daemon uses a loopback TCP port with a token there. CI runs on Linux and macOS.
 
 ---
 
@@ -432,12 +475,12 @@ See [docs/performance.md](docs/performance.md) for full methodology.
 
 | Guide | Description |
 |-------|-------------|
-| [Architecture](docs/architecture.md) | Component design, algorithms, data flow |
+| [Architecture](docs/architecture.md) | Components, algorithms, data flow |
 | [Performance](docs/performance.md) | Benchmarks, methodology, cache footprint |
 | [Security](docs/security.md) | Threat model, input validation, size limits |
-| [Advanced Usage](docs/advanced-usage.md) | Programmatic API, custom storage backends |
+| [Advanced Usage](docs/advanced-usage.md) | Python API |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues, debug logging |
-| [Environment Variables](docs/env_variables.md) | All env vars with defaults and examples |
+| [Environment Variables](docs/env_variables.md) | Every variable, with defaults |
 
 ---
 
@@ -450,20 +493,14 @@ uv sync --extra dev
 uv run pytest
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, pre-commit hooks, and code standards.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions, hooks and code standards. Issues and pull requests are welcome.
 
 ---
 
 ## License
 
-[MIT License](LICENSE). Use it freely in personal and commercial projects.
-
----
+[MIT](LICENSE). Use it freely in personal and commercial projects.
 
 ## Credits
 
-Built with [FastMCP 4.0+](https://github.com/jlowin/fastmcp) and:
-
-- SQLite with FTS5 for keyword (BM25) full-text search, vendored as a small built-in store
-- BLAKE3 cryptographic hashing for content freshness
-- W-TinyLFU frequency-aware cache eviction
+Built with [FastMCP](https://github.com/jlowin/fastmcp), SQLite FTS5 for BM25 search, BLAKE3 for content hashing, and TinyLFU-style eviction.

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.CoderDayton/semantic-cache-mcp",
+  "title": "Semantic Cache MCP",
+  "description": "File cache for coding agents: re-reads cost ~40 tokens, changed files return diffs.",
+  "repository": {
+    "url": "https://github.com/CoderDayton/semantic-cache-mcp",
+    "source": "github"
+  },
+  "version": "0.7.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "semantic-cache-mcp",
+      "version": "0.7.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
