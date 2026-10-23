@@ -48,6 +48,7 @@ from .tools import CONNECTION_CWD
 logger = logging.getLogger(__name__)
 
 IDLE_TIMEOUT = 600.0
+FIRST_CLIENT_GRACE = 10.0
 LOCK_WAIT = 0.5
 _PREAMBLE_MAX = 64 * 1024
 _PREAMBLE_TIMEOUT = 10.0
@@ -100,11 +101,13 @@ class _Connections:
 
     def __init__(self) -> None:
         self.active = 0
+        self.served = False
         self.last_closed = time.monotonic()
         self._changed = anyio.Event()
 
     def opened(self) -> None:
         self.active += 1
+        self.served = True
         self._notify()
 
     def closed(self) -> None:
@@ -116,13 +119,17 @@ class _Connections:
         self._changed.set()
         self._changed = anyio.Event()
 
-    async def wait_idle(self, idle: float) -> None:
+    async def wait_idle(self, idle: float, *, first_client_grace: float) -> None:
+        """Return once no connection has been open for ``idle`` seconds.
+        Until the first connection the wait is at least ``first_client_grace``,
+        so the launcher that started the daemon always gets to connect."""
         while True:
             changed = self._changed
             if self.active:
                 await changed.wait()
                 continue
-            remaining = idle - (time.monotonic() - self.last_closed)
+            limit = idle if self.served else max(idle, first_client_grace)
+            remaining = limit - (time.monotonic() - self.last_closed)
             if remaining <= 0:
                 return
             with anyio.move_on_after(remaining):
@@ -203,7 +210,7 @@ async def _accept(
 
 
 async def _stop_when_idle(connections: _Connections, idle: float, stop: anyio.Event) -> None:
-    await connections.wait_idle(idle)
+    await connections.wait_idle(idle, first_client_grace=FIRST_CLIENT_GRACE)
     stop.set()
 
 

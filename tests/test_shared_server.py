@@ -186,6 +186,21 @@ class TestSharedServer:
             assert await asyncio.wait_for(reader.read(), timeout=10) == b""
             writer.close()
 
+    async def test_an_idle_timeout_of_zero_still_serves_the_first_client(
+        self, tmp_path: Path, runtime: Path
+    ) -> None:
+        import time
+
+        env = _env(tmp_path, runtime)
+        env["SCMCP_IDLE_TIMEOUT"] = "0"
+        (tmp_path / "x.txt").write_text("epsilon\n")
+        started = time.monotonic()
+        async with _client(env, tmp_path, tmp_path / "z.log") as c:
+            assert "epsilon" in _text(await c.call_tool("read", {"path": "x.txt"}))
+            assert len(_sockets(runtime)) == 1
+        assert time.monotonic() - started < 20
+        assert await _wait_for_no_sockets(runtime, 5), "daemon outlived its last client"
+
     async def test_turned_off_it_serves_in_process(self, tmp_path: Path, runtime: Path) -> None:
         env = _env(tmp_path, runtime, SCMCP_SHARED_SERVER="0")
         (tmp_path / "x.txt").write_text("gamma\n")
@@ -300,6 +315,25 @@ class TestRelay:
         started = time.monotonic()
         assert _daemon._spawn_and_connect(target, {}) is None
         assert time.monotonic() - started < 5
+
+
+class TestIdle:
+    async def test_a_new_daemon_waits_for_its_first_client(self) -> None:
+        from semantic_cache_mcp.server import _daemon as daemon
+
+        connections = daemon._Connections()
+        with anyio.move_on_after(0.3) as scope:
+            await connections.wait_idle(0.0, first_client_grace=5.0)
+        assert scope.cancelled_caught, "exited before any client connected"
+
+    async def test_after_its_last_client_it_uses_the_idle_timeout(self) -> None:
+        from semantic_cache_mcp.server import _daemon as daemon
+
+        connections = daemon._Connections()
+        connections.opened()
+        connections.closed()
+        with anyio.fail_after(1):
+            await connections.wait_idle(0.0, first_client_grace=5.0)
 
 
 class TestPreamble:
